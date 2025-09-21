@@ -1,0 +1,8 @@
+[package]
+name = "petalsonic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+audionimbus = "0.8.1"
+glam = "0.30.7"

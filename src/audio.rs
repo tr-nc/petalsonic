@@ -186,62 +186,51 @@ impl PetalSonicAudioData {
             return Ok(self.clone());
         }
 
-        use rubato::{
-            Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
-            WindowFunction,
-        };
+        use rubato::{FftFixedIn, Resampler};
 
-        let params = SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
+        let chunk_size = 1024;
 
-        let resample_ratio = target_sample_rate as f64 / self.inner.sample_rate as f64;
-
-        let mut resampler = SincFixedIn::new(
-            resample_ratio,
-            2.0, // resample_ratio_relative_range
-            params,
-            1024, // chunk_size
+        let mut resampler = FftFixedIn::new(
+            self.inner.sample_rate as usize,
+            target_sample_rate as usize,
+            chunk_size,
+            2, // sub_chunks
             self.inner.channels as usize,
         )
         .map_err(|e| PetalSonicError::AudioLoading(format!("Failed to create resampler: {}", e)))?;
 
         let mut resampled_samples = Vec::new();
-        let frames_per_channel = self.inner.total_frames;
 
         // Process each channel separately
         for ch in 0..self.inner.channels as usize {
             let channel_samples = self.channel_samples(ch)?;
-
-            let mut waves_in = vec![channel_samples];
-            let mut waves_out = vec![vec![0.0f32; 2048]; 1]; // Output buffer
-
             let mut output_buffer = Vec::new();
-            let mut frame_idx = 0;
+            let mut input_index = 0;
 
-            while frame_idx < frames_per_channel {
-                let frames_to_process = (frames_per_channel - frame_idx).min(1024);
+            while input_index < channel_samples.len() {
+                let remaining_samples = channel_samples.len() - input_index;
+                let samples_to_process = remaining_samples.min(chunk_size);
 
-                // Prepare input for this chunk
-                let chunk: Vec<f32> =
-                    waves_in[0][frame_idx..frame_idx + frames_to_process].to_vec();
-                waves_in[0] = chunk;
-
-                let (_, n_out) = resampler
-                    .process_into_buffer(&waves_in, &mut waves_out, None)
-                    .map_err(|e| {
-                        PetalSonicError::AudioLoading(format!("Resampling error: {}", e))
-                    })?;
-
-                if n_out > 0 {
-                    output_buffer.extend_from_slice(&waves_out[0][..n_out]);
+                if samples_to_process == 0 {
+                    break;
                 }
 
-                frame_idx += frames_to_process;
+                // Pad the chunk to chunk_size if needed
+                let mut input_chunk = vec![0.0f32; chunk_size];
+                let end_index = (input_index + samples_to_process).min(channel_samples.len());
+                input_chunk[..samples_to_process]
+                    .copy_from_slice(&channel_samples[input_index..end_index]);
+
+                let waves_in = vec![input_chunk];
+                let waves_out = resampler.process(&waves_in, None).map_err(|e| {
+                    PetalSonicError::AudioLoading(format!("Resampling error: {}", e))
+                })?;
+
+                if let Some(first_channel) = waves_out.get(0) {
+                    output_buffer.extend_from_slice(first_channel);
+                }
+
+                input_index += samples_to_process;
             }
 
             resampled_samples.push(output_buffer);
@@ -253,7 +242,9 @@ impl PetalSonicAudioData {
 
         for frame_idx in 0..new_frames {
             for ch in 0..self.inner.channels as usize {
-                interleaved_samples.push(resampled_samples[ch][frame_idx]);
+                if frame_idx < resampled_samples[ch].len() {
+                    interleaved_samples.push(resampled_samples[ch][frame_idx]);
+                }
             }
         }
 

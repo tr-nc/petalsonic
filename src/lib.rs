@@ -85,7 +85,8 @@ mod tests {
 
         // Load the audio file
         let wav_path = "res/cicada_test_96k.wav";
-        let load_options = LoadOptions::default();
+        let config = PetalSonicConfig::default();
+        let load_options = LoadOptions::default().target_sample_rate(config.sample_rate); // Resample to match playback device
 
         println!("Loading audio file: {}", wav_path);
         let audio_data =
@@ -99,7 +100,7 @@ mod tests {
         println!("  - Total samples: {}", audio_data.len());
 
         // Create world configuration
-        let config = PetalSonicConfig::default().enable_spatialization(false); // No spatialization for direct playback
+        let config = config.enable_spatialization(false); // No spatialization for direct playback
         println!("✓ World configuration created (spatialization disabled)");
 
         // Create and start the world

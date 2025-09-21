@@ -1,3 +1,5 @@
+//! Simple audio playback for testing purposes
+
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -23,12 +25,15 @@ pub fn play_audio_samples(samples: Vec<f32>, sample_rate: u32) -> Result<()> {
     println!("\n📋 Available Output Devices:");
     let output_devices: Vec<_> = host.output_devices()?.collect();
     for (i, device) in output_devices.iter().enumerate() {
-        let device_name = device.name().unwrap_or_else(|_| "Unknown Device".to_string());
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "Unknown Device".to_string());
         println!("  {}. {}", i + 1, device_name);
 
         // Show default config for each device
         if let Ok(default_config) = device.default_output_config() {
-            println!("     Default: {}ch, {}Hz, {:?}",
+            println!(
+                "     Default: {}ch, {}Hz, {:?}",
                 default_config.channels(),
                 default_config.sample_rate().0,
                 default_config.sample_format()
@@ -54,7 +59,8 @@ pub fn play_audio_samples(samples: Vec<f32>, sample_rate: u32) -> Result<()> {
     let supported_configs: Vec<_> = device.supported_output_configs()?.collect();
     println!("\n🔧 All Supported Configurations:");
     for (i, config) in supported_configs.iter().enumerate() {
-        println!("  {}. Channels: {}, Rate: {}-{}Hz, Format: {:?}",
+        println!(
+            "  {}. Channels: {}, Rate: {}-{}Hz, Format: {:?}",
             i + 1,
             config.channels(),
             config.min_sample_rate().0,
@@ -82,8 +88,11 @@ pub fn play_audio_samples(samples: Vec<f32>, sample_rate: u32) -> Result<()> {
             "⚠ Sample rate {} Hz not directly supported, using default config",
             sample_rate
         );
-        println!("  WASAPI will handle resampling from {}Hz to {}Hz",
-            sample_rate, default_config.sample_rate().0);
+        println!(
+            "  WASAPI will handle resampling from {}Hz to {}Hz",
+            sample_rate,
+            default_config.sample_rate().0
+        );
         default_config.config()
     };
 
@@ -108,13 +117,13 @@ pub fn play_audio_samples(samples: Vec<f32>, sample_rate: u32) -> Result<()> {
     // Start the stream
     stream.play()?;
 
-    println!("Playing audio... (press Ctrl+C to stop)");
+    println!("\n🔊 Playing audio... (press Ctrl+C to stop)");
 
     // Keep the stream alive for the duration of the audio
     let duration_secs = frames as f64 / sample_rate as f64;
     std::thread::sleep(std::time::Duration::from_secs_f64(duration_secs + 1.0));
 
-    println!("Playback finished");
+    println!("✓ Playback finished");
 
     Ok(())
 }

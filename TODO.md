@@ -8,23 +8,23 @@ Only install the dependencies where needed.
 
 ## Project Setup
 
-- [ ] Initialize Cargo project with dependencies
-- [ ] Set up basic crate structure following layout in README
+- [x] Initialize Cargo project with dependencies
+- [x] Set up basic crate structure following layout in README
 
 ## Core Infrastructure (Phase 1)
 
-- [ ] Implement error types (`PetalSonicError`)
-- [ ] Create configuration struct (`PetalSonicConfig`)
-- [ ] Set up math types (`Vec3`, `Quat`, `Pose`) using glam
-- [ ] Define event types (`PetalSonicEvent`)
+- [x] Implement error types (`PetalSonicError`)
+- [x] Create configuration struct (`PetalSonicConfig`)
+- [x] Set up math types (`Pose`) using glam
+- [x] Define event types (`PetalSonicEvent`)
 
 ## Audio Data Loading (Phase 2)
 
-- [ ] Implement `PetalSonicAudioData` with Arc-backed inner data
-- [ ] Create Symphonia-based audio loader (`symphonia_loader.rs`)
-- [ ] Add resampling functionality using rubato
-- [ ] Implement mono downmixing for spatial sources
-- [ ] Create `LoadOptions` struct for loading configuration
+- [x] Implement `PetalSonicAudioData` with Arc-backed inner data
+- [x] Create Symphonia-based audio loader (`symphonia_loader.rs`)
+- [x] Add resampling functionality using rubato
+- [x] Implement mono downmixing for spatial sources
+- [x] Create `LoadOptions` struct for loading configuration
 
 ## Ring Buffer & Audio Backend (Phase 3)
 
@@ -82,20 +82,6 @@ Only install the dependencies where needed.
 - [ ] Sample rate adaptation for different devices
 - [ ] Additional spatial audio features (reverb, occlusion)
 
-## Dependencies to Add
-
-```toml
-[dependencies]
-symphonia = "0.5"
-cpal = "0.15"
-audionimbus = "0.1"  # or steam-audio-rs
-rubato = "0.14"
-glam = "0.25"
-anyhow = "1.0"
-crossbeam-channel = "0.5"
-thiserror = "1.0"
-```
-
 ## Key Design Principles
 
 - Real-time safety: No allocations/locks in audio callback
@@ -103,3 +89,4 @@ thiserror = "1.0"
 - Fixed-size blocks for predictable performance
 - Automatic cleanup of finished one-shot sources
 - Spatial audio using Steam Audio for HRTF processing
+- Keep it simple and stupid

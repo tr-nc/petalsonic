@@ -1,6 +1,19 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! PetalSonic - Spatial Audio Library
+//!
+//! A real-time safe spatial audio library using Steam Audio (audionimbus) for spatialization.
+
+pub mod audio;
+pub mod config;
+pub mod engine;
+pub mod error;
+pub mod events;
+pub mod math;
+pub mod world;
+
+pub use config::PetalSonicConfig;
+pub use error::PetalSonicError;
+pub use events::PetalSonicEvent;
+pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld};
 
 #[cfg(test)]
 mod tests {
@@ -8,7 +21,6 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+        assert_eq!(2 + 2, 4);
     }
 }

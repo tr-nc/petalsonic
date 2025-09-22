@@ -1,7 +1,7 @@
-//! Symphonia-based audio loader for PetalSonic
-
-use crate::audio::{LoadOptions, PetalSonicAudioData};
-use crate::error::{PetalSonicError, Result};
+use crate::{
+    audio_data::{LoadOptions, PetalSonicAudioData},
+    error::{PetalSonicError, Result},
+};
 use std::fs::File;
 use std::path::Path;
 use std::time::Duration;

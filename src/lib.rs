@@ -1,17 +1,11 @@
-//! PetalSonic - Spatial Audio Library
-//!
-//! A real-time safe spatial audio library using Steam Audio (audionimbus) for spatialization.
-
-pub mod audio;
+pub mod audio_data;
 pub mod config;
 pub mod engine;
 pub mod error;
 pub mod events;
 pub mod math;
-pub mod world;
-
-#[cfg(test)]
 pub mod test_audio_playback;
+pub mod world;
 
 pub use config::PetalSonicConfig;
 pub use error::PetalSonicError;
@@ -20,19 +14,13 @@ pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld}
 
 #[cfg(test)]
 mod tests {
-    use crate::audio::{LoadOptions, load_audio_file};
-
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
+    use crate::audio_data::{LoadOptions, load_audio_file};
 
     #[test]
     fn test_decode_wav_file() {
-        let wav_path = "res/cicada_test.wav";
+        const WAV_PATH: &str = "res/cicada_test_96k.wav";
         let load_options = LoadOptions::default();
-
-        match load_audio_file(wav_path, &load_options) {
+        match load_audio_file(WAV_PATH, &load_options) {
             Ok(audio_data) => {
                 println!("Successfully loaded audio file:");
                 println!("  Sample rate: {} Hz", audio_data.sample_rate());
@@ -40,29 +28,6 @@ mod tests {
                 println!("  Duration: {:?}", audio_data.duration());
                 println!("  Total frames: {}", audio_data.total_frames());
                 println!("  Total samples: {}", audio_data.len());
-
-                // Get the first 10 values of the left channel (channel 0)
-                match audio_data.channel_samples(0) {
-                    Ok(left_channel) => {
-                        println!("\nFirst 10 values of left channel:");
-                        for (i, &sample) in left_channel.iter().take(10).enumerate() {
-                            println!("  Sample {}: {:.6}", i, sample);
-                        }
-
-                        // Show samples 1000-1010
-                        println!("\nSamples 1000-1010 of left channel:");
-                        for (i, &sample) in left_channel.iter().skip(1000).take(11).enumerate() {
-                            println!("  Sample {}: {:.6}", i + 1000, sample);
-                        }
-
-                        // Also show some basic statistics
-                        let max_val = left_channel.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
-                        println!("\nMax absolute value in left channel: {:.6}", max_val);
-                    }
-                    Err(e) => {
-                        println!("Error getting left channel samples: {}", e);
-                    }
-                }
             }
             Err(e) => {
                 println!("Error loading audio file: {}", e);
@@ -73,10 +38,7 @@ mod tests {
 
     #[test]
     fn test_play_audio_file() {
-        // load the audio, create the world, play the audio inside the world.
-        // no spatial is required for now. just play the audio directly.
-
-        use crate::audio::{LoadOptions, load_audio_file};
+        use crate::audio_data::LoadOptions;
         use crate::config::PetalSonicConfig;
         use crate::world::PetalSonicWorld;
         use std::sync::Arc;

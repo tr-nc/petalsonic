@@ -1,6 +1,4 @@
-//! World API for PetalSonic
-
-use crate::audio::PetalSonicAudioData;
+use crate::audio_data::PetalSonicAudioData;
 use crate::config::PetalSonicConfig;
 use crate::error::Result;
 use crate::events::PetalSonicEvent;

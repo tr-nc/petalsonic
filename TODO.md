@@ -6,25 +6,15 @@ You can find reference under src/reference-audio/, you can copy code from there,
 
 Only install the dependencies where needed.
 
-## Project Setup
+## Adapt different sample rates
 
-- [x] Initialize Cargo project with dependencies
-- [x] Set up basic crate structure following layout in README
-
-## Core Infrastructure (Phase 1)
-
-- [x] Implement error types (`PetalSonicError`)
-- [x] Create configuration struct (`PetalSonicConfig`)
-- [x] Set up math types (`Pose`) using glam
-- [x] Define event types (`PetalSonicEvent`)
-
-## Audio Data Loading (Phase 2)
-
-- [x] Implement `PetalSonicAudioData` with Arc-backed inner data
-- [x] Create Symphonia-based audio loader (`symphonia_loader.rs`)
-- [x] Add resampling functionality using rubato
-- [x] Implement mono downmixing for spatial sources
-- [x] Create `LoadOptions` struct for loading configuration
+- [ ] Use a fixed sample rate in world, for example 44100 Hz.
+- [ ] Everytime we load a audio data into the world, we should resample it during loading time.
+- [ ] Store each audio data in a Arc to avoid copying the audio data.
+- [ ] Store all audio data in a HashMap in world, so we can access them by their uuid.
+- [ ] Get the output sample rate from the device.
+- [ ] Create a callback function that is required to fill a certain amount of samples, this function must not be blocking, and the target sample rate of the filled samples is configured in the world.
+- [ ] Use rubato to resample the audio to the output sample rate in realtime. The source of the audio is given from the callback function.
 
 ## Ring Buffer & Audio Backend (Phase 3)
 

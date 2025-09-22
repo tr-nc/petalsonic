@@ -1,5 +1,3 @@
-//! Simple audio playback for testing purposes
-
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};

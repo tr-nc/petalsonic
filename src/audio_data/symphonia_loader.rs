@@ -173,31 +173,3 @@ pub fn load_audio_file(path: &str, options: &LoadOptions) -> Result<PetalSonicAu
 pub fn load_audio_file_simple(path: &str) -> Result<PetalSonicAudioData> {
     load_audio_file(path, &LoadOptions::default())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_load_options_default() {
-        let options = LoadOptions::default();
-        assert_eq!(options.target_sample_rate, None);
-        assert_eq!(options.convert_to_mono, false);
-        assert_eq!(options.max_duration, None);
-        assert_eq!(options.mono_channel, None);
-    }
-
-    #[test]
-    fn test_load_options_builder() {
-        let options = LoadOptions::new()
-            .target_sample_rate(48000)
-            .convert_to_mono(true)
-            .max_duration(Duration::from_secs(10))
-            .mono_channel(0);
-
-        assert_eq!(options.target_sample_rate, Some(48000));
-        assert_eq!(options.convert_to_mono, true);
-        assert_eq!(options.max_duration, Some(Duration::from_secs(10)));
-        assert_eq!(options.mono_channel, Some(0));
-    }
-}

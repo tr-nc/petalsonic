@@ -12,3 +12,4 @@ glam = "0.29.2"
 anyhow = "1.0.89"
 crossbeam-channel = "0.5.13"
 thiserror = "1.0.69"
+uuid = { version = "1.10", features = ["v4"] }

@@ -14,22 +14,10 @@ PetalSonic is a real-time safe spatial audio library for Rust that uses Steam Au
 # Build the project
 cargo build
 
-# Build in release mode
-cargo build --release
-
 # Run tests
 cargo test
 
-# Run a specific test
-cargo test test_name
-
-# Check code without building
-cargo check
-
-# Format code (automatically run after tasks)
-cargo fmt
-
-# Run clippy linter
+# Check if the code is correct and idiomatic
 cargo clippy
 ```
 

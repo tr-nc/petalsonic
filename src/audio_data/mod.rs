@@ -1,8 +1,10 @@
 mod load_options;
+mod resampler;
 mod symphonia_loader;
 
 use crate::error::{PetalSonicError, Result};
 pub use load_options::LoadOptions;
+pub use resampler::AudioResampler;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -137,75 +139,22 @@ impl PetalSonicAudioData {
             return Ok(self.clone());
         }
 
-        use rubato::{FftFixedIn, Resampler};
+        let resampler = AudioResampler::new(
+            self.inner.sample_rate,
+            target_sample_rate,
+            self.inner.channels,
+            Some(1024), // chunk_size
+        )?;
 
-        let chunk_size = 1024;
-
-        let mut resampler = FftFixedIn::new(
-            self.inner.sample_rate as usize,
-            target_sample_rate as usize,
-            chunk_size,
-            2, // sub_chunks
-            self.inner.channels as usize,
-        )
-        .map_err(|e| PetalSonicError::AudioLoading(format!("Failed to create resampler: {}", e)))?;
-
-        let mut resampled_samples = Vec::new();
-
-        // Process each channel separately
-        for ch in 0..self.inner.channels as usize {
-            let channel_samples = self.channel_samples(ch)?;
-            let mut output_buffer = Vec::new();
-            let mut input_index = 0;
-
-            while input_index < channel_samples.len() {
-                let remaining_samples = channel_samples.len() - input_index;
-                let samples_to_process = remaining_samples.min(chunk_size);
-
-                if samples_to_process == 0 {
-                    break;
-                }
-
-                // Pad the chunk to chunk_size if needed
-                let mut input_chunk = vec![0.0f32; chunk_size];
-                let end_index = (input_index + samples_to_process).min(channel_samples.len());
-                input_chunk[..samples_to_process]
-                    .copy_from_slice(&channel_samples[input_index..end_index]);
-
-                let waves_in = vec![input_chunk];
-                let waves_out = resampler.process(&waves_in, None).map_err(|e| {
-                    PetalSonicError::AudioLoading(format!("Resampling error: {}", e))
-                })?;
-
-                if let Some(first_channel) = waves_out.get(0) {
-                    output_buffer.extend_from_slice(first_channel);
-                }
-
-                input_index += samples_to_process;
-            }
-
-            resampled_samples.push(output_buffer);
-        }
-
-        // Interleave the resampled channels
-        let mut interleaved_samples = Vec::new();
-        let new_frames = resampled_samples[0].len();
-
-        for frame_idx in 0..new_frames {
-            for ch in 0..self.inner.channels as usize {
-                if frame_idx < resampled_samples[ch].len() {
-                    interleaved_samples.push(resampled_samples[ch][frame_idx]);
-                }
-            }
-        }
+        let resampled_samples = resampler.resample_interleaved(&self.inner.samples)?;
 
         let new_duration = Duration::from_secs_f64(
-            interleaved_samples.len() as f64
+            resampled_samples.len() as f64
                 / (target_sample_rate * self.inner.channels as u32) as f64,
         );
 
         Ok(Self::new(
-            interleaved_samples,
+            resampled_samples,
             target_sample_rate,
             self.inner.channels,
             new_duration,

@@ -1,17 +1,48 @@
-use crate::audio_data::PetalSonicAudioData;
+use crate::audio_data::{LoadOptions, PetalSonicAudioData, load_audio_file};
 use crate::config::PetalSonicConfig;
 use crate::error::Result;
 use crate::events::PetalSonicEvent;
 use crate::math::{Pose, Vec3};
+use std::collections::HashMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct PetalSonicWorld {
     config: PetalSonicConfig,
+    audio_data_storage: HashMap<Uuid, Arc<PetalSonicAudioData>>,
 }
 
 impl PetalSonicWorld {
     pub fn new(config: PetalSonicConfig) -> Result<Self> {
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            audio_data_storage: HashMap::new(),
+        })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
+    /// Load an audio file and automatically resample it to the world's sample rate
+    pub fn load_audio_file(&self, path: &str) -> Result<Arc<PetalSonicAudioData>> {
+        let load_options = LoadOptions::default().target_sample_rate(self.config.sample_rate);
+
+        let audio_data = load_audio_file(path, &load_options)?;
+        Ok(Arc::new(audio_data))
+    }
+
+    /// Load an audio file with custom options, but ensure it matches the world's sample rate
+    pub fn load_audio_file_with_options(
+        &self,
+        path: &str,
+        mut options: LoadOptions,
+    ) -> Result<Arc<PetalSonicAudioData>> {
+        // Override the target sample rate to match the world's sample rate
+        options.target_sample_rate = Some(self.config.sample_rate);
+
+        let audio_data = load_audio_file(path, &options)?;
+        Ok(Arc::new(audio_data))
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -27,31 +58,35 @@ impl PetalSonicWorld {
         Vec::new()
     }
 
-    /// Add an audio source and play it immediately (basic implementation)
-    pub fn add_source(&mut self, audio_data: Arc<PetalSonicAudioData>) -> Result<u64> {
-        println!("🎵 Playing audio source directly (non-spatial)...");
-
-        // Get samples from the first channel
-        let samples = audio_data.channel_samples(0)?;
-        let sample_rate = audio_data.sample_rate();
-
-        println!("  - Samples: {}", samples.len());
-        println!("  - Sample rate: {} Hz", sample_rate);
-        println!("  - Duration: {:?}", audio_data.duration());
-
-        // For now, we'll use a simple approach - play the audio directly
-        // In a real implementation, this would be queued for the audio thread
-        #[cfg(test)]
-        {
-            use crate::test_audio_playback::play_audio_samples;
-            match play_audio_samples(samples.to_vec(), sample_rate) {
-                Ok(()) => println!("✓ Audio playback completed successfully"),
-                Err(e) => println!("✗ Audio playback failed: {}", e),
-            }
+    /// Add an audio source to the world storage and return its UUID
+    pub fn add_source(&mut self, audio_data: Arc<PetalSonicAudioData>) -> Result<Uuid> {
+        // Verify that the audio data sample rate matches the world's sample rate
+        if audio_data.sample_rate() != self.config.sample_rate {
+            return Err(crate::error::PetalSonicError::AudioFormat(format!(
+                "Audio data sample rate ({} Hz) does not match world sample rate ({} Hz). Use world.load_audio_file() to automatically resample.",
+                audio_data.sample_rate(),
+                self.config.sample_rate
+            )));
         }
 
-        // Return a dummy source ID
-        Ok(1)
+        let uuid = Uuid::new_v4();
+        self.audio_data_storage.insert(uuid, audio_data);
+        Ok(uuid)
+    }
+
+    /// Get audio data by UUID
+    pub fn get_audio_data(&self, uuid: Uuid) -> Option<&Arc<PetalSonicAudioData>> {
+        self.audio_data_storage.get(&uuid)
+    }
+
+    /// Remove audio data by UUID
+    pub fn remove_audio_data(&mut self, uuid: Uuid) -> Option<Arc<PetalSonicAudioData>> {
+        self.audio_data_storage.remove(&uuid)
+    }
+
+    /// Get all stored audio data UUIDs
+    pub fn get_audio_data_uuids(&self) -> Vec<Uuid> {
+        self.audio_data_storage.keys().copied().collect()
     }
 }
 

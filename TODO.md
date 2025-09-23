@@ -8,8 +8,8 @@ Only install the dependencies where needed.
 
 ## Adapt different sample rates
 
-- [ ] Use a fixed sample rate in world, for example 44100 Hz.
-- [ ] Everytime we load a audio data into the world, we should resample it during loading time.
+- [ ] TODO: Everytime we load a audio data into the world, we should resample it during loading time.
+- [ ] TODO: For PetalSonicAudioData::resample, it's better to create a module for rubato interactions, and call that module inside the resample function, rather than making itself very verbose.
 - [ ] Store each audio data in a Arc to avoid copying the audio data.
 - [ ] Store all audio data in a HashMap in world, so we can access them by their uuid.
 - [ ] Get the output sample rate from the device.

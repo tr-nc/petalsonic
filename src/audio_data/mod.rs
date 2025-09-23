@@ -3,7 +3,7 @@ mod resampler;
 mod symphonia_loader;
 
 use crate::error::{PetalSonicError, Result};
-pub use load_options::LoadOptions;
+pub use load_options::{ConvertToMono, LoadOptions};
 pub use resampler::AudioResampler;
 use std::sync::Arc;
 use std::time::Duration;

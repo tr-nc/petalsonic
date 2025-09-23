@@ -41,7 +41,6 @@ mod tests {
         use crate::audio_data::LoadOptions;
         use crate::config::PetalSonicConfig;
         use crate::world::PetalSonicWorld;
-        use std::sync::Arc;
 
         println!("=== PetalSonic Audio Playback Test ===");
 
@@ -53,7 +52,7 @@ mod tests {
             ..Default::default()
         };
 
-        let load_options = LoadOptions::default().target_sample_rate(config.sample_rate); // Resample to match playback device
+        let load_options = LoadOptions::default();
 
         println!("Loading audio file: {}", wav_path);
         let audio_data =
@@ -76,7 +75,7 @@ mod tests {
 
         // Now actually add the audio source and play it!
         println!("\n🎵 Adding audio source to world...");
-        let audio_data_arc = Arc::new(audio_data);
+        let audio_data_arc = audio_data;
         match world.add_source(audio_data_arc) {
             Ok(source_id) => {
                 println!("✓ Audio source added successfully with ID: {}", source_id);
@@ -84,7 +83,6 @@ mod tests {
                 // Get the audio source by ID and play it
                 if let Some(audio_data) = world.get_audio_data(source_id) {
                     println!("✓ Retrieved audio data for source ID: {}", source_id);
-                    println!("🎵 Playing audio for 20 seconds...");
 
                     // Extract samples for playback
                     let samples = audio_data.samples().to_vec();
@@ -96,9 +94,13 @@ mod tests {
                         Err(e) => println!("✗ Audio playback failed: {}", e),
                     }
 
-                    // Additional sleep to ensure we wait 20 seconds total
-                    println!("⏱️ Sleeping for 20 seconds...");
-                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    // Sleep for the duration of the audio + 1 second
+                    let sleep_duration = audio_data.duration() + std::time::Duration::from_secs(1);
+                    println!(
+                        "⏱️ Sleeping for {:.2} seconds (audio duration + 1s)...",
+                        sleep_duration.as_secs_f32()
+                    );
+                    std::thread::sleep(sleep_duration);
                     println!("✓ Sleep completed");
                 } else {
                     println!(

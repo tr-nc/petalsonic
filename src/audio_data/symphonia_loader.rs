@@ -1,9 +1,10 @@
 use crate::{
-    audio_data::{LoadOptions, PetalSonicAudioData},
+    audio_data::{ConvertToMono, LoadOptions, PetalSonicAudioData},
     error::{PetalSonicError, Result},
 };
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use symphonia::{
     core::{
@@ -13,7 +14,7 @@ use symphonia::{
     default::{get_codecs, get_probe},
 };
 
-pub fn load_audio_file(path: &str, options: &LoadOptions) -> Result<PetalSonicAudioData> {
+pub fn load_audio_file(path: &str, options: &LoadOptions) -> Result<Arc<PetalSonicAudioData>> {
     let file = File::open(path)
         .map_err(|e| PetalSonicError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e)))?;
 
@@ -59,18 +60,8 @@ pub fn load_audio_file(path: &str, options: &LoadOptions) -> Result<PetalSonicAu
         .map_err(|e| PetalSonicError::AudioLoading(format!("Failed to create decoder: {:?}", e)))?;
 
     let mut samples: Vec<f32> = Vec::new();
-    let max_frames = options
-        .max_duration
-        .map(|d| (d.as_secs_f64() * sample_rate as f64) as usize)
-        .unwrap_or(usize::MAX);
-
-    let mut frames_decoded = 0;
 
     loop {
-        if frames_decoded >= max_frames {
-            break;
-        }
-
         // Read the next packet from the container
         let packet = match format.next_packet() {
             Ok(packet) => packet,
@@ -104,72 +95,48 @@ pub fn load_audio_file(path: &str, options: &LoadOptions) -> Result<PetalSonicAu
         let mut tmp = SampleBuffer::<f32>::new(capacity as u64, spec);
         tmp.copy_interleaved_ref(decoded);
 
-        if options.mono_channel.is_some() {
-            // Extract specific channel for mono
-            let mono_ch = options.mono_channel.unwrap();
-            if mono_ch >= channels as usize {
-                return Err(PetalSonicError::AudioFormat(format!(
-                    "Channel {} out of range (max: {})",
-                    mono_ch,
-                    channels - 1
-                )));
-            }
-            samples.extend(
-                tmp.samples()
-                    .chunks(channels as usize)
-                    .map(|frame| frame[mono_ch]),
-            );
-        } else {
-            // Keep all channels
-            samples.extend_from_slice(tmp.samples());
-        }
-
-        frames_decoded += capacity / channels as usize;
+        samples.extend_from_slice(tmp.samples());
     }
 
-    // Apply mono conversion if requested
+    // Apply mono conversion based on the option
     let final_samples;
     let final_channels;
 
-    if options.convert_to_mono && channels > 1 {
-        if options.mono_channel.is_some() {
-            // Already extracted single channel during decoding
+    match options.convert_to_mono {
+        ConvertToMono::Original => {
+            // Keep original channels
             final_samples = samples;
-            final_channels = 1;
-        } else {
-            // Downmix all channels to mono
-            final_samples = samples
-                .chunks(channels as usize)
-                .map(|frame| {
-                    let sum: f32 = frame.iter().sum();
-                    sum / channels as f32
-                })
-                .collect();
-            final_channels = 1;
+            final_channels = channels;
         }
-    } else {
-        final_samples = samples;
-        final_channels = channels;
+        ConvertToMono::ForceMono => {
+            if channels == 1 {
+                // Already mono, keep as is
+                final_samples = samples;
+                final_channels = 1;
+            } else {
+                // Downmix all channels to mono using the most common technique (averaging)
+                final_samples = samples
+                    .chunks(channels as usize)
+                    .map(|frame| {
+                        let sum: f32 = frame.iter().sum();
+                        sum / channels as f32
+                    })
+                    .collect();
+                final_channels = 1;
+            }
+        }
     }
 
     let duration = Duration::from_secs_f64(
         final_samples.len() as f64 / (sample_rate * final_channels as u32) as f64,
     );
 
-    let mut audio_data =
-        PetalSonicAudioData::new(final_samples, sample_rate, final_channels, duration);
+    let audio_data = PetalSonicAudioData::new(final_samples, sample_rate, final_channels, duration);
 
-    // Apply resampling if requested
-    if let Some(target_rate) = options.target_sample_rate {
-        if target_rate != sample_rate {
-            audio_data = audio_data.resample(target_rate)?;
-        }
-    }
-
-    Ok(audio_data)
+    Ok(Arc::new(audio_data))
 }
 
 /// Convenience function to load audio with default options
-pub fn load_audio_file_simple(path: &str) -> Result<PetalSonicAudioData> {
+pub fn load_audio_file_simple(path: &str) -> Result<Arc<PetalSonicAudioData>> {
     load_audio_file(path, &LoadOptions::default())
 }

@@ -24,25 +24,22 @@ impl PetalSonicWorld {
         self.config.sample_rate
     }
 
-    /// Load an audio file and automatically resample it to the world's sample rate
+    /// Load an audio file using its original sample rate
     pub fn load_audio_file(&self, path: &str) -> Result<Arc<PetalSonicAudioData>> {
-        let load_options = LoadOptions::default().target_sample_rate(self.config.sample_rate);
+        let load_options = LoadOptions::default();
 
         let audio_data = load_audio_file(path, &load_options)?;
-        Ok(Arc::new(audio_data))
+        Ok(audio_data)
     }
 
-    /// Load an audio file with custom options, but ensure it matches the world's sample rate
+    /// Load an audio file with custom options using its original sample rate
     pub fn load_audio_file_with_options(
         &self,
         path: &str,
-        mut options: LoadOptions,
+        options: LoadOptions,
     ) -> Result<Arc<PetalSonicAudioData>> {
-        // Override the target sample rate to match the world's sample rate
-        options.target_sample_rate = Some(self.config.sample_rate);
-
         let audio_data = load_audio_file(path, &options)?;
-        Ok(Arc::new(audio_data))
+        Ok(audio_data)
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -60,17 +57,15 @@ impl PetalSonicWorld {
 
     /// Add an audio source to the world storage and return its UUID
     pub fn add_source(&mut self, audio_data: Arc<PetalSonicAudioData>) -> Result<Uuid> {
-        // Verify that the audio data sample rate matches the world's sample rate
-        if audio_data.sample_rate() != self.config.sample_rate {
-            return Err(crate::error::PetalSonicError::AudioFormat(format!(
-                "Audio data sample rate ({} Hz) does not match world sample rate ({} Hz). Use world.load_audio_file() to automatically resample.",
-                audio_data.sample_rate(),
-                self.config.sample_rate
-            )));
-        }
+        // Automatically resample if the audio data sample rate doesn't match the world's sample rate
+        let resampled_audio_data = if audio_data.sample_rate() != self.config.sample_rate {
+            Arc::new(audio_data.resample(self.config.sample_rate)?)
+        } else {
+            audio_data
+        };
 
         let uuid = Uuid::new_v4();
-        self.audio_data_storage.insert(uuid, audio_data);
+        self.audio_data_storage.insert(uuid, resampled_audio_data);
         Ok(uuid)
     }
 

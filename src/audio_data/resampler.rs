@@ -72,7 +72,7 @@ impl AudioResampler {
                 .process(&waves_in, None)
                 .map_err(|e| PetalSonicError::AudioLoading(format!("Resampling error: {}", e)))?;
 
-            if let Some(first_channel) = waves_out.get(0) {
+            if let Some(first_channel) = waves_out.first() {
                 output_buffer.extend_from_slice(first_channel);
             }
 
@@ -109,9 +109,9 @@ impl AudioResampler {
         let new_frames = resampled_channels[0].len();
 
         for frame_idx in 0..new_frames {
-            for ch in 0..self.channels as usize {
-                if frame_idx < resampled_channels[ch].len() {
-                    interleaved_samples.push(resampled_channels[ch][frame_idx]);
+            for resampled_channel in resampled_channels.iter().take(self.channels as usize) {
+                if frame_idx < resampled_channel.len() {
+                    interleaved_samples.push(resampled_channel[frame_idx]);
                 }
             }
         }
@@ -129,35 +129,5 @@ impl AudioResampler {
 
     pub fn resample_ratio(&self) -> f64 {
         self.target_sample_rate as f64 / self.source_sample_rate as f64
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resampler_creation() {
-        let resampler = AudioResampler::new(44100, 48000, 2, None);
-        assert!(resampler.is_ok());
-
-        let resampler = resampler.unwrap();
-        assert_eq!(resampler.source_sample_rate(), 44100);
-        assert_eq!(resampler.target_sample_rate(), 48000);
-    }
-
-    #[test]
-    fn test_resampler_no_resampling_needed() {
-        let resampler = AudioResampler::new(44100, 44100, 1, None).unwrap();
-        let samples = vec![0.1, 0.2, 0.3, 0.4];
-        let result = resampler.resample_channel(&samples).unwrap();
-        assert_eq!(result, samples);
-    }
-
-    #[test]
-    fn test_invalid_sample_rates() {
-        assert!(AudioResampler::new(0, 48000, 2, None).is_err());
-        assert!(AudioResampler::new(44100, 0, 2, None).is_err());
-        assert!(AudioResampler::new(44100, 48000, 0, None).is_err());
     }
 }

@@ -1,5 +1,5 @@
 use crate::audio_data::{LoadOptions, PetalSonicAudioData, load_audio_file};
-use crate::config::PetalSonicConfig;
+use crate::config::PetalSonicWorldDesc;
 use crate::error::Result;
 use crate::events::PetalSonicEvent;
 use crate::math::{Pose, Vec3};
@@ -8,20 +8,20 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct PetalSonicWorld {
-    config: PetalSonicConfig,
+    desc: PetalSonicWorldDesc,
     audio_data_storage: HashMap<Uuid, Arc<PetalSonicAudioData>>,
 }
 
 impl PetalSonicWorld {
-    pub fn new(config: PetalSonicConfig) -> Result<Self> {
+    pub fn new(config: PetalSonicWorldDesc) -> Result<Self> {
         Ok(Self {
-            config,
+            desc: config,
             audio_data_storage: HashMap::new(),
         })
     }
 
     pub fn sample_rate(&self) -> u32 {
-        self.config.sample_rate
+        self.desc.sample_rate
     }
 
     /// Load an audio file using its original sample rate
@@ -58,8 +58,8 @@ impl PetalSonicWorld {
     /// Add an audio source to the world storage and return its UUID
     pub fn add_source(&mut self, audio_data: Arc<PetalSonicAudioData>) -> Result<Uuid> {
         // Automatically resample if the audio data sample rate doesn't match the world's sample rate
-        let resampled_audio_data = if audio_data.sample_rate() != self.config.sample_rate {
-            Arc::new(audio_data.resample(self.config.sample_rate)?)
+        let resampled_audio_data = if audio_data.sample_rate() != self.desc.sample_rate {
+            Arc::new(audio_data.resample(self.desc.sample_rate)?)
         } else {
             audio_data
         };
@@ -86,7 +86,7 @@ impl PetalSonicWorld {
 }
 
 pub struct PetalSonicAudioSource {
-    pub(crate) id: u64,
+    pub(crate) _id: u64,
     pub(crate) position: Vec3,
     pub(crate) volume: f32,
 }

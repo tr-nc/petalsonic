@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
-pub struct PetalSonicConfig {
+pub struct PetalSonicWorldDesc {
     pub sample_rate: u32,
     pub block_size: usize,
     pub channels: u16,
@@ -10,7 +10,7 @@ pub struct PetalSonicConfig {
     pub enable_spatialization: bool,
 }
 
-impl Default for PetalSonicConfig {
+impl Default for PetalSonicWorldDesc {
     fn default() -> Self {
         Self {
             sample_rate: 48000,

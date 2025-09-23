@@ -81,16 +81,6 @@ pub fn play_audio_samples(samples: Vec<f32>, sample_rate: u32) -> Result<()> {
             buffer_size: cpal::BufferSize::Default,
         }
     } else {
-        // Fall back to default config - WASAPI will resample
-        println!(
-            "⚠ Sample rate {} Hz not directly supported, using default config",
-            sample_rate
-        );
-        println!(
-            "  WASAPI will handle resampling from {}Hz to {}Hz",
-            sample_rate,
-            default_config.sample_rate().0
-        );
         default_config.config()
     };
 
@@ -99,7 +89,6 @@ pub fn play_audio_samples(samples: Vec<f32>, sample_rate: u32) -> Result<()> {
     println!("  Sample Rate: {} Hz", config_to_use.sample_rate.0);
     println!("  Buffer Size: {:?}", config_to_use.buffer_size);
     println!("  Sample Format: {:?}", default_config.sample_format());
-    println!("  WASAPI shared mode will handle any necessary resampling");
 
     // Prepare audio data
     let audio_data = Arc::new(Mutex::new((samples, 0usize))); // (samples, current_position)
@@ -117,12 +106,10 @@ pub fn play_audio_samples(samples: Vec<f32>, sample_rate: u32) -> Result<()> {
 
     println!("\n🔊 Playing audio... (press Ctrl+C to stop)");
 
-    // Keep the stream alive for the duration of the audio
-    let duration_secs = frames as f64 / sample_rate as f64;
-    std::thread::sleep(std::time::Duration::from_secs_f64(duration_secs + 1.0));
+    // let duration_secs = frames as f64 / sample_rate as f64;
+    std::thread::sleep(std::time::Duration::from_secs_f64(3.0));
 
     println!("✓ Playback finished");
-
     Ok(())
 }
 

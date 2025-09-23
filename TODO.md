@@ -8,12 +8,7 @@ Only install the dependencies where needed.
 
 ## Adapt different sample rates
 
-- [ ] TODO: Everytime we load a audio data into the world, we should resample it during loading time.
-- [ ] TODO: For PetalSonicAudioData::resample, it's better to create a module for rubato interactions, and call that module inside the resample function, rather than making itself very verbose.
-- [ ] Store each audio data in a Arc to avoid copying the audio data.
-- [ ] Store all audio data in a HashMap in world, so we can access them by their uuid.
-- [ ] Get the output sample rate from the device.
-- [ ] Create a callback function that is required to fill a certain amount of samples, this function must not be blocking, and the target sample rate of the filled samples is configured in the world.
+- [ ] TODO: Create a callback function that is required to fill a certain amount of samples, this function must not be blocking, and the target sample rate of the filled samples is configured in the world.
 - [ ] Use rubato to resample the audio to the output sample rate in realtime. The source of the audio is given from the callback function.
 
 ## Ring Buffer & Audio Backend (Phase 3)

@@ -18,6 +18,8 @@ mod tests {
 
     #[test]
     fn test_play_audio_file() {
+        env_logger::init();
+
         use crate::audio_data::LoadOptions;
         use crate::config::PetalSonicWorldDesc;
         use crate::engine::PetalSonicEngine;
@@ -29,7 +31,7 @@ mod tests {
 
         let load_options = LoadOptions::default();
 
-        println!("Loading audio file: {}", wav_path);
+        log::info!("Loading audio file: {}", wav_path);
         let audio_data =
             load_audio_file(wav_path, &load_options).expect("Failed to load audio file");
 
@@ -46,12 +48,12 @@ mod tests {
             Ok(source_id) => {
                 // Get the audio source by ID and play it
                 if let Some(audio_data) = world.get_audio_data(source_id) {
-                    println!("✓ Retrieved audio data for source ID: {}", source_id);
+                    log::debug!("Retrieved audio data for source ID: {}", source_id);
 
                     // Extract samples for playback
                     let samples = audio_data.samples().to_vec();
                     let sample_rate = audio_data.sample_rate();
-                    println!("Sample rate: {} Hz", sample_rate);
+                    log::debug!("Sample rate: {} Hz", sample_rate);
 
                     // Create and use the new audio engine with callback
                     let mut engine =
@@ -102,11 +104,11 @@ mod tests {
                     // Start the engine and play
                     match engine.start() {
                         Ok(_) => {
-                            println!("✓ Audio engine started");
+                            log::info!("Audio engine started");
 
                             // Calculate playback duration
                             let duration_secs = samples_arc.len() as f64 / sample_rate as f64;
-                            println!("Playing for {:.2} seconds...", duration_secs);
+                            log::info!("Playing for {:.2} seconds...", duration_secs);
 
                             // Wait for playback to complete (with a small buffer)
                             std::thread::sleep(std::time::Duration::from_secs_f64(
@@ -114,19 +116,16 @@ mod tests {
                             ));
 
                             engine.stop().expect("Failed to stop engine");
-                            println!("✓ Audio playback completed successfully");
+                            log::info!("Audio playback completed successfully");
                         }
-                        Err(e) => println!("✗ Audio playback failed: {}", e),
+                        Err(e) => log::error!("Audio playback failed: {}", e),
                     }
                 } else {
-                    println!(
-                        "✗ Failed to retrieve audio data for source ID: {}",
-                        source_id
-                    );
+                    log::error!("Failed to retrieve audio data for source ID: {}", source_id);
                 }
             }
             Err(e) => {
-                println!("✗ Failed to add audio source: {}", e);
+                log::error!("Failed to add audio source: {}", e);
             }
         }
     }

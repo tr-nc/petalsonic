@@ -200,7 +200,7 @@ impl PetalSonicEngine {
                     frames_processed.fetch_add(frames_filled, Ordering::Relaxed);
                 },
                 move |err| {
-                    eprintln!("Audio stream error: {}", err);
+                    log::error!("Audio stream error: {}", err);
                 },
                 None,
             )

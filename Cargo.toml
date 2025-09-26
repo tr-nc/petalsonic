@@ -13,3 +13,7 @@ anyhow = "1.0.89"
 crossbeam-channel = "0.5.13"
 thiserror = "1.0.69"
 uuid = { version = "1.10", features = ["v4"] }
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.10"

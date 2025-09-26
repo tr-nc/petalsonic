@@ -1,19 +1,8 @@
-[package]
-name = "petalsonic"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["petalsonic-core", "petalsonic-demo"]
+resolver = "2"
 
-[dependencies]
-symphonia = "0.5.4"
-cpal = "0.15.3"
-audionimbus = { version = "0.8.1", features = ["auto-install"] }
-rubato = "0.14.1"
+[workspace.dependencies]
 glam = "0.29.2"
-anyhow = "1.0.89"
-crossbeam-channel = "0.5.13"
 thiserror = "1.0.69"
-uuid = { version = "1.10", features = ["v4"] }
 log = "0.4"
-
-[dev-dependencies]
-env_logger = "0.10"

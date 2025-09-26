@@ -6,19 +6,55 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PetalSonic is a real-time safe spatial audio library for Rust that uses Steam Audio (audionimbus) for 3D spatialization. It provides a world-driven API where the main thread owns and updates a 3D world (listener + sources), while fixed-size audio processing threads handle spatialization and playback.
 
+## Workspace Architecture
+
+This project uses a **workspace structure** to separate the core library from demo/example code:
+
+```
+petalsonic/
+├── Cargo.toml              # Workspace manifest
+├── petalsonic-core/        # Pure audio library
+│   ├── Cargo.toml
+│   └── src/                # Core library modules
+└── petalsonic-demo/        # Demo applications and examples
+    ├── Cargo.toml
+    └── src/main.rs         # CLI demo and tests
+```
+
+### Core Library (`petalsonic-core`)
+
+**Purpose**: Pure spatial audio processing library with no UI dependencies
+**Contains**: Audio engine, world management, spatialization, data loading
+**Dependencies**: Only audio-related crates (cpal, audionimbus, symphonia, etc.)
+
+### Demo Crate (`petalsonic-demo`)
+
+**Purpose**: Examples, tests, and future interactive applications
+**Contains**: CLI demos, integration tests, future web UI components
+**Dependencies**: Core library + UI frameworks when needed
+
 ## Common Development Commands
 
 ### Build and Test
 
 ```bash
-# Build the project
+# Build entire workspace
 cargo build
 
-# Run tests
-cargo test
+# Build only core library
+cargo build -p petalsonic-core
 
-# Check if the code is correct and idiomatic
+# Build only demo
+cargo build -p petalsonic-demo
+
+# Run demo application
+cargo run -p petalsonic-demo
+
+# Run clippy on workspace
 cargo clippy
+
+# Run tests (currently in demo crate)
+cargo test -p petalsonic-demo
 ```
 
 ### Documentation
@@ -33,26 +69,26 @@ cargo doc --no-deps
 
 ## Architecture Overview
 
-### Core Components
+### Core Components (`petalsonic-core/src/`)
 
-1. **Main Thread API (`src/world.rs`)**
+1. **Main Thread API (`world.rs`)**
    - `PetalSonicWorld`: Main controller that owns engine configuration and object registry
    - `PetalSonicAudioSource`: Source instances with position, volume, and playback parameters
    - `PetalSonicAudioListener`: Single listener with pose information
    - Thread-safe command passing to engine via crossbeam channels
 
-2. **Audio Engine (`src/engine.rs`)**
+2. **Audio Engine (`engine.rs`)**
    - Manages audio processing threads
    - Handles CPAL integration for audio output
    - Coordinates with spatializer for 3D audio processing
 
-3. **Audio Data (`src/audio.rs`)**
+3. **Audio Data (`audio_data.rs`)**
    - `PetalSonicAudioData`: Decoded PCM samples stored in Arc for cheap cloning
    - Supports loading from files via Symphonia
    - Built-in resampling and mono conversion capabilities
 
-4. **Configuration (`src/config.rs`)**
-   - `PetalSonicConfig`: Sample rate, block size, channels, buffer settings
+4. **Configuration (`config.rs`)**
+   - `PetalSonicWorldDesc`: Sample rate, block size, channels, buffer settings
    - Builder pattern for configuration
    - Defaults: 48kHz sample rate, 512 block size, stereo output
 
@@ -98,6 +134,60 @@ All operations return `Result<T, PetalSonicError>` with structured error types:
 3. **Block Sizes**: Target <60% of block time for processing (e.g., <12ms for 1024@48kHz)
 4. **Coordinate System**: Right-handed, meters for positions, quaternions for orientation
 5. **Thread Safety**: Main thread owns world, engine threads process audio independently
+6. **Separation of Concerns**: Core library stays pure, demos/UI go in petalsonic-demo
+
+## Implementation Workflow
+
+### Adding New Core Library Features
+
+1. **Implement in `petalsonic-core/src/`**
+   ```bash
+   # Work in core library
+   cd petalsonic-core/src/
+   # Edit relevant modules (world.rs, engine.rs, etc.)
+   ```
+
+2. **Update public API in `lib.rs`**
+   ```rust
+   pub use new_module::NewFeature;
+   ```
+
+3. **Test via demo crate**
+   ```bash
+   # Create demo in petalsonic-demo/src/
+   # Add dependency: petalsonic-core = { path = "../petalsonic-core" }
+   cargo run -p petalsonic-demo
+   ```
+
+### Creating New Demos and Examples
+
+1. **Simple CLI demo**: Add to `petalsonic-demo/src/main.rs`
+2. **Complex example**: Create new file in `petalsonic-demo/src/examples/`
+3. **Future web UI**: Add web framework dependencies to `petalsonic-demo/Cargo.toml`
+
+Example demo structure:
+```rust
+use petalsonic_core::*;
+
+fn main() {
+    // Demo your feature here
+    let config = PetalSonicWorldDesc::default();
+    let world = PetalSonicWorld::new(config).unwrap();
+    // ...
+}
+```
+
+### Testing Strategy
+
+1. **Unit tests**: In core library modules (keep minimal)
+2. **Integration tests**: In `petalsonic-demo/src/` as executable demos
+3. **Real-world testing**: Via interactive demos and examples
+
+### Adding Dependencies
+
+- **Audio/core dependencies**: Add to `petalsonic-core/Cargo.toml`
+- **UI/demo dependencies**: Add to `petalsonic-demo/Cargo.toml`
+- **Shared dependencies**: Add to workspace `Cargo.toml` and reference via `{ workspace = true }`
 
 ## Common Tasks
 
@@ -122,3 +212,9 @@ All operations return `Result<T, PetalSonicError>` with structured error types:
 - Spatial sources should be mono for best 3D positioning
 - Non-spatial sources can be stereo for music/UI
 - All sources resampled to world sample rate on load
+
+### Creating Interactive Demos
+
+1. **Start simple**: CLI demo with keyboard input
+2. **Add frameworks**: Web UI (axum + leptos), desktop UI (egui), or game engine (bevy)
+3. **Keep separation**: UI logic in demo crate, audio logic in core library

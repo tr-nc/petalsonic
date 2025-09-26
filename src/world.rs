@@ -42,15 +42,6 @@ impl PetalSonicWorld {
         Ok(audio_data)
     }
 
-    pub fn start(&mut self) -> Result<()> {
-        println!("World started - ready for audio playback");
-        Ok(())
-    }
-
-    pub fn stop(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     pub fn poll_events(&mut self) -> Vec<PetalSonicEvent> {
         Vec::new()
     }

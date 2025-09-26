@@ -8,7 +8,7 @@ Only install the dependencies where needed.
 
 ## Adapt different sample rates
 
-- [ ] TODO: Create a callback function that is required to fill a certain amount of samples, this function must not be blocking, and the target sample rate of the filled samples is configured in the world.
+- [x] TODO: Create a callback function that is required to fill a certain amount of samples, to be consumed directly by the output device (so the samples feeded in must be the final result), this function must not be blocking, and the target sample rate of the filled samples is configured in the world.
 - [ ] Use rubato to resample the audio to the output sample rate in realtime. The source of the audio is given from the callback function.
 
 ## Ring Buffer & Audio Backend (Phase 3)

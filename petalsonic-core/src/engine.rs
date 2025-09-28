@@ -1,9 +1,13 @@
 use crate::config::PetalSonicWorldDesc;
 use crate::error::Result;
+use crate::playback::{PlaybackCommand, PlaybackInstance};
+use crate::world::PetalSonicWorld;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use uuid::Uuid;
 
 /// Callback function type for filling audio samples
 ///
@@ -22,17 +26,21 @@ pub struct PetalSonicEngine {
     is_running: Arc<AtomicBool>,
     frames_processed: Arc<AtomicUsize>,
     fill_callback: Option<Arc<AudioFillCallback>>,
+    world: Arc<PetalSonicWorld>,
+    active_playback: Arc<std::sync::Mutex<HashMap<Uuid, PlaybackInstance>>>,
 }
 
 impl PetalSonicEngine {
-    /// Create a new audio engine with the given configuration
-    pub fn new(desc: PetalSonicWorldDesc) -> Result<Self> {
+    /// Create a new audio engine with the given configuration and world
+    pub fn new(desc: PetalSonicWorldDesc, world: Arc<PetalSonicWorld>) -> Result<Self> {
         Ok(Self {
             desc,
             stream: None,
             is_running: Arc::new(AtomicBool::new(false)),
             frames_processed: Arc::new(AtomicUsize::new(0)),
             fill_callback: None,
+            world,
+            active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -45,16 +53,11 @@ impl PetalSonicEngine {
         self.fill_callback = Some(Arc::new(callback));
     }
 
-    /// Start the audio engine with the configured callback
+    /// Start the audio engine with automatic playback management
     pub fn start(&mut self) -> Result<()> {
         if self.is_running.load(Ordering::Relaxed) {
             return Ok(());
         }
-
-        let fill_callback = self
-            .fill_callback
-            .clone()
-            .ok_or_else(|| crate::error::PetalSonicError::Engine("No fill callback set".into()))?;
 
         // Get the default audio device
         let host = cpal::default_host();
@@ -73,6 +76,8 @@ impl PetalSonicEngine {
         let frames_processed = self.frames_processed.clone();
         let sample_rate = self.desc.sample_rate;
         let channels = self.desc.channels;
+        let active_playback = self.active_playback.clone();
+        let world = self.world.clone();
 
         // Create the stream based on the device's default format
         let default_config = device.default_output_config().map_err(|e| {
@@ -86,29 +91,32 @@ impl PetalSonicEngine {
             cpal::SampleFormat::F32 => self.create_stream::<f32>(
                 &device,
                 &config,
-                fill_callback,
                 is_running,
                 frames_processed,
                 sample_rate,
                 channels,
+                active_playback,
+                world,
             )?,
             cpal::SampleFormat::I16 => self.create_stream::<i16>(
                 &device,
                 &config,
-                fill_callback,
                 is_running,
                 frames_processed,
                 sample_rate,
                 channels,
+                active_playback,
+                world,
             )?,
             cpal::SampleFormat::U16 => self.create_stream::<u16>(
                 &device,
                 &config,
-                fill_callback,
                 is_running,
                 frames_processed,
                 sample_rate,
                 channels,
+                active_playback,
+                world,
             )?,
             _ => {
                 return Err(crate::error::PetalSonicError::AudioFormat(
@@ -156,16 +164,17 @@ impl PetalSonicEngine {
         &self,
         device: &cpal::Device,
         config: &cpal::StreamConfig,
-        fill_callback: Arc<AudioFillCallback>,
         is_running: Arc<AtomicBool>,
         frames_processed: Arc<AtomicUsize>,
-        sample_rate: u32,
+        _sample_rate: u32,
         channels: u16,
+        active_playback: Arc<std::sync::Mutex<HashMap<Uuid, PlaybackInstance>>>,
+        world: Arc<PetalSonicWorld>,
     ) -> Result<cpal::Stream>
     where
         T: SizedSample + FromSample<f32>,
     {
-        let channels_usize = channels as usize;
+        let _channels_usize = channels as usize;
 
         let stream = device
             .build_output_stream(
@@ -179,12 +188,54 @@ impl PetalSonicEngine {
                         return;
                     }
 
-                    // Create a temporary f32 buffer for the callback
-                    let _frame_count = data.len() / channels_usize;
-                    let mut temp_buffer = vec![0.0f32; data.len()];
+                    // Process any pending commands from the world
+                    while let Ok(command) = world.command_receiver().try_recv() {
+                        if let Ok(mut active_playback) = active_playback.try_lock() {
+                            match command {
+                                PlaybackCommand::Play(audio_id) => {
+                                    if let Some(audio_data) = world.get_audio_data(audio_id) {
+                                        if let Some(instance) = active_playback.get_mut(&audio_id) {
+                                            // Resume existing instance
+                                            instance.play();
+                                        } else {
+                                            // Create new playback instance
+                                            let mut instance =
+                                                PlaybackInstance::new(audio_id, audio_data.clone());
+                                            instance.play();
+                                            active_playback.insert(audio_id, instance);
+                                        }
+                                    }
+                                }
+                                PlaybackCommand::Pause(audio_id) => {
+                                    if let Some(instance) = active_playback.get_mut(&audio_id) {
+                                        instance.pause();
+                                    }
+                                }
+                                PlaybackCommand::Stop(audio_id) => {
+                                    active_playback.remove(&audio_id);
+                                }
+                                PlaybackCommand::StopAll => {
+                                    active_playback.clear();
+                                }
+                            }
+                        }
+                    }
 
-                    // Call the user-provided fill callback (non-blocking)
-                    let frames_filled = fill_callback(&mut temp_buffer, sample_rate, channels);
+                    // Create a temporary f32 buffer for mixing
+                    let mut temp_buffer = vec![0.0f32; data.len()];
+                    let mut total_frames = 0;
+
+                    // Mix all active playback instances
+                    if let Ok(mut active_playback) = active_playback.try_lock() {
+                        // Remove finished instances
+                        active_playback.retain(|_, instance| !instance.info.is_finished());
+
+                        // Mix all active instances
+                        for instance in active_playback.values_mut() {
+                            let frames_filled = instance.fill_buffer(&mut temp_buffer, channels);
+                            total_frames = total_frames.max(frames_filled);
+                        }
+                    }
 
                     // Convert and copy to the output buffer
                     for (i, sample) in data.iter_mut().enumerate() {
@@ -197,7 +248,7 @@ impl PetalSonicEngine {
                     }
 
                     // Update frame counter
-                    frames_processed.fetch_add(frames_filled, Ordering::Relaxed);
+                    frames_processed.fetch_add(total_frames, Ordering::Relaxed);
                 },
                 move |err| {
                     log::error!("Audio stream error: {}", err);

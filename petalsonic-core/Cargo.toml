@@ -6,13 +6,13 @@ edition = "2024"
 [dependencies]
 symphonia = "0.5.4"
 cpal = "0.15.3"
-audionimbus = { version = "0.8.1", features = ["auto-install"] }
 rubato = "0.14.1"
-glam = { workspace = true }
 anyhow = "1.0.89"
 crossbeam-channel = "0.5.13"
-thiserror = { workspace = true }
+audionimbus = { version = "0.8.1", features = ["auto-install"] }
 uuid = { version = "1.10", features = ["v4"] }
 log = { workspace = true }
+glam = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]

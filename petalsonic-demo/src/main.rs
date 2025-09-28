@@ -1,3 +1,4 @@
+use anyhow::Result;
 use petalsonic_core::audio_data::LoadOptions;
 use petalsonic_core::audio_data::load_audio_file;
 use petalsonic_core::config::PetalSonicWorldDesc;
@@ -11,16 +12,16 @@ fn main() {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    test_play_audio_file();
+    test_play_audio_file().unwrap();
 }
 
-fn test_play_audio_file() {
+fn test_play_audio_file() -> Result<()> {
     let wav_path = "res/cicada_test_96k.wav";
 
     let load_options = LoadOptions::default();
 
     log::info!("Loading audio file: {}", wav_path);
-    let audio_data = load_audio_file(wav_path, &load_options).expect("Failed to load audio file");
+    let audio_data = load_audio_file(wav_path, &load_options)?;
 
     let config = PetalSonicWorldDesc {
         sample_rate: 48000,
@@ -30,85 +31,81 @@ fn test_play_audio_file() {
 
     let mut world = PetalSonicWorld::new(config.clone()).expect("Failed to create PetalSonicWorld");
 
-    match world.add_source(audio_data) {
-        Ok(source_id) => {
-            // Get the audio source by ID and play it
-            if let Some(audio_data) = world.get_audio_data(source_id) {
-                log::debug!("Retrieved audio data for source ID: {}", source_id);
+    let source_id = world.add_source(audio_data)?;
+    let audio_data = world.get_audio_data(source_id).ok_or(anyhow::anyhow!(
+        "Failed to get audio data for source ID: {}",
+        source_id
+    ))?;
 
-                // Extract samples for playback
-                let samples = audio_data.samples().to_vec();
-                let sample_rate = audio_data.sample_rate();
-                log::debug!("Sample rate: {} Hz", sample_rate);
+    log::debug!("Retrieved audio data for source ID: {}", source_id);
 
-                // Create and use the new audio engine with callback
-                let mut engine = PetalSonicEngine::new(config).expect("Failed to create engine");
+    // Extract samples for playback
+    let samples = audio_data.samples().to_vec();
+    let sample_rate = audio_data.sample_rate();
+    log::debug!("Sample rate: {} Hz", sample_rate);
 
-                // Create a playback position tracker
-                let position = Arc::new(AtomicUsize::new(0));
-                let samples_arc = Arc::new(samples);
+    // Create and use the new audio engine with callback
+    let mut engine = PetalSonicEngine::new(config).expect("Failed to create engine");
 
-                // Set up the callback to play the loaded audio
-                let position_clone = position.clone();
-                let samples_clone = samples_arc.clone();
-                engine.set_fill_callback(
-                    move |buffer: &mut [f32], _sample_rate: u32, channels: u16| {
-                        let channels_usize = channels as usize;
-                        let frame_count = buffer.len() / channels_usize;
-                        let mut frames_filled = 0;
+    // Create a playback position tracker
+    let position = Arc::new(AtomicUsize::new(0));
+    let samples_arc = Arc::new(samples);
 
-                        for frame_idx in 0..frame_count {
-                            let current_pos = position_clone.fetch_add(1, Ordering::Relaxed);
+    // Set up the callback to play the loaded audio
+    let position_clone = position.clone();
+    let samples_clone = samples_arc.clone();
+    engine.set_fill_callback(
+        move |buffer: &mut [f32], _sample_rate: u32, channels: u16| {
+            let channels_usize = channels as usize;
+            let frame_count = buffer.len() / channels_usize;
+            let mut frames_filled = 0;
 
-                            let sample = if current_pos < samples_clone.len() {
-                                samples_clone[current_pos]
-                            } else {
-                                0.0 // Silence when we've played all samples
-                            };
+            for frame_idx in 0..frame_count {
+                let current_pos = position_clone.fetch_add(1, Ordering::Relaxed);
 
-                            // Fill all channels with the same sample
-                            for channel in 0..channels_usize {
-                                let buffer_idx = frame_idx * channels_usize + channel;
-                                if buffer_idx < buffer.len() {
-                                    buffer[buffer_idx] = sample;
-                                }
-                            }
+                let sample = if current_pos < samples_clone.len() {
+                    samples_clone[current_pos]
+                } else {
+                    0.0 // Silence when we've played all samples
+                };
 
-                            frames_filled += 1;
-
-                            // Stop when we've played all samples
-                            if current_pos >= samples_clone.len() {
-                                break;
-                            }
-                        }
-
-                        frames_filled
-                    },
-                );
-
-                // Start the engine and play
-                match engine.start() {
-                    Ok(_) => {
-                        log::info!("Audio engine started");
-
-                        // Calculate playback duration
-                        let duration_secs = samples_arc.len() as f64 / sample_rate as f64;
-                        log::info!("Playing for {:.2} seconds...", duration_secs);
-
-                        // Wait for playback to complete (with a small buffer)
-                        std::thread::sleep(std::time::Duration::from_secs_f64(duration_secs + 0.5));
-
-                        engine.stop().expect("Failed to stop engine");
-                        log::info!("Audio playback completed successfully");
+                // Fill all channels with the same sample
+                for channel in 0..channels_usize {
+                    let buffer_idx = frame_idx * channels_usize + channel;
+                    if buffer_idx < buffer.len() {
+                        buffer[buffer_idx] = sample;
                     }
-                    Err(e) => log::error!("Audio playback failed: {}", e),
                 }
-            } else {
-                log::error!("Failed to retrieve audio data for source ID: {}", source_id);
+
+                frames_filled += 1;
+
+                // Stop when we've played all samples
+                if current_pos >= samples_clone.len() {
+                    break;
+                }
             }
+
+            frames_filled
+        },
+    );
+
+    // Start the engine and play
+    match engine.start() {
+        Ok(_) => {
+            log::info!("Audio engine started");
+
+            // Calculate playback duration
+            let duration_secs = samples_arc.len() as f64 / sample_rate as f64;
+            log::info!("Playing for {:.2} seconds...", duration_secs);
+
+            // Wait for playback to complete (with a small buffer)
+            std::thread::sleep(std::time::Duration::from_secs_f64(duration_secs + 0.5));
+
+            engine.stop().expect("Failed to stop engine");
+            log::info!("Audio playback completed successfully");
         }
-        Err(e) => {
-            log::error!("Failed to add audio source: {}", e);
-        }
+        Err(e) => log::error!("Audio playback failed: {}", e),
     }
+
+    Ok(())
 }

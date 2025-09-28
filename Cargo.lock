@@ -660,6 +660,7 @@ dependencies = [
 name = "petalsonic-demo"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "env_logger",
  "log",
  "petalsonic-core",

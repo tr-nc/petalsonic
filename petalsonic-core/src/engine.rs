@@ -284,79 +284,83 @@ impl PetalSonicEngine {
                     // Determine how many frames we need at the world sample rate
                     let device_frames = data.len() / channels_usize;
 
-                    // If we're resampling, we need to calculate how many input frames to generate
-                    let (world_frames, needs_resampling) =
-                        if let Some(ref resampler_arc) = resampler {
-                            if let Ok(resampler) = resampler_arc.try_lock() {
-                                // Calculate approximate input frames needed
-                                let ratio = resampler.resample_ratio();
-                                let world_frames_needed =
-                                    (device_frames as f64 * ratio).ceil() as usize;
-                                (world_frames_needed, true)
-                            } else {
-                                // Can't lock resampler, just use device frames
-                                (device_frames, false)
+                    // Now convert world_buffer to device sample rate if needed
+                    if let Some(ref resampler_arc) = resampler {
+                        if let Ok(mut resampler) = resampler_arc.try_lock() {
+                            // Ask the resampler exactly how many input frames it needs
+                            let input_frames_needed = resampler.input_frames_needed();
+
+                            // Create a temporary f32 buffer for mixing at world sample rate
+                            let world_buffer_size = input_frames_needed * channels_usize;
+                            let mut world_buffer = vec![0.0f32; world_buffer_size];
+
+                            // Mix all active playback instances at world sample rate
+                            if let Ok(mut active_playback) = active_playback.try_lock() {
+                                // Remove finished instances
+                                active_playback.retain(|_, instance| !instance.info.is_finished());
+
+                                // Mix all active instances
+                                for instance in active_playback.values_mut() {
+                                    instance.fill_buffer(&mut world_buffer, channels);
+                                }
+                            }
+
+                            // Create output buffer for resampled data
+                            let mut resampled_buffer = vec![0.0f32; data.len()];
+
+                            // Feed input to the resampler and get output
+                            match resampler
+                                .process_interleaved(&world_buffer, &mut resampled_buffer)
+                            {
+                                Ok(frames_out) => {
+                                    // Convert and copy to the output buffer
+                                    for (i, sample) in data.iter_mut().enumerate() {
+                                        let sample_value = if i < resampled_buffer.len() {
+                                            resampled_buffer[i]
+                                        } else {
+                                            0.0f32
+                                        };
+                                        *sample = T::from_sample(sample_value);
+                                    }
+
+                                    // Update frame counter
+                                    frames_processed.fetch_add(frames_out, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    log::error!("Resampling error: {}", e);
+                                    // Fill with silence on error
+                                    for sample in data.iter_mut() {
+                                        *sample = T::from_sample(0.0f32);
+                                    }
+                                }
                             }
                         } else {
-                            (device_frames, false)
-                        };
-
-                    // Create a temporary f32 buffer for mixing at world sample rate
-                    let world_buffer_size = world_frames * channels_usize;
-                    let mut world_buffer = vec![0.0f32; world_buffer_size];
-                    let mut total_frames = 0;
-
-                    // Mix all active playback instances at world sample rate
-                    if let Ok(mut active_playback) = active_playback.try_lock() {
-                        // Remove finished instances
-                        active_playback.retain(|_, instance| !instance.info.is_finished());
-
-                        // Mix all active instances
-                        for instance in active_playback.values_mut() {
-                            let frames_filled = instance.fill_buffer(&mut world_buffer, channels);
-                            total_frames = total_frames.max(frames_filled);
-                        }
-                    }
-
-                    // Now convert world_buffer to device sample rate if needed
-                    if needs_resampling {
-                        if let Some(ref resampler_arc) = resampler {
-                            if let Ok(mut resampler) = resampler_arc.try_lock() {
-                                // Create output buffer for resampled data
-                                let mut resampled_buffer = vec![0.0f32; data.len()];
-
-                                // Resample from world to device rate
-                                match resampler
-                                    .process_interleaved(&world_buffer, &mut resampled_buffer)
-                                {
-                                    Ok(_frames_out) => {
-                                        // Convert and copy to the output buffer
-                                        for (i, sample) in data.iter_mut().enumerate() {
-                                            let sample_value = if i < resampled_buffer.len() {
-                                                resampled_buffer[i]
-                                            } else {
-                                                0.0f32
-                                            };
-                                            *sample = T::from_sample(sample_value);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("Resampling error: {}", e);
-                                        // Fill with silence on error
-                                        for sample in data.iter_mut() {
-                                            *sample = T::from_sample(0.0f32);
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Can't lock resampler, fill with silence
-                                for sample in data.iter_mut() {
-                                    *sample = T::from_sample(0.0f32);
-                                }
+                            // Can't lock resampler, fill with silence
+                            for sample in data.iter_mut() {
+                                *sample = T::from_sample(0.0f32);
                             }
                         }
                     } else {
-                        // No resampling needed, directly convert world buffer to output
+                        // No resampling needed
+                        // Create a temporary f32 buffer for mixing at world sample rate
+                        let world_buffer_size = device_frames * channels_usize;
+                        let mut world_buffer = vec![0.0f32; world_buffer_size];
+                        let mut total_frames = 0;
+
+                        // Mix all active playback instances at world sample rate
+                        if let Ok(mut active_playback) = active_playback.try_lock() {
+                            // Remove finished instances
+                            active_playback.retain(|_, instance| !instance.info.is_finished());
+
+                            // Mix all active instances
+                            for instance in active_playback.values_mut() {
+                                let frames_filled =
+                                    instance.fill_buffer(&mut world_buffer, channels);
+                                total_frames = total_frames.max(frames_filled);
+                            }
+                        }
+
+                        // Directly convert world buffer to output
                         for (i, sample) in data.iter_mut().enumerate() {
                             let sample_value = if i < world_buffer.len() {
                                 world_buffer[i]
@@ -365,10 +369,10 @@ impl PetalSonicEngine {
                             };
                             *sample = T::from_sample(sample_value);
                         }
-                    }
 
-                    // Update frame counter
-                    frames_processed.fetch_add(total_frames, Ordering::Relaxed);
+                        // Update frame counter
+                        frames_processed.fetch_add(total_frames, Ordering::Relaxed);
+                    }
                 },
                 move |err| {
                     log::error!("Audio stream error: {}", err);

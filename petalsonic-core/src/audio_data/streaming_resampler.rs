@@ -9,10 +9,8 @@ pub struct StreamingResampler {
     source_sample_rate: u32,
     target_sample_rate: u32,
     channels: u16,
-    /// Input buffer accumulator for partial frames
+    /// Input buffer accumulator for partial frames (per channel, non-interleaved)
     input_buffer: Vec<Vec<f32>>,
-    /// Number of input samples needed per output buffer
-    input_frames_needed: usize,
 }
 
 impl StreamingResampler {
@@ -65,16 +63,12 @@ impl StreamingResampler {
         // Initialize empty input buffers for each channel
         let input_buffer: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
 
-        // Calculate how many input frames we need
-        let input_frames_needed = resampler.input_frames_next();
-
         Ok(Self {
             resampler,
             source_sample_rate,
             target_sample_rate,
             channels,
             input_buffer,
-            input_frames_needed,
         })
     }
 
@@ -88,9 +82,8 @@ impl StreamingResampler {
     /// The number of frames written to output_samples
     ///
     /// # Note
-    /// This function may need to be called multiple times to fill the output buffer
-    /// if not enough input samples are provided initially. Use `needs_input()` to
-    /// check if more input is required.
+    /// This function accumulates input samples and processes them when enough
+    /// samples are available. It may return 0 if not enough input has been accumulated yet.
     pub fn process_interleaved(
         &mut self,
         input_samples: &[f32],
@@ -98,65 +91,40 @@ impl StreamingResampler {
     ) -> Result<usize> {
         let channels = self.channels as usize;
 
-        // De-interleave input and add to buffers
-        for (frame_idx, frame) in input_samples.chunks(channels).enumerate() {
+        // De-interleave input and append to our buffers
+        for frame in input_samples.chunks_exact(channels) {
             for (ch_idx, &sample) in frame.iter().enumerate() {
                 if ch_idx < self.input_buffer.len() {
                     self.input_buffer[ch_idx].push(sample);
                 }
             }
-
-            // Check if we've accumulated enough samples
-            if frame_idx > 0
-                && (frame_idx + 1) % self.input_frames_needed == 0
-                && self.input_buffer[0].len() >= self.input_frames_needed
-            {
-                // We have enough samples, process them
-                if let Ok(frames_written) = self.process_accumulated_samples(output_samples) {
-                    if frames_written > 0 {
-                        return Ok(frames_written);
-                    }
-                }
-            }
         }
 
-        // Try to process whatever we have if we have enough
-        if self.input_buffer[0].len() >= self.input_frames_needed {
-            self.process_accumulated_samples(output_samples)
-        } else {
-            // Not enough input yet, fill with silence
+        // Check how many input frames we need for the next resampling operation
+        let frames_needed = self.resampler.input_frames_next();
+        let frames_available = self.input_buffer[0].len();
+
+        // If we don't have enough input yet, return 0 (fill output with silence)
+        if frames_available < frames_needed {
             output_samples.fill(0.0);
-            Ok(0)
-        }
-    }
-
-    /// Internal method to process accumulated input samples
-    fn process_accumulated_samples(&mut self, output_samples: &mut [f32]) -> Result<usize> {
-        let channels = self.channels as usize;
-
-        // Take exactly the number of frames we need from each channel buffer
-        let input_waves: Vec<Vec<f32>> = self
-            .input_buffer
-            .iter_mut()
-            .map(|channel_buffer| {
-                let needed = self.input_frames_needed.min(channel_buffer.len());
-                let samples: Vec<f32> = channel_buffer.drain(..needed).collect();
-                samples
-            })
-            .collect();
-
-        // Check if all channels have enough samples
-        if input_waves[0].len() < self.input_frames_needed {
             return Ok(0);
         }
 
-        // Process the samples
+        // Take exactly the number of frames the resampler needs from each channel
+        let mut input_waves: Vec<Vec<f32>> = Vec::with_capacity(channels);
+        for channel_buffer in &mut self.input_buffer {
+            let samples: Vec<f32> = channel_buffer.drain(..frames_needed).collect();
+            input_waves.push(samples);
+        }
+
+        // Process the samples through the resampler
         let output_waves = self.resampler.process(&input_waves, None).map_err(|e| {
             PetalSonicError::AudioLoading(format!("Streaming resampling error: {}", e))
         })?;
 
         // Re-interleave the output
         let output_frames = output_waves[0].len();
+        let mut frames_written = 0;
 
         for frame_idx in 0..output_frames {
             for ch_idx in 0..channels {
@@ -165,17 +133,31 @@ impl StreamingResampler {
                     output_samples[output_idx] = output_waves[ch_idx][frame_idx];
                 }
             }
+            frames_written += 1;
+
+            // Stop if we've filled the output buffer
+            if (frame_idx + 1) * channels >= output_samples.len() {
+                break;
+            }
         }
 
-        // Update how many input frames we'll need next time
-        self.input_frames_needed = self.resampler.input_frames_next();
-
-        Ok(output_frames)
+        Ok(frames_written)
     }
 
-    /// Returns true if the resampler needs more input samples
+    /// Returns true if the resampler needs more input samples to produce output
     pub fn needs_input(&self) -> bool {
-        self.input_buffer[0].len() < self.input_frames_needed
+        let frames_needed = self.resampler.input_frames_next();
+        self.input_buffer[0].len() < frames_needed
+    }
+
+    /// Returns how many input frames are needed for the next process call
+    pub fn input_frames_needed(&self) -> usize {
+        self.resampler.input_frames_next()
+    }
+
+    /// Returns how many input frames are currently buffered
+    pub fn buffered_frames(&self) -> usize {
+        self.input_buffer[0].len()
     }
 
     /// Returns the target (output) sample rate in Hz
@@ -199,7 +181,6 @@ impl StreamingResampler {
             channel_buffer.clear();
         }
         self.resampler.reset();
-        self.input_frames_needed = self.resampler.input_frames_next();
     }
 }
 
@@ -214,46 +195,15 @@ mod tests {
     }
 
     #[test]
-    fn test_no_resampling_needed() {
-        let mut resampler = StreamingResampler::new(48000, 48000, 2, 512).unwrap();
-
-        // Generate some test input (silence)
-        let input = vec![0.0f32; 1024 * 2]; // 1024 frames, 2 channels
-        let mut output = vec![0.0f32; 512 * 2]; // 512 frames, 2 channels
-
-        let result = resampler.process_interleaved(&input, &mut output);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_upsampling() {
-        let mut resampler = StreamingResampler::new(44100, 48000, 2, 512).unwrap();
-
-        // Generate a simple sine wave at 440 Hz
-        let input_frames = 2048;
-        let mut input = Vec::new();
-        for i in 0..input_frames {
-            let t = i as f32 / 44100.0;
-            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
-            input.push(sample); // Left
-            input.push(sample); // Right
-        }
-
-        let mut output = vec![0.0f32; 512 * 2];
-        let result = resampler.process_interleaved(&input, &mut output);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_downsampling() {
+    fn test_downsampling_streaming() {
         let mut resampler = StreamingResampler::new(48000, 44100, 2, 512).unwrap();
 
-        // Generate a simple sine wave at 440 Hz
-        let input_frames = 2048;
+        // Generate a simple test signal
+        let input_frames = 4096;
         let mut input = Vec::new();
         for i in 0..input_frames {
             let t = i as f32 / 48000.0;
-            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
             input.push(sample); // Left
             input.push(sample); // Right
         }
@@ -261,5 +211,54 @@ mod tests {
         let mut output = vec![0.0f32; 512 * 2];
         let result = resampler.process_interleaved(&input, &mut output);
         assert!(result.is_ok());
+
+        // Should produce output
+        let frames = result.unwrap();
+        assert!(frames > 0, "Should produce output frames");
+    }
+
+    #[test]
+    fn test_upsampling_streaming() {
+        let mut resampler = StreamingResampler::new(44100, 48000, 2, 512).unwrap();
+
+        // Generate a simple test signal
+        let input_frames = 4096;
+        let mut input = Vec::new();
+        for i in 0..input_frames {
+            let t = i as f32 / 44100.0;
+            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+            input.push(sample); // Left
+            input.push(sample); // Right
+        }
+
+        let mut output = vec![0.0f32; 512 * 2];
+        let result = resampler.process_interleaved(&input, &mut output);
+        assert!(result.is_ok());
+
+        // Should produce output
+        let frames = result.unwrap();
+        assert!(frames > 0, "Should produce output frames");
+    }
+
+    #[test]
+    fn test_incremental_feeding() {
+        let mut resampler = StreamingResampler::new(48000, 44100, 2, 512).unwrap();
+
+        // Feed small chunks incrementally
+        let chunk_size = 128;
+        for chunk_idx in 0..20 {
+            let mut input = Vec::new();
+            for i in 0..chunk_size {
+                let sample_idx = chunk_idx * chunk_size + i;
+                let t = sample_idx as f32 / 48000.0;
+                let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+                input.push(sample); // Left
+                input.push(sample); // Right
+            }
+
+            let mut output = vec![0.0f32; 512 * 2];
+            let result = resampler.process_interleaved(&input, &mut output);
+            assert!(result.is_ok());
+        }
     }
 }

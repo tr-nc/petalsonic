@@ -14,6 +14,30 @@ use symphonia::{
     default::{get_codecs, get_probe},
 };
 
+/// Loads an audio file from disk using the Symphonia decoder library.
+///
+/// This function supports various audio formats (MP3, WAV, FLAC, OGG, etc.) and decodes them
+/// into f32 PCM samples. The audio data can be optionally converted to mono based on the
+/// provided options.
+///
+/// # Arguments
+///
+/// * `path` - File path to the audio file to load
+/// * `options` - Loading options that control behavior like mono conversion
+///
+/// # Returns
+///
+/// Returns an `Arc<PetalSonicAudioData>` containing the decoded audio samples, sample rate,
+/// channel count, and duration on success.
+///
+/// # Errors
+///
+/// Returns a `PetalSonicError` if:
+/// - The file cannot be opened
+/// - The audio format cannot be probed
+/// - No default audio track is found
+/// - Required audio metadata (sample rate, channels) is missing
+/// - Decoding fails due to an unrecoverable error
 pub fn load_audio_file(path: &str, options: &LoadOptions) -> Result<Arc<PetalSonicAudioData>> {
     let file = File::open(path)
         .map_err(|e| PetalSonicError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e)))?;

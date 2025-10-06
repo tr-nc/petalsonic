@@ -1,7 +1,6 @@
 use crate::audio_data::{LoadOptions, PetalSonicAudioData, load_audio_file};
 use crate::config::PetalSonicWorldDesc;
 use crate::error::Result;
-use crate::events::PetalSonicEvent;
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackCommand;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -9,6 +8,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Main world object that manages 3D audio sources and playback.
+///
+/// `PetalSonicWorld` is the central API for PetalSonic. It runs on the main thread
+/// and provides a world-driven interface where you manage audio sources, listeners,
+/// and playback commands. The actual audio processing happens on a separate thread
+/// via the audio engine.
+///
+/// # Architecture
+///
+/// - **Main thread**: Owns the `PetalSonicWorld`, loads audio files, manages sources
+/// - **Audio thread**: Receives commands via channels, performs spatialization and playback
 pub struct PetalSonicWorld {
     desc: PetalSonicWorldDesc,
     audio_data_storage: HashMap<Uuid, Arc<PetalSonicAudioData>>,
@@ -27,11 +37,20 @@ impl PetalSonicWorld {
         })
     }
 
+    /// Returns the sample rate of the audio world.
     pub fn sample_rate(&self) -> u32 {
         self.desc.sample_rate
     }
 
-    /// Load an audio file using its original sample rate
+    /// Loads an audio file from disk with default options.
+    ///
+    /// The audio data is decoded and loaded into memory but not yet added to the world.
+    /// Use [`add_source`](Self::add_source) to register it for playback.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the audio file (supports WAV, MP3, FLAC, OGG, etc.)
+    ///
     pub fn load_audio_file(&self, path: &str) -> Result<Arc<PetalSonicAudioData>> {
         let load_options = LoadOptions::default();
 
@@ -39,7 +58,14 @@ impl PetalSonicWorld {
         Ok(audio_data)
     }
 
-    /// Load an audio file with custom options using its original sample rate
+    /// Loads an audio file with custom loading options.
+    ///
+    /// Allows you to specify custom decoding and processing options when loading audio data.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the audio file
+    /// * `options` - Custom load options for the audio file
     pub fn load_audio_file_with_options(
         &self,
         path: &str,
@@ -49,11 +75,9 @@ impl PetalSonicWorld {
         Ok(audio_data)
     }
 
-    pub fn poll_events(&mut self) -> Vec<PetalSonicEvent> {
-        Vec::new()
-    }
-
-    /// Add an audio source to the world storage and return its UUID
+    /// Adds audio data to the world's internal storage and returns a UUID handle.
+    ///
+    /// The audio data is automatically resampled to match the world's sample rate if needed.
     pub fn add_source(&mut self, audio_data: Arc<PetalSonicAudioData>) -> Result<Uuid> {
         // Automatically resample if the audio data sample rate doesn't match the world's sample rate
         let resampled_audio_data = if audio_data.sample_rate() != self.desc.sample_rate {
@@ -67,22 +91,50 @@ impl PetalSonicWorld {
         Ok(uuid)
     }
 
-    /// Get audio data by UUID
+    /// Retrieves audio data by its UUID.
+    ///
+    /// # Arguments
+    ///
+    /// * `uuid` - The UUID of the audio source
+    ///
+    /// # Returns
+    ///
+    /// `Some(&Arc<PetalSonicAudioData>)` if found, `None` otherwise
     pub fn get_audio_data(&self, uuid: Uuid) -> Option<&Arc<PetalSonicAudioData>> {
         self.audio_data_storage.get(&uuid)
     }
 
-    /// Remove audio data by UUID
+    /// Removes audio data from the world by its UUID.
+    ///
+    /// # Arguments
+    ///
+    /// * `uuid` - The UUID of the audio source to remove
+    ///
+    /// # Returns
+    ///
+    /// The removed audio data if it existed, `None` otherwise
     pub fn remove_audio_data(&mut self, uuid: Uuid) -> Option<Arc<PetalSonicAudioData>> {
         self.audio_data_storage.remove(&uuid)
     }
 
-    /// Get all stored audio data UUIDs
+    /// Returns a list of all audio source UUIDs currently stored in the world.
     pub fn get_audio_data_uuids(&self) -> Vec<Uuid> {
         self.audio_data_storage.keys().copied().collect()
     }
 
-    /// Start playing audio by UUID
+    /// Starts playing an audio source by its UUID.
+    ///
+    /// Sends a play command to the audio engine thread. The audio will begin playing
+    /// from its current position (or from the beginning if not yet played).
+    ///
+    /// # Arguments
+    ///
+    /// * `audio_id` - UUID of the audio source to play
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the audio source UUID is not found in the world storage
+    /// or if the command fails to send to the audio engine.
     pub fn play(&self, audio_id: Uuid) -> Result<()> {
         if !self.audio_data_storage.contains_key(&audio_id) {
             return Err(crate::error::PetalSonicError::Engine(
@@ -101,7 +153,18 @@ impl PetalSonicWorld {
         Ok(())
     }
 
-    /// Pause playing audio by UUID
+    /// Pauses a playing audio source by its UUID.
+    ///
+    /// Sends a pause command to the audio engine thread. The audio will stop playing
+    /// but retain its current playback position.
+    ///
+    /// # Arguments
+    ///
+    /// * `audio_id` - UUID of the audio source to pause
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails to send to the audio engine.
     pub fn pause(&self, audio_id: Uuid) -> Result<()> {
         self.command_sender
             .send(PlaybackCommand::Pause(audio_id))
@@ -114,7 +177,18 @@ impl PetalSonicWorld {
         Ok(())
     }
 
-    /// Stop playing audio by UUID
+    /// Stops a playing audio source by its UUID.
+    ///
+    /// Sends a stop command to the audio engine thread. The audio will stop playing
+    /// and reset its playback position to the beginning.
+    ///
+    /// # Arguments
+    ///
+    /// * `audio_id` - UUID of the audio source to stop
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails to send to the audio engine.
     pub fn stop(&self, audio_id: Uuid) -> Result<()> {
         self.command_sender
             .send(PlaybackCommand::Stop(audio_id))
@@ -127,7 +201,14 @@ impl PetalSonicWorld {
         Ok(())
     }
 
-    /// Stop all currently playing audio
+    /// Stops all currently playing audio sources.
+    ///
+    /// Sends a stop-all command to the audio engine thread. All active audio playback
+    /// will be stopped and reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails to send to the audio engine.
     pub fn stop_all(&self) -> Result<()> {
         self.command_sender
             .send(PlaybackCommand::StopAll)
@@ -140,7 +221,15 @@ impl PetalSonicWorld {
         Ok(())
     }
 
-    /// Get the command receiver for the audio engine
+    /// Returns a reference to the command receiver for the audio engine.
+    ///
+    /// This receiver is used by the audio engine thread to poll for playback commands
+    /// sent from the main thread. This method is primarily used internally when
+    /// initializing the audio engine.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the `Receiver<PlaybackCommand>` channel
     pub fn command_receiver(&self) -> &Receiver<PlaybackCommand> {
         &self.command_receiver
     }

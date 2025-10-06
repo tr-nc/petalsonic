@@ -1,92 +1,6 @@
 # PetalSonic Implementation TODO
 
-This is a spatial audio library with real-time safe audio processing using Steam Audio (audionimbus) for spatialization.
-
-You can find reference under src/reference-audio/, you can copy code from there, but you must not change, reference or update anything inside that folder, these are our reference files.
-
-Only install the dependencies where needed.
-
-## Separating core lib code with demo code
-
-### Workspace Structure Plan
-
-```
-petalsonic/
-├── Cargo.toml          # Workspace manifest
-├── README.md
-├── TODO.md
-├── petalsonic-core/    # The audio library
-│   ├── Cargo.toml
-│   ├── src/lib.rs
-│   └── ...
-└── petalsonic-demo/    # Interactive demo application
-    ├── Cargo.toml
-    ├── src/
-    │   ├── main.rs
-    │   ├── audio/      # Audio management layer
-    │   ├── ui/         # Web UI components
-    │   ├── scene/      # 3D scene management
-    │   └── input/      # User interaction handling
-    └── assets/         # Audio files, UI assets
-```
-
-### Demo Crate Architecture (petalsonic-demo)
-
-**Technology Stack:**
-
-- **Web Framework**: `axum` for HTTP server + WebSocket support
-- **Frontend**: `leptos` or `yew` for Rust WASM frontend
-- **3D Visualization**: `three-d` or `bevy` for 3D scene rendering
-- **Audio Bridge**: Custom layer connecting web events to PetalSonic
-
-**Module Structure:**
-
-**`src/audio/`** - Audio Management Layer
-
-- `manager.rs`: Wraps PetalSonicWorld, handles audio thread coordination
-- `bridge.rs`: Converts UI events to audio commands
-- `presets.rs`: Pre-defined audio scenes and effects
-
-**`src/ui/`** - Web Interface
-
-- `app.rs`: Main web application component
-- `components/`: Draggable audio sources, listener controls, scene controls
-- `canvas.rs`: 3D scene visualization and interaction
-- `websocket.rs`: Real-time communication with audio backend
-
-**`src/scene/`** - Scene Management
-
-- `world.rs`: 3D world state (separate from audio world)
-- `objects.rs`: Visual representations of audio sources/listener
-- `physics.rs`: Collision detection, movement constraints
-- `serialization.rs`: Save/load scene configurations
-
-**`src/input/`** - User Interaction
-
-- `drag.rs`: Drag-and-drop logic for positioning objects
-- `gestures.rs`: Multi-touch, zoom, rotate interactions
-- `keyboard.rs`: Hotkeys and shortcuts
-
-### Separation of Concerns
-
-**PetalSonic Core Library (petalsonic-core)**
-
-- Pure spatial audio processing
-- Steam Audio integration
-- Thread-safe audio pipeline
-- Audio data loading/resampling
-- Real-time safe operations
-
-**Demo Crate (petalsonic-demo)**
-
-- Web server and UI framework
-- Visual scene representation
-- User interaction (drag/drop, controls)
-- Scene persistence and presets
-- Performance monitoring and debugging tools
-- Example integrations and tutorials
-
-### Development Evolution Path
+## Development Evolution Path
 
 1. **Phase 1**: Simple CLI examples demonstrating core library features
 2. **Phase 2**: Basic web UI with static audio source positioning
@@ -95,7 +9,6 @@ petalsonic/
 
 ## Adapt different sample rates
 
-- [x] Create a callback function that is required to fill a certain amount of samples, to be consumed directly by the output device (so the samples feeded in must be the final result), this function must not be blocking, and the target sample rate of the filled samples is configured in the world.
 - [ ] Use rubato to resample the audio to the output sample rate in realtime. The source of the audio is given from the callback function.
 
 ## Ring Buffer & Audio Backend (Phase 3)

@@ -50,8 +50,8 @@ impl StreamingResampler {
 
         // Create the rubato resampler with fixed output size
         let resampler = FastFixedOut::new(
-            source_sample_rate as f64 / target_sample_rate as f64,
-            1.0, // max_resample_ratio_relative - we're not changing it dynamically
+            target_sample_rate as f64 / source_sample_rate as f64,
+            1.0,
             rubato::PolynomialDegree::Septic,
             output_frames,
             channels as usize,

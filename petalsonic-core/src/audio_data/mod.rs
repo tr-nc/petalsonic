@@ -185,7 +185,7 @@ impl PetalSonicAudioData {
         ))
     }
 
-    /// Resample to a different sample rate using rubato
+    /// Resample to a different sample rate using rubato, returns a new `PetalSonicAudioData` instance
     pub fn resample(&self, target_sample_rate: u32) -> Result<Self> {
         if target_sample_rate == self.inner.sample_rate {
             return Ok(self.clone());

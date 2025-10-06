@@ -8,6 +8,16 @@ pub struct AudioResampler {
 }
 
 impl AudioResampler {
+    /// Creates a new audio resampler.
+    ///
+    /// # Arguments
+    /// * `source_sample_rate` - The sample rate of the input audio
+    /// * `target_sample_rate` - The desired sample rate of the output audio
+    /// * `channels` - Number of channels in the audio data
+    /// * `chunk_size` - Optional size of processing chunks (defaults to 1024)
+    ///
+    /// # Returns
+    /// A new `AudioResampler` instance
     pub fn new(
         source_sample_rate: u32,
         target_sample_rate: u32,
@@ -34,6 +44,17 @@ impl AudioResampler {
         })
     }
 
+    /// Resamples a single channel of audio data.
+    ///
+    /// # Data Format
+    /// - **Input**: NON-INTERLEAVED (planar) - Single channel data: `[L0, L1, L2, ...]`
+    /// - **Output**: NON-INTERLEAVED (planar) - Single channel data: `[L0, L1, L2, ...]`
+    ///
+    /// # Arguments
+    /// * `channel_samples` - A slice of f32 samples from a single audio channel (NOT interleaved)
+    ///
+    /// # Returns
+    /// A vector of resampled f32 samples for the single channel (NOT interleaved)
     pub fn resample_channel(&self, channel_samples: &[f32]) -> Result<Vec<f32>> {
         if self.source_sample_rate == self.target_sample_rate {
             return Ok(channel_samples.to_vec());
@@ -82,6 +103,25 @@ impl AudioResampler {
         Ok(output_buffer)
     }
 
+    /// Resamples multi-channel interleaved audio data.
+    ///
+    /// # Data Format
+    /// - **Input**: INTERLEAVED - Samples from all channels mixed: `[L0, R0, L1, R1, L2, R2, ...]`
+    /// - **Output**: INTERLEAVED - Resampled samples from all channels mixed: `[L0, R0, L1, R1, ...]`
+    ///
+    /// For stereo (2-channel) audio:
+    /// - Input:  `[Left0, Right0, Left1, Right1, ...]`
+    /// - Output: `[Left0, Right0, Left1, Right1, ...]` (at new sample rate)
+    ///
+    /// # Arguments
+    /// * `interleaved_samples` - A slice of f32 samples with all channels interleaved
+    ///
+    /// # Returns
+    /// A vector of resampled f32 samples with all channels interleaved
+    ///
+    /// # Implementation Note
+    /// This function internally de-interleaves the data, resamples each channel separately,
+    /// then re-interleaves the results.
     pub fn resample_interleaved(&self, interleaved_samples: &[f32]) -> Result<Vec<f32>> {
         if self.source_sample_rate == self.target_sample_rate {
             return Ok(interleaved_samples.to_vec());
@@ -119,14 +159,23 @@ impl AudioResampler {
         Ok(interleaved_samples)
     }
 
+    /// Returns the target (output) sample rate in Hz.
     pub fn target_sample_rate(&self) -> u32 {
         self.target_sample_rate
     }
 
+    /// Returns the source (input) sample rate in Hz.
     pub fn source_sample_rate(&self) -> u32 {
         self.source_sample_rate
     }
 
+    /// Calculates the resampling ratio (target/source).
+    ///
+    /// # Returns
+    /// A ratio where:
+    /// - `> 1.0` means upsampling (increasing sample rate)
+    /// - `< 1.0` means downsampling (decreasing sample rate)
+    /// - `= 1.0` means no resampling needed
     pub fn resample_ratio(&self) -> f64 {
         self.target_sample_rate as f64 / self.source_sample_rate as f64
     }

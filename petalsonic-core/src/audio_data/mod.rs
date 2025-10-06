@@ -10,17 +10,69 @@ use std::time::Duration;
 
 pub use symphonia_loader::{load_audio_file, load_audio_file_simple};
 
+/// Container for loaded audio data with reference-counted sharing.
+///
+/// # Data Format
+/// All audio samples are stored in **INTERLEAVED** format internally.
+/// See [`AudioDataInner`] for details on the data layout.
 #[derive(Debug, Clone)]
 pub struct PetalSonicAudioData {
     inner: Arc<AudioDataInner>,
 }
 
+/// Internal audio data storage.
+///
+/// # Data Format
+/// All audio samples are stored in **INTERLEAVED** format, where samples from different
+/// channels are mixed together frame by frame.
+///
+/// ## Interleaved Format (used here)
+/// Samples from all channels are stored together, alternating by frame:
+/// - Stereo (2-channel): `[L0, R0, L1, R1, L2, R2, ...]`
+/// - Mono (1-channel): `[M0, M1, M2, M3, ...]`
+/// - 5.1 surround: `[FL0, FR0, C0, LFE0, RL0, RR0, FL1, FR1, C1, LFE1, RL1, RR1, ...]`
+///
+/// ## Planar Format (alternative, NOT used here)
+/// Each channel is stored in a separate contiguous buffer:
+/// - Stereo: `Left: [L0, L1, L2, ...], Right: [R0, R1, R2, ...]`
+/// - Would require: `Vec<Vec<f32>>` or separate buffers per channel
+///
+/// ## Why Interleaved?
+/// 1. **Audio file compatibility**: Most audio files (WAV, MP3, FLAC) store data interleaved
+/// 2. **Hardware/API compatibility**: Audio APIs (CPAL, PortAudio) typically expect interleaved data
+/// 3. **Cache locality for playback**: When processing frames sequentially, all channel data
+///    for a given time point is adjacent in memory
+/// 4. **Simpler API**: Single buffer is easier to manage than per-channel buffers
+/// 5. **Frame-based operations**: Makes it trivial to extract/process complete frames
+///
+/// ## When Planar is Better
+/// - Per-channel DSP operations (e.g., independent channel processing)
+/// - SIMD operations on single channels
+/// - Some audio processing libraries prefer planar (e.g., FFmpeg, some VST plugins)
+///
+/// **Note**: Functions like `channel_samples()` can extract planar data when needed.
 #[derive(Debug)]
 pub(crate) struct AudioDataInner {
+    /// Audio samples stored in **INTERLEAVED** format.
+    ///
+    /// # Format: INTERLEAVED
+    /// - Samples from all channels are mixed: `[L0, R0, L1, R1, L2, R2, ...]`
+    /// - Total length = `total_frames * channels`
+    /// - Each frame contains one sample from each channel
     pub samples: Vec<f32>,
+
+    /// Sample rate in Hz (e.g., 44100, 48000)
     pub sample_rate: u32,
+
+    /// Number of audio channels (1 = mono, 2 = stereo, etc.)
     pub channels: u16,
+
+    /// Total duration of the audio
     pub duration: Duration,
+
+    /// Total number of frames (one frame = one sample from each channel)
+    ///
+    /// Calculated as: `samples.len() / channels`
     pub total_frames: usize,
 }
 

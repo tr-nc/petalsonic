@@ -12,4 +12,4 @@ pub use engine::{AudioFillCallback, PetalSonicEngine};
 pub use error::PetalSonicError;
 pub use events::PetalSonicEvent;
 pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
-pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld};
+pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};

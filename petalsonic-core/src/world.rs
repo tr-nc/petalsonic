@@ -6,7 +6,19 @@ use crate::playback::PlaybackCommand;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::HashMap;
 use std::sync::Arc;
-use uuid::Uuid;
+
+/// Lightweight, type-safe handle for audio sources.
+///
+/// Returned when adding audio data to the world. Used to reference audio sources
+/// for playback operations (play, pause, stop).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceId(u64);
+
+impl std::fmt::Display for SourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SourceId({})", self.0)
+    }
+}
 
 /// Main world object that manages 3D audio sources and playback.
 ///
@@ -21,7 +33,8 @@ use uuid::Uuid;
 /// - **Audio thread**: Receives commands via channels, performs spatialization and playback
 pub struct PetalSonicWorld {
     desc: PetalSonicWorldDesc,
-    audio_data_storage: HashMap<Uuid, Arc<PetalSonicAudioData>>,
+    audio_data_storage: HashMap<SourceId, Arc<PetalSonicAudioData>>,
+    next_source_id: u64,
     command_sender: Sender<PlaybackCommand>,
     command_receiver: Receiver<PlaybackCommand>,
 }
@@ -32,6 +45,7 @@ impl PetalSonicWorld {
         Ok(Self {
             desc: config,
             audio_data_storage: HashMap::new(),
+            next_source_id: 0,
             command_sender,
             command_receiver,
         })
@@ -42,10 +56,10 @@ impl PetalSonicWorld {
         self.desc.sample_rate
     }
 
-    /// Adds audio data to the world's internal storage and returns a UUID handle.
+    /// Adds audio data to the world's internal storage and returns a SourceId handle.
     ///
     /// The audio data is automatically resampled to match the world's sample rate if needed.
-    pub fn add_source(&mut self, audio_data: Arc<PetalSonicAudioData>) -> Result<Uuid> {
+    pub fn add_source(&mut self, audio_data: Arc<PetalSonicAudioData>) -> Result<SourceId> {
         // Automatically resample if the audio data sample rate doesn't match the world's sample rate
         let resampled_audio_data = if audio_data.sample_rate() != self.desc.sample_rate {
             Arc::new(audio_data.resample(self.desc.sample_rate)?)
@@ -53,59 +67,60 @@ impl PetalSonicWorld {
             audio_data
         };
 
-        let uuid = Uuid::new_v4();
-        self.audio_data_storage.insert(uuid, resampled_audio_data);
-        Ok(uuid)
+        let id = SourceId(self.next_source_id);
+        self.next_source_id += 1;
+        self.audio_data_storage.insert(id, resampled_audio_data);
+        Ok(id)
     }
 
-    /// Retrieves audio data by its UUID.
+    /// Retrieves audio data by its SourceId.
     ///
     /// # Arguments
     ///
-    /// * `uuid` - The UUID of the audio source
+    /// * `id` - The SourceId of the audio source
     ///
     /// # Returns
     ///
     /// `Some(&Arc<PetalSonicAudioData>)` if found, `None` otherwise
-    pub fn get_audio_data(&self, uuid: Uuid) -> Option<&Arc<PetalSonicAudioData>> {
-        self.audio_data_storage.get(&uuid)
+    pub fn get_audio_data(&self, id: SourceId) -> Option<&Arc<PetalSonicAudioData>> {
+        self.audio_data_storage.get(&id)
     }
 
-    /// Removes audio data from the world by its UUID.
+    /// Removes audio data from the world by its SourceId.
     ///
     /// # Arguments
     ///
-    /// * `uuid` - The UUID of the audio source to remove
+    /// * `id` - The SourceId of the audio source to remove
     ///
     /// # Returns
     ///
     /// The removed audio data if it existed, `None` otherwise
-    pub fn remove_audio_data(&mut self, uuid: Uuid) -> Option<Arc<PetalSonicAudioData>> {
-        self.audio_data_storage.remove(&uuid)
+    pub fn remove_audio_data(&mut self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
+        self.audio_data_storage.remove(&id)
     }
 
-    /// Returns a list of all audio source UUIDs currently stored in the world.
-    pub fn get_audio_data_uuids(&self) -> Vec<Uuid> {
+    /// Returns a list of all audio source IDs currently stored in the world.
+    pub fn get_audio_source_ids(&self) -> Vec<SourceId> {
         self.audio_data_storage.keys().copied().collect()
     }
 
-    /// Starts playing an audio source by its UUID.
+    /// Starts playing an audio source by its SourceId.
     ///
     /// Sends a play command to the audio engine thread. The audio will begin playing
     /// from its current position (or from the beginning if not yet played).
     ///
     /// # Arguments
     ///
-    /// * `audio_id` - UUID of the audio source to play
+    /// * `audio_id` - SourceId of the audio source to play
     ///
     /// # Errors
     ///
-    /// Returns an error if the audio source UUID is not found in the world storage
+    /// Returns an error if the audio source ID is not found in the world storage
     /// or if the command fails to send to the audio engine.
-    pub fn play(&self, audio_id: Uuid) -> Result<()> {
+    pub fn play(&self, audio_id: SourceId) -> Result<()> {
         if !self.audio_data_storage.contains_key(&audio_id) {
             return Err(crate::error::PetalSonicError::Engine(
-                format!("Audio data with UUID {} not found", audio_id).into(),
+                format!("Audio data with ID {:?} not found", audio_id).into(),
             ));
         }
 
@@ -120,19 +135,19 @@ impl PetalSonicWorld {
         Ok(())
     }
 
-    /// Pauses a playing audio source by its UUID.
+    /// Pauses a playing audio source by its SourceId.
     ///
     /// Sends a pause command to the audio engine thread. The audio will stop playing
     /// but retain its current playback position.
     ///
     /// # Arguments
     ///
-    /// * `audio_id` - UUID of the audio source to pause
+    /// * `audio_id` - SourceId of the audio source to pause
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails to send to the audio engine.
-    pub fn pause(&self, audio_id: Uuid) -> Result<()> {
+    pub fn pause(&self, audio_id: SourceId) -> Result<()> {
         self.command_sender
             .send(PlaybackCommand::Pause(audio_id))
             .map_err(|e| {
@@ -144,19 +159,19 @@ impl PetalSonicWorld {
         Ok(())
     }
 
-    /// Stops a playing audio source by its UUID.
+    /// Stops a playing audio source by its SourceId.
     ///
     /// Sends a stop command to the audio engine thread. The audio will stop playing
     /// and reset its playback position to the beginning.
     ///
     /// # Arguments
     ///
-    /// * `audio_id` - UUID of the audio source to stop
+    /// * `audio_id` - SourceId of the audio source to stop
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails to send to the audio engine.
-    pub fn stop(&self, audio_id: Uuid) -> Result<()> {
+    pub fn stop(&self, audio_id: SourceId) -> Result<()> {
         self.command_sender
             .send(PlaybackCommand::Stop(audio_id))
             .map_err(|e| {

@@ -1,13 +1,12 @@
 use crate::config::PetalSonicWorldDesc;
 use crate::error::Result;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
-use crate::world::PetalSonicWorld;
+use crate::world::{PetalSonicWorld, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use uuid::Uuid;
 
 /// Callback function type for filling audio samples
 ///
@@ -27,7 +26,7 @@ pub struct PetalSonicEngine {
     frames_processed: Arc<AtomicUsize>,
     fill_callback: Option<Arc<AudioFillCallback>>,
     world: Arc<PetalSonicWorld>,
-    active_playback: Arc<std::sync::Mutex<HashMap<Uuid, PlaybackInstance>>>,
+    active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
 }
 
 impl PetalSonicEngine {
@@ -168,7 +167,7 @@ impl PetalSonicEngine {
         frames_processed: Arc<AtomicUsize>,
         _sample_rate: u32,
         channels: u16,
-        active_playback: Arc<std::sync::Mutex<HashMap<Uuid, PlaybackInstance>>>,
+        active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         world: Arc<PetalSonicWorld>,
     ) -> Result<cpal::Stream>
     where

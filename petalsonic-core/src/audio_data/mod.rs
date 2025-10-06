@@ -2,6 +2,7 @@ mod default_loader;
 mod load_options;
 mod loader;
 mod resampler;
+mod streaming_resampler;
 
 use crate::error::{PetalSonicError, Result};
 pub use default_loader::DefaultAudioLoader;
@@ -10,6 +11,7 @@ pub use loader::AudioDataLoader;
 pub use resampler::AudioResampler;
 use std::sync::Arc;
 use std::time::Duration;
+pub use streaming_resampler::StreamingResampler;
 
 /// Container for loaded audio data with reference-counted sharing.
 ///

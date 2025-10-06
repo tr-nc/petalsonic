@@ -165,6 +165,7 @@ petalsonic-core/src/
 ### Implementation Plan
 
 #### **Phase 1: Core Infrastructure (Foundation)**
+
 - [ ] Create `spatial/` module structure
 - [ ] Define communication types (`WorldUpdate`, `SimulationResult`, `SimulationState`)
 - [ ] Add `triple_buffer` crate dependency
@@ -173,6 +174,7 @@ petalsonic-core/src/
 - [ ] Create `SpatialConfig` with sensible defaults
 
 #### **Phase 2: Simulation Thread**
+
 - [ ] Create `SpatialSimulator` struct with Steam Audio integration
   - [ ] Initialize Context, Simulator, Scene
   - [ ] Set up update_receiver channel
@@ -191,6 +193,7 @@ petalsonic-core/src/
 - [ ] Test simulation thread standalone (logging outputs)
 
 #### **Phase 3: Audio Thread Processing**
+
 - [ ] Create `SpatialProcessor` struct with DSP objects
   - [ ] Initialize Context, HRTF, AmbisonicsDecodeEffect
   - [ ] Set up triple buffer reader
@@ -212,6 +215,7 @@ petalsonic-core/src/
 - [ ] Ensure real-time safety (no allocations, no blocking)
 
 #### **Phase 4: World Integration**
+
 - [ ] Add `PetalSonicAudioListener` to `PetalSonicWorld`
   - [ ] Store listener pose
   - [ ] Add `set_listener_pose(&mut self, pose: Pose)`
@@ -229,6 +233,7 @@ petalsonic-core/src/
 - [ ] Wire up to existing play/pause/stop commands
 
 #### **Phase 5: Engine Integration**
+
 - [ ] Initialize `SpatialProcessor` on engine start
   - [ ] Create triple buffer (writer for sim, reader for audio)
   - [ ] Pass reader to SpatialProcessor
@@ -248,6 +253,7 @@ petalsonic-core/src/
   - [ ] Join simulation thread on engine drop
 
 #### **Phase 6: Testing & Validation**
+
 - [ ] Unit tests for spatial types (SimulationResult, SpatialConfig)
 - [ ] Test simulation thread in isolation
   - [ ] Verify position updates propagate correctly
@@ -261,6 +267,7 @@ petalsonic-core/src/
 - [ ] Test graceful degradation (slow simulation thread)
 
 #### **Phase 7: Optimization & Polish**
+
 - [ ] Profile simulation thread CPU usage
   - [ ] Measure time per simulation run
   - [ ] Tune simulation rate (30Hz? 60Hz? 120Hz?)

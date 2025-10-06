@@ -1,4 +1,5 @@
 use anyhow::Result;
+use petalsonic_core::audio_data::PetalSonicAudioData;
 use petalsonic_core::config::PetalSonicWorldDesc;
 use petalsonic_core::engine::PetalSonicEngine;
 use petalsonic_core::world::PetalSonicWorld;
@@ -24,8 +25,8 @@ fn test_new_playback_system() -> Result<()> {
     log::info!("Creating world and loading audio file: {}", wav_path);
     let mut world = PetalSonicWorld::new(config.clone()).expect("Failed to create PetalSonicWorld");
 
-    // Load audio file into the world
-    let audio_data = world.load_audio_file(wav_path)?;
+    // Load audio file using the new API
+    let audio_data = PetalSonicAudioData::from_path(wav_path)?;
     let audio_id = world.add_source(audio_data)?;
     log::info!("Audio loaded with ID: {}", audio_id);
 
@@ -75,7 +76,7 @@ fn test_play_audio_file() -> Result<()> {
     let load_options = petalsonic_core::audio_data::LoadOptions::default();
 
     log::info!("Loading audio file: {}", wav_path);
-    let audio_data = petalsonic_core::audio_data::load_audio_file(wav_path, &load_options)?;
+    let audio_data = PetalSonicAudioData::from_path_with_options(wav_path, &load_options)?;
 
     let config = PetalSonicWorldDesc {
         sample_rate: 48000,

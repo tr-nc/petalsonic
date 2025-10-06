@@ -1,14 +1,15 @@
+mod default_loader;
 mod load_options;
+mod loader;
 mod resampler;
-mod symphonia_loader;
 
 use crate::error::{PetalSonicError, Result};
+pub use default_loader::DefaultAudioLoader;
 pub use load_options::{ConvertToMono, LoadOptions};
+pub use loader::AudioDataLoader;
 pub use resampler::AudioResampler;
 use std::sync::Arc;
 use std::time::Duration;
-
-pub use symphonia_loader::{load_audio_file, load_audio_file_simple};
 
 /// Container for loaded audio data with reference-counted sharing.
 ///
@@ -93,6 +94,75 @@ impl PetalSonicAudioData {
                 total_frames,
             }),
         }
+    }
+
+    /// Load audio data from a file path using the default loader.
+    ///
+    /// This is a convenience method that uses the built-in Symphonia-based loader
+    /// with default loading options.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the audio file (supports WAV, MP3, FLAC, OGG, etc.)
+    ///
+    /// # Returns
+    ///
+    /// Returns an `Arc<PetalSonicAudioData>` containing the decoded audio on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `PetalSonicError` if the file cannot be loaded or decoded.
+    pub fn from_path(path: &str) -> Result<Arc<Self>> {
+        let loader = DefaultAudioLoader;
+        loader.load(path, &LoadOptions::default())
+    }
+
+    /// Load audio data from a file path with custom loading options.
+    ///
+    /// This is a convenience method that uses the built-in Symphonia-based loader
+    /// with user-specified loading options.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the audio file
+    /// * `options` - Loading options that control behavior like mono conversion
+    ///
+    /// # Returns
+    ///
+    /// Returns an `Arc<PetalSonicAudioData>` containing the decoded audio on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `PetalSonicError` if the file cannot be loaded or decoded.
+    pub fn from_path_with_options(path: &str, options: &LoadOptions) -> Result<Arc<Self>> {
+        let loader = DefaultAudioLoader;
+        loader.load(path, options)
+    }
+
+    /// Load audio data from a file path using a custom loader.
+    ///
+    /// This method allows you to use your own audio loading implementation
+    /// by providing a custom loader that implements the [`AudioDataLoader`] trait.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the audio file
+    /// * `loader` - A custom loader implementing the `AudioDataLoader` trait
+    /// * `options` - Loading options that control behavior like mono conversion
+    ///
+    /// # Returns
+    ///
+    /// Returns an `Arc<PetalSonicAudioData>` containing the decoded audio on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `PetalSonicError` if the file cannot be loaded or decoded.
+    pub fn from_path_with_loader<L: AudioDataLoader>(
+        path: &str,
+        loader: &L,
+        options: &LoadOptions,
+    ) -> Result<Arc<Self>> {
+        loader.load(path, options)
     }
 
     pub fn sample_rate(&self) -> u32 {

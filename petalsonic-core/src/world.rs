@@ -1,4 +1,4 @@
-use crate::audio_data::{LoadOptions, PetalSonicAudioData, load_audio_file};
+use crate::audio_data::PetalSonicAudioData;
 use crate::config::PetalSonicWorldDesc;
 use crate::error::Result;
 use crate::math::{Pose, Vec3};
@@ -40,39 +40,6 @@ impl PetalSonicWorld {
     /// Returns the sample rate of the audio world.
     pub fn sample_rate(&self) -> u32 {
         self.desc.sample_rate
-    }
-
-    /// Loads an audio file from disk with default options.
-    ///
-    /// The audio data is decoded and loaded into memory but not yet added to the world.
-    /// Use [`add_source`](Self::add_source) to register it for playback.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the audio file (supports WAV, MP3, FLAC, OGG, etc.)
-    ///
-    pub fn load_audio_file(&self, path: &str) -> Result<Arc<PetalSonicAudioData>> {
-        let load_options = LoadOptions::default();
-
-        let audio_data = load_audio_file(path, &load_options)?;
-        Ok(audio_data)
-    }
-
-    /// Loads an audio file with custom loading options.
-    ///
-    /// Allows you to specify custom decoding and processing options when loading audio data.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the audio file
-    /// * `options` - Custom load options for the audio file
-    pub fn load_audio_file_with_options(
-        &self,
-        path: &str,
-        options: LoadOptions,
-    ) -> Result<Arc<PetalSonicAudioData>> {
-        let audio_data = load_audio_file(path, &options)?;
-        Ok(audio_data)
     }
 
     /// Adds audio data to the world's internal storage and returns a UUID handle.

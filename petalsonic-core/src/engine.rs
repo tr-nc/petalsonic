@@ -352,6 +352,11 @@ impl PetalSonicEngine {
 
         let device_frames = data.len() / channels_usize;
 
+        log::info!(
+            "[CALLBACK] Audio callback requested {} frames",
+            device_frames,
+        );
+
         // Try to lock the ring buffer
         let Ok(mut ring_buf) = ring_buffer.try_lock() else {
             log::warn!("Failed to acquire ring buffer lock in audio callback");
@@ -469,6 +474,12 @@ impl PetalSonicEngine {
         drop(producer);
         drop(ring_buf);
 
+        log::info!(
+            "[CALLBACK] Consumed {} frames from ring buffer (requested: {})",
+            samples_consumed,
+            device_frames
+        );
+
         frames_processed.fetch_add(samples_consumed, Ordering::Relaxed);
     }
 
@@ -528,6 +539,11 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         world_block_size: usize,
     ) {
+        log::info!(
+            "[GENERATE] Starting resampled generation: need {} frames",
+            samples_needed
+        );
+
         let Ok(mut resampler) = resampler_arc.try_lock() else {
             log::warn!("Failed to acquire resampler lock in generate_resampled_samples");
             return;
@@ -543,7 +559,14 @@ impl PetalSonicEngine {
                 world_buffer.resize(world_buffer_size, 0.0f32);
                 world_buffer.fill(0.0f32);
 
-                Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+                let frames_mixed =
+                    Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+
+                log::info!(
+                    "[GENERATE] Mixed {} frames from audio files (world_block_size: {})",
+                    frames_mixed,
+                    world_block_size
+                );
 
                 RESAMPLED_BUFFER.with(|rbuf| {
                     let mut resampled_buffer = rbuf.borrow_mut();
@@ -552,13 +575,16 @@ impl PetalSonicEngine {
                     resampled_buffer.resize(max_output_size, 0.0f32);
 
                     match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
-                        Ok((frames_out, _frames_in)) => {
-                            // Push frames to ring buffer
+                        Ok((frames_out, frames_in)) => {
+                            log::info!(
+                                "[GENERATE] Resampler: input {} frames → output {} frames",
+                                frames_in,
+                                frames_out
+                            );
+
+                            // Push all generated frames to ring buffer
                             let mut pushed = 0;
                             for i in 0..frames_out {
-                                if pushed >= samples_needed - total_generated {
-                                    break;
-                                }
                                 let left_idx = i * channels_usize;
                                 let right_idx = left_idx + 1;
                                 let frame = StereoFrame {
@@ -569,10 +595,28 @@ impl PetalSonicEngine {
                                     pushed += 1;
                                 } else {
                                     // Ring buffer is full
+                                    log::warn!(
+                                        "[GENERATE] Ring buffer full! Pushed {}/{} frames",
+                                        pushed,
+                                        frames_out
+                                    );
                                     break;
                                 }
                             }
+
+                            log::info!(
+                                "[GENERATE] Pushed {}/{} frames to ring buffer (total so far: {})",
+                                pushed,
+                                frames_out,
+                                total_generated + pushed
+                            );
+
                             total_generated += pushed;
+
+                            // If we couldn't push any frames, ring buffer is full, stop trying
+                            if pushed == 0 {
+                                return;
+                            }
                         }
                         Err(e) => {
                             log::error!("Resampling error: {}", e);
@@ -587,6 +631,12 @@ impl PetalSonicEngine {
                 break;
             }
         }
+
+        log::info!(
+            "[GENERATE] Finished resampled generation: generated {} frames (needed: {})",
+            total_generated,
+            samples_needed
+        );
     }
 
     /// Generate direct samples (no resampling) and push to ring buffer
@@ -597,6 +647,11 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         world_block_size: usize,
     ) {
+        log::info!(
+            "[GENERATE] Starting direct generation (no resampling): need {} frames",
+            samples_needed
+        );
+
         let channels_usize = channels as usize;
 
         // Generate samples in world_block_size chunks
@@ -608,14 +663,18 @@ impl PetalSonicEngine {
                 world_buffer.resize(world_buffer_size, 0.0f32);
                 world_buffer.fill(0.0f32);
 
-                Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+                let frames_mixed =
+                    Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
 
-                // Push frames to ring buffer
+                log::info!(
+                    "[GENERATE] Mixed {} frames from audio files (world_block_size: {})",
+                    frames_mixed,
+                    world_block_size
+                );
+
+                // Push all generated frames to ring buffer
                 let mut pushed = 0;
                 for i in 0..world_block_size {
-                    if pushed >= samples_needed - total_generated {
-                        break;
-                    }
                     let left_idx = i * channels_usize;
                     let right_idx = left_idx + 1;
                     let frame = StereoFrame {
@@ -626,10 +685,28 @@ impl PetalSonicEngine {
                         pushed += 1;
                     } else {
                         // Ring buffer is full
+                        log::warn!(
+                            "[GENERATE] Ring buffer full! Pushed {}/{} frames",
+                            pushed,
+                            world_block_size
+                        );
                         break;
                     }
                 }
+
+                log::info!(
+                    "[GENERATE] Pushed {}/{} frames to ring buffer (total so far: {})",
+                    pushed,
+                    world_block_size,
+                    total_generated + pushed
+                );
+
                 total_generated += pushed;
+
+                // If we couldn't push any frames, ring buffer is full, stop trying
+                if pushed == 0 {
+                    return;
+                }
             });
 
             // If we've generated enough or can't push more, stop
@@ -637,6 +714,12 @@ impl PetalSonicEngine {
                 break;
             }
         }
+
+        log::info!(
+            "[GENERATE] Finished direct generation: generated {} frames (needed: {})",
+            total_generated,
+            samples_needed
+        );
     }
 
     /// Mix all active playback instances into the buffer

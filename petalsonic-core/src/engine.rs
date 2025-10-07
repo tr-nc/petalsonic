@@ -352,10 +352,7 @@ impl PetalSonicEngine {
 
         let device_frames = data.len() / channels_usize;
 
-        log::info!(
-            "[CALLBACK] Audio callback requested {} frames",
-            device_frames,
-        );
+        log::info!("callback requires {} samples", device_frames);
 
         // Try to lock the ring buffer
         let Ok(mut ring_buf) = ring_buffer.try_lock() else {
@@ -367,44 +364,33 @@ impl PetalSonicEngine {
         // Split the ring buffer to get producer and consumer
         let (mut producer, mut consumer) = ring_buf.split_ref();
 
-        // Check if we need to generate more samples
-        // We try to consume from the ring buffer, and if there's not enough, generate more
-        loop {
-            // Try to peek if we can consume at least one sample
-            if consumer.is_empty() {
-                // Generate more samples
-                if let Some(resampler_arc) = resampler {
-                    Self::generate_resampled_samples(
-                        &mut producer,
-                        device_frames,
-                        channels_usize,
-                        channels,
-                        resampler_arc,
-                        active_playback,
-                        world_block_size,
-                    );
-                } else {
-                    Self::generate_direct_samples(
-                        &mut producer,
-                        device_frames,
-                        channels,
-                        active_playback,
-                        world_block_size,
-                    );
-                }
-            }
+        // Check current ring buffer status
+        let available_samples = consumer.occupied_len();
+        log::info!("ringbuf has {} samples", available_samples);
 
-            // If still empty after generation, break
-            if consumer.is_empty() {
-                Self::fill_silence(data);
-                drop(consumer);
-                drop(producer);
-                drop(ring_buf);
-                return;
-            }
+        // If not enough samples, generate more
+        if available_samples < device_frames {
+            log::info!("insufficient samples, filling now");
 
-            // Now we have some samples, try to consume them
-            break;
+            if let Some(resampler_arc) = resampler {
+                Self::generate_resampled_samples(
+                    &mut producer,
+                    device_frames - available_samples,
+                    channels_usize,
+                    channels,
+                    resampler_arc,
+                    active_playback,
+                    world_block_size,
+                );
+            } else {
+                Self::generate_direct_samples(
+                    &mut producer,
+                    device_frames - available_samples,
+                    channels,
+                    active_playback,
+                    world_block_size,
+                );
+            }
         }
 
         // Consume samples from ring buffer to fill output
@@ -421,64 +407,26 @@ impl PetalSonicEngine {
                 }
                 samples_consumed += 1;
             } else {
-                // Not enough samples, generate more
-                if let Some(resampler_arc) = resampler {
-                    Self::generate_resampled_samples(
-                        &mut producer,
-                        device_frames - samples_consumed,
-                        channels_usize,
-                        channels,
-                        resampler_arc,
-                        active_playback,
-                        world_block_size,
-                    );
-                } else {
-                    Self::generate_direct_samples(
-                        &mut producer,
-                        device_frames - samples_consumed,
-                        channels,
-                        active_playback,
-                        world_block_size,
-                    );
-                }
-
-                // Try again to consume
-                if let Some(frame) = consumer.try_pop() {
-                    let left_idx = i * channels_usize;
+                // Not enough samples even after generation, fill rest with silence
+                for j in i..device_frames {
+                    let left_idx = j * channels_usize;
                     let right_idx = left_idx + 1;
                     if left_idx < data.len() {
-                        data[left_idx] = T::from_sample(frame.left);
+                        data[left_idx] = T::from_sample(0.0f32);
                     }
                     if right_idx < data.len() {
-                        data[right_idx] = T::from_sample(frame.right);
+                        data[right_idx] = T::from_sample(0.0f32);
                     }
-                    samples_consumed += 1;
-                } else {
-                    // Still not enough, fill rest with silence
-                    for j in i..device_frames {
-                        let left_idx = j * channels_usize;
-                        let right_idx = left_idx + 1;
-                        if left_idx < data.len() {
-                            data[left_idx] = T::from_sample(0.0f32);
-                        }
-                        if right_idx < data.len() {
-                            data[right_idx] = T::from_sample(0.0f32);
-                        }
-                    }
-                    break;
                 }
+                break;
             }
         }
+
+        log::info!("consumes {} samples from ringbuf", samples_consumed);
 
         drop(consumer);
         drop(producer);
         drop(ring_buf);
-
-        log::info!(
-            "[CALLBACK] Consumed {} frames from ring buffer (requested: {})",
-            samples_consumed,
-            device_frames
-        );
 
         frames_processed.fetch_add(samples_consumed, Ordering::Relaxed);
     }
@@ -539,11 +487,6 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         world_block_size: usize,
     ) {
-        log::info!(
-            "[GENERATE] Starting resampled generation: need {} frames",
-            samples_needed
-        );
-
         let Ok(mut resampler) = resampler_arc.try_lock() else {
             log::warn!("Failed to acquire resampler lock in generate_resampled_samples");
             return;
@@ -559,14 +502,7 @@ impl PetalSonicEngine {
                 world_buffer.resize(world_buffer_size, 0.0f32);
                 world_buffer.fill(0.0f32);
 
-                let frames_mixed =
-                    Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
-
-                log::info!(
-                    "[GENERATE] Mixed {} frames from audio files (world_block_size: {})",
-                    frames_mixed,
-                    world_block_size
-                );
+                Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
 
                 RESAMPLED_BUFFER.with(|rbuf| {
                     let mut resampled_buffer = rbuf.borrow_mut();
@@ -577,7 +513,7 @@ impl PetalSonicEngine {
                     match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
                         Ok((frames_out, frames_in)) => {
                             log::info!(
-                                "[GENERATE] Resampler: input {} frames → output {} frames",
+                                "generated {} samples, which is {} samples after resampling",
                                 frames_in,
                                 frames_out
                             );
@@ -595,21 +531,9 @@ impl PetalSonicEngine {
                                     pushed += 1;
                                 } else {
                                     // Ring buffer is full
-                                    log::warn!(
-                                        "[GENERATE] Ring buffer full! Pushed {}/{} frames",
-                                        pushed,
-                                        frames_out
-                                    );
                                     break;
                                 }
                             }
-
-                            log::info!(
-                                "[GENERATE] Pushed {}/{} frames to ring buffer (total so far: {})",
-                                pushed,
-                                frames_out,
-                                total_generated + pushed
-                            );
 
                             total_generated += pushed;
 
@@ -631,12 +555,6 @@ impl PetalSonicEngine {
                 break;
             }
         }
-
-        log::info!(
-            "[GENERATE] Finished resampled generation: generated {} frames (needed: {})",
-            total_generated,
-            samples_needed
-        );
     }
 
     /// Generate direct samples (no resampling) and push to ring buffer
@@ -647,11 +565,6 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         world_block_size: usize,
     ) {
-        log::info!(
-            "[GENERATE] Starting direct generation (no resampling): need {} frames",
-            samples_needed
-        );
-
         let channels_usize = channels as usize;
 
         // Generate samples in world_block_size chunks
@@ -663,12 +576,11 @@ impl PetalSonicEngine {
                 world_buffer.resize(world_buffer_size, 0.0f32);
                 world_buffer.fill(0.0f32);
 
-                let frames_mixed =
-                    Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+                Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
 
                 log::info!(
-                    "[GENERATE] Mixed {} frames from audio files (world_block_size: {})",
-                    frames_mixed,
+                    "generated {} samples, which is {} samples after resampling",
+                    world_block_size,
                     world_block_size
                 );
 
@@ -685,21 +597,9 @@ impl PetalSonicEngine {
                         pushed += 1;
                     } else {
                         // Ring buffer is full
-                        log::warn!(
-                            "[GENERATE] Ring buffer full! Pushed {}/{} frames",
-                            pushed,
-                            world_block_size
-                        );
                         break;
                     }
                 }
-
-                log::info!(
-                    "[GENERATE] Pushed {}/{} frames to ring buffer (total so far: {})",
-                    pushed,
-                    world_block_size,
-                    total_generated + pushed
-                );
 
                 total_generated += pushed;
 
@@ -714,12 +614,6 @@ impl PetalSonicEngine {
                 break;
             }
         }
-
-        log::info!(
-            "[GENERATE] Finished direct generation: generated {} frames (needed: {})",
-            total_generated,
-            samples_needed
-        );
     }
 
     /// Mix all active playback instances into the buffer

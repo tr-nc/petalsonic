@@ -17,7 +17,7 @@ fn test_new_playback_system() -> Result<()> {
     let wav_path = "res/cicada_test_96k.wav";
 
     let world_desc = PetalSonicWorldDesc {
-        sample_rate: 44100,
+        sample_rate: 48000,
         block_size: 1024,
         enable_spatialization: false,
         ..Default::default()

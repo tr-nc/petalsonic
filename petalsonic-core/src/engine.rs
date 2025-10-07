@@ -6,11 +6,31 @@ use crate::playback::{PlaybackCommand, PlaybackInstance};
 use crate::world::{PetalSonicWorld, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
+use ringbuf::{
+    HeapRb,
+    traits::{Consumer, Observer, Producer, SplitRef},
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+// Stereo frame for ring buffer
+#[derive(Clone, Copy, Debug)]
+struct StereoFrame {
+    left: f32,
+    right: f32,
+}
+
+impl Default for StereoFrame {
+    fn default() -> Self {
+        Self {
+            left: 0.0,
+            right: 0.0,
+        }
+    }
+}
 
 // Thread-local buffers to avoid allocations in audio callback
 thread_local! {
@@ -69,58 +89,6 @@ impl PetalSonicEngine {
         self.is_running.load(Ordering::Relaxed)
     }
 
-    /// Calculate the appropriate device buffer size based on sample rate ratio
-    ///
-    /// When resampling is needed, the device buffer size must be scaled by the
-    /// sample rate ratio to maintain consistent time duration between world and device buffers.
-    ///
-    /// # Arguments
-    /// * `world_block_size` - The block size at the world's sample rate (from desc.block_size)
-    /// * `world_sample_rate` - The world's sample rate
-    /// * `device_sample_rate` - The audio device's sample rate
-    ///
-    /// # Returns
-    /// The calculated buffer size in frames for the device
-    ///
-    /// # Implementation Notes
-    ///
-    /// The result is rounded up using `ceil()` to prevent buffer underflow. Fractional
-    /// results are acceptable - the sub-frame error (typically < 1 frame ≈ 0.02ms) is
-    /// negligible and handled correctly by the streaming resampler's internal buffering.
-    ///
-    /// **Recommended block sizes**: Power-of-2 values (256, 512, 1024) work best for:
-    /// - Hardware compatibility (most devices expect power-of-2 or have limited options)
-    /// - CPU cache alignment and performance
-    /// - Common practice in audio engines
-    ///
-    /// **Integer alignment is NOT required**: While some sample rate pairs like 44.1kHz ↔ 48kHz
-    /// have complex ratios (160/147 ≈ 1.0884), the fractional frame error is inaudible and
-    /// the resampler handles it without drift. Special block sizes (e.g., multiples of 147)
-    /// offer no practical benefit.
-    fn calculate_device_buffer_size(
-        world_block_size: usize,
-        world_sample_rate: u32,
-        device_sample_rate: u32,
-    ) -> usize {
-        if world_sample_rate == device_sample_rate {
-            return world_block_size;
-        }
-
-        // Calculate the scaled buffer size for the device
-        // device_buffer = world_buffer × (device_rate / world_rate)
-        let ratio = device_sample_rate as f64 / world_sample_rate as f64;
-        let device_buffer = (world_block_size as f64 * ratio).ceil() as usize;
-
-        log::info!(
-            "Calculated device buffer size: {} frames (world buffer: {} frames, ratio: {:.4})",
-            device_buffer,
-            world_block_size,
-            ratio
-        );
-
-        device_buffer
-    }
-
     /// Start the audio engine with automatic playback management
     pub fn start(&mut self) -> Result<()> {
         if self.is_running() {
@@ -133,14 +101,8 @@ impl PetalSonicEngine {
         self.device_sample_rate = device_sample_rate;
         self.log_sample_rate_info(device_sample_rate);
 
-        // Calculate the appropriate device buffer size based on sample rate ratio
-        let device_buffer_size = Self::calculate_device_buffer_size(
-            self.desc.block_size,
-            self.desc.sample_rate,
-            device_sample_rate,
-        );
-
-        let buffer_size = Self::validate_buffer_size(&device_config, device_buffer_size)?;
+        // Use default buffer size - let the device decide
+        let buffer_size = cpal::BufferSize::Default;
         let config =
             Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
 
@@ -181,39 +143,6 @@ impl PetalSonicEngine {
                 self.desc.sample_rate,
                 device_sample_rate
             );
-        }
-    }
-
-    /// Validate the requested buffer size against the device's supported range
-    fn validate_buffer_size(
-        device_config: &cpal::SupportedStreamConfig,
-        block_size: usize,
-    ) -> Result<cpal::BufferSize> {
-        let requested_buffer_size = block_size as u32;
-
-        match device_config.buffer_size() {
-            cpal::SupportedBufferSize::Range { min, max } => {
-                if requested_buffer_size < *min || requested_buffer_size > *max {
-                    return Err(PetalSonicError::AudioDevice(format!(
-                        "Requested buffer size {} is outside device's supported range [{}, {}]",
-                        requested_buffer_size, min, max
-                    )));
-                }
-                log::info!(
-                    "Using fixed buffer size: {} frames (device supports: {} to {})",
-                    requested_buffer_size,
-                    min,
-                    max
-                );
-                Ok(cpal::BufferSize::Fixed(requested_buffer_size))
-            }
-            cpal::SupportedBufferSize::Unknown => {
-                log::warn!(
-                    "Device buffer size range unknown, using requested size: {} frames",
-                    requested_buffer_size
-                );
-                Ok(cpal::BufferSize::Fixed(requested_buffer_size))
-            }
         }
     }
 
@@ -328,12 +257,19 @@ impl PetalSonicEngine {
     where
         T: SizedSample + FromSample<f32>,
     {
+        let world_block_size = self.desc.block_size;
         let resampler = Self::create_resampler_if_needed(
             world_sample_rate,
             device_sample_rate,
             channels,
-            &config.buffer_size,
+            world_block_size,
         )?;
+
+        // Calculate ring buffer size: enough to store several blocks
+        let ring_buffer_size = world_block_size * 8; // 8x the block size for safety
+        let ring_buffer = Arc::new(Mutex::new(HeapRb::<StereoFrame>::new(ring_buffer_size)));
+
+        log::info!("Created ring buffer with size: {} frames", ring_buffer_size);
 
         let stream = device
             .build_output_stream(
@@ -348,6 +284,8 @@ impl PetalSonicEngine {
                         &world,
                         &resampler,
                         channels,
+                        world_block_size,
+                        &ring_buffer,
                     );
                 },
                 move |err| {
@@ -365,30 +303,25 @@ impl PetalSonicEngine {
         world_sample_rate: u32,
         device_sample_rate: u32,
         channels: u16,
-        buffer_size: &cpal::BufferSize,
+        world_block_size: usize,
     ) -> Result<Option<Arc<Mutex<StreamingResampler>>>> {
         if world_sample_rate == device_sample_rate {
             return Ok(None);
         }
 
-        let output_frames_usize = match buffer_size {
-            cpal::BufferSize::Fixed(size) => *size as usize,
-            cpal::BufferSize::Default => 512, // Fallback default
-        };
-
         let resampler = StreamingResampler::new(
             world_sample_rate,
             device_sample_rate,
             channels,
-            output_frames_usize,
+            world_block_size,
             None, // Use default (Sinc) resampler
         )?;
 
         log::info!(
-            "Created streaming resampler: {} Hz -> {} Hz (output frames: {})",
+            "Created streaming resampler: {} Hz -> {} Hz (world block size: {})",
             world_sample_rate,
             device_sample_rate,
-            output_frames_usize
+            world_block_size
         );
 
         Ok(Some(Arc::new(Mutex::new(resampler))))
@@ -404,6 +337,8 @@ impl PetalSonicEngine {
         world: &Arc<PetalSonicWorld>,
         resampler: &Option<Arc<Mutex<StreamingResampler>>>,
         channels: u16,
+        world_block_size: usize,
+        ring_buffer: &Arc<Mutex<HeapRb<StereoFrame>>>,
     ) where
         T: SizedSample + FromSample<f32>,
     {
@@ -417,19 +352,124 @@ impl PetalSonicEngine {
 
         let device_frames = data.len() / channels_usize;
 
-        if let Some(resampler_arc) = resampler {
-            Self::process_with_resampling(
-                data,
-                device_frames,
-                channels_usize,
-                channels,
-                resampler_arc,
-                active_playback,
-                frames_processed,
-            );
-        } else {
-            Self::process_without_resampling(data, channels, active_playback, frames_processed);
+        // Try to lock the ring buffer
+        let Ok(mut ring_buf) = ring_buffer.try_lock() else {
+            log::warn!("Failed to acquire ring buffer lock in audio callback");
+            Self::fill_silence(data);
+            return;
+        };
+
+        // Split the ring buffer to get producer and consumer
+        let (mut producer, mut consumer) = ring_buf.split_ref();
+
+        // Check if we need to generate more samples
+        // We try to consume from the ring buffer, and if there's not enough, generate more
+        loop {
+            // Try to peek if we can consume at least one sample
+            if consumer.is_empty() {
+                // Generate more samples
+                if let Some(resampler_arc) = resampler {
+                    Self::generate_resampled_samples(
+                        &mut producer,
+                        device_frames,
+                        channels_usize,
+                        channels,
+                        resampler_arc,
+                        active_playback,
+                        world_block_size,
+                    );
+                } else {
+                    Self::generate_direct_samples(
+                        &mut producer,
+                        device_frames,
+                        channels,
+                        active_playback,
+                        world_block_size,
+                    );
+                }
+            }
+
+            // If still empty after generation, break
+            if consumer.is_empty() {
+                Self::fill_silence(data);
+                drop(consumer);
+                drop(producer);
+                drop(ring_buf);
+                return;
+            }
+
+            // Now we have some samples, try to consume them
+            break;
         }
+
+        // Consume samples from ring buffer to fill output
+        let mut samples_consumed = 0;
+        for i in 0..device_frames {
+            if let Some(frame) = consumer.try_pop() {
+                let left_idx = i * channels_usize;
+                let right_idx = left_idx + 1;
+                if left_idx < data.len() {
+                    data[left_idx] = T::from_sample(frame.left);
+                }
+                if right_idx < data.len() {
+                    data[right_idx] = T::from_sample(frame.right);
+                }
+                samples_consumed += 1;
+            } else {
+                // Not enough samples, generate more
+                if let Some(resampler_arc) = resampler {
+                    Self::generate_resampled_samples(
+                        &mut producer,
+                        device_frames - samples_consumed,
+                        channels_usize,
+                        channels,
+                        resampler_arc,
+                        active_playback,
+                        world_block_size,
+                    );
+                } else {
+                    Self::generate_direct_samples(
+                        &mut producer,
+                        device_frames - samples_consumed,
+                        channels,
+                        active_playback,
+                        world_block_size,
+                    );
+                }
+
+                // Try again to consume
+                if let Some(frame) = consumer.try_pop() {
+                    let left_idx = i * channels_usize;
+                    let right_idx = left_idx + 1;
+                    if left_idx < data.len() {
+                        data[left_idx] = T::from_sample(frame.left);
+                    }
+                    if right_idx < data.len() {
+                        data[right_idx] = T::from_sample(frame.right);
+                    }
+                    samples_consumed += 1;
+                } else {
+                    // Still not enough, fill rest with silence
+                    for j in i..device_frames {
+                        let left_idx = j * channels_usize;
+                        let right_idx = left_idx + 1;
+                        if left_idx < data.len() {
+                            data[left_idx] = T::from_sample(0.0f32);
+                        }
+                        if right_idx < data.len() {
+                            data[right_idx] = T::from_sample(0.0f32);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        drop(consumer);
+        drop(producer);
+        drop(ring_buf);
+
+        frames_processed.fetch_add(samples_consumed, Ordering::Relaxed);
     }
 
     /// Fill buffer with silence
@@ -478,93 +518,125 @@ impl PetalSonicEngine {
         }
     }
 
-    /// Process audio with resampling
-    fn process_with_resampling<T>(
-        data: &mut [T],
-        device_frames: usize,
+    /// Generate resampled samples and push to ring buffer
+    fn generate_resampled_samples(
+        producer: &mut impl Producer<Item = StereoFrame>,
+        samples_needed: usize,
         channels_usize: usize,
         channels: u16,
         resampler_arc: &Arc<Mutex<StreamingResampler>>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
-        frames_processed: &Arc<AtomicUsize>,
-    ) where
-        T: SizedSample + FromSample<f32>,
-    {
+        world_block_size: usize,
+    ) {
         let Ok(mut resampler) = resampler_arc.try_lock() else {
-            // log instead of throwing error here, to avoid blocking the audio callback
-            log::warn!("Failed to acquire resampler lock in audio callback");
-            Self::fill_silence(data);
+            log::warn!("Failed to acquire resampler lock in generate_resampled_samples");
             return;
         };
 
-        let mut total_output_written = 0;
+        // Generate samples in world_block_size chunks
+        let mut total_generated = 0;
+        while total_generated < samples_needed {
+            // Use thread-local buffers to avoid allocations
+            WORLD_BUFFER.with(|buf| {
+                let mut world_buffer = buf.borrow_mut();
+                let world_buffer_size = world_block_size * channels_usize;
+                world_buffer.resize(world_buffer_size, 0.0f32);
+                world_buffer.fill(0.0f32);
 
-        // Use thread-local buffers to avoid allocations
-        RESAMPLED_BUFFER.with(|buf| {
-            let mut resampled_buffer = buf.borrow_mut();
-            resampled_buffer.resize(data.len(), 0.0f32);
-            resampled_buffer.fill(0.0f32);
+                Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
 
-            while total_output_written < device_frames {
-                let input_frames_needed = resampler.input_frames_needed();
-                let world_buffer_size = input_frames_needed * channels_usize;
-
-                WORLD_BUFFER.with(|buf| {
-                    let mut world_buffer = buf.borrow_mut();
-                    world_buffer.resize(world_buffer_size, 0.0f32);
-                    world_buffer.fill(0.0f32);
-
-                    Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+                RESAMPLED_BUFFER.with(|rbuf| {
+                    let mut resampled_buffer = rbuf.borrow_mut();
+                    // Allocate enough space for resampled output
+                    let max_output_size = world_buffer_size * 2; // Conservative estimate
+                    resampled_buffer.resize(max_output_size, 0.0f32);
 
                     match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
-                        Ok((frames_out, _)) => {
-                            total_output_written += frames_out;
-                            if frames_out == 0 {
-                                return;
+                        Ok((frames_out, _frames_in)) => {
+                            // Push frames to ring buffer
+                            let mut pushed = 0;
+                            for i in 0..frames_out {
+                                if pushed >= samples_needed - total_generated {
+                                    break;
+                                }
+                                let left_idx = i * channels_usize;
+                                let right_idx = left_idx + 1;
+                                let frame = StereoFrame {
+                                    left: *resampled_buffer.get(left_idx).unwrap_or(&0.0),
+                                    right: *resampled_buffer.get(right_idx).unwrap_or(&0.0),
+                                };
+                                if producer.try_push(frame).is_ok() {
+                                    pushed += 1;
+                                } else {
+                                    // Ring buffer is full
+                                    break;
+                                }
                             }
+                            total_generated += pushed;
                         }
                         Err(e) => {
                             log::error!("Resampling error: {}", e);
-                            Self::fill_silence(data);
                             return;
                         }
                     }
                 });
+            });
 
-                if total_output_written >= device_frames {
-                    break;
-                }
+            // If we've generated enough or can't push more, stop
+            if total_generated >= samples_needed {
+                break;
             }
-
-            Self::copy_to_output(data, &resampled_buffer);
-        });
-
-        frames_processed.fetch_add(total_output_written, Ordering::Relaxed);
+        }
     }
 
-    /// Process audio without resampling (direct path)
-    fn process_without_resampling<T>(
-        data: &mut [T],
+    /// Generate direct samples (no resampling) and push to ring buffer
+    fn generate_direct_samples(
+        producer: &mut impl Producer<Item = StereoFrame>,
+        samples_needed: usize,
         channels: u16,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
-        frames_processed: &Arc<AtomicUsize>,
-    ) where
-        T: SizedSample + FromSample<f32>,
-    {
-        let world_buffer_size = data.len();
+        world_block_size: usize,
+    ) {
+        let channels_usize = channels as usize;
 
-        // Use thread-local buffer to avoid allocations
-        WORLD_BUFFER.with(|buf| {
-            let mut world_buffer = buf.borrow_mut();
-            world_buffer.resize(world_buffer_size, 0.0f32);
-            world_buffer.fill(0.0f32);
+        // Generate samples in world_block_size chunks
+        let mut total_generated = 0;
+        while total_generated < samples_needed {
+            WORLD_BUFFER.with(|buf| {
+                let mut world_buffer = buf.borrow_mut();
+                let world_buffer_size = world_block_size * channels_usize;
+                world_buffer.resize(world_buffer_size, 0.0f32);
+                world_buffer.fill(0.0f32);
 
-            let frames_filled_max =
                 Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
 
-            Self::copy_to_output(data, &world_buffer);
-            frames_processed.fetch_add(frames_filled_max, Ordering::Relaxed);
-        });
+                // Push frames to ring buffer
+                let mut pushed = 0;
+                for i in 0..world_block_size {
+                    if pushed >= samples_needed - total_generated {
+                        break;
+                    }
+                    let left_idx = i * channels_usize;
+                    let right_idx = left_idx + 1;
+                    let frame = StereoFrame {
+                        left: *world_buffer.get(left_idx).unwrap_or(&0.0),
+                        right: *world_buffer.get(right_idx).unwrap_or(&0.0),
+                    };
+                    if producer.try_push(frame).is_ok() {
+                        pushed += 1;
+                    } else {
+                        // Ring buffer is full
+                        break;
+                    }
+                }
+                total_generated += pushed;
+            });
+
+            // If we've generated enough or can't push more, stop
+            if total_generated >= samples_needed {
+                break;
+            }
+        }
     }
 
     /// Mix all active playback instances into the buffer
@@ -588,17 +660,6 @@ impl PetalSonicEngine {
         }
 
         frames_filled_max
-    }
-
-    /// Copy f32 buffer to typed output buffer
-    fn copy_to_output<T>(data: &mut [T], source: &[f32])
-    where
-        T: SizedSample + FromSample<f32>,
-    {
-        for (i, sample) in data.iter_mut().enumerate() {
-            let sample_value = source.get(i).copied().unwrap_or(0.0f32);
-            *sample = T::from_sample(sample_value);
-        }
     }
 }
 

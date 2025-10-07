@@ -6,10 +6,17 @@ use crate::playback::{PlaybackCommand, PlaybackInstance};
 use crate::world::{PetalSonicWorld, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+// Thread-local buffers to avoid allocations in audio callback
+thread_local! {
+    static WORLD_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static RESAMPLED_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+}
 
 /// Callback function type for filling audio samples
 ///
@@ -361,14 +368,7 @@ impl PetalSonicEngine {
                 frames_processed,
             );
         } else {
-            Self::process_without_resampling(
-                data,
-                device_frames,
-                channels_usize,
-                channels,
-                active_playback,
-                frames_processed,
-            );
+            Self::process_without_resampling(data, channels, active_playback, frames_processed);
         }
     }
 
@@ -431,62 +431,80 @@ impl PetalSonicEngine {
         T: SizedSample + FromSample<f32>,
     {
         let Ok(mut resampler) = resampler_arc.try_lock() else {
+            // log instead of throwing error here, to avoid blocking the audio callback
+            log::warn!("Failed to acquire resampler lock in audio callback");
             Self::fill_silence(data);
             return;
         };
 
         let mut total_output_written = 0;
-        let mut resampled_buffer = vec![0.0f32; data.len()];
 
-        while total_output_written < device_frames {
-            let input_frames_needed = resampler.input_frames_needed();
-            let world_buffer_size = input_frames_needed * channels_usize;
-            let mut world_buffer = vec![0.0f32; world_buffer_size];
+        // Use thread-local buffers to avoid allocations
+        RESAMPLED_BUFFER.with(|buf| {
+            let mut resampled_buffer = buf.borrow_mut();
+            resampled_buffer.resize(data.len(), 0.0f32);
+            resampled_buffer.fill(0.0f32);
 
-            Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+            while total_output_written < device_frames {
+                let input_frames_needed = resampler.input_frames_needed();
+                let world_buffer_size = input_frames_needed * channels_usize;
 
-            match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
-                Ok((frames_out, _)) => {
-                    total_output_written += frames_out;
-                    if frames_out == 0 {
-                        break;
+                WORLD_BUFFER.with(|buf| {
+                    let mut world_buffer = buf.borrow_mut();
+                    world_buffer.resize(world_buffer_size, 0.0f32);
+                    world_buffer.fill(0.0f32);
+
+                    Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+
+                    match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
+                        Ok((frames_out, _)) => {
+                            total_output_written += frames_out;
+                            if frames_out == 0 {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Resampling error: {}", e);
+                            Self::fill_silence(data);
+                            return;
+                        }
                     }
-                }
-                Err(e) => {
-                    log::error!("Resampling error: {}", e);
-                    Self::fill_silence(data);
-                    return;
+                });
+
+                if total_output_written >= device_frames {
+                    break;
                 }
             }
 
-            if total_output_written >= device_frames {
-                break;
-            }
-        }
+            Self::copy_to_output(data, &resampled_buffer);
+        });
 
-        Self::copy_to_output(data, &resampled_buffer);
         frames_processed.fetch_add(total_output_written, Ordering::Relaxed);
     }
 
     /// Process audio without resampling (direct path)
     fn process_without_resampling<T>(
         data: &mut [T],
-        device_frames: usize,
-        channels_usize: usize,
         channels: u16,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         frames_processed: &Arc<AtomicUsize>,
     ) where
         T: SizedSample + FromSample<f32>,
     {
-        let world_buffer_size = device_frames * channels_usize;
-        let mut world_buffer = vec![0.0f32; world_buffer_size];
+        let world_buffer_size = data.len();
 
-        let total_frames =
-            Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+        // Use thread-local buffer to avoid allocations
+        WORLD_BUFFER.with(|buf| {
+            let mut world_buffer = buf.borrow_mut();
+            world_buffer.resize(world_buffer_size, 0.0f32);
+            world_buffer.fill(0.0f32);
 
-        Self::copy_to_output(data, &world_buffer);
-        frames_processed.fetch_add(total_frames, Ordering::Relaxed);
+            let frames_filled_max =
+                Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+
+            Self::copy_to_output(data, &world_buffer);
+            frames_processed.fetch_add(frames_filled_max, Ordering::Relaxed);
+        });
     }
 
     /// Mix all active playback instances into the buffer
@@ -496,18 +514,20 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
     ) -> usize {
         let Ok(mut active_playback) = active_playback.try_lock() else {
+            log::warn!("Failed to acquire active playback lock in audio callback");
             return 0;
         };
 
+        // only keep the instances that are not finished
         active_playback.retain(|_, instance| !instance.info.is_finished());
 
-        let mut total_frames = 0;
+        let mut frames_filled_max = 0;
         for instance in active_playback.values_mut() {
             let frames_filled = instance.fill_buffer(world_buffer, channels);
-            total_frames = total_frames.max(frames_filled);
+            frames_filled_max = frames_filled_max.max(frames_filled);
         }
 
-        total_frames
+        frames_filled_max
     }
 
     /// Copy f32 buffer to typed output buffer

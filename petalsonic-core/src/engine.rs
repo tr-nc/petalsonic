@@ -96,14 +96,37 @@ impl PetalSonicEngine {
             );
         }
 
-        // FIXME:
-        // [Default] is used when no specific buffer size is set and uses the default behavior of the given host. Note, the default buffer size may be surprisingly large, leading to latency issues. If low latency is desired, [Fixed(FrameCount)] should be used in accordance with the SupportedBufferSize range produced by the [SupportedStreamConfig] API.
-        // you should add check for if the buffer size is valid, based on the SupportedStreamConfig.
+        // Validate buffer size against device's supported range
+        let requested_buffer_size = self.desc.block_size as u32;
+        let buffer_size = match device_default_config.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                if requested_buffer_size < *min || requested_buffer_size > *max {
+                    return Err(PetalSonicError::AudioDevice(format!(
+                        "Requested buffer size {} is outside device's supported range [{}, {}]",
+                        requested_buffer_size, min, max
+                    )));
+                }
+                log::info!(
+                    "Using fixed buffer size: {} frames (device supports: {} to {})",
+                    requested_buffer_size,
+                    min,
+                    max
+                );
+                cpal::BufferSize::Fixed(requested_buffer_size)
+            }
+            cpal::SupportedBufferSize::Unknown => {
+                log::warn!(
+                    "Device buffer size range unknown, using requested size: {} frames",
+                    requested_buffer_size
+                );
+                cpal::BufferSize::Fixed(requested_buffer_size)
+            }
+        };
 
         let config = cpal::StreamConfig {
             channels: self.desc.channels,
             sample_rate: cpal::SampleRate(device_sample_rate),
-            buffer_size: cpal::BufferSize::Fixed(self.desc.block_size as u32),
+            buffer_size,
         };
 
         let is_running = self.is_running.clone();

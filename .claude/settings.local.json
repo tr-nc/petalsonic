@@ -5,7 +5,8 @@
       "Bash(cargo build:*)",
       "WebSearch",
       "WebFetch(domain:crates.io)",
-      "Bash(cargo:*)"
+      "Bash(cargo:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []

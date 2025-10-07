@@ -69,6 +69,58 @@ impl PetalSonicEngine {
         self.is_running.load(Ordering::Relaxed)
     }
 
+    /// Calculate the appropriate device buffer size based on sample rate ratio
+    ///
+    /// When resampling is needed, the device buffer size must be scaled by the
+    /// sample rate ratio to maintain consistent time duration between world and device buffers.
+    ///
+    /// # Arguments
+    /// * `world_block_size` - The block size at the world's sample rate (from desc.block_size)
+    /// * `world_sample_rate` - The world's sample rate
+    /// * `device_sample_rate` - The audio device's sample rate
+    ///
+    /// # Returns
+    /// The calculated buffer size in frames for the device
+    ///
+    /// # Implementation Notes
+    ///
+    /// The result is rounded up using `ceil()` to prevent buffer underflow. Fractional
+    /// results are acceptable - the sub-frame error (typically < 1 frame ≈ 0.02ms) is
+    /// negligible and handled correctly by the streaming resampler's internal buffering.
+    ///
+    /// **Recommended block sizes**: Power-of-2 values (256, 512, 1024) work best for:
+    /// - Hardware compatibility (most devices expect power-of-2 or have limited options)
+    /// - CPU cache alignment and performance
+    /// - Common practice in audio engines
+    ///
+    /// **Integer alignment is NOT required**: While some sample rate pairs like 44.1kHz ↔ 48kHz
+    /// have complex ratios (160/147 ≈ 1.0884), the fractional frame error is inaudible and
+    /// the resampler handles it without drift. Special block sizes (e.g., multiples of 147)
+    /// offer no practical benefit.
+    fn calculate_device_buffer_size(
+        world_block_size: usize,
+        world_sample_rate: u32,
+        device_sample_rate: u32,
+    ) -> usize {
+        if world_sample_rate == device_sample_rate {
+            return world_block_size;
+        }
+
+        // Calculate the scaled buffer size for the device
+        // device_buffer = world_buffer × (device_rate / world_rate)
+        let ratio = device_sample_rate as f64 / world_sample_rate as f64;
+        let device_buffer = (world_block_size as f64 * ratio).ceil() as usize;
+
+        log::info!(
+            "Calculated device buffer size: {} frames (world buffer: {} frames, ratio: {:.4})",
+            device_buffer,
+            world_block_size,
+            ratio
+        );
+
+        device_buffer
+    }
+
     /// Start the audio engine with automatic playback management
     pub fn start(&mut self) -> Result<()> {
         if self.is_running() {
@@ -81,7 +133,14 @@ impl PetalSonicEngine {
         self.device_sample_rate = device_sample_rate;
         self.log_sample_rate_info(device_sample_rate);
 
-        let buffer_size = Self::validate_buffer_size(&device_config, self.desc.block_size)?;
+        // Calculate the appropriate device buffer size based on sample rate ratio
+        let device_buffer_size = Self::calculate_device_buffer_size(
+            self.desc.block_size,
+            self.desc.sample_rate,
+            device_sample_rate,
+        );
+
+        let buffer_size = Self::validate_buffer_size(&device_config, device_buffer_size)?;
         let config =
             Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
 
@@ -126,6 +185,7 @@ impl PetalSonicEngine {
     }
 
     /// Validate the requested buffer size against the device's supported range
+    // TODO: make this return bool
     fn validate_buffer_size(
         device_config: &cpal::SupportedStreamConfig,
         block_size: usize,

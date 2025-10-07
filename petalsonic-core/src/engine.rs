@@ -382,6 +382,7 @@ impl PetalSonicEngine {
             device_sample_rate,
             channels,
             output_frames_usize,
+            None, // Use default (Sinc) resampler
         )?;
 
         log::info!(

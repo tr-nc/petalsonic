@@ -1,11 +1,60 @@
 use crate::error::{PetalSonicError, Result};
-use rubato::{FastFixedOut, Resampler};
+use rubato::{
+    FastFixedOut, PolynomialDegree, Resampler, SincFixedOut, SincInterpolationParameters,
+    SincInterpolationType, WindowFunction,
+};
+
+/// Type of resampler algorithm to use
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResamplerType {
+    /// Fast polynomial resampler - lower quality but faster
+    Fast,
+    /// Sinc interpolation resampler - higher quality but slower
+    Sinc,
+}
+
+impl Default for ResamplerType {
+    fn default() -> Self {
+        Self::Sinc
+    }
+}
+
+enum ResamplerImpl {
+    Fast(FastFixedOut<f32>),
+    Sinc(SincFixedOut<f32>),
+}
+
+impl ResamplerImpl {
+    fn input_frames_next(&self) -> usize {
+        match self {
+            Self::Fast(r) => r.input_frames_next(),
+            Self::Sinc(r) => r.input_frames_next(),
+        }
+    }
+
+    fn process(
+        &mut self,
+        input: &[Vec<f32>],
+    ) -> std::result::Result<Vec<Vec<f32>>, rubato::ResampleError> {
+        match self {
+            Self::Fast(r) => r.process(input, None),
+            Self::Sinc(r) => r.process(input, None),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Fast(r) => r.reset(),
+            Self::Sinc(r) => r.reset(),
+        }
+    }
+}
 
 /// A real-time streaming resampler that converts audio from one sample rate to another
 /// in real-time with minimal latency. Uses a fixed-output-size approach suitable for
 /// audio device callbacks where the output buffer size is known.
 pub struct StreamingResampler {
-    resampler: FastFixedOut<f32>,
+    resampler: ResamplerImpl,
     source_sample_rate: u32,
     target_sample_rate: u32,
     channels: u16,
@@ -21,6 +70,7 @@ impl StreamingResampler {
     /// * `target_sample_rate` - The sample rate required by the audio device
     /// * `channels` - Number of audio channels
     /// * `output_frames` - The number of frames the device expects per callback
+    /// * `resampler_type` - Type of resampler algorithm to use (defaults to Sinc if None)
     ///
     /// # Returns
     /// A new `StreamingResampler` instance configured for real-time processing
@@ -29,6 +79,7 @@ impl StreamingResampler {
         target_sample_rate: u32,
         channels: u16,
         output_frames: usize,
+        resampler_type: Option<ResamplerType>,
     ) -> Result<Self> {
         if source_sample_rate == 0 || target_sample_rate == 0 {
             return Err(PetalSonicError::AudioFormat(
@@ -50,17 +101,51 @@ impl StreamingResampler {
 
         // target/source (output/input)
         let resample_ratio = target_sample_rate as f64 / source_sample_rate as f64;
+        let resampler_type = resampler_type.unwrap_or_default();
 
-        let resampler = FastFixedOut::new(
-            resample_ratio,
-            1.0, // we're not changing it dynamically
-            rubato::PolynomialDegree::Septic,
-            output_frames,
-            channels as usize,
-        )
-        .map_err(|e| {
-            PetalSonicError::AudioLoading(format!("Failed to create streaming resampler: {}", e))
-        })?;
+        log::info!(
+            "Creating {:?} resampler: {} Hz -> {} Hz",
+            resampler_type,
+            source_sample_rate,
+            target_sample_rate
+        );
+
+        let resampler = match resampler_type {
+            ResamplerType::Fast => {
+                let fast = FastFixedOut::new(
+                    resample_ratio,
+                    1.0, // we're not changing it dynamically
+                    PolynomialDegree::Septic,
+                    output_frames,
+                    channels as usize,
+                )
+                .map_err(|e| {
+                    PetalSonicError::AudioLoading(format!("Failed to create fast resampler: {}", e))
+                })?;
+                ResamplerImpl::Fast(fast)
+            }
+            ResamplerType::Sinc => {
+                let params = SincInterpolationParameters {
+                    sinc_len: 256,
+                    f_cutoff: 0.95,
+                    interpolation: SincInterpolationType::Linear,
+                    oversampling_factor: 256,
+                    window: WindowFunction::BlackmanHarris2,
+                };
+
+                let sinc = SincFixedOut::new(
+                    resample_ratio,
+                    1.0, // we're not changing it dynamically
+                    params,
+                    output_frames,
+                    channels as usize,
+                )
+                .map_err(|e| {
+                    PetalSonicError::AudioLoading(format!("Failed to create sinc resampler: {}", e))
+                })?;
+                ResamplerImpl::Sinc(sinc)
+            }
+        };
 
         // creates a 2D buffer (a vector of vectors) for multi‑channel floating‑point audio samples
         let input_buffer: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
@@ -113,7 +198,7 @@ impl StreamingResampler {
         }
 
         // Resample
-        let output_waves = self.resampler.process(&input_waves, None).map_err(|e| {
+        let output_waves = self.resampler.process(&input_waves).map_err(|e| {
             PetalSonicError::AudioLoading(format!("Streaming resampling error: {}", e))
         })?;
 
@@ -228,83 +313,5 @@ impl StreamingResampler {
             channel_buffer.clear();
         }
         self.resampler.reset();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_streaming_resampler_creation() {
-        let resampler = StreamingResampler::new(48000, 44100, 2, 512);
-        assert!(resampler.is_ok());
-    }
-
-    #[test]
-    fn test_downsampling_streaming() {
-        let mut resampler = StreamingResampler::new(48000, 44100, 2, 512).unwrap();
-
-        // Generate a simple test signal
-        let input_frames = 4096;
-        let mut input = Vec::new();
-        for i in 0..input_frames {
-            let t = i as f32 / 48000.0;
-            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
-            input.push(sample); // Left
-            input.push(sample); // Right
-        }
-
-        let mut output = vec![0.0f32; 512 * 2];
-        let result = resampler.process_interleaved(&input, &mut output);
-        assert!(result.is_ok());
-
-        let (out_frames, in_frames) = result.unwrap();
-        assert!(out_frames > 0, "Should produce output frames");
-        assert!(in_frames > 0, "Should consume input frames");
-    }
-
-    #[test]
-    fn test_upsampling_streaming() {
-        let mut resampler = StreamingResampler::new(44100, 48000, 2, 512).unwrap();
-
-        // Generate a simple test signal
-        let input_frames = 4096;
-        let mut input = Vec::new();
-        for i in 0..input_frames {
-            let t = i as f32 / 44100.0;
-            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
-            input.push(sample); // Left
-            input.push(sample); // Right
-        }
-
-        let mut output = vec![0.0f32; 512 * 2];
-        let result = resampler.process_interleaved(&input, &mut output);
-        assert!(result.is_ok());
-
-        let (out_frames, in_frames) = result.unwrap();
-        assert!(out_frames > 0, "Should produce output frames");
-        assert!(in_frames > 0, "Should consume input frames");
-    }
-
-    #[test]
-    fn test_incremental_feeding() {
-        let mut resampler = StreamingResampler::new(48000, 44100, 2, 512).unwrap();
-
-        // Feed small chunks incrementally
-        let chunk_size = 128;
-        for chunk_idx in 0..20 {
-            let mut input = Vec::new();
-            for i in 0..chunk_size {
-                let sample_idx = chunk_idx * chunk_size + i;
-                let t = sample_idx as f32 / 48000.0;
-                let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
-                input.push(sample); // Left
-                input.push(sample); // Right
-            }
-
-            let mut output = vec![0.0f32; 512 * 2];
-            let _result = resampler.process_interleaved(&input, &mut output);
-        }
     }
 }

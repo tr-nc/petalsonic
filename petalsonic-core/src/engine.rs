@@ -68,20 +68,41 @@ impl PetalSonicEngine {
             return Ok(());
         }
 
-        // Get the default audio device
+        let (device, device_config) = Self::init_audio_device()?;
+        let device_sample_rate = device_config.sample_rate().0;
+
+        self.device_sample_rate = device_sample_rate;
+        self.log_sample_rate_info(device_sample_rate);
+
+        let buffer_size = Self::validate_buffer_size(&device_config, self.desc.block_size)?;
+        let config =
+            Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
+
+        let stream =
+            self.build_and_start_stream(&device, &device_config, &config, device_sample_rate)?;
+
+        self.stream = Some(stream);
+        self.is_running.store(true, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Initialize the audio device and retrieve its configuration
+    fn init_audio_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             PetalSonicError::AudioDevice("No default output device available".into())
         })?;
 
-        let device_default_config = device.default_output_config().map_err(|e| {
+        let device_config = device.default_output_config().map_err(|e| {
             PetalSonicError::AudioDevice(format!("Failed to get default config: {}", e))
         })?;
 
-        // Use the device's native sample rate
-        let device_sample_rate = device_default_config.sample_rate().0;
-        self.device_sample_rate = device_sample_rate;
+        Ok((device, device_config))
+    }
 
+    /// Log information about sample rates
+    fn log_sample_rate_info(&self, device_sample_rate: u32) {
         log::info!(
             "Audio engine: world sample rate = {} Hz, device sample rate = {} Hz",
             self.desc.sample_rate,
@@ -95,10 +116,16 @@ impl PetalSonicEngine {
                 device_sample_rate
             );
         }
+    }
 
-        // Validate buffer size against device's supported range
-        let requested_buffer_size = self.desc.block_size as u32;
-        let buffer_size = match device_default_config.buffer_size() {
+    /// Validate the requested buffer size against the device's supported range
+    fn validate_buffer_size(
+        device_config: &cpal::SupportedStreamConfig,
+        block_size: usize,
+    ) -> Result<cpal::BufferSize> {
+        let requested_buffer_size = block_size as u32;
+
+        match device_config.buffer_size() {
             cpal::SupportedBufferSize::Range { min, max } => {
                 if requested_buffer_size < *min || requested_buffer_size > *max {
                     return Err(PetalSonicError::AudioDevice(format!(
@@ -112,23 +139,39 @@ impl PetalSonicEngine {
                     min,
                     max
                 );
-                cpal::BufferSize::Fixed(requested_buffer_size)
+                Ok(cpal::BufferSize::Fixed(requested_buffer_size))
             }
             cpal::SupportedBufferSize::Unknown => {
                 log::warn!(
                     "Device buffer size range unknown, using requested size: {} frames",
                     requested_buffer_size
                 );
-                cpal::BufferSize::Fixed(requested_buffer_size)
+                Ok(cpal::BufferSize::Fixed(requested_buffer_size))
             }
-        };
+        }
+    }
 
-        let config = cpal::StreamConfig {
-            channels: self.desc.channels,
+    /// Create the stream configuration
+    fn create_stream_config(
+        channels: u16,
+        device_sample_rate: u32,
+        buffer_size: cpal::BufferSize,
+    ) -> cpal::StreamConfig {
+        cpal::StreamConfig {
+            channels,
             sample_rate: cpal::SampleRate(device_sample_rate),
             buffer_size,
-        };
+        }
+    }
 
+    /// Build and start the audio stream
+    fn build_and_start_stream(
+        &self,
+        device: &cpal::Device,
+        device_config: &cpal::SupportedStreamConfig,
+        config: &cpal::StreamConfig,
+        device_sample_rate: u32,
+    ) -> Result<cpal::Stream> {
         let is_running = self.is_running.clone();
         let frames_processed = self.frames_processed.clone();
         let world_sample_rate = self.desc.sample_rate;
@@ -136,11 +179,10 @@ impl PetalSonicEngine {
         let active_playback = self.active_playback.clone();
         let world = self.world.clone();
 
-        // Create the stream based on the device's default format
-        let stream = match device_default_config.sample_format() {
+        let stream = match device_config.sample_format() {
             cpal::SampleFormat::F32 => self.create_stream::<f32>(
-                &device,
-                &config,
+                device,
+                config,
                 is_running,
                 frames_processed,
                 world_sample_rate,
@@ -150,8 +192,8 @@ impl PetalSonicEngine {
                 world,
             )?,
             cpal::SampleFormat::I16 => self.create_stream::<i16>(
-                &device,
-                &config,
+                device,
+                config,
                 is_running,
                 frames_processed,
                 world_sample_rate,
@@ -161,8 +203,8 @@ impl PetalSonicEngine {
                 world,
             )?,
             cpal::SampleFormat::U16 => self.create_stream::<u16>(
-                &device,
-                &config,
+                device,
+                config,
                 is_running,
                 frames_processed,
                 world_sample_rate,
@@ -182,10 +224,7 @@ impl PetalSonicEngine {
             .play()
             .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to start stream: {}", e)))?;
 
-        self.stream = Some(stream);
-        self.is_running.store(true, Ordering::Relaxed);
-
-        Ok(())
+        Ok(stream)
     }
 
     /// Stop the audio engine

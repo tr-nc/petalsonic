@@ -16,14 +16,15 @@ fn main() {
 fn test_new_playback_system() -> Result<()> {
     let wav_path = "res/cicada_test_96k.wav";
 
-    let config = PetalSonicWorldDesc {
+    let world_desc = PetalSonicWorldDesc {
         sample_rate: 48000,
         enable_spatialization: false,
         ..Default::default()
     };
 
     log::info!("Creating world and loading audio file: {}", wav_path);
-    let mut world = PetalSonicWorld::new(config.clone()).expect("Failed to create PetalSonicWorld");
+    let mut world =
+        PetalSonicWorld::new(world_desc.clone()).expect("Failed to create PetalSonicWorld");
 
     // Load audio file using the new API
     let audio_data = PetalSonicAudioData::from_path(wav_path)?;
@@ -33,7 +34,7 @@ fn test_new_playback_system() -> Result<()> {
     // Create engine with the world
     let world_arc = Arc::new(world);
     let mut engine =
-        PetalSonicEngine::new(config, world_arc.clone()).expect("Failed to create engine");
+        PetalSonicEngine::new(world_desc, world_arc.clone()).expect("Failed to create engine");
 
     // Start the engine
     match engine.start() {

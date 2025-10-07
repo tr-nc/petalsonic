@@ -104,6 +104,10 @@ impl PetalSonicWorld {
         self.audio_data_storage.keys().copied().collect()
     }
 
+    pub fn contains_audio(&self, id: SourceId) -> bool {
+        self.audio_data_storage.contains_key(&id)
+    }
+
     /// Starts playing an audio source by its SourceId.
     ///
     /// Sends a play command to the audio engine thread. The audio will begin playing
@@ -118,7 +122,7 @@ impl PetalSonicWorld {
     /// Returns an error if the audio source ID is not found in the world storage
     /// or if the command fails to send to the audio engine.
     pub fn play(&self, audio_id: SourceId) -> Result<()> {
-        if !self.audio_data_storage.contains_key(&audio_id) {
+        if !self.contains_audio(audio_id) {
             return Err(crate::error::PetalSonicError::Engine(
                 format!("Audio data with ID {:?} not found", audio_id).into(),
             ));

@@ -1,5 +1,6 @@
 use crate::audio_data::StreamingResampler;
 use crate::config::PetalSonicWorldDesc;
+use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
 use crate::world::{PetalSonicWorld, SourceId};
@@ -57,28 +58,28 @@ impl PetalSonicEngine {
         self.fill_callback = Some(Arc::new(callback));
     }
 
+    pub fn is_running(&self) -> bool {
+        self.is_running.load(Ordering::Relaxed)
+    }
+
     /// Start the audio engine with automatic playback management
     pub fn start(&mut self) -> Result<()> {
-        if self.is_running.load(Ordering::Relaxed) {
+        if self.is_running() {
             return Ok(());
         }
 
         // Get the default audio device
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
-            crate::error::PetalSonicError::AudioDevice("No default output device available".into())
+            PetalSonicError::AudioDevice("No default output device available".into())
         })?;
 
-        // Get the device's default config to find out what sample rate it supports
-        let default_config = device.default_output_config().map_err(|e| {
-            crate::error::PetalSonicError::AudioDevice(format!(
-                "Failed to get default config: {}",
-                e
-            ))
+        let device_default_config = device.default_output_config().map_err(|e| {
+            PetalSonicError::AudioDevice(format!("Failed to get default config: {}", e))
         })?;
 
         // Use the device's native sample rate
-        let device_sample_rate = default_config.sample_rate().0;
+        let device_sample_rate = device_default_config.sample_rate().0;
         self.device_sample_rate = device_sample_rate;
 
         log::info!(
@@ -95,7 +96,10 @@ impl PetalSonicEngine {
             );
         }
 
-        // Configure the stream with the device's native sample rate and settings
+        // FIXME:
+        // [Default] is used when no specific buffer size is set and uses the default behavior of the given host. Note, the default buffer size may be surprisingly large, leading to latency issues. If low latency is desired, [Fixed(FrameCount)] should be used in accordance with the SupportedBufferSize range produced by the [SupportedStreamConfig] API.
+        // you should add check for if the buffer size is valid, based on the SupportedStreamConfig.
+
         let config = cpal::StreamConfig {
             channels: self.desc.channels,
             sample_rate: cpal::SampleRate(device_sample_rate),
@@ -110,7 +114,7 @@ impl PetalSonicEngine {
         let world = self.world.clone();
 
         // Create the stream based on the device's default format
-        let stream = match default_config.sample_format() {
+        let stream = match device_default_config.sample_format() {
             cpal::SampleFormat::F32 => self.create_stream::<f32>(
                 &device,
                 &config,
@@ -145,15 +149,15 @@ impl PetalSonicEngine {
                 world,
             )?,
             _ => {
-                return Err(crate::error::PetalSonicError::AudioFormat(
+                return Err(PetalSonicError::AudioFormat(
                     "Unsupported sample format".into(),
                 ));
             }
         };
 
-        stream.play().map_err(|e| {
-            crate::error::PetalSonicError::AudioDevice(format!("Failed to start stream: {}", e))
-        })?;
+        stream
+            .play()
+            .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to start stream: {}", e)))?;
 
         self.stream = Some(stream);
         self.is_running.store(true, Ordering::Relaxed);
@@ -168,11 +172,6 @@ impl PetalSonicEngine {
             drop(stream); // This stops the stream
         }
         Ok(())
-    }
-
-    /// Check if the engine is currently running
-    pub fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::Relaxed)
     }
 
     /// Get the number of audio frames processed since start
@@ -399,9 +398,7 @@ impl PetalSonicEngine {
                 },
                 None,
             )
-            .map_err(|e| {
-                crate::error::PetalSonicError::AudioDevice(format!("Failed to build stream: {}", e))
-            })?;
+            .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to build stream: {}", e)))?;
 
         Ok(stream)
     }

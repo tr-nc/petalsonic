@@ -262,7 +262,6 @@ impl PetalSonicEngine {
     where
         T: SizedSample + FromSample<f32>,
     {
-        let channels_usize = channels as usize;
         let resampler = Self::create_resampler_if_needed(
             world_sample_rate,
             device_sample_rate,
@@ -278,7 +277,7 @@ impl PetalSonicEngine {
                         data,
                         &is_running,
                         &frames_processed,
-                        channels_usize,
+                        channels as usize,
                         &active_playback,
                         &world,
                         &resampler,
@@ -382,37 +381,37 @@ impl PetalSonicEngine {
         }
     }
 
-    /// Process pending playback commands from the world
+    /// Processes playback commands from the world and updates the active playback instances.
     fn process_playback_commands(
         world: &Arc<PetalSonicWorld>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
     ) {
         while let Ok(command) = world.command_receiver().try_recv() {
-            if let Ok(mut active_playback) = active_playback.try_lock() {
-                match command {
-                    PlaybackCommand::Play(audio_id) => {
-                        if let Some(audio_data) = world.get_audio_data(audio_id) {
-                            if let Some(instance) = active_playback.get_mut(&audio_id) {
-                                instance.play();
-                            } else {
-                                let mut instance =
-                                    PlaybackInstance::new(audio_id, audio_data.clone());
-                                instance.play();
-                                active_playback.insert(audio_id, instance);
-                            }
-                        }
+            let Ok(mut active_playback) = active_playback.try_lock() else {
+                continue;
+            };
+
+            match command {
+                PlaybackCommand::Play(audio_id) => {
+                    let Some(audio_data) = world.get_audio_data(audio_id) else {
+                        continue;
+                    };
+
+                    active_playback
+                        .entry(audio_id)
+                        .or_insert_with(|| PlaybackInstance::new(audio_id, audio_data.clone()))
+                        .play();
+                }
+                PlaybackCommand::Pause(audio_id) => {
+                    if let Some(instance) = active_playback.get_mut(&audio_id) {
+                        instance.pause();
                     }
-                    PlaybackCommand::Pause(audio_id) => {
-                        if let Some(instance) = active_playback.get_mut(&audio_id) {
-                            instance.pause();
-                        }
-                    }
-                    PlaybackCommand::Stop(audio_id) => {
-                        active_playback.remove(&audio_id);
-                    }
-                    PlaybackCommand::StopAll => {
-                        active_playback.clear();
-                    }
+                }
+                PlaybackCommand::Stop(audio_id) => {
+                    active_playback.remove(&audio_id);
+                }
+                PlaybackCommand::StopAll => {
+                    active_playback.clear();
                 }
             }
         }

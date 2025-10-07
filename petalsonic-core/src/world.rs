@@ -3,7 +3,7 @@ use crate::config::PetalSonicWorldDesc;
 use crate::error::Result;
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackCommand;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ pub struct PetalSonicWorld {
 
 impl PetalSonicWorld {
     pub fn new(config: PetalSonicWorldDesc) -> Result<Self> {
-        let (command_sender, command_receiver) = unbounded();
+        let (command_sender, command_receiver) = crossbeam_channel::unbounded();
         Ok(Self {
             desc: config,
             audio_data_storage: HashMap::new(),

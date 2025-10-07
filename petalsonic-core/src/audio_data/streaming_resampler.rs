@@ -160,8 +160,7 @@ impl StreamingResampler {
         input_samples: &[f32],
         output_samples: &mut [f32],
     ) -> Result<(usize, usize)> {
-        let channels = self.channels as usize;
-        let out_frames_capacity = output_samples.len() / channels;
+        let out_frames_capacity = output_samples.len() / self.channels as usize;
         let mut out_frames_written = 0usize;
         let mut in_frames_consumed = 0usize;
 

@@ -185,7 +185,6 @@ impl PetalSonicEngine {
     }
 
     /// Validate the requested buffer size against the device's supported range
-    // TODO: make this return bool
     fn validate_buffer_size(
         device_config: &cpal::SupportedStreamConfig,
         block_size: usize,

@@ -340,6 +340,7 @@ impl PetalSonicEngine {
     ) where
         T: SizedSample + FromSample<f32>,
     {
+        // if not running
         if !is_running.load(Ordering::Relaxed) {
             Self::fill_silence(data);
             return;
@@ -381,7 +382,7 @@ impl PetalSonicEngine {
         }
     }
 
-    /// Processes playback commands from the world and updates the active playback instances.
+    /// Process playback commands from the world and updates the active playback instances.
     fn process_playback_commands(
         world: &Arc<PetalSonicWorld>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,

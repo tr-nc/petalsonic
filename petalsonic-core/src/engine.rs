@@ -512,11 +512,17 @@ impl PetalSonicEngine {
 
                     match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
                         Ok((frames_out, frames_in)) => {
-                            log::info!(
-                                "generated {} samples, which is {} samples after resampling",
-                                frames_in,
-                                frames_out
-                            );
+                            // Streaming resamplers need to buffer input before producing output.
+                            // On the first few calls, frames_out may be 0 while the resampler
+                            // fills its internal buffer. This is normal behavior - we only log
+                            // when actual samples are generated to avoid confusing "0 samples" logs.
+                            if frames_out > 0 {
+                                log::info!(
+                                    "generated {} samples, which is {} samples after resampling",
+                                    frames_in,
+                                    frames_out
+                                );
+                            }
 
                             // Push all generated frames to ring buffer
                             let mut pushed = 0;
@@ -537,8 +543,11 @@ impl PetalSonicEngine {
 
                             total_generated += pushed;
 
-                            // If we couldn't push any frames, ring buffer is full, stop trying
-                            if pushed == 0 {
+                            // Only exit early if we had samples to push but the ring buffer was full.
+                            // If frames_out == 0, the resampler is just buffering input - continue
+                            // the loop to feed it more data until it produces output.
+                            if pushed == 0 && frames_out > 0 {
+                                // Ring buffer is full but we had samples to push
                                 return;
                             }
                         }

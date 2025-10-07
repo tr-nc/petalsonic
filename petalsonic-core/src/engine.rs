@@ -287,53 +287,73 @@ impl PetalSonicEngine {
                     // Now convert world_buffer to device sample rate if needed
                     if let Some(ref resampler_arc) = resampler {
                         if let Ok(mut resampler) = resampler_arc.try_lock() {
-                            // Ask the resampler exactly how many input frames it needs
-                            let input_frames_needed = resampler.input_frames_needed();
-
-                            // Create a temporary f32 buffer for mixing at world sample rate
-                            let world_buffer_size = input_frames_needed * channels_usize;
-                            let mut world_buffer = vec![0.0f32; world_buffer_size];
-
-                            // Mix all active playback instances at world sample rate
-                            if let Ok(mut active_playback) = active_playback.try_lock() {
-                                // Remove finished instances
-                                active_playback.retain(|_, instance| !instance.info.is_finished());
-
-                                // Mix all active instances
-                                for instance in active_playback.values_mut() {
-                                    instance.fill_buffer(&mut world_buffer, channels);
-                                }
-                            }
-
-                            // Create output buffer for resampled data
+                            // Query the resampler for exactly how many input frames it needs
+                            // to produce enough output to fill the device buffer
+                            let mut total_output_written = 0;
                             let mut resampled_buffer = vec![0.0f32; data.len()];
 
-                            // Feed input to the resampler and get output
-                            match resampler
-                                .process_interleaved(&world_buffer, &mut resampled_buffer)
-                            {
-                                Ok(frames_out) => {
-                                    // Convert and copy to the output buffer
-                                    for (i, sample) in data.iter_mut().enumerate() {
-                                        let sample_value = if i < resampled_buffer.len() {
-                                            resampled_buffer[i]
-                                        } else {
-                                            0.0f32
-                                        };
-                                        *sample = T::from_sample(sample_value);
-                                    }
+                            // Keep feeding input until we fill the output buffer
+                            while total_output_written < device_frames {
+                                let input_frames_needed = resampler.input_frames_needed();
 
-                                    // Update frame counter
-                                    frames_processed.fetch_add(frames_out, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    log::error!("Resampling error: {}", e);
-                                    // Fill with silence on error
-                                    for sample in data.iter_mut() {
-                                        *sample = T::from_sample(0.0f32);
+                                // Generate exactly the amount of input the resampler needs
+                                let world_buffer_size = input_frames_needed * channels_usize;
+                                let mut world_buffer = vec![0.0f32; world_buffer_size];
+
+                                // Mix all active playback instances at world sample rate
+                                if let Ok(mut active_playback) = active_playback.try_lock() {
+                                    // Remove finished instances
+                                    active_playback
+                                        .retain(|_, instance| !instance.info.is_finished());
+
+                                    // Mix all active instances
+                                    for instance in active_playback.values_mut() {
+                                        instance.fill_buffer(&mut world_buffer, channels);
                                     }
+                                }
+
+                                // Feed input to the resampler and get output
+                                match resampler
+                                    .process_interleaved(&world_buffer, &mut resampled_buffer)
+                                {
+                                    Ok((frames_out, _frames_consumed)) => {
+                                        total_output_written += frames_out;
+
+                                        // If we didn't get enough output, we need more input
+                                        // The resampler will accumulate the input and try again next iteration
+                                        if frames_out == 0 {
+                                            // Not enough input buffered yet, break and we'll get it next callback
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Resampling error: {}", e);
+                                        // Fill with silence on error
+                                        for sample in data.iter_mut() {
+                                            *sample = T::from_sample(0.0f32);
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // If we've filled the buffer, we're done
+                                if total_output_written >= device_frames {
+                                    break;
                                 }
                             }
+
+                            // Convert and copy to the output buffer
+                            for (i, sample) in data.iter_mut().enumerate() {
+                                let sample_value = if i < resampled_buffer.len() {
+                                    resampled_buffer[i]
+                                } else {
+                                    0.0f32
+                                };
+                                *sample = T::from_sample(sample_value);
+                            }
+
+                            // Update frame counter (using output frames)
+                            frames_processed.fetch_add(total_output_written, Ordering::Relaxed);
                         } else {
                             // Can't lock resampler, fill with silence
                             for sample in data.iter_mut() {

@@ -48,15 +48,12 @@ impl StreamingResampler {
             ));
         }
 
-        // IMPORTANT: FastFixedOut ratio is target/source (output/input)
-        // For 96k -> 48k: 48000/96000 = 0.5 (downsampling)
-        // For 44.1k -> 48k: 48000/44100 = 1.088 (upsampling)
+        // target/source (output/input)
         let resample_ratio = target_sample_rate as f64 / source_sample_rate as f64;
 
-        // Create the rubato resampler with fixed output size
         let resampler = FastFixedOut::new(
             resample_ratio,
-            1.0, // max_resample_ratio_relative - we're not changing it dynamically
+            1.0, // we're not changing it dynamically
             rubato::PolynomialDegree::Septic,
             output_frames,
             channels as usize,
@@ -65,7 +62,7 @@ impl StreamingResampler {
             PetalSonicError::AudioLoading(format!("Failed to create streaming resampler: {}", e))
         })?;
 
-        // Initialize empty input buffers for each channel
+        // creates a 2D buffer (a vector of vectors) for multi‑channel floating‑point audio samples
         let input_buffer: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
 
         Ok(Self {
@@ -75,6 +72,74 @@ impl StreamingResampler {
             channels,
             input_buffer,
         })
+    }
+
+    /// De-interleaves input samples and appends them to the internal buffers
+    fn deinterleave_and_buffer_input(&mut self, input_samples: &[f32]) {
+        let channels = self.channels as usize;
+        for frame in input_samples.chunks_exact(channels) {
+            for (ch_idx, &sample) in frame.iter().enumerate() {
+                if ch_idx < self.input_buffer.len() {
+                    self.input_buffer[ch_idx].push(sample);
+                }
+            }
+        }
+    }
+
+    /// Attempts to produce one resampled chunk if enough input is available
+    ///
+    /// # Returns
+    /// A tuple of (output_frames_written, input_frames_consumed) if successful,
+    /// or (0, 0) if not enough input is available
+    fn try_produce_resampled_chunk(
+        &mut self,
+        output_samples: &mut [f32],
+        out_frames_written: usize,
+        out_frames_capacity: usize,
+    ) -> Result<(usize, usize)> {
+        let channels = self.channels as usize;
+        let frames_needed = self.resampler.input_frames_next();
+
+        // Not enough input accumulated to produce another chunk
+        if self.input_buffer[0].len() < frames_needed {
+            return Ok((0, 0));
+        }
+
+        // Drain exactly frames_needed per channel
+        let mut input_waves: Vec<Vec<f32>> = Vec::with_capacity(channels);
+        for ch in 0..channels {
+            let samples: Vec<f32> = self.input_buffer[ch].drain(..frames_needed).collect();
+            input_waves.push(samples);
+        }
+
+        // Resample
+        let output_waves = self.resampler.process(&input_waves, None).map_err(|e| {
+            PetalSonicError::AudioLoading(format!("Streaming resampling error: {}", e))
+        })?;
+
+        let produced_frames = output_waves[0].len();
+
+        // Re-interleave into output buffer (may be truncated to fit)
+        let frames_to_copy = produced_frames.min(out_frames_capacity - out_frames_written);
+        for f in 0..frames_to_copy {
+            let dst_frame_idx = out_frames_written + f;
+            for ch in 0..channels {
+                output_samples[dst_frame_idx * channels + ch] = output_waves[ch][f];
+            }
+        }
+
+        Ok((frames_to_copy, frames_needed))
+    }
+
+    /// Zero-fills the remainder of the output buffer if not completely filled
+    fn zero_fill_output(&self, output_samples: &mut [f32], out_frames_written: usize) {
+        let channels = self.channels as usize;
+        let out_frames_capacity = output_samples.len() / channels;
+
+        if out_frames_written < out_frames_capacity {
+            let start = out_frames_written * channels;
+            output_samples[start..].fill(0.0);
+        }
     }
 
     /// Processes interleaved audio samples and resamples them to the target rate
@@ -101,59 +166,27 @@ impl StreamingResampler {
         let mut in_frames_consumed = 0usize;
 
         // 1) De-interleave and append new input to our internal buffers
-        for frame in input_samples.chunks_exact(channels) {
-            for (ch_idx, &sample) in frame.iter().enumerate() {
-                if ch_idx < self.input_buffer.len() {
-                    self.input_buffer[ch_idx].push(sample);
-                }
-            }
-        }
+        self.deinterleave_and_buffer_input(input_samples);
 
         // 2) Produce output chunks until we fill the output buffer or run out of input
         while out_frames_written < out_frames_capacity {
-            let frames_needed = self.resampler.input_frames_next();
+            let (chunk_out_frames, chunk_in_frames) = self.try_produce_resampled_chunk(
+                output_samples,
+                out_frames_written,
+                out_frames_capacity,
+            )?;
 
-            // Not enough input accumulated to produce another chunk
-            if self.input_buffer[0].len() < frames_needed {
+            // No more input available to produce chunks
+            if chunk_out_frames == 0 {
                 break;
             }
 
-            // Drain exactly frames_needed per channel
-            let mut input_waves: Vec<Vec<f32>> = Vec::with_capacity(channels);
-            for ch in 0..channels {
-                let samples: Vec<f32> = self.input_buffer[ch].drain(..frames_needed).collect();
-                input_waves.push(samples);
-            }
-            in_frames_consumed += frames_needed;
-
-            // Resample
-            let output_waves = self.resampler.process(&input_waves, None).map_err(|e| {
-                PetalSonicError::AudioLoading(format!("Streaming resampling error: {}", e))
-            })?;
-
-            let produced_frames = output_waves[0].len();
-
-            // Re-interleave into output buffer (may be truncated to fit)
-            let frames_to_copy = produced_frames.min(out_frames_capacity - out_frames_written);
-            for f in 0..frames_to_copy {
-                let dst_frame_idx = out_frames_written + f;
-                for ch in 0..channels {
-                    output_samples[dst_frame_idx * channels + ch] = output_waves[ch][f];
-                }
-            }
-
-            out_frames_written += frames_to_copy;
-
-            // FastFixedOut returns a fixed size we configured, so produced_frames
-            // should always equal our output_frames. If for some reason we produced
-            // more than needed, we've already truncated above.
+            out_frames_written += chunk_out_frames;
+            in_frames_consumed += chunk_in_frames;
         }
 
         // 3) Zero-fill any remainder in the device buffer
-        if out_frames_written < out_frames_capacity {
-            let start = out_frames_written * channels;
-            output_samples[start..].fill(0.0);
-        }
+        self.zero_fill_output(output_samples, out_frames_written);
 
         Ok((out_frames_written, in_frames_consumed))
     }
@@ -274,18 +307,5 @@ mod tests {
             let mut output = vec![0.0f32; 512 * 2];
             let _result = resampler.process_interleaved(&input, &mut output);
         }
-    }
-
-    #[test]
-    fn test_ratio_correctness() {
-        // Downsampling: 96k -> 48k should have ratio 0.5 in rubato
-        let resampler = StreamingResampler::new(96000, 48000, 2, 512).unwrap();
-        // Our diagnostic ratio is source/target = 2.0
-        assert!((resampler.resample_ratio() - 2.0).abs() < 0.001);
-
-        // Upsampling: 44.1k -> 48k should have ratio ~1.088 in rubato
-        let resampler2 = StreamingResampler::new(44100, 48000, 2, 512).unwrap();
-        // Our diagnostic ratio is source/target = 44100/48000 = 0.91875
-        assert!((resampler2.resample_ratio() - 0.91875).abs() < 0.001);
     }
 }

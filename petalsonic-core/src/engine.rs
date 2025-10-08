@@ -313,7 +313,7 @@ impl PetalSonicEngine {
     fn render_thread_loop(mut ctx: RenderThreadContext) {
         log::info!("Render thread started");
 
-        let target_buffer_fill = ctx.block_size * 4; // Keep buffer 50% full (4x block size out of 8x total)
+        let target_buffer_fill = ctx.block_size * 4;
 
         while !ctx.shutdown.load(Ordering::Relaxed) {
             // Check ring buffer occupancy (lock-free!)
@@ -363,8 +363,10 @@ impl PetalSonicEngine {
             block_size,
         )?;
 
-        // Calculate ring buffer size: enough to store several blocks
-        let ring_buffer_size = 10000;
+        // TODO: the audio callback may need even more samples at a time, we should consider that too,
+        // otherwise when that exceeds the ring buffer size, we will never be able to fill enough samples
+        const RING_BUFFER_SIZE_MIN: usize = 100000;
+        let ring_buffer_size = RING_BUFFER_SIZE_MIN.max(block_size * 8);
         let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
 
         log::info!("Created ring buffer with size: {} frames", ring_buffer_size);
@@ -581,6 +583,7 @@ impl PetalSonicEngine {
                 let mut world_buffer = buf.borrow_mut();
                 // Generate exactly block_size frames at world sample rate
                 let world_buffer_size = block_size * channels_usize;
+
                 world_buffer.resize(world_buffer_size, 0.0f32);
                 world_buffer.fill(0.0f32);
 

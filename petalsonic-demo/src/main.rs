@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 fn main() {
     env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .init();
 
     test_new_playback_system().unwrap();

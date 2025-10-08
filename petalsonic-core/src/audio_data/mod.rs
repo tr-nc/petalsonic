@@ -11,7 +11,7 @@ pub use loader::AudioDataLoader;
 pub use resampler::AudioResampler;
 use std::sync::Arc;
 use std::time::Duration;
-pub use streaming_resampler::StreamingResampler;
+pub use streaming_resampler::{ResamplerType, StreamingResampler};
 
 /// Container for loaded audio data with reference-counted sharing.
 ///

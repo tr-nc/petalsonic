@@ -1,4 +1,4 @@
-use crate::audio_data::StreamingResampler;
+use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::PetalSonicWorldDesc;
 use crate::error::PetalSonicError;
 use crate::error::Result;
@@ -314,7 +314,7 @@ impl PetalSonicEngine {
             device_sample_rate,
             channels,
             world_block_size,
-            None, // Use default (Sinc) resampler
+            Some(ResamplerType::Fast),
         )?;
 
         log::info!(
@@ -352,8 +352,6 @@ impl PetalSonicEngine {
 
         let device_frames = data.len() / channels_usize;
 
-        log::info!("callback requires {} samples", device_frames);
-
         // Try to lock the ring buffer
         let Ok(mut ring_buf) = ring_buffer.try_lock() else {
             log::warn!("Failed to acquire ring buffer lock in audio callback");
@@ -366,7 +364,6 @@ impl PetalSonicEngine {
 
         // Check current ring buffer status
         let available_samples = consumer.occupied_len();
-        log::info!("ringbuf has {} samples", available_samples);
 
         // If not enough samples, generate more
         if available_samples < device_frames {
@@ -419,8 +416,6 @@ impl PetalSonicEngine {
                 break;
             }
         }
-
-        log::info!("consumes {} samples from ringbuf", samples_consumed);
 
         drop(consumer);
         drop(producer);
@@ -514,12 +509,6 @@ impl PetalSonicEngine {
 
                     match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
                         Ok((frames_out, frames_in)) => {
-                            log::info!(
-                                "generated {} samples, which is {} samples after resampling",
-                                frames_in,
-                                frames_out
-                            );
-
                             // Push all generated frames to ring buffer
                             let mut pushed = 0;
                             for i in 0..frames_out {

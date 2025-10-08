@@ -108,7 +108,7 @@ impl StreamingResampler {
             ResamplerType::Fast => {
                 let fast = FastFixedIn::new(
                     resample_ratio,
-                    1.0, // we're not changing it dynamically
+                    1.0, // the ratio's always fixed
                     PolynomialDegree::Septic,
                     input_frames,
                     channels as usize,

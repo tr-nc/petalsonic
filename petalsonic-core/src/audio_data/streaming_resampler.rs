@@ -177,6 +177,13 @@ impl StreamingResampler {
             )));
         }
 
+        // Bypass resampling if sample rates are identical
+        if self.source_sample_rate == self.target_sample_rate {
+            let samples_to_copy = input_samples.len().min(output_samples.len());
+            output_samples[..samples_to_copy].copy_from_slice(&input_samples[..samples_to_copy]);
+            return Ok((input_frames, input_frames));
+        }
+
         // De-interleave input
         let mut input_waves: Vec<Vec<f32>> = vec![Vec::with_capacity(input_frames); channels];
         for frame_idx in 0..input_frames {

@@ -367,7 +367,7 @@ impl PetalSonicEngine {
 
         // If not enough samples, generate more
         if available_samples < device_frames {
-            Self::generate_resampled_samples(
+            Self::generate_samples(
                 &mut producer,
                 device_frames - available_samples,
                 channels_usize,
@@ -461,7 +461,7 @@ impl PetalSonicEngine {
     }
 
     /// Generate resampled samples and push to ring buffer
-    fn generate_resampled_samples(
+    fn generate_samples(
         producer: &mut impl Producer<Item = StereoFrame>,
         samples_needed: usize,
         channels_usize: usize,

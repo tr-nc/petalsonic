@@ -1,6 +1,6 @@
 use crate::error::{PetalSonicError, Result};
 use rubato::{
-    FastFixedOut, PolynomialDegree, Resampler, SincFixedOut, SincInterpolationParameters,
+    FastFixedIn, PolynomialDegree, Resampler, SincFixedIn, SincInterpolationParameters,
     SincInterpolationType, WindowFunction,
 };
 
@@ -20,18 +20,11 @@ impl Default for ResamplerType {
 }
 
 enum ResamplerImpl {
-    Fast(FastFixedOut<f32>),
-    Sinc(SincFixedOut<f32>),
+    Fast(FastFixedIn<f32>),
+    Sinc(SincFixedIn<f32>),
 }
 
 impl ResamplerImpl {
-    fn input_frames_next(&self) -> usize {
-        match self {
-            Self::Fast(r) => r.input_frames_next(),
-            Self::Sinc(r) => r.input_frames_next(),
-        }
-    }
-
     fn process(
         &mut self,
         input: &[Vec<f32>],
@@ -51,25 +44,25 @@ impl ResamplerImpl {
 }
 
 /// A real-time streaming resampler that converts audio from one sample rate to another
-/// in real-time with minimal latency. Uses a fixed-output-size approach suitable for
-/// audio device callbacks where the output buffer size is known.
+/// in real-time with minimal latency. Uses a fixed-input-size approach where the world
+/// generates a fixed number of frames and the resampler produces variable output based
+/// on the sample rate ratio.
 pub struct StreamingResampler {
     resampler: ResamplerImpl,
     source_sample_rate: u32,
     target_sample_rate: u32,
     channels: u16,
-    /// Input buffer accumulator for partial frames (per channel, non-interleaved)
-    input_buffer: Vec<Vec<f32>>,
+    input_chunk_size: usize,
 }
 
 impl StreamingResampler {
-    /// Creates a new streaming resampler
+    /// Creates a new streaming resampler with fixed input size
     ///
     /// # Arguments
-    /// * `source_sample_rate` - The sample rate of the audio being produced by the engine
+    /// * `source_sample_rate` - The sample rate of the audio being produced by the world
     /// * `target_sample_rate` - The sample rate required by the audio device
     /// * `channels` - Number of audio channels
-    /// * `output_frames` - The number of frames the device expects per callback
+    /// * `input_frames` - The fixed number of frames to generate at world sample rate per chunk
     /// * `resampler_type` - Type of resampler algorithm to use (defaults to Sinc if None)
     ///
     /// # Returns
@@ -78,7 +71,7 @@ impl StreamingResampler {
         source_sample_rate: u32,
         target_sample_rate: u32,
         channels: u16,
-        output_frames: usize,
+        input_frames: usize,
         resampler_type: Option<ResamplerType>,
     ) -> Result<Self> {
         if source_sample_rate == 0 || target_sample_rate == 0 {
@@ -93,9 +86,9 @@ impl StreamingResampler {
             ));
         }
 
-        if output_frames == 0 {
+        if input_frames == 0 {
             return Err(PetalSonicError::AudioFormat(
-                "Output frames must be greater than 0".to_string(),
+                "Input frames must be greater than 0".to_string(),
             ));
         }
 
@@ -104,19 +97,20 @@ impl StreamingResampler {
         let resampler_type = resampler_type.unwrap_or_default();
 
         log::info!(
-            "Creating {:?} resampler: {} Hz -> {} Hz",
+            "Creating {:?} resampler: {} Hz -> {} Hz (fixed input: {} frames)",
             resampler_type,
             source_sample_rate,
-            target_sample_rate
+            target_sample_rate,
+            input_frames
         );
 
         let resampler = match resampler_type {
             ResamplerType::Fast => {
-                let fast = FastFixedOut::new(
+                let fast = FastFixedIn::new(
                     resample_ratio,
                     1.0, // we're not changing it dynamically
                     PolynomialDegree::Septic,
-                    output_frames,
+                    input_frames,
                     channels as usize,
                 )
                 .map_err(|e| {
@@ -133,11 +127,11 @@ impl StreamingResampler {
                     window: WindowFunction::BlackmanHarris2,
                 };
 
-                let sinc = SincFixedOut::new(
+                let sinc = SincFixedIn::new(
                     resample_ratio,
                     1.0, // we're not changing it dynamically
                     params,
-                    output_frames,
+                    input_frames,
                     channels as usize,
                 )
                 .map_err(|e| {
@@ -147,54 +141,48 @@ impl StreamingResampler {
             }
         };
 
-        // creates a 2D buffer (a vector of vectors) for multi‑channel floating‑point audio samples
-        let input_buffer: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
-
         Ok(Self {
             resampler,
             source_sample_rate,
             target_sample_rate,
             channels,
-            input_buffer,
+            input_chunk_size: input_frames,
         })
     }
 
-    /// De-interleaves input samples and appends them to the internal buffers
-    fn deinterleave_and_buffer_input(&mut self, input_samples: &[f32]) {
-        let channels = self.channels as usize;
-        for frame in input_samples.chunks_exact(channels) {
-            for (ch_idx, &sample) in frame.iter().enumerate() {
-                if ch_idx < self.input_buffer.len() {
-                    self.input_buffer[ch_idx].push(sample);
-                }
-            }
-        }
-    }
-
-    /// Attempts to produce one resampled chunk if enough input is available
+    /// Processes interleaved audio samples and resamples them to the target rate
+    ///
+    /// # Arguments
+    /// * `input_samples` - Interleaved f32 samples at the source sample rate (must be exactly input_chunk_size frames)
+    /// * `output_samples` - Interleaved f32 buffer to fill with resampled audio (will be resized as needed)
     ///
     /// # Returns
-    /// A tuple of (output_frames_written, input_frames_consumed) if successful,
-    /// or (0, 0) if not enough input is available
-    fn try_produce_resampled_chunk(
+    /// A tuple of (output_frames_written, input_frames_consumed)
+    ///
+    /// # Important
+    /// - Input must contain exactly `input_chunk_size` frames (input_chunk_size * channels samples)
+    /// - Output size will vary based on the resampling ratio
+    pub fn process_interleaved(
         &mut self,
+        input_samples: &[f32],
         output_samples: &mut [f32],
-        out_frames_written: usize,
-        out_frames_capacity: usize,
     ) -> Result<(usize, usize)> {
         let channels = self.channels as usize;
-        let frames_needed = self.resampler.input_frames_next();
+        let input_frames = input_samples.len() / channels;
 
-        // Not enough input accumulated to produce another chunk
-        if self.input_buffer[0].len() < frames_needed {
-            return Ok((0, 0));
+        if input_frames != self.input_chunk_size {
+            return Err(PetalSonicError::AudioFormat(format!(
+                "Input size mismatch: expected {} frames, got {} frames",
+                self.input_chunk_size, input_frames
+            )));
         }
 
-        // Drain exactly frames_needed per channel
-        let mut input_waves: Vec<Vec<f32>> = Vec::with_capacity(channels);
-        for ch in 0..channels {
-            let samples: Vec<f32> = self.input_buffer[ch].drain(..frames_needed).collect();
-            input_waves.push(samples);
+        // De-interleave input
+        let mut input_waves: Vec<Vec<f32>> = vec![Vec::with_capacity(input_frames); channels];
+        for frame_idx in 0..input_frames {
+            for ch in 0..channels {
+                input_waves[ch].push(input_samples[frame_idx * channels + ch]);
+            }
         }
 
         // Resample
@@ -202,93 +190,31 @@ impl StreamingResampler {
             PetalSonicError::AudioLoading(format!("Streaming resampling error: {}", e))
         })?;
 
-        let produced_frames = output_waves[0].len();
+        let output_frames = output_waves[0].len();
+        let output_samples_needed = output_frames * channels;
 
-        // Re-interleave into output buffer (may be truncated to fit)
-        let frames_to_copy = produced_frames.min(out_frames_capacity - out_frames_written);
-        for f in 0..frames_to_copy {
-            let dst_frame_idx = out_frames_written + f;
+        // Check if output buffer is large enough
+        if output_samples.len() < output_samples_needed {
+            return Err(PetalSonicError::AudioFormat(format!(
+                "Output buffer too small: need {} samples, got {}",
+                output_samples_needed,
+                output_samples.len()
+            )));
+        }
+
+        // Re-interleave output
+        for frame_idx in 0..output_frames {
             for ch in 0..channels {
-                output_samples[dst_frame_idx * channels + ch] = output_waves[ch][f];
+                output_samples[frame_idx * channels + ch] = output_waves[ch][frame_idx];
             }
         }
 
-        Ok((frames_to_copy, frames_needed))
+        Ok((output_frames, input_frames))
     }
 
-    /// Zero-fills the remainder of the output buffer if not completely filled
-    fn zero_fill_output(&self, output_samples: &mut [f32], out_frames_written: usize) {
-        let channels = self.channels as usize;
-        let out_frames_capacity = output_samples.len() / channels;
-
-        if out_frames_written < out_frames_capacity {
-            let start = out_frames_written * channels;
-            output_samples[start..].fill(0.0);
-        }
-    }
-
-    /// Processes interleaved audio samples and resamples them to the target rate
-    ///
-    /// # Arguments
-    /// * `input_samples` - Interleaved f32 samples at the source sample rate
-    /// * `output_samples` - Interleaved f32 buffer to fill with resampled audio
-    ///
-    /// # Returns
-    /// A tuple of (output_frames_written, input_frames_consumed)
-    ///
-    /// # Important
-    /// - Always advance your audio source by `input_frames_consumed`, NOT by `output_frames_written`
-    /// - The function will fill as much of the output buffer as possible
-    /// - Any unfilled portion of the output buffer is zero-filled
-    pub fn process_interleaved(
-        &mut self,
-        input_samples: &[f32],
-        output_samples: &mut [f32],
-    ) -> Result<(usize, usize)> {
-        let out_frames_capacity = output_samples.len() / self.channels as usize;
-        let mut out_frames_written = 0usize;
-        let mut in_frames_consumed = 0usize;
-
-        // 1) De-interleave and append new input to our internal buffers
-        self.deinterleave_and_buffer_input(input_samples);
-
-        // 2) Produce output chunks until we fill the output buffer or run out of input
-        while out_frames_written < out_frames_capacity {
-            let (chunk_out_frames, chunk_in_frames) = self.try_produce_resampled_chunk(
-                output_samples,
-                out_frames_written,
-                out_frames_capacity,
-            )?;
-
-            // No more input available to produce chunks
-            if chunk_out_frames == 0 {
-                break;
-            }
-
-            out_frames_written += chunk_out_frames;
-            in_frames_consumed += chunk_in_frames;
-        }
-
-        // 3) Zero-fill any remainder in the device buffer
-        self.zero_fill_output(output_samples, out_frames_written);
-
-        Ok((out_frames_written, in_frames_consumed))
-    }
-
-    /// Returns true if the resampler needs more input samples to produce output
-    pub fn needs_input(&self) -> bool {
-        let frames_needed = self.resampler.input_frames_next();
-        self.input_buffer[0].len() < frames_needed
-    }
-
-    /// Returns how many input frames are needed for the next process call
-    pub fn input_frames_needed(&self) -> usize {
-        self.resampler.input_frames_next()
-    }
-
-    /// Returns how many input frames are currently buffered
-    pub fn buffered_frames(&self) -> usize {
-        self.input_buffer[0].len()
+    /// Returns the fixed input chunk size (in frames)
+    pub fn input_chunk_size(&self) -> usize {
+        self.input_chunk_size
     }
 
     /// Returns the target (output) sample rate in Hz
@@ -309,9 +235,6 @@ impl StreamingResampler {
 
     /// Reset the internal state of the resampler
     pub fn reset(&mut self) {
-        for channel_buffer in &mut self.input_buffer {
-            channel_buffer.clear();
-        }
         self.resampler.reset();
     }
 }

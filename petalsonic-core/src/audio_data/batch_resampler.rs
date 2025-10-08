@@ -1,14 +1,14 @@
 use crate::error::{PetalSonicError, Result};
 
-pub struct AudioResampler {
+pub struct BatchResampler {
     source_sample_rate: u32,
     target_sample_rate: u32,
     channels: u16,
     chunk_size: usize,
 }
 
-impl AudioResampler {
-    /// Creates a new audio resampler.
+impl BatchResampler {
+    /// Creates a new batch resampler for offline audio processing.
     ///
     /// # Arguments
     /// * `source_sample_rate` - The sample rate of the input audio
@@ -17,7 +17,7 @@ impl AudioResampler {
     /// * `chunk_size` - Optional size of processing chunks (defaults to 1024)
     ///
     /// # Returns
-    /// A new `AudioResampler` instance
+    /// A new `BatchResampler` instance
     pub fn new(
         source_sample_rate: u32,
         target_sample_rate: u32,

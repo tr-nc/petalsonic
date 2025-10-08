@@ -1,14 +1,14 @@
+mod batch_resampler;
 mod default_loader;
 mod load_options;
 mod loader;
-mod resampler;
 mod streaming_resampler;
 
 use crate::error::{PetalSonicError, Result};
+pub use batch_resampler::BatchResampler;
 pub use default_loader::DefaultAudioLoader;
 pub use load_options::{ConvertToMono, LoadOptions};
 pub use loader::AudioDataLoader;
-pub use resampler::AudioResampler;
 use std::sync::Arc;
 use std::time::Duration;
 pub use streaming_resampler::{ResamplerType, StreamingResampler};
@@ -263,7 +263,7 @@ impl PetalSonicAudioData {
             return Ok(self.clone());
         }
 
-        let resampler = AudioResampler::new(
+        let resampler = BatchResampler::new(
             self.inner.sample_rate,
             target_sample_rate,
             self.inner.channels,

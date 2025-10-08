@@ -34,8 +34,31 @@ impl Default for StereoFrame {
 
 // Thread-local buffers to avoid allocations in audio callback
 thread_local! {
-    static WORLD_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
-    static RESAMPLED_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    static WORLD_BUFFER: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static RESAMPLED_BUFFER: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Context for audio callback - groups related parameters to reduce argument count
+struct AudioCallbackContext {
+    is_running: Arc<AtomicBool>,
+    frames_processed: Arc<AtomicUsize>,
+    active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    world: Arc<PetalSonicWorld>,
+    resampler: Arc<Mutex<StreamingResampler>>,
+    ring_buffer: Arc<Mutex<HeapRb<StereoFrame>>>,
+    channels: u16,
+    block_size: usize,
+}
+
+/// Parameters for stream creation - groups related parameters to reduce argument count
+struct StreamCreationParams {
+    is_running: Arc<AtomicBool>,
+    frames_processed: Arc<AtomicUsize>,
+    world_sample_rate: u32,
+    device_sample_rate: u32,
+    channels: u16,
+    active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    world: Arc<PetalSonicWorld>,
 }
 
 /// Callback function type for filling audio samples
@@ -178,35 +201,41 @@ impl PetalSonicEngine {
             cpal::SampleFormat::F32 => self.create_stream::<f32>(
                 device,
                 config,
-                is_running,
-                frames_processed,
-                world_sample_rate,
-                device_sample_rate,
-                channels,
-                active_playback,
-                world,
+                StreamCreationParams {
+                    is_running,
+                    frames_processed,
+                    world_sample_rate,
+                    device_sample_rate,
+                    channels,
+                    active_playback,
+                    world,
+                },
             )?,
             cpal::SampleFormat::I16 => self.create_stream::<i16>(
                 device,
                 config,
-                is_running,
-                frames_processed,
-                world_sample_rate,
-                device_sample_rate,
-                channels,
-                active_playback,
-                world,
+                StreamCreationParams {
+                    is_running,
+                    frames_processed,
+                    world_sample_rate,
+                    device_sample_rate,
+                    channels,
+                    active_playback,
+                    world,
+                },
             )?,
             cpal::SampleFormat::U16 => self.create_stream::<u16>(
                 device,
                 config,
-                is_running,
-                frames_processed,
-                world_sample_rate,
-                device_sample_rate,
-                channels,
-                active_playback,
-                world,
+                StreamCreationParams {
+                    is_running,
+                    frames_processed,
+                    world_sample_rate,
+                    device_sample_rate,
+                    channels,
+                    active_playback,
+                    world,
+                },
             )?,
             _ => {
                 return Err(PetalSonicError::AudioFormat(
@@ -246,20 +275,18 @@ impl PetalSonicEngine {
         &self,
         device: &cpal::Device,
         config: &cpal::StreamConfig,
-        is_running: Arc<AtomicBool>,
-        frames_processed: Arc<AtomicUsize>,
-        world_sample_rate: u32,
-        device_sample_rate: u32,
-        channels: u16,
-        active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
-        world: Arc<PetalSonicWorld>,
+        params: StreamCreationParams,
     ) -> Result<cpal::Stream>
     where
         T: SizedSample + FromSample<f32>,
     {
         let block_size = self.desc.block_size;
-        let resampler =
-            Self::create_resampler(world_sample_rate, device_sample_rate, channels, block_size)?;
+        let resampler = Self::create_resampler(
+            params.world_sample_rate,
+            params.device_sample_rate,
+            params.channels,
+            block_size,
+        )?;
 
         // Calculate ring buffer size: enough to store several blocks
         let ring_buffer_size = block_size * 8; // 8x the block size for safety
@@ -267,22 +294,23 @@ impl PetalSonicEngine {
 
         log::info!("Created ring buffer with size: {} frames", ring_buffer_size);
 
+        // Create context for audio callback
+        let context = AudioCallbackContext {
+            is_running: params.is_running,
+            frames_processed: params.frames_processed,
+            active_playback: params.active_playback,
+            world: params.world,
+            resampler,
+            ring_buffer,
+            channels: params.channels,
+            block_size,
+        };
+
         let stream = device
             .build_output_stream(
                 config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                    Self::audio_callback(
-                        data,
-                        &is_running,
-                        &frames_processed,
-                        channels as usize,
-                        &active_playback,
-                        &world,
-                        &resampler,
-                        channels,
-                        block_size,
-                        &ring_buffer,
-                    );
+                    Self::audio_callback(data, &context);
                 },
                 move |err| {
                     log::error!("Audio stream error: {}", err);
@@ -328,32 +356,24 @@ impl PetalSonicEngine {
     }
 
     /// Main audio callback that fills the output buffer
-    fn audio_callback<T>(
-        data: &mut [T],
-        is_running: &Arc<AtomicBool>,
-        frames_processed: &Arc<AtomicUsize>,
-        channels_usize: usize,
-        active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
-        world: &Arc<PetalSonicWorld>,
-        resampler: &Arc<Mutex<StreamingResampler>>,
-        channels: u16,
-        block_size: usize,
-        ring_buffer: &Arc<Mutex<HeapRb<StereoFrame>>>,
-    ) where
+    fn audio_callback<T>(data: &mut [T], ctx: &AudioCallbackContext)
+    where
         T: SizedSample + FromSample<f32>,
     {
+        let channels_usize = ctx.channels as usize;
+
         // if not running
-        if !is_running.load(Ordering::Relaxed) {
+        if !ctx.is_running.load(Ordering::Relaxed) {
             Self::fill_silence(data);
             return;
         }
 
-        Self::process_playback_commands(world, active_playback);
+        Self::process_playback_commands(&ctx.world, &ctx.active_playback);
 
         let device_frames = data.len() / channels_usize;
 
         // Try to lock the ring buffer
-        let Ok(mut ring_buf) = ring_buffer.try_lock() else {
+        let Ok(mut ring_buf) = ctx.ring_buffer.try_lock() else {
             log::warn!("Failed to acquire ring buffer lock in audio callback");
             Self::fill_silence(data);
             return;
@@ -371,10 +391,10 @@ impl PetalSonicEngine {
                 &mut producer,
                 device_frames - available_samples,
                 channels_usize,
-                channels,
-                resampler,
-                active_playback,
-                block_size,
+                ctx.channels,
+                &ctx.resampler,
+                &ctx.active_playback,
+                ctx.block_size,
             );
         }
 
@@ -411,7 +431,8 @@ impl PetalSonicEngine {
         drop(producer);
         drop(ring_buf);
 
-        frames_processed.fetch_add(samples_consumed, Ordering::Relaxed);
+        ctx.frames_processed
+            .fetch_add(samples_consumed, Ordering::Relaxed);
     }
 
     /// Fill buffer with silence
@@ -519,13 +540,10 @@ impl PetalSonicEngine {
                             total_generated += pushed;
 
                             // If we couldn't push any frames, ring buffer is full
-                            if pushed == 0 {
-                                return;
-                            }
+                            if pushed == 0 {}
                         }
                         Err(e) => {
                             log::error!("Resampling error: {}", e);
-                            return;
                         }
                     }
                 });

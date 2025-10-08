@@ -123,17 +123,16 @@ impl PetalSonicWorld {
     /// or if the command fails to send to the audio engine.
     pub fn play(&self, audio_id: SourceId) -> Result<()> {
         if !self.contains_audio(audio_id) {
-            return Err(crate::error::PetalSonicError::Engine(
-                format!("Audio data with ID {:?} not found", audio_id).into(),
-            ));
+            return Err(crate::error::PetalSonicError::Engine(format!(
+                "Audio data with ID {:?} not found",
+                audio_id
+            )));
         }
 
         self.command_sender
             .send(PlaybackCommand::Play(audio_id))
             .map_err(|e| {
-                crate::error::PetalSonicError::Engine(
-                    format!("Failed to send play command: {}", e).into(),
-                )
+                crate::error::PetalSonicError::Engine(format!("Failed to send play command: {}", e))
             })?;
 
         Ok(())
@@ -155,9 +154,10 @@ impl PetalSonicWorld {
         self.command_sender
             .send(PlaybackCommand::Pause(audio_id))
             .map_err(|e| {
-                crate::error::PetalSonicError::Engine(
-                    format!("Failed to send pause command: {}", e).into(),
-                )
+                crate::error::PetalSonicError::Engine(format!(
+                    "Failed to send pause command: {}",
+                    e
+                ))
             })?;
 
         Ok(())
@@ -179,9 +179,7 @@ impl PetalSonicWorld {
         self.command_sender
             .send(PlaybackCommand::Stop(audio_id))
             .map_err(|e| {
-                crate::error::PetalSonicError::Engine(
-                    format!("Failed to send stop command: {}", e).into(),
-                )
+                crate::error::PetalSonicError::Engine(format!("Failed to send stop command: {}", e))
             })?;
 
         Ok(())
@@ -199,9 +197,10 @@ impl PetalSonicWorld {
         self.command_sender
             .send(PlaybackCommand::StopAll)
             .map_err(|e| {
-                crate::error::PetalSonicError::Engine(
-                    format!("Failed to send stop all command: {}", e).into(),
-                )
+                crate::error::PetalSonicError::Engine(format!(
+                    "Failed to send stop all command: {}",
+                    e
+                ))
             })?;
 
         Ok(())

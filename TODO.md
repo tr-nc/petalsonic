@@ -1,149 +1,94 @@
 # PetalSonic Implementation TODO
 
-## Development Evolution Path
+## Advanced Features (Planned for Future)
 
-1. **Phase 1**: Simple CLI examples demonstrating core library features
-2. **Phase 2**: Basic web UI with static audio source positioning
-3. **Phase 3**: Interactive drag-and-drop with real-time audio updates
-4. **Phase 4**: Advanced features (physics, presets, multiplayer, VR integration)
+### Core
 
-## Adapt different sample rates
-
-- [ ] Use rubato to resample the audio to the output sample rate in realtime. The source of the audio is given from the callback function.
-
-## Ring Buffer & Audio Backend (Phase 3)
-
-- [ ] Implement lock-free SPSC ring buffer (`AudioRing`)
-- [ ] Set up CPAL integration (`cpal_backend.rs`)
-- [ ] Create basic audio output with synthetic tone for testing
-- [ ] Ensure real-time safety (no allocations in audio callback)
-
-## Spatialization System (Phase 4)
-
-- [ ] Define `Spatializer` trait interface
-- [ ] Create mock spatializer for testing (simple panning)
-- [ ] Implement `SourceBlock` struct for spatial processing
-- [ ] Set up audionimbus adapter (`audionimbus_adapter.rs`)
-
-## Audio Engine (Phase 5)
-
-- [ ] Create engine command system (`EngineCmd` enum)
-- [ ] Implement producer/mixer thread with fixed block processing
-- [ ] Add source state management (`SourceState`, `ListenerState`)
-- [ ] Implement mixing logic for spatial and non-spatial sources
-- [ ] Add one-shot completion detection and event emission
-- [ ] Create engine handle for thread-safe communication
-
-## World API (Phase 6)
-
-- [ ] Implement `PetalSonicAudioListener`
-- [ ] Create `PetalSonicAudioSource` with builder pattern
-- [ ] Build `PetalSonicWorld` main controller
-- [ ] Add source management (add/update/remove)
-- [ ] Implement listener pose updates
-- [ ] Add start/stop functionality
-- [ ] Create event polling system
-
-## Testing & Examples (Phase 7)
-
-- [ ] Write unit tests for ring buffer
-- [ ] Test audio data loading and resampling
-- [ ] Create integration tests with mock spatializer
-- [ ] Build example: `play_one_shot.rs`
-- [ ] Build example: `loop_spatial.rs`
-- [ ] Add performance benchmarks
-
-## Performance Optimization
-
-- [ ] Preallocate scratch buffers for mixing
-- [ ] Optimize spatial processing for multiple sources
-- [ ] Measure and optimize producer tick time
-- [ ] Add metrics collection for underruns/overruns
-
-## Advanced Features (Future)
-
-- [ ] Streaming audio support for long files
-- [ ] Device change handling
-- [ ] Sample rate adaptation for different devices
+- [ ] Device switch handling
 - [ ] Additional spatial audio features (reverb, occlusion)
 
-## Key Design Principles
+### Demo
 
-- Real-time safety: No allocations/locks in audio callback
-- Main-thread world control with background audio processing
-- Fixed-size blocks for predictable performance
-- Automatic cleanup of finished one-shot sources
-- Spatial audio using Steam Audio for HRTF processing
-- Keep it simple and stupid
+- [ ] Basic web UI with static audio source positioning
+- [ ] Interactive drag-and-drop with real-time audio updates
 
 ---
 
-## Spatial Audio Implementation (Multi-Threaded Architecture)
+## Spatial Audio Implementation
 
 ### Architecture Overview
 
-```
-┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
-│   Main Thread   │────────→│ Simulation Thread│────────→│  Audio Thread   │
-│                 │         │                  │         │                 │
-│ - World state   │         │ - Steam Audio    │         │ - Effect DSP    │
-│ - Add/remove    │         │ - Distance calc  │         │ - Ambisonics    │
-│ - Positions     │         │ - Air absorption │         │ - Binaural out  │
-└─────────────────┘         └──────────────────┘         └─────────────────┘
-        │                            │                            │
-        │ WorldUpdate               │ SimulationResult           │
-        │ (lock-free channel)       │ (triple buffer)           │
-        └───────────────────────────┴───────────────────────────┘
+```plaintext
+┌──────────────────────────────────────────────────────────────┐
+│ Main Thread (World)                                          │
+│ - add_source(audio_data, SourceConfig)                       │
+│   * SourceConfig::NonSpatial                                 │
+│   * SourceConfig::Spatial { position, volume, ... }          │
+│ - set_listener_pose(pose)                                    │
+│ - send PlaybackCommand via channel                           │
+└──────────────────────────────────────────────────────────────┘
+                             ↓ PlaybackCommand + SourceConfig
+┌──────────────────────────────────────────────────────────────┐
+│ Render Thread (generates samples at world rate)              │
+│ - Process PlaybackCommand                                    │
+│ - For each active source:                                    │
+│   ├─ NonSpatial → current mixing logic                       │
+│   └─ Spatial → Steam Audio (Direct, Encode, Decode) → mix    │
+│ - Push frames to ring buffer                                 │
+└──────────────────────────────────────────────────────────────┘
+                             ↓ Ring Buffer (StereoFrame)
+┌──────────────────────────────────────────────────────────────┐
+│ Audio Callback (device rate)                                 │
+│ - Consume from ring buffer (lock-free)                       │
+│ - Output to device                                           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Decisions
 
-- **No ring buffer**: Direct processing in audio callback (Steam Audio is real-time safe)
-- **Lock-free audio thread**: Uses triple buffer to read simulation results without blocking
-- **Separate simulation thread**: Runs at lower rate (60Hz) vs audio (48kHz)
-- **Graceful degradation**: Audio uses last-known results if simulation falls behind
-- **Clear ownership**: Each thread owns its data structures
+- **Coexistence**: Spatial and non-spatial sources work together
+- **Render thread does spatial processing**: No separate simulation thread (simpler architecture)
+- **Per-source spatial mode**: Each source has `SourceConfig` to determine processing path
+- **World-level listener**: Single global listener pose for all spatial sources
+- **Existing threading model**: Use current render thread + ring buffer + audio callback
+- **Learn from reference-audio**: Study `petalsonic-core/src/reference-audio/spatial_sound_manager.rs` for Steam Audio API patterns
+
+### Reference Code for Steam Audio Usage
+
+**IMPORTANT**: The `petalsonic-core/src/reference-audio/` directory contains working examples of Steam Audio integration. Study these files:
+
+- **`spatial_sound_manager.rs`**: Complete Steam Audio setup (Context, Scene, Simulator, HRTF, effect chains)
+  - See how to initialize Steam Audio objects
+  - See Direct/Ambisonics effect chains
+  - See per-source effect management
+- **`spatial_sound.rs`**: Per-source spatial configuration
+- **`pal.rs`**: Steam Audio Context/Scene/Simulator initialization patterns
+
+**Note**: Ignore Kira-specific code. Extract only the Steam Audio (audionimbus) API patterns.
 
 ### Data Structures
 
 ```rust
-// Main → Simulation
-pub enum WorldUpdate {
-    ListenerMoved { pose: Pose },
-    SourceAdded { id: Uuid, position: Vec3, audio_data: Arc<PetalSonicAudioData> },
-    SourceMoved { id: Uuid, position: Vec3 },
-    SourceRemoved { id: Uuid },
-    SourceVolumeChanged { id: Uuid, volume: f32 },
+// Source configuration (per-source spatial mode)
+pub enum SourceConfig {
+    NonSpatial,
+    Spatial {
+        position: Vec3,
+        volume: f32,
+        // Additional spatial params (distance model, air absorption, etc.)
+    },
 }
 
-// Simulation → Audio (lock-free via triple buffer)
-pub struct SimulationResult {
-    pub distance_attenuation: f32,
-    pub air_absorption: [f32; 3],  // Low, mid, high frequency bands
-    pub direction: Vec3,  // Direction relative to listener
+// World-level listener
+pub struct PetalSonicAudioListener {
+    pose: Pose,  // Position + orientation
 }
 
-pub struct SimulationState {
-    per_source: HashMap<Uuid, SimulationResult>,
-    listener_pose: Pose,
-    generation: u64,
-}
-
-// Spatial source config (owned by World)
-pub struct SpatialSourceConfig {
-    pub position: Vec3,
-    pub volume: f32,
-    pub looping: bool,
-}
-
-// Spatial configuration
+// Spatial configuration for engine
 pub struct SpatialConfig {
-    pub sample_rate: u32,
-    pub frame_size: usize,
     pub ambisonics_order: u8,     // Default: 2
-    pub distance_scaler: f32,     // Default: 10.0
-    pub simulation_rate_hz: f32,  // Default: 60.0
-    pub hrtf_path: Option<String>, // None = use default
+    pub distance_scaler: f32,     // Default: 10.0 (converts game units to meters)
+    pub hrtf_path: Option<String>, // None = use default HRTF
 }
 ```
 
@@ -152,150 +97,130 @@ pub struct SpatialConfig {
 ```
 petalsonic-core/src/
 ├── spatial/
-│   ├── mod.rs           # Public API, types (SpatialSourceConfig, SpatialConfig)
-│   ├── simulator.rs     # SpatialSimulator (simulation thread)
-│   ├── processor.rs     # SpatialProcessor (audio thread DSP)
-│   ├── state.rs         # SimulationState, SimulationResult
+│   ├── mod.rs           # Public API, types (SpatialConfig)
+│   ├── effects.rs       # Steam Audio effect management (Direct, Encode, Decode)
+│   ├── processor.rs     # Spatial processing logic for render thread
 │   └── hrtf.rs          # HRTF loading utilities
-├── world.rs             # Add spatial source management
-├── engine.rs            # Spawn simulation thread, integrate processor
-└── playback.rs          # Update for spatial playback
+├── config/
+│   ├── mod.rs           # Re-exports
+│   └── source_config.rs # SourceConfig enum
+├── mixer.rs             # Extract mixing logic from engine
+├── world.rs             # Add listener management + SourceConfig API
+├── engine.rs            # Initialize spatial processor, route to mixer
+└── playback.rs          # Store SourceConfig in PlaybackInstance
 ```
 
 ### Implementation Plan
 
-#### **Phase 1: Core Infrastructure (Foundation)**
+#### **Stage 1: Refactor for Coexistence (Foundation)**
 
-- [ ] Create `spatial/` module structure
-- [ ] Define communication types (`WorldUpdate`, `SimulationResult`, `SimulationState`)
-- [ ] Add `triple_buffer` crate dependency
-- [ ] Implement triple buffer wrapper for lock-free state sharing
-- [ ] Add HRTF loading utilities (`spatial/hrtf.rs`)
-- [ ] Create `SpatialConfig` with sensible defaults
+**Goal**: Separate spatial/non-spatial modes, refactor mixing into clean modules, prepare for Steam Audio integration.
 
-#### **Phase 2: Simulation Thread**
+- [ ] Create module structure
+  - [ ] Create `config/source_config.rs` with `SourceConfig` enum
+  - [ ] Create `mixer.rs` module (extract mixing logic from engine)
+  - [ ] Create `spatial/mod.rs` (placeholder for Stage 2)
+- [ ] Define `SourceConfig` enum
+  - [ ] `NonSpatial` variant
+  - [ ] `Spatial { position, volume }` variant
+- [ ] Update `PetalSonicWorld` API
+  - [ ] Change `add_source()` to accept `(audio_data, SourceConfig)`
+  - [ ] Add listener management: `set_listener_pose(&mut self, pose)`
+  - [ ] Store listener pose in `PetalSonicAudioListener`
+- [ ] Update `PlaybackCommand` and `PlaybackInstance`
+  - [ ] Store `SourceConfig` in `PlaybackInstance`
+  - [ ] Pass config through `PlaybackCommand::Play`
+- [ ] Refactor render thread mixing
+  - [ ] Extract `mix_playback_instances()` to `mixer.rs`
+  - [ ] Add branching: if spatial → silence (placeholder), else → current logic
+  - [ ] Clean up `engine.rs` by using mixer module
+- [ ] Update demo/tests to use new API
+  - [ ] All existing sources use `SourceConfig::NonSpatial`
 
-- [ ] Create `SpatialSimulator` struct with Steam Audio integration
-  - [ ] Initialize Context, Simulator, Scene
-  - [ ] Set up update_receiver channel
-  - [ ] Set up triple buffer writer
-- [ ] Implement `run()` loop with update processing
-  - [ ] Process WorldUpdate messages (non-blocking)
-  - [ ] Handle source add/remove/move
-  - [ ] Handle listener updates
-- [ ] Add `run_simulation()` with Steam Audio
-  - [ ] Set shared inputs (listener pose, ray tracing params)
-  - [ ] Set per-source inputs (positions, distance model, air absorption)
-  - [ ] Call `simulator.commit()` and `simulator.run_direct()`
-  - [ ] Extract simulation outputs (distance attenuation, air absorption)
-- [ ] Write results to triple buffer (non-blocking)
-- [ ] Add configurable update rate (sleep between iterations)
-- [ ] Test simulation thread standalone (logging outputs)
+**Validation**: All existing functionality works, spatial sources output silence.
 
-#### **Phase 3: Audio Thread Processing**
+---
 
-- [ ] Create `SpatialProcessor` struct with DSP objects
-  - [ ] Initialize Context, HRTF, AmbisonicsDecodeEffect
-  - [ ] Set up triple buffer reader
-  - [ ] Pre-allocate scratch buffers (input, direct, encoded, summed, decoded)
+#### **Stage 2: Steam Audio Integration (Implementation)**
+
+**Goal**: Implement full spatial audio processing in render thread, learn from reference-audio examples.
+
+- [ ] Study reference-audio implementation
+  - [ ] Read `spatial_sound_manager.rs` (lines 1-500) for initialization patterns
+  - [ ] Identify Steam Audio object lifecycle (Context, Scene, Simulator, HRTF)
+  - [ ] Understand effect chain: Direct → AmbisonicsEncode → (accumulate) → AmbisonicsDecode
+- [ ] Initialize Steam Audio in engine
+  - [ ] Create `SpatialProcessor` struct in `spatial/processor.rs`
+  - [ ] Initialize Context, Scene, Simulator (see `pal.rs` for patterns)
+  - [ ] Load HRTF (see `spatial_sound_manager.rs` for HRTF loading)
+  - [ ] Initialize AmbisonicsDecode effect (shared across sources)
 - [ ] Implement per-source effect management
-  - [ ] Create `SpatialSourceEffects` (DirectEffect, AmbisonicsEncodeEffect)
-  - [ ] Add `add_source()` to create effect objects
-  - [ ] Add `remove_source()` to clean up
-- [ ] Implement `process_spatial_sources()` for audio callback
-  - [ ] Read latest simulation state (non-blocking try_read)
-  - [ ] Clear accumulation buffer
-  - [ ] For each spatial source:
-    - [ ] Fill input buffer from PlaybackInstance
-    - [ ] Apply DirectEffect (distance + air absorption)
-    - [ ] Encode to ambisonics with direction
-    - [ ] Accumulate to summed buffer
-  - [ ] Decode summed ambisonics to binaural stereo
-  - [ ] Mix into output buffer
-- [ ] Ensure real-time safety (no allocations, no blocking)
-
-#### **Phase 4: World Integration**
-
-- [ ] Add `PetalSonicAudioListener` to `PetalSonicWorld`
-  - [ ] Store listener pose
-  - [ ] Add `set_listener_pose(&mut self, pose: Pose)`
-- [ ] Add spatial source storage
-  - [ ] `spatial_sources: HashMap<Uuid, SpatialSourceConfig>`
-- [ ] Add communication channel to simulation thread
-  - [ ] Create `sim_update_sender: Sender<WorldUpdate>`
-  - [ ] Send updates on listener/source changes
-- [ ] Implement spatial source management APIs
-  - [ ] `add_spatial_source(audio_data, config) -> Result<Uuid>`
-  - [ ] `update_spatial_source_position(id, position) -> Result<()>`
-  - [ ] `update_spatial_source_volume(id, volume) -> Result<()>`
-  - [ ] `remove_spatial_source(id) -> Result<()>`
-- [ ] Handle automatic resampling for spatial sources
-- [ ] Wire up to existing play/pause/stop commands
-
-#### **Phase 5: Engine Integration**
-
-- [ ] Initialize `SpatialProcessor` on engine start
-  - [ ] Create triple buffer (writer for sim, reader for audio)
-  - [ ] Pass reader to SpatialProcessor
-- [ ] Spawn simulation thread
-  - [ ] Create SpatialSimulator with writer and channel receiver
-  - [ ] Spawn thread with `run()` loop
-  - [ ] Store JoinHandle for cleanup
-- [ ] Update audio callback to route spatial playback
-  - [ ] Separate spatial vs non-spatial active instances
-  - [ ] Call `spatial_processor.process_spatial_sources()`
-  - [ ] Mix spatial output with non-spatial output
-- [ ] Handle effect object lifecycle
+  - [ ] Create `SpatialSourceEffects` struct in `spatial/effects.rs`
+  - [ ] Store DirectEffect + AmbisonicsEncodeEffect per source
+  - [ ] Add `create_effects_for_source(source_id, config)` method
+  - [ ] Add `remove_effects_for_source(source_id)` method
+- [ ] Implement spatial processing in render thread
+  - [ ] Update `mixer.rs` to call spatial processor for spatial sources
+  - [ ] In `SpatialProcessor`, implement processing loop:
+    - [ ] Get source audio samples from PlaybackInstance
+    - [ ] Apply DirectEffect (distance attenuation, air absorption)
+    - [ ] Apply AmbisonicsEncodeEffect (encode with direction)
+    - [ ] Accumulate to ambisonics buffer
+  - [ ] After all sources processed:
+    - [ ] Apply AmbisonicsDecode (convert to binaural stereo)
+    - [ ] Mix spatial output with non-spatial output
+- [ ] Wire listener pose updates
+  - [ ] Pass listener pose from World → Engine → SpatialProcessor
+  - [ ] Update Steam Audio simulator with listener pose each frame
+- [ ] Handle effect lifecycle
   - [ ] Create effects when PlaybackCommand::Play for spatial source
-  - [ ] Remove effects when source finishes or stops
-- [ ] Implement graceful shutdown
-  - [ ] Send shutdown signal to simulation thread
-  - [ ] Join simulation thread on engine drop
+  - [ ] Remove effects when source stops/finishes
+- [ ] Add error handling and logging
+  - [ ] Log Steam Audio initialization
+  - [ ] Handle Steam Audio errors gracefully
 
-#### **Phase 6: Testing & Validation**
+**Validation**: Spatial sources produce spatialized audio, coexist with non-spatial sources.
 
-- [ ] Unit tests for spatial types (SimulationResult, SpatialConfig)
-- [ ] Test simulation thread in isolation
-  - [ ] Verify position updates propagate correctly
-  - [ ] Check simulation results are computed
-- [ ] Test audio processing with mock simulation state
-  - [ ] Verify effect chain (Direct → Encode → Decode)
-  - [ ] Check buffer management (no overflows)
-- [ ] Integration test: Moving listener + static source
-- [ ] Integration test: Static listener + moving source
-- [ ] Integration test: Multiple sources mixing correctly
-- [ ] Test graceful degradation (slow simulation thread)
+---
 
-#### **Phase 7: Optimization & Polish**
+#### **Stage 3: Polish & Optimization**
 
-- [ ] Profile simulation thread CPU usage
-  - [ ] Measure time per simulation run
-  - [ ] Tune simulation rate (30Hz? 60Hz? 120Hz?)
-- [ ] Profile audio callback latency
-  - [ ] Ensure spatial processing fits in buffer time
-- [ ] Add metrics/logging
-  - [ ] Track simulation lag (generation counter)
-  - [ ] Log audio callback overruns
-  - [ ] Add optional tracing/profiling hooks
-- [ ] Optimize hot paths
-  - [ ] Minimize HashMap lookups in audio callback
-  - [ ] Consider array-based storage for active sources
-- [ ] Test with high source counts (32, 64, 128 sources)
-- [ ] Add documentation and examples
-  - [ ] Example: `spatial_source_moving.rs`
-  - [ ] Example: `listener_moving.rs`
-  - [ ] API documentation for spatial module
+**Goal**: Performance tuning, testing, documentation.
+
+- [ ] Performance profiling
+  - [ ] Measure render thread CPU usage with spatial sources
+  - [ ] Ensure spatial processing fits in render thread budget
+  - [ ] Test with multiple spatial sources (8, 16, 32+)
+- [ ] Testing
+  - [ ] Unit tests for SourceConfig
+  - [ ] Integration test: static listener + moving spatial source
+  - [ ] Integration test: moving listener + static spatial source
+  - [ ] Integration test: mix of spatial + non-spatial sources
+- [ ] API refinement
+  - [ ] Add `update_source_position(source_id, position)` to World
+  - [ ] Add `update_source_volume(source_id, volume)` to World
+- [ ] Documentation
+  - [ ] Document SourceConfig API
+  - [ ] Add example: `spatial_audio_demo.rs`
+  - [ ] Document Steam Audio configuration options
+- [ ] Optimization
+  - [ ] Pre-allocate buffers for spatial processing
+  - [ ] Minimize allocations in render thread
+  - [ ] Consider batch processing for multiple spatial sources
+
+**Validation**: Production-ready spatial audio with good performance.
+
+---
 
 ### Features Included (MVP)
 
+✅ Coexistence of spatial and non-spatial sources
 ✅ HRTF-based binaural spatialization
 ✅ Distance attenuation + air absorption
-✅ Ambisonics (order 2) for spatial accuracy
-✅ Loop and one-shot playback
-✅ Per-source volume control
-✅ Listener pose updates (position + orientation)
-✅ Lock-free audio thread (triple buffer)
-✅ Separate simulation thread (better performance)
+✅ Ambisonics encoding/decoding
+✅ World-level listener pose
+✅ Per-source spatial configuration
+✅ Clean module separation
 
 ### Features Deferred (Future)
 
@@ -304,28 +229,22 @@ petalsonic-core/src/
 ❌ Doppler effect
 ❌ Per-source directivity
 ❌ Dynamic HRTF switching
-❌ Streaming spatial sources
+❌ Source streaming (currently all sources are pre-loaded)
 
-### Performance Targets
-
-- **Simulation rate**: 60Hz (16.6ms per update)
-- **Audio callback**: < 10ms processing time (for 1024 samples @ 48kHz = 21ms budget)
-- **Max sources**: 64 spatial sources mixing simultaneously
-- **Latency**: Triple buffer adds ~1-2 simulation frames (16-33ms) to position updates
-
-### Dependencies to Add
+### Dependencies (Already Present)
 
 ```toml
 [dependencies]
-triple_buffer = "7.0"
-audionimbus = "0.5"  # Already present
-crossbeam-channel = "0.5"  # Already present for other use
+audionimbus = { version = "0.8.1", features = ["auto-install"] }  # Steam Audio
+crossbeam-channel = "0.5.13"  # Command channels
+ringbuf = "0.4.7"  # Ring buffer
+glam = { workspace = true }  # Vec3, math
 ```
 
 ### Notes
 
-- **Triple buffer** prevents audio thread from blocking on simulation state reads
-- **Simulation thread** can safely use HashMap, allocations, etc. (not real-time constrained)
-- **Audio thread** remains real-time safe (no blocking, no allocations)
-- **Generation counter** helps detect if simulation is falling behind
-- **Distance scaler** converts game units to Steam Audio units (typically meters)
+- **No separate simulation thread**: Spatial processing happens in existing render thread (simpler)
+- **Render thread is not real-time critical**: Can do Steam Audio processing safely
+- **Audio callback remains lock-free**: Only consumes from ring buffer
+- **Learn from reference-audio**: Don't reinvent, adapt existing patterns
+- **Staged approach**: Stage 1 = foundation (non-breaking), Stage 2 = spatial implementation

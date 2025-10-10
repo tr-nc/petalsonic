@@ -179,10 +179,11 @@ impl SpatialAudioDemo {
         );
     }
 
-    fn handle_mouse_click(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let response = ui.allocate_rect(rect, egui::Sense::click());
+    fn handle_mouse_drag(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let response = ui.allocate_rect(rect, egui::Sense::drag());
 
-        if response.clicked() {
+        // Check if we're currently dragging or if drag just started
+        if response.dragged() || response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
                 // Convert screen position to world position
                 let new_world_pos = self.screen_to_world(pos, rect);
@@ -203,8 +204,14 @@ impl SpatialAudioDemo {
                     log::error!("Failed to update source config: {}", e);
                 }
 
-                log::info!("Source position updated to {:?}", clamped_pos);
+                if response.drag_started() {
+                    log::info!("Started dragging source");
+                }
             }
+        }
+
+        if response.drag_stopped() {
+            log::info!("Stopped dragging source at {:?}", self.source_position);
         }
     }
 }
@@ -213,7 +220,7 @@ impl eframe::App for SpatialAudioDemo {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("PetalSonic Spatial Audio Demo");
-            ui.label("Click anywhere on the grid to move the audio source");
+            ui.label("Drag anywhere on the grid to move the audio source");
             ui.separator();
 
             // Allocate space for the visualization
@@ -228,7 +235,7 @@ impl eframe::App for SpatialAudioDemo {
             self.draw_source(ui, rect);
 
             // Handle mouse input
-            self.handle_mouse_click(ui, rect);
+            self.handle_mouse_drag(ui, rect);
 
             ui.separator();
             ui.label(format!(

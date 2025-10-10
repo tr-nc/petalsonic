@@ -4,6 +4,7 @@ use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::mixer;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
+use crate::spatial::SpatialProcessor;
 use crate::world::{PetalSonicWorld, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -59,6 +60,8 @@ struct RenderThreadContext {
     ring_buffer_producer: HeapProd<StereoFrame>,
     channels: u16,
     block_size: usize,
+    spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
+    world: Arc<PetalSonicWorld>,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -98,11 +101,28 @@ pub struct PetalSonicEngine {
     render_thread: Option<thread::JoinHandle<()>>,
     /// Shutdown signal for render thread
     render_shutdown: Arc<AtomicBool>,
+    /// Spatial audio processor
+    spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
 }
 
 impl PetalSonicEngine {
     /// Create a new audio engine with the given configuration and world
     pub fn new(desc: PetalSonicWorldDesc, world: Arc<PetalSonicWorld>) -> Result<Self> {
+        // Initialize spatial processor
+        // Use distance_scaler of 10.0 (converts game units to meters, as in reference)
+        let spatial_processor = match SpatialProcessor::new(desc.sample_rate, desc.block_size, 10.0)
+        {
+            Ok(processor) => {
+                log::info!("Spatial audio processor initialized");
+                Some(Arc::new(Mutex::new(processor)))
+            }
+            Err(e) => {
+                log::warn!("Failed to initialize spatial audio processor: {}", e);
+                log::warn!("Spatial audio will be disabled");
+                None
+            }
+        };
+
         Ok(Self {
             device_sample_rate: desc.sample_rate, // Will be updated when stream starts
             desc,
@@ -114,6 +134,7 @@ impl PetalSonicEngine {
             active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
             render_thread: None,
             render_shutdown: Arc::new(AtomicBool::new(false)),
+            spatial_processor,
         })
     }
 
@@ -317,6 +338,16 @@ impl PetalSonicEngine {
         let target_buffer_fill = ctx.block_size * 4;
 
         while !ctx.shutdown.load(Ordering::Relaxed) {
+            // Update listener pose in spatial processor if available
+            if let Some(ref spatial_processor) = ctx.spatial_processor {
+                if let Ok(mut processor) = spatial_processor.try_lock() {
+                    let listener_pose = ctx.world.listener().pose();
+                    if let Err(e) = processor.set_listener_pose(listener_pose) {
+                        log::error!("Failed to update listener pose: {}", e);
+                    }
+                }
+            }
+
             // Check ring buffer occupancy (lock-free!)
             let occupied = ctx.ring_buffer_producer.occupied_len();
             let should_generate = occupied < target_buffer_fill;
@@ -335,6 +366,7 @@ impl PetalSonicEngine {
                         &ctx.resampler,
                         &ctx.active_playback,
                         ctx.block_size,
+                        ctx.spatial_processor.as_ref(),
                     );
                 }
             }
@@ -384,6 +416,8 @@ impl PetalSonicEngine {
             ring_buffer_producer: producer,
             channels: params.channels,
             block_size,
+            spatial_processor: self.spatial_processor.clone(),
+            world: params.world.clone(),
         };
 
         // Spawn render thread
@@ -572,6 +606,7 @@ impl PetalSonicEngine {
         resampler_arc: &Arc<Mutex<StreamingResampler>>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         block_size: usize,
+        spatial_processor: Option<&Arc<Mutex<SpatialProcessor>>>,
     ) {
         let Ok(mut resampler) = resampler_arc.try_lock() else {
             log::warn!("Failed to acquire resampler lock in generate_resampled_samples");
@@ -591,7 +626,16 @@ impl PetalSonicEngine {
                 world_buffer.fill(0.0f32);
 
                 // Use the mixer module to mix all playback instances
-                mixer::mix_playback_instances(&mut world_buffer, channels, active_playback);
+                // Pass spatial processor if available
+                let mut spatial_processor_guard =
+                    spatial_processor.and_then(|sp| sp.try_lock().ok());
+
+                mixer::mix_playback_instances(
+                    &mut world_buffer,
+                    channels,
+                    active_playback,
+                    spatial_processor_guard.as_deref_mut(),
+                );
 
                 RESAMPLED_BUFFER.with(|rbuf| {
                     let mut resampled_buffer = rbuf.borrow_mut();

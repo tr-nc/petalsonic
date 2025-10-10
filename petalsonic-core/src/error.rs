@@ -28,6 +28,9 @@ pub enum PetalSonicError {
     #[error("Spatialization error: {0}")]
     Spatialization(String),
 
+    #[error("Spatial audio error: {0}")]
+    SpatialAudio(String),
+
     #[error("Unknown error: {0}")]
     Unknown(String),
 }

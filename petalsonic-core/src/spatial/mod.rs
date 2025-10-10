@@ -1,7 +1,11 @@
-// Spatial audio module - placeholder for Stage 2
-// This module will contain:
-// - effects.rs: Steam Audio effect management (Direct, Encode, Decode)
-// - processor.rs: Spatial processing logic for render thread
-// - hrtf.rs: HRTF loading utilities
+// Spatial audio module
+//
+// This module provides Steam Audio integration for 3D spatial audio processing.
+// It includes effect management, HRTF loading, and the main spatial processor.
 
-// For now, this module is empty and will be implemented in Stage 2
+mod effects;
+mod hrtf;
+mod processor;
+
+// Public API
+pub use processor::SpatialProcessor;

@@ -12,8 +12,8 @@ fn main() {
         .filter_level(log::LevelFilter::Debug)
         .init();
 
-    log::info!("=== Running Non-Spatial Audio Test ===");
-    test_non_spatial_audio().unwrap();
+    // log::info!("=== Running Non-Spatial Audio Test ===");
+    // test_non_spatial_audio().unwrap();
 
     log::info!("\n=== Running Spatial Audio Test ===");
     test_spatial_audio().unwrap();
@@ -105,7 +105,7 @@ fn test_spatial_audio() -> Result<()> {
 
     // Load audio file and create a spatial source at (0, 0, -1) - directly in front
     let audio_data = PetalSonicAudioData::from_path(wav_path)?;
-    let spatial_position = Vec3::new(0.0, 0.0, -1.0);
+    let spatial_position = Vec3::new(0.0, 0.0, -0.1);
     let audio_id = world.add_source(
         audio_data,
         SourceConfig::spatial_with_volume(spatial_position, 1.0),

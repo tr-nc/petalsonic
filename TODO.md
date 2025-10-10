@@ -112,32 +112,32 @@ petalsonic-core/src/
 
 ### Implementation Plan
 
-#### **Stage 1: Refactor for Coexistence (Foundation)**
+#### **Stage 1: Refactor for Coexistence (Foundation)** ✅
 
 **Goal**: Separate spatial/non-spatial modes, refactor mixing into clean modules, prepare for Steam Audio integration.
 
-- [ ] Create module structure
-  - [ ] Create `config/source_config.rs` with `SourceConfig` enum
-  - [ ] Create `mixer.rs` module (extract mixing logic from engine)
-  - [ ] Create `spatial/mod.rs` (placeholder for Stage 2)
-- [ ] Define `SourceConfig` enum
-  - [ ] `NonSpatial` variant
-  - [ ] `Spatial { position, volume }` variant
-- [ ] Update `PetalSonicWorld` API
-  - [ ] Change `add_source()` to accept `(audio_data, SourceConfig)`
-  - [ ] Add listener management: `set_listener_pose(&mut self, pose)`
-  - [ ] Store listener pose in `PetalSonicAudioListener`
-- [ ] Update `PlaybackCommand` and `PlaybackInstance`
-  - [ ] Store `SourceConfig` in `PlaybackInstance`
-  - [ ] Pass config through `PlaybackCommand::Play`
-- [ ] Refactor render thread mixing
-  - [ ] Extract `mix_playback_instances()` to `mixer.rs`
-  - [ ] Add branching: if spatial → silence (placeholder), else → current logic
-  - [ ] Clean up `engine.rs` by using mixer module
-- [ ] Update demo/tests to use new API
-  - [ ] All existing sources use `SourceConfig::NonSpatial`
+- [x] Create module structure
+  - [x] Create `config/source_config.rs` with `SourceConfig` enum
+  - [x] Create `mixer.rs` module (extract mixing logic from engine)
+  - [x] Create `spatial/mod.rs` (placeholder for Stage 2)
+- [x] Define `SourceConfig` enum
+  - [x] `NonSpatial` variant
+  - [x] `Spatial { position, volume }` variant
+- [x] Update `PetalSonicWorld` API
+  - [x] Change `add_source()` to accept `(audio_data, SourceConfig)`
+  - [x] Add listener management: `set_listener_pose(&mut self, pose)`
+  - [x] Store listener pose in `PetalSonicAudioListener`
+- [x] Update `PlaybackCommand` and `PlaybackInstance`
+  - [x] Store `SourceConfig` in `PlaybackInstance`
+  - [x] Pass config through `PlaybackCommand::Play`
+- [x] Refactor render thread mixing
+  - [x] Extract `mix_playback_instances()` to `mixer.rs`
+  - [x] Add branching: if spatial → silence (placeholder), else → current logic
+  - [x] Clean up `engine.rs` by using mixer module
+- [x] Update demo/tests to use new API
+  - [x] All existing sources use `SourceConfig::NonSpatial`
 
-**Validation**: All existing functionality works, spatial sources output silence.
+**Validation**: ✅ All existing functionality works, spatial sources output silence.
 
 ---
 

@@ -4,10 +4,12 @@ pub mod engine;
 pub mod error;
 pub mod events;
 pub mod math;
+pub mod mixer;
 pub mod playback;
+pub mod spatial;
 pub mod world;
 
-pub use config::PetalSonicWorldDesc;
+pub use config::{PetalSonicWorldDesc, SourceConfig};
 pub use engine::{AudioFillCallback, PetalSonicEngine};
 pub use error::PetalSonicError;
 pub use events::PetalSonicEvent;

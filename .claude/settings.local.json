@@ -8,7 +8,9 @@
       "Bash(cargo:*)",
       "Bash(git commit:*)",
       "WebFetch(domain:github.com)",
-      "Bash(git mv:*)"
+      "Bash(git mv:*)",
+      "Bash(mkdir:*)",
+      "Bash(mv:*)"
     ],
     "deny": [],
     "ask": []

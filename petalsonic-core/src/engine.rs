@@ -2,6 +2,7 @@ use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::PetalSonicWorldDesc;
 use crate::error::PetalSonicError;
 use crate::error::Result;
+use crate::mixer;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
 use crate::world::{PetalSonicWorld, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -535,14 +536,16 @@ impl PetalSonicEngine {
             };
 
             match command {
-                PlaybackCommand::Play(audio_id) => {
+                PlaybackCommand::Play(audio_id, config) => {
                     let Some(audio_data) = world.get_audio_data(audio_id) else {
                         continue;
                     };
 
                     active_playback
                         .entry(audio_id)
-                        .or_insert_with(|| PlaybackInstance::new(audio_id, audio_data.clone()))
+                        .or_insert_with(|| {
+                            PlaybackInstance::new(audio_id, audio_data.clone(), config)
+                        })
                         .play();
                 }
                 PlaybackCommand::Pause(audio_id) => {
@@ -587,7 +590,8 @@ impl PetalSonicEngine {
                 world_buffer.resize(world_buffer_size, 0.0f32);
                 world_buffer.fill(0.0f32);
 
-                Self::mix_playback_instances(&mut world_buffer, channels, active_playback);
+                // Use the mixer module to mix all playback instances
+                mixer::mix_playback_instances(&mut world_buffer, channels, active_playback);
 
                 RESAMPLED_BUFFER.with(|rbuf| {
                     let mut resampled_buffer = rbuf.borrow_mut();
@@ -634,29 +638,6 @@ impl PetalSonicEngine {
                 break;
             }
         }
-    }
-
-    /// Mix all active playback instances into the buffer
-    fn mix_playback_instances(
-        world_buffer: &mut [f32],
-        channels: u16,
-        active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
-    ) -> usize {
-        let Ok(mut active_playback) = active_playback.try_lock() else {
-            log::warn!("Failed to acquire active playback lock in audio callback");
-            return 0;
-        };
-
-        // only keep the instances that are not finished
-        active_playback.retain(|_, instance| !instance.info.is_finished());
-
-        let mut frames_filled_max = 0;
-        for instance in active_playback.values_mut() {
-            let frames_filled = instance.fill_buffer(world_buffer, channels);
-            frames_filled_max = frames_filled_max.max(frames_filled);
-        }
-
-        frames_filled_max
     }
 }
 

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use petalsonic_core::SourceConfig;
 use petalsonic_core::audio_data::PetalSonicAudioData;
 use petalsonic_core::config::PetalSonicWorldDesc;
 use petalsonic_core::engine::PetalSonicEngine;
@@ -29,7 +30,7 @@ fn test_new_playback_system() -> Result<()> {
 
     // Load audio file using the new API
     let audio_data = PetalSonicAudioData::from_path(wav_path)?;
-    let audio_id = world.add_source(audio_data)?;
+    let audio_id = world.add_source(audio_data, SourceConfig::NonSpatial)?;
     log::info!("Audio loaded with ID: {}", audio_id);
 
     // Create engine with the world

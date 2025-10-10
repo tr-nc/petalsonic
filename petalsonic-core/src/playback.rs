@@ -1,4 +1,5 @@
 use crate::audio_data::PetalSonicAudioData;
+use crate::config::SourceConfig;
 use crate::world::SourceId;
 use std::sync::Arc;
 
@@ -56,10 +57,16 @@ pub struct PlaybackInstance {
     pub audio_data: Arc<PetalSonicAudioData>,
     /// Current playback information
     pub info: PlaybackInfo,
+    /// Source configuration (spatial/non-spatial)
+    pub config: SourceConfig,
 }
 
 impl PlaybackInstance {
-    pub fn new(audio_id: SourceId, audio_data: Arc<PetalSonicAudioData>) -> Self {
+    pub fn new(
+        audio_id: SourceId,
+        audio_data: Arc<PetalSonicAudioData>,
+        config: SourceConfig,
+    ) -> Self {
         let total_frames = audio_data.samples().len();
         let sample_rate = audio_data.sample_rate();
         let info = PlaybackInfo::new(total_frames, sample_rate);
@@ -68,6 +75,7 @@ impl PlaybackInstance {
             audio_id,
             audio_data,
             info,
+            config,
         }
     }
 
@@ -131,7 +139,7 @@ impl PlaybackInstance {
 /// Commands that can be sent to the audio engine for playback control
 #[derive(Debug)]
 pub enum PlaybackCommand {
-    Play(SourceId),
+    Play(SourceId, SourceConfig),
     Pause(SourceId),
     Stop(SourceId),
     StopAll,

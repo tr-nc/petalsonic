@@ -143,4 +143,5 @@ pub enum PlaybackCommand {
     Pause(SourceId),
     Stop(SourceId),
     StopAll,
+    UpdateConfig(SourceId, SourceConfig),
 }

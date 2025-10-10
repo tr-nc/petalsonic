@@ -141,45 +141,45 @@ petalsonic-core/src/
 
 ---
 
-#### **Stage 2: Steam Audio Integration (Implementation)**
+#### **Stage 2: Steam Audio Integration (Implementation)** ✅
 
 **Goal**: Implement full spatial audio processing in render thread, learn from reference-audio examples.
 
-- [ ] Study reference-audio implementation
-  - [ ] Read `spatial_sound_manager.rs` (lines 1-500) for initialization patterns
-  - [ ] Identify Steam Audio object lifecycle (Context, Scene, Simulator, HRTF)
-  - [ ] Understand effect chain: Direct → AmbisonicsEncode → (accumulate) → AmbisonicsDecode
-- [ ] Initialize Steam Audio in engine
-  - [ ] Create `SpatialProcessor` struct in `spatial/processor.rs`
-  - [ ] Initialize Context, Scene, Simulator (see `pal.rs` for patterns)
-  - [ ] Load HRTF (see `spatial_sound_manager.rs` for HRTF loading)
-  - [ ] Initialize AmbisonicsDecode effect (shared across sources)
-- [ ] Implement per-source effect management
-  - [ ] Create `SpatialSourceEffects` struct in `spatial/effects.rs`
-  - [ ] Store DirectEffect + AmbisonicsEncodeEffect per source
-  - [ ] Add `create_effects_for_source(source_id, config)` method
-  - [ ] Add `remove_effects_for_source(source_id)` method
-- [ ] Implement spatial processing in render thread
-  - [ ] Update `mixer.rs` to call spatial processor for spatial sources
-  - [ ] In `SpatialProcessor`, implement processing loop:
-    - [ ] Get source audio samples from PlaybackInstance
-    - [ ] Apply DirectEffect (distance attenuation, air absorption)
-    - [ ] Apply AmbisonicsEncodeEffect (encode with direction)
-    - [ ] Accumulate to ambisonics buffer
-  - [ ] After all sources processed:
-    - [ ] Apply AmbisonicsDecode (convert to binaural stereo)
-    - [ ] Mix spatial output with non-spatial output
-- [ ] Wire listener pose updates
-  - [ ] Pass listener pose from World → Engine → SpatialProcessor
-  - [ ] Update Steam Audio simulator with listener pose each frame
-- [ ] Handle effect lifecycle
-  - [ ] Create effects when PlaybackCommand::Play for spatial source
-  - [ ] Remove effects when source stops/finishes
-- [ ] Add error handling and logging
-  - [ ] Log Steam Audio initialization
-  - [ ] Handle Steam Audio errors gracefully
+- [x] Study reference-audio implementation
+  - [x] Read `spatial_sound_manager.rs` (lines 1-500) for initialization patterns
+  - [x] Identify Steam Audio object lifecycle (Context, Scene, Simulator, HRTF)
+  - [x] Understand effect chain: Direct → AmbisonicsEncode → (accumulate) → AmbisonicsDecode
+- [x] Initialize Steam Audio in engine
+  - [x] Create `SpatialProcessor` struct in `spatial/processor.rs`
+  - [x] Initialize Context, Scene, Simulator (see `pal.rs` for patterns)
+  - [x] Load HRTF (see `spatial_sound_manager.rs` for HRTF loading)
+  - [x] Initialize AmbisonicsDecode effect (shared across sources)
+- [x] Implement per-source effect management
+  - [x] Create `SpatialSourceEffects` struct in `spatial/effects.rs`
+  - [x] Store DirectEffect + AmbisonicsEncodeEffect per source
+  - [x] Add `create_effects_for_source(source_id, config)` method
+  - [x] Add `remove_effects_for_source(source_id)` method
+- [x] Implement spatial processing in render thread
+  - [x] Update `mixer.rs` to call spatial processor for spatial sources
+  - [x] In `SpatialProcessor`, implement processing loop:
+    - [x] Get source audio samples from PlaybackInstance
+    - [x] Apply DirectEffect (distance attenuation, air absorption)
+    - [x] Apply AmbisonicsEncodeEffect (encode with direction)
+    - [x] Accumulate to ambisonics buffer
+  - [x] After all sources processed:
+    - [x] Apply AmbisonicsDecode (convert to binaural stereo)
+    - [x] Mix spatial output with non-spatial output
+- [x] Wire listener pose updates
+  - [x] Pass listener pose from World → Engine → SpatialProcessor
+  - [x] Update Steam Audio simulator with listener pose each frame
+- [x] Handle effect lifecycle
+  - [x] Create effects when PlaybackCommand::Play for spatial source
+  - [x] Remove effects when source stops/finishes
+- [x] Add error handling and logging
+  - [x] Log Steam Audio initialization
+  - [x] Handle Steam Audio errors gracefully
 
-**Validation**: Spatial sources produce spatialized audio, coexist with non-spatial sources.
+**Validation**: ✅ Spatial sources produce spatialized audio, coexist with non-spatial sources.
 
 ---
 

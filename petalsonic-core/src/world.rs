@@ -34,7 +34,7 @@ impl std::fmt::Display for SourceId {
 pub struct PetalSonicWorld {
     desc: PetalSonicWorldDesc,
     audio_data_storage: HashMap<SourceId, Arc<PetalSonicAudioData>>,
-    source_configs: HashMap<SourceId, SourceConfig>,
+    source_configs: std::sync::Mutex<HashMap<SourceId, SourceConfig>>,
     listener: PetalSonicAudioListener,
     next_source_id: u64,
     command_sender: Sender<PlaybackCommand>,
@@ -47,7 +47,7 @@ impl PetalSonicWorld {
         Ok(Self {
             desc: config,
             audio_data_storage: HashMap::new(),
-            source_configs: HashMap::new(),
+            source_configs: std::sync::Mutex::new(HashMap::new()),
             listener: PetalSonicAudioListener::default(),
             next_source_id: 0,
             command_sender,
@@ -83,7 +83,7 @@ impl PetalSonicWorld {
         let id = SourceId(self.next_source_id);
         self.next_source_id += 1;
         self.audio_data_storage.insert(id, resampled_audio_data);
-        self.source_configs.insert(id, config);
+        self.source_configs.lock().unwrap().insert(id, config);
         Ok(id)
     }
 
@@ -110,7 +110,7 @@ impl PetalSonicWorld {
     ///
     /// The removed audio data if it existed, `None` otherwise
     pub fn remove_audio_data(&mut self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
-        self.source_configs.remove(&id);
+        self.source_configs.lock().unwrap().remove(&id);
         self.audio_data_storage.remove(&id)
     }
 
@@ -140,6 +140,47 @@ impl PetalSonicWorld {
         &self.listener
     }
 
+    /// Updates the configuration for a source (e.g., position, volume).
+    ///
+    /// This is useful for dynamically changing spatial audio properties without
+    /// stopping and restarting playback.
+    ///
+    /// # Arguments
+    ///
+    /// * `audio_id` - SourceId of the audio source to update
+    /// * `config` - New configuration for the source
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the audio source ID is not found or if the command
+    /// fails to send to the audio engine.
+    pub fn update_source_config(&self, audio_id: SourceId, config: SourceConfig) -> Result<()> {
+        if !self.contains_audio(audio_id) {
+            return Err(crate::error::PetalSonicError::Engine(format!(
+                "Audio data with ID {:?} not found",
+                audio_id
+            )));
+        }
+
+        // Update the config in storage
+        self.source_configs
+            .lock()
+            .unwrap()
+            .insert(audio_id, config.clone());
+
+        // Send command to update active playback instance if it exists
+        self.command_sender
+            .send(PlaybackCommand::UpdateConfig(audio_id, config))
+            .map_err(|e| {
+                crate::error::PetalSonicError::Engine(format!(
+                    "Failed to send update config command: {}",
+                    e
+                ))
+            })?;
+
+        Ok(())
+    }
+
     /// Starts playing an audio source by its SourceId.
     ///
     /// Sends a play command to the audio engine thread. The audio will begin playing
@@ -164,6 +205,8 @@ impl PetalSonicWorld {
         // Get the source config for this audio source
         let config = self
             .source_configs
+            .lock()
+            .unwrap()
             .get(&audio_id)
             .cloned()
             .unwrap_or_default();

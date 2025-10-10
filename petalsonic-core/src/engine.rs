@@ -590,6 +590,11 @@ impl PetalSonicEngine {
                 PlaybackCommand::Stop(audio_id) => {
                     active_playback.remove(&audio_id);
                 }
+                PlaybackCommand::UpdateConfig(audio_id, config) => {
+                    if let Some(instance) = active_playback.get_mut(&audio_id) {
+                        instance.config = config;
+                    }
+                }
                 PlaybackCommand::StopAll => {
                     active_playback.clear();
                 }

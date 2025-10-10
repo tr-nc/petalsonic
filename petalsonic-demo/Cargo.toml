@@ -8,3 +8,5 @@ petalsonic-core = { path = "../petalsonic-core" }
 env_logger = "0.10"
 log = { workspace = true }
 anyhow = "1.0"
+eframe = "0.29"
+egui = "0.29"

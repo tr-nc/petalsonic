@@ -25,7 +25,6 @@ fn test_non_spatial_audio() -> Result<()> {
     let world_desc = PetalSonicWorldDesc {
         sample_rate: 48000,
         block_size: 1024,
-        enable_spatialization: false,
         ..Default::default()
     };
 
@@ -84,7 +83,6 @@ fn test_spatial_audio() -> Result<()> {
     let world_desc = PetalSonicWorldDesc {
         sample_rate: 48000,
         block_size: 1024,
-        enable_spatialization: true,
         ..Default::default()
     };
 

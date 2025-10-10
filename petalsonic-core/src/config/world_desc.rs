@@ -15,8 +15,6 @@ pub struct PetalSonicWorldDesc {
     pub buffer_duration: Duration,
     /// Maximum number of concurrent audio sources
     pub max_sources: usize,
-    /// Whether to enable spatial audio processing
-    pub enable_spatialization: bool,
 }
 
 impl Default for PetalSonicWorldDesc {
@@ -27,7 +25,6 @@ impl Default for PetalSonicWorldDesc {
             channels: 2,
             buffer_duration: Duration::from_millis(10),
             max_sources: 64,
-            enable_spatialization: true,
         }
     }
 }

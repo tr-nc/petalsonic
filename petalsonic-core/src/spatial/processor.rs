@@ -272,6 +272,7 @@ impl SpatialProcessor {
         let samples = instance.audio_data.samples();
         let current_frame = instance.info.current_frame;
 
+        // Read samples for this block
         for i in 0..self.frame_size {
             let sample_idx = current_frame + i;
             if sample_idx < samples.len() {
@@ -279,24 +280,9 @@ impl SpatialProcessor {
             }
         }
 
-        // Advance playback position
-        instance.info.current_frame += self.frame_size;
-        instance
-            .info
-            .update_position(instance.info.current_frame, self.sample_rate);
-
-        // Check if finished and set flags (same logic as PlaybackInstance::fill_buffer)
-        if instance.info.is_finished() {
-            log::debug!(
-                "SpatialProcessor: Source {} reached end at frame {} (loop mode: {:?})",
-                instance.audio_id,
-                instance.info.current_frame,
-                instance.loop_mode
-            );
-            // Set flag for event emission
-            instance.reached_end_this_iteration = true;
-            instance.info.play_state = crate::playback::PlayState::Stopped;
-        }
+        // Advance cursor and check for completion (single source of truth!)
+        // This ensures both spatial and non-spatial paths use identical completion logic
+        instance.advance_and_check_completion(self.frame_size);
     }
 
     /// Apply direct effect to the input buffer

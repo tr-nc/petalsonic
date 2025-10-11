@@ -163,13 +163,52 @@ impl PlaybackInstance {
         self.info.play_state = PlayState::Stopped;
     }
 
+    /// Advance playback cursor and check for completion
+    ///
+    /// This is the **single source of truth** for frame advancement and completion checking.
+    /// Call this whenever you consume frames from the audio data, whether in regular
+    /// fill_buffer() or in the spatial processor.
+    ///
+    /// # Arguments
+    /// * `frames_consumed` - Number of frames consumed from audio data
+    ///
+    /// # Behavior
+    /// - Updates current_frame and timing info
+    /// - If reached end of audio data:
+    ///   - Sets `reached_end_this_iteration` flag for event emission
+    ///   - Sets state to Stopped (for BOTH Once and Infinite modes)
+    ///   - The mixer will handle restart for Infinite mode
+    pub(crate) fn advance_and_check_completion(&mut self, frames_consumed: usize) {
+        self.info.current_frame += frames_consumed;
+        self.info
+            .update_position(self.info.current_frame, self.audio_data.sample_rate());
+
+        // Check if we've reached the end
+        if self.info.current_frame >= self.audio_data.samples().len() {
+            log::debug!(
+                "Source {} reached end at frame {}/{} (loop mode: {:?}, consumed {} frames)",
+                self.audio_id,
+                self.info.current_frame,
+                self.audio_data.samples().len(),
+                self.loop_mode,
+                frames_consumed
+            );
+
+            // Mark that we reached the end this iteration (for event emission)
+            self.reached_end_this_iteration = true;
+
+            // Stop playback - mixer will handle restart for Infinite mode
+            self.info.play_state = PlayState::Stopped;
+        }
+    }
+
     /// Fill audio buffer for this instance
     /// Returns the number of frames actually filled
     ///
     /// # Behavior
     /// When reaching the end of audio data:
-    /// - Sets `reached_end_this_iteration` flag for event emission
-    /// - Stops playing (for BOTH Once and Infinite modes)
+    /// - Calls advance_and_check_completion() which handles all completion logic
+    /// - For BOTH Once and Infinite modes, playback stops
     /// - Infinite mode will be explicitly restarted by the mixer
     pub fn fill_buffer(&mut self, buffer: &mut [f32], channels: u16) -> usize {
         if !matches!(self.info.play_state, PlayState::Playing) {
@@ -182,22 +221,14 @@ impl PlaybackInstance {
         let mut frames_filled = 0;
 
         for frame_idx in 0..frame_count {
-            if self.info.current_frame >= samples.len() {
-                // Reached end of audio - mark flag and STOP (no cursor wrapping!)
-                self.reached_end_this_iteration = true;
-                self.info.play_state = PlayState::Stopped;
+            let sample_idx = self.info.current_frame + frame_idx;
 
-                log::debug!(
-                    "Source {} reached end at frame {} (loop mode: {:?}, filled {} frames)",
-                    self.audio_id,
-                    self.info.current_frame,
-                    self.loop_mode,
-                    frames_filled
-                );
+            if sample_idx >= samples.len() {
+                // Reached end - stop here
                 break;
             }
 
-            let sample = samples[self.info.current_frame];
+            let sample = samples[sample_idx];
 
             // Fill all channels with the same sample (mono to stereo)
             for channel in 0..channels_usize {
@@ -207,13 +238,14 @@ impl PlaybackInstance {
                 }
             }
 
-            self.info.current_frame += 1;
             frames_filled += 1;
         }
 
-        // Update timing info
-        self.info
-            .update_position(self.info.current_frame, self.audio_data.sample_rate());
+        // Advance cursor and check for completion (single source of truth!)
+        if frames_filled > 0 {
+            self.advance_and_check_completion(frames_filled);
+        }
+
         frames_filled
     }
 

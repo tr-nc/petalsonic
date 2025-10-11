@@ -5,6 +5,7 @@ use petalsonic_core::{
     config::PetalSonicWorldDesc,
     engine::PetalSonicEngine,
     math::{Pose, Quat, Vec3},
+    playback::LoopMode,
     world::{PetalSonicWorld, SourceId},
 };
 use std::sync::Arc;
@@ -28,7 +29,7 @@ impl SpatialAudioDemo {
         let world_desc = PetalSonicWorldDesc {
             sample_rate: 48000,
             block_size: 1024,
-            hrtf_path: Some("petalsonic-demo/assets/hrtf/hrtf_b_nh172.sofa".to_string()),
+            hrtf_path: Some("petalsonic-demo/asset/hrtf/hrtf_b_nh172.sofa".to_string()),
             ..Default::default()
         };
 
@@ -42,9 +43,9 @@ impl SpatialAudioDemo {
         log::info!("Listener pose set to origin");
 
         // Load audio file and create a spatial source
-        let wav_path = "res/cicada_test_96k.wav";
+        let wav_path = "petalsonic-demo/asset/sound/cicada_test_96k.wav";
         let audio_data = PetalSonicAudioData::from_path(wav_path)
-            .expect("Failed to load audio file. Make sure res/cicada_test_96k.wav exists.");
+            .expect("Failed to load audio file. Make sure petalsonic-demo/asset/sound/cicada_test_96k.wav exists.");
 
         let initial_position = Vec3::new(0.0, 0.0, -1.0); // 1 meter in front
         let source_id = world
@@ -69,7 +70,9 @@ impl SpatialAudioDemo {
         log::info!("Audio engine started");
 
         // Start playback
-        world_arc.play(source_id).expect("Failed to start playback");
+        world_arc
+            .play(source_id, LoopMode::Infinite)
+            .expect("Failed to start playback");
         log::info!("Playback started");
 
         Self {

@@ -4,6 +4,7 @@ use petalsonic_core::audio_data::PetalSonicAudioData;
 use petalsonic_core::config::PetalSonicWorldDesc;
 use petalsonic_core::engine::PetalSonicEngine;
 use petalsonic_core::math::{Pose, Quat, Vec3};
+use petalsonic_core::playback::LoopMode;
 use petalsonic_core::world::PetalSonicWorld;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ pub fn run_cli_tests() {
 }
 
 fn test_non_spatial_audio() -> Result<()> {
-    let wav_path = "res/cicada_test_96k.wav";
+    let wav_path = "petalsonic-demo/asset/sound/cicada_test_96k.wav";
 
     let world_desc = PetalSonicWorldDesc {
         sample_rate: 48000,
@@ -45,10 +46,10 @@ fn test_non_spatial_audio() -> Result<()> {
 
             // Now use the simple API to play audio
             log::info!("Starting playback...");
-            world_arc.play(audio_id)?;
+            world_arc.play(audio_id, LoopMode::Infinite)?;
 
             // Let it play for a few seconds
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_secs(30));
 
             // Pause playback
             log::info!("Pausing playback...");
@@ -57,7 +58,7 @@ fn test_non_spatial_audio() -> Result<()> {
 
             // Resume playback
             log::info!("Resuming playback...");
-            world_arc.play(audio_id)?;
+            world_arc.play(audio_id, LoopMode::Once)?;
             std::thread::sleep(std::time::Duration::from_secs(2));
 
             // Stop playback
@@ -74,12 +75,12 @@ fn test_non_spatial_audio() -> Result<()> {
 }
 
 fn test_spatial_audio() -> Result<()> {
-    let wav_path = "res/cicada_test_96k.wav";
+    let wav_path = "petalsonic-demo/asset/sound/cicada_test_96k.wav";
 
     let world_desc = PetalSonicWorldDesc {
         sample_rate: 48000,
         block_size: 1024,
-        hrtf_path: Some("petalsonic-demo/assets/hrtf/hrtf_b_nh172.sofa".to_string()),
+        hrtf_path: Some("petalsonic-demo/asset/hrtf/hrtf_b_nh172.sofa".to_string()),
         ..Default::default()
     };
 
@@ -125,7 +126,7 @@ fn test_spatial_audio() -> Result<()> {
 
             // Play the spatial audio source
             log::info!("Starting spatial playback...");
-            world_arc.play(audio_id)?;
+            world_arc.play(audio_id, LoopMode::Once)?;
 
             // Let it play for 5 seconds to hear the spatial effect
             log::info!("Playing spatial audio for 5 seconds...");

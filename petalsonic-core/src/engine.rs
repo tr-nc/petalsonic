@@ -574,17 +574,24 @@ impl PetalSonicEngine {
             };
 
             match command {
-                PlaybackCommand::Play(audio_id, config) => {
+                PlaybackCommand::Play(audio_id, config, loop_mode) => {
                     let Some(audio_data) = world.get_audio_data(audio_id) else {
                         continue;
                     };
 
-                    active_playback
-                        .entry(audio_id)
-                        .or_insert_with(|| {
-                            PlaybackInstance::new(audio_id, audio_data.clone(), config)
-                        })
-                        .play();
+                    let instance = active_playback.entry(audio_id).or_insert_with(|| {
+                        PlaybackInstance::new(
+                            audio_id,
+                            audio_data.clone(),
+                            config.clone(),
+                            loop_mode,
+                        )
+                    });
+
+                    // Always update config and loop_mode when playing
+                    instance.config = config;
+                    instance.set_loop_mode(loop_mode);
+                    instance.play();
                 }
                 PlaybackCommand::Pause(audio_id) => {
                     if let Some(instance) = active_playback.get_mut(&audio_id) {

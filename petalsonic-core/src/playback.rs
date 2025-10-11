@@ -3,6 +3,23 @@ use crate::config::SourceConfig;
 use crate::world::SourceId;
 use std::sync::Arc;
 
+/// Loop mode for audio playback
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopMode {
+    /// Play once and stop
+    Once,
+    /// Loop infinitely
+    Infinite,
+    /// Loop a specific number of times
+    Count(u32),
+}
+
+impl Default for LoopMode {
+    fn default() -> Self {
+        Self::Once
+    }
+}
+
 /// Playback state for an audio source
 #[derive(Debug, Clone)]
 pub enum PlayState {
@@ -59,6 +76,10 @@ pub struct PlaybackInstance {
     pub info: PlaybackInfo,
     /// Source configuration (spatial/non-spatial)
     pub config: SourceConfig,
+    /// Loop mode for this playback
+    pub loop_mode: LoopMode,
+    /// Remaining loops (only used for LoopMode::Count)
+    loops_remaining: u32,
 }
 
 impl PlaybackInstance {
@@ -66,22 +87,41 @@ impl PlaybackInstance {
         audio_id: SourceId,
         audio_data: Arc<PetalSonicAudioData>,
         config: SourceConfig,
+        loop_mode: LoopMode,
     ) -> Self {
         let total_frames = audio_data.samples().len();
         let sample_rate = audio_data.sample_rate();
         let info = PlaybackInfo::new(total_frames, sample_rate);
+
+        // Initialize loops_remaining based on loop_mode
+        let loops_remaining = match loop_mode {
+            LoopMode::Count(n) => n,
+            _ => 0,
+        };
 
         Self {
             audio_id,
             audio_data,
             info,
             config,
+            loop_mode,
+            loops_remaining,
         }
     }
 
     /// Start playing this instance
     pub fn play(&mut self) {
         self.info.play_state = PlayState::Playing;
+    }
+
+    /// Set the loop mode and reset the loop counter if needed
+    pub fn set_loop_mode(&mut self, loop_mode: LoopMode) {
+        self.loop_mode = loop_mode;
+        // Reset loops_remaining when loop mode changes
+        self.loops_remaining = match loop_mode {
+            LoopMode::Count(n) => n,
+            _ => 0,
+        };
     }
 
     /// Pause this instance
@@ -110,9 +150,29 @@ impl PlaybackInstance {
 
         for frame_idx in 0..frame_count {
             if self.info.current_frame >= samples.len() {
-                // Reached end of audio
-                self.info.play_state = PlayState::Stopped;
-                break;
+                // Reached end of audio - check loop mode
+                match self.loop_mode {
+                    LoopMode::Once => {
+                        // Stop playback
+                        self.info.play_state = PlayState::Stopped;
+                        break;
+                    }
+                    LoopMode::Infinite => {
+                        // Reset to beginning and continue
+                        self.info.current_frame = 0;
+                    }
+                    LoopMode::Count(_) => {
+                        if self.loops_remaining > 0 {
+                            // Decrement and reset to beginning
+                            self.loops_remaining -= 1;
+                            self.info.current_frame = 0;
+                        } else {
+                            // No more loops, stop playback
+                            self.info.play_state = PlayState::Stopped;
+                            break;
+                        }
+                    }
+                }
             }
 
             let sample = samples[self.info.current_frame];
@@ -139,7 +199,7 @@ impl PlaybackInstance {
 /// Commands that can be sent to the audio engine for playback control
 #[derive(Debug)]
 pub enum PlaybackCommand {
-    Play(SourceId, SourceConfig),
+    Play(SourceId, SourceConfig, LoopMode),
     Pause(SourceId),
     Stop(SourceId),
     StopAll,

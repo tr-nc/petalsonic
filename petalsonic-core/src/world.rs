@@ -2,7 +2,7 @@ use crate::audio_data::PetalSonicAudioData;
 use crate::config::{PetalSonicWorldDesc, SourceConfig};
 use crate::error::Result;
 use crate::math::{Pose, Vec3};
-use crate::playback::PlaybackCommand;
+use crate::playback::{LoopMode, PlaybackCommand};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -189,12 +189,13 @@ impl PetalSonicWorld {
     /// # Arguments
     ///
     /// * `audio_id` - SourceId of the audio source to play
+    /// * `loop_mode` - How the audio should loop (Once, Infinite, or Count(n))
     ///
     /// # Errors
     ///
     /// Returns an error if the audio source ID is not found in the world storage
     /// or if the command fails to send to the audio engine.
-    pub fn play(&self, audio_id: SourceId) -> Result<()> {
+    pub fn play(&self, audio_id: SourceId, loop_mode: LoopMode) -> Result<()> {
         if !self.contains_audio(audio_id) {
             return Err(crate::error::PetalSonicError::Engine(format!(
                 "Audio data with ID {:?} not found",
@@ -212,7 +213,7 @@ impl PetalSonicWorld {
             .unwrap_or_default();
 
         self.command_sender
-            .send(PlaybackCommand::Play(audio_id, config))
+            .send(PlaybackCommand::Play(audio_id, config, loop_mode))
             .map_err(|e| {
                 crate::error::PetalSonicError::Engine(format!("Failed to send play command: {}", e))
             })?;

@@ -285,8 +285,16 @@ impl SpatialProcessor {
             .info
             .update_position(instance.info.current_frame, self.sample_rate);
 
-        // Check if finished
+        // Check if finished and set flags (same logic as PlaybackInstance::fill_buffer)
         if instance.info.is_finished() {
+            log::debug!(
+                "SpatialProcessor: Source {} reached end at frame {} (loop mode: {:?})",
+                instance.audio_id,
+                instance.info.current_frame,
+                instance.loop_mode
+            );
+            // Set flag for event emission
+            instance.reached_end_this_iteration = true;
             instance.info.play_state = crate::playback::PlayState::Stopped;
         }
     }

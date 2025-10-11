@@ -46,56 +46,33 @@ pub fn mix_playback_instances(
         };
     };
 
-    // Collect source IDs that reached the end of playback and their loop modes
-    // This allows us to emit appropriate events (SourceCompleted or SourceLooped)
-    let mut completed_sources = Vec::new();
-    let mut looped_sources = Vec::new();
-
-    for (source_id, instance) in active_playback.iter_mut() {
-        if let Some(loop_mode) = instance.check_and_clear_end_flag() {
-            match loop_mode {
-                LoopMode::Once => {
-                    // Source finished - will be removed and emit SourceCompleted
-                    log::info!(
-                        "Mixer: Source {} completed (Once mode), will be removed",
-                        source_id
-                    );
-                    completed_sources.push(*source_id);
-                }
-                LoopMode::Infinite => {
-                    // Source reached end - explicitly restart from beginning
-                    log::info!(
-                        "Mixer: Source {} reached end (Infinite mode), restarting from beginning",
-                        source_id
-                    );
-                    instance.play_from_beginning();
-                    looped_sources.push(*source_id);
-                }
-            }
-        }
-    }
-
-    // Only remove instances that are actually finished (stopped playing)
-    // Infinite looping sources were explicitly restarted, so they keep playing
-    let removed_count = active_playback.len();
-    active_playback.retain(|_, instance| !instance.info.is_finished());
-    let removed = removed_count - active_playback.len();
-    if removed > 0 {
-        log::debug!(
-            "Mixer: Removed {} finished sources from active playback",
-            removed
-        );
-    }
-
-    // Separate spatial and non-spatial sources
+    // Separate spatial and non-spatial sources FIRST
     let mut spatial_instances = Vec::new();
     let mut non_spatial_instances = Vec::new();
+
+    log::debug!(
+        "Mixer: Starting mix with {} active sources",
+        active_playback.len()
+    );
 
     for (source_id, instance) in active_playback.iter_mut() {
         // Only process playing instances
         if !matches!(instance.info.play_state, PlayState::Playing) {
+            log::debug!(
+                "Mixer: Skipping source {} - not playing (state: {:?})",
+                source_id,
+                instance.info.play_state
+            );
             continue;
         }
+
+        log::debug!(
+            "Mixer: Processing source {} - frame {}/{} (spatial: {})",
+            source_id,
+            instance.info.current_frame,
+            instance.audio_data.samples().len(),
+            instance.config.is_spatial()
+        );
 
         if instance.config.is_spatial() {
             spatial_instances.push((*source_id, instance as &mut PlaybackInstance));
@@ -128,6 +105,61 @@ pub fn mix_playback_instances(
         log::warn!(
             "Spatial processor not available, {} spatial sources will be silent",
             spatial_instances.len()
+        );
+    }
+
+    // NOW check for sources that reached the end during this mix iteration
+    // This must happen AFTER fill_buffer() has been called on all sources
+    let mut completed_sources = Vec::new();
+    let mut looped_sources = Vec::new();
+
+    log::debug!("Mixer: Checking for completed/looped sources...");
+
+    for (source_id, instance) in active_playback.iter_mut() {
+        log::debug!(
+            "Mixer: Checking source {} - reached_end_flag: {}, state: {:?}",
+            source_id,
+            instance.reached_end_this_iteration,
+            instance.info.play_state
+        );
+
+        if let Some(loop_mode) = instance.check_and_clear_end_flag() {
+            log::debug!(
+                "Mixer: Source {} reached end with loop mode: {:?}",
+                source_id,
+                loop_mode
+            );
+            match loop_mode {
+                LoopMode::Once => {
+                    // Source finished - will be removed and emit SourceCompleted
+                    log::info!(
+                        "Mixer: Source {} completed (Once mode), will be removed",
+                        source_id
+                    );
+                    completed_sources.push(*source_id);
+                }
+                LoopMode::Infinite => {
+                    // Source reached end - explicitly restart from beginning
+                    log::info!(
+                        "Mixer: Source {} reached end (Infinite mode), restarting from beginning",
+                        source_id
+                    );
+                    instance.play_from_beginning();
+                    looped_sources.push(*source_id);
+                }
+            }
+        }
+    }
+
+    // Only remove instances that are actually finished (stopped playing)
+    // Infinite looping sources were explicitly restarted, so they keep playing
+    let removed_count = active_playback.len();
+    active_playback.retain(|_, instance| !instance.info.is_finished());
+    let removed = removed_count - active_playback.len();
+    if removed > 0 {
+        log::debug!(
+            "Mixer: Removed {} finished sources from active playback",
+            removed
         );
     }
 

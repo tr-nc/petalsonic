@@ -79,7 +79,7 @@ pub struct PlaybackInstance {
     /// Loop mode for this playback
     pub loop_mode: LoopMode,
     /// Flag to track if we've reached the end this iteration (for event emission)
-    reached_end_this_iteration: bool,
+    pub(crate) reached_end_this_iteration: bool,
 }
 
 impl PlaybackInstance {

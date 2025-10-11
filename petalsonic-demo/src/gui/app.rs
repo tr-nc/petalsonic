@@ -289,19 +289,36 @@ impl SpatialAudioDemo {
         let file_name = &self.available_audio_files[self.selected_audio_file_index];
         let file_path = format!("petalsonic-demo/asset/sound/{}", file_name);
 
+        log::info!("GUI: Loading audio file: {}", file_path);
+
         let audio_data = PetalSonicAudioData::from_path(&file_path)
             .map_err(|e| format!("Failed to load audio file: {}", e))?;
+
+        log::debug!(
+            "GUI: Audio loaded - {} samples at {} Hz",
+            audio_data.samples().len(),
+            audio_data.sample_rate()
+        );
 
         let source_id = self
             .world
             .register_audio(audio_data, SourceConfig::spatial_with_volume(position, 1.0))
             .map_err(|e| format!("Failed to register audio in world: {}", e))?;
 
+        log::debug!("GUI: Audio registered with source ID: {}", source_id);
+
         let loop_mode = match self.selected_loop_mode_index {
             0 => LoopMode::Once,
             1 => LoopMode::Infinite,
             _ => LoopMode::Once,
         };
+
+        log::info!(
+            "GUI: Starting playback for source {} at position {:?} with loop mode {:?}",
+            source_id,
+            position,
+            loop_mode
+        );
 
         self.world
             .play(source_id, loop_mode)
@@ -314,7 +331,15 @@ impl SpatialAudioDemo {
             loop_mode,
         });
 
-        log::info!("Added source '{}' at position {:?}", file_name, position);
+        log::info!(
+            "GUI: Added source '{}' at position ({:.1}, {:.1}, {:.1}) - total sources: {}",
+            file_name,
+            position.x,
+            position.y,
+            position.z,
+            self.sources.len()
+        );
+
         Ok(())
     }
 }
@@ -324,24 +349,41 @@ impl eframe::App for SpatialAudioDemo {
         // Poll for audio events and handle them
         // This checks for completed sources and removes them from the UI
         let events = self.engine.poll_events();
+        if !events.is_empty() {
+            log::debug!("GUI: Received {} event(s)", events.len());
+        }
+
         for event in events {
             match event {
                 petalsonic_core::PetalSonicEvent::SourceCompleted { source_id } => {
-                    log::info!("Source {} completed, removing from UI", source_id);
+                    log::info!(
+                        "GUI: Source {} completed, removing from UI and world storage",
+                        source_id
+                    );
 
                     // Remove from UI sources list
                     if let Some(pos) = self.sources.iter().position(|s| s.id == source_id) {
                         let removed = self.sources.remove(pos);
-                        log::info!("Removed source '{}' from UI", removed.file_name);
+                        log::info!("GUI: Removed source '{}' from UI list", removed.file_name);
+                    } else {
+                        log::warn!(
+                            "GUI: Source {} completed but not found in UI list",
+                            source_id
+                        );
                     }
 
                     // Remove from world storage to free memory
                     // Note: You could also keep it in world storage if you want to replay it later
                     if let Some(audio_data) = self.world.remove_audio_data(source_id) {
-                        log::debug!(
-                            "Freed audio data for source {}: {} samples",
+                        log::info!(
+                            "GUI: Freed audio data for source {}: {} samples",
                             source_id,
                             audio_data.samples().len()
+                        );
+                    } else {
+                        log::warn!(
+                            "GUI: Source {} already removed from world storage",
+                            source_id
                         );
                     }
                 }
@@ -351,11 +393,15 @@ impl eframe::App for SpatialAudioDemo {
                 } => {
                     // Infinite looping sources emit this event each time they loop
                     // They continue playing, so we don't remove them
-                    log::debug!("Source {} looped (count: {})", source_id, loop_count);
+                    log::info!(
+                        "GUI: Source {} looped (count: {}), continuing playback",
+                        source_id,
+                        loop_count
+                    );
                 }
                 _ => {
                     // Handle other events if needed
-                    log::debug!("Received event: {:?}", event);
+                    log::debug!("GUI: Received event: {:?}", event);
                 }
             }
         }

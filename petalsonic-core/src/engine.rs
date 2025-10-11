@@ -425,7 +425,10 @@ impl PetalSonicEngine {
                         {
                             log::error!("Failed to send SourceCompleted event: {}", e);
                         } else {
-                            log::debug!("Source {} completed", source_id);
+                            log::info!(
+                                "RenderThread: Emitted SourceCompleted event for source {}",
+                                source_id
+                            );
                         }
                     }
 
@@ -437,7 +440,10 @@ impl PetalSonicEngine {
                         }) {
                             log::error!("Failed to send SourceLooped event: {}", e);
                         } else {
-                            log::debug!("Source {} looped", source_id);
+                            log::info!(
+                                "RenderThread: Emitted SourceLooped event for source {}",
+                                source_id
+                            );
                         }
                     }
                 }
@@ -644,11 +650,22 @@ impl PetalSonicEngine {
 
             match command {
                 PlaybackCommand::Play(audio_id, config, loop_mode) => {
+                    log::debug!(
+                        "Engine: Received Play command for source {} (loop mode: {:?})",
+                        audio_id,
+                        loop_mode
+                    );
+
                     let Some(audio_data) = world.get_audio_data(audio_id) else {
+                        log::warn!("Engine: Audio data not found for source {}", audio_id);
                         continue;
                     };
 
                     let instance = active_playback.entry(audio_id).or_insert_with(|| {
+                        log::debug!(
+                            "Engine: Creating new PlaybackInstance for source {}",
+                            audio_id
+                        );
                         PlaybackInstance::new(
                             audio_id,
                             audio_data.clone(),
@@ -660,22 +677,50 @@ impl PetalSonicEngine {
                     // Always update config and loop_mode when playing
                     instance.config = config;
                     instance.set_loop_mode(loop_mode);
-                    instance.play();
+                    instance.play_from_beginning();
                 }
                 PlaybackCommand::Pause(audio_id) => {
+                    log::debug!("Engine: Received Pause command for source {}", audio_id);
                     if let Some(instance) = active_playback.get_mut(&audio_id) {
                         instance.pause();
+                    } else {
+                        log::warn!(
+                            "Engine: Cannot pause, source {} not in active playback",
+                            audio_id
+                        );
                     }
                 }
                 PlaybackCommand::Stop(audio_id) => {
-                    active_playback.remove(&audio_id);
+                    log::debug!("Engine: Received Stop command for source {}", audio_id);
+                    if active_playback.remove(&audio_id).is_some() {
+                        log::debug!("Engine: Removed source {} from active playback", audio_id);
+                    } else {
+                        log::warn!(
+                            "Engine: Cannot stop, source {} not in active playback",
+                            audio_id
+                        );
+                    }
                 }
                 PlaybackCommand::UpdateConfig(audio_id, config) => {
+                    log::debug!(
+                        "Engine: Received UpdateConfig command for source {}",
+                        audio_id
+                    );
                     if let Some(instance) = active_playback.get_mut(&audio_id) {
                         instance.config = config;
+                    } else {
+                        log::warn!(
+                            "Engine: Cannot update config, source {} not in active playback",
+                            audio_id
+                        );
                     }
                 }
                 PlaybackCommand::StopAll => {
+                    let count = active_playback.len();
+                    log::info!(
+                        "Engine: Received StopAll command, stopping {} sources",
+                        count
+                    );
                     active_playback.clear();
                 }
             }

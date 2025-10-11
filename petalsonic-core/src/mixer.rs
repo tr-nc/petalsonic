@@ -55,11 +55,20 @@ pub fn mix_playback_instances(
         if let Some(loop_mode) = instance.check_and_clear_end_flag() {
             match loop_mode {
                 LoopMode::Once => {
-                    // Source finished and stopped - will be removed and emit SourceCompleted
+                    // Source finished - will be removed and emit SourceCompleted
+                    log::info!(
+                        "Mixer: Source {} completed (Once mode), will be removed",
+                        source_id
+                    );
                     completed_sources.push(*source_id);
                 }
                 LoopMode::Infinite => {
-                    // Source looped and continues - emit SourceLooped
+                    // Source reached end - explicitly restart from beginning
+                    log::info!(
+                        "Mixer: Source {} reached end (Infinite mode), restarting from beginning",
+                        source_id
+                    );
+                    instance.play_from_beginning();
                     looped_sources.push(*source_id);
                 }
             }
@@ -67,8 +76,16 @@ pub fn mix_playback_instances(
     }
 
     // Only remove instances that are actually finished (stopped playing)
-    // Infinite looping sources continue playing, so don't remove them
+    // Infinite looping sources were explicitly restarted, so they keep playing
+    let removed_count = active_playback.len();
     active_playback.retain(|_, instance| !instance.info.is_finished());
+    let removed = removed_count - active_playback.len();
+    if removed > 0 {
+        log::debug!(
+            "Mixer: Removed {} finished sources from active playback",
+            removed
+        );
+    }
 
     // Separate spatial and non-spatial sources
     let mut spatial_instances = Vec::new();

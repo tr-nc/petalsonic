@@ -103,30 +103,74 @@ impl PlaybackInstance {
         }
     }
 
-    /// Start playing this instance
-    pub fn play(&mut self) {
+    /// Resume playing from current position
+    pub fn resume(&mut self) {
+        log::debug!(
+            "Source {} resuming from frame {} (loop mode: {:?})",
+            self.audio_id,
+            self.info.current_frame,
+            self.loop_mode
+        );
         self.info.play_state = PlayState::Playing;
+    }
+
+    /// Reset playback cursor to the beginning
+    pub fn reset(&mut self) {
+        log::debug!("Source {} resetting cursor to beginning", self.audio_id);
+        self.info.current_frame = 0;
+        self.info.current_time = 0.0;
+    }
+
+    /// Play from the beginning (reset + resume)
+    pub fn play_from_beginning(&mut self) {
+        log::debug!(
+            "Source {} playing from beginning (loop mode: {:?})",
+            self.audio_id,
+            self.loop_mode
+        );
+        self.reset();
+        self.resume();
     }
 
     /// Set the loop mode
     pub fn set_loop_mode(&mut self, loop_mode: LoopMode) {
+        log::debug!(
+            "Source {} loop mode changed: {:?} -> {:?}",
+            self.audio_id,
+            self.loop_mode,
+            loop_mode
+        );
         self.loop_mode = loop_mode;
     }
 
     /// Pause this instance
     pub fn pause(&mut self) {
+        log::debug!(
+            "Source {} paused at frame {}",
+            self.audio_id,
+            self.info.current_frame
+        );
         self.info.play_state = PlayState::Paused;
     }
 
-    /// Stop this instance and reset position
+    /// Stop this instance (keeps current position)
     pub fn stop(&mut self) {
+        log::debug!(
+            "Source {} stopped at frame {}",
+            self.audio_id,
+            self.info.current_frame
+        );
         self.info.play_state = PlayState::Stopped;
-        self.info.current_frame = 0;
-        self.info.current_time = 0.0;
     }
 
     /// Fill audio buffer for this instance
     /// Returns the number of frames actually filled
+    ///
+    /// # Behavior
+    /// When reaching the end of audio data:
+    /// - Sets `reached_end_this_iteration` flag for event emission
+    /// - Stops playing (for BOTH Once and Infinite modes)
+    /// - Infinite mode will be explicitly restarted by the mixer
     pub fn fill_buffer(&mut self, buffer: &mut [f32], channels: u16) -> usize {
         if !matches!(self.info.play_state, PlayState::Playing) {
             return 0;
@@ -139,21 +183,18 @@ impl PlaybackInstance {
 
         for frame_idx in 0..frame_count {
             if self.info.current_frame >= samples.len() {
-                // Reached end of audio - mark that we've reached the end this iteration
+                // Reached end of audio - mark flag and STOP (no cursor wrapping!)
                 self.reached_end_this_iteration = true;
+                self.info.play_state = PlayState::Stopped;
 
-                // Handle based on loop mode
-                match self.loop_mode {
-                    LoopMode::Once => {
-                        // Stop playback - will emit SourceCompleted event
-                        self.info.play_state = PlayState::Stopped;
-                        break;
-                    }
-                    LoopMode::Infinite => {
-                        // Reset to beginning and continue - will emit SourceLooped event
-                        self.info.current_frame = 0;
-                    }
-                }
+                log::debug!(
+                    "Source {} reached end at frame {} (loop mode: {:?}, filled {} frames)",
+                    self.audio_id,
+                    self.info.current_frame,
+                    self.loop_mode,
+                    frames_filled
+                );
+                break;
             }
 
             let sample = samples[self.info.current_frame];

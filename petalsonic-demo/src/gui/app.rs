@@ -294,8 +294,8 @@ impl SpatialAudioDemo {
 
         let source_id = self
             .world
-            .add_source(audio_data, SourceConfig::spatial_with_volume(position, 1.0))
-            .map_err(|e| format!("Failed to add source to world: {}", e))?;
+            .register_audio(audio_data, SourceConfig::spatial_with_volume(position, 1.0))
+            .map_err(|e| format!("Failed to register audio in world: {}", e))?;
 
         let loop_mode = match self.selected_loop_mode_index {
             0 => LoopMode::Once,

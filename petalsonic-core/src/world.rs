@@ -60,15 +60,18 @@ impl PetalSonicWorld {
         self.desc.sample_rate
     }
 
-    /// Adds audio data to the world's internal storage and returns a SourceId handle.
+    /// Registers audio data in the world's internal storage and returns a SourceId handle.
+    ///
+    /// This pre-loads and prepares the audio for playback but does not start playing it.
+    /// Call `play()` with the returned SourceId to actually start playback.
     ///
     /// The audio data is automatically resampled to match the world's sample rate if needed.
     ///
     /// # Arguments
     ///
-    /// * `audio_data` - The audio data to add
+    /// * `audio_data` - The audio data to register
     /// * `config` - Configuration for how the source should be processed (spatial or non-spatial)
-    pub fn add_source(
+    pub fn register_audio(
         &self,
         audio_data: Arc<PetalSonicAudioData>,
         config: SourceConfig,

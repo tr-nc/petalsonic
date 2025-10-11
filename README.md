@@ -30,7 +30,7 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 ```plaintext
 ┌──────────────────────────────────────────────────────────────┐
 │ Main Thread (World)                                          │
-│ - add_source(audio_data, SourceConfig)                       │
+│ - register_audio(audio_data, SourceConfig)                   │
 │   * SourceConfig::NonSpatial                                 │
 │   * SourceConfig::Spatial { position, volume, ... }          │
 │ - set_listener_pose(pose)                                    │

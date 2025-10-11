@@ -56,7 +56,13 @@ impl SpatialProcessor {
     /// * `sample_rate` - Sample rate for audio processing
     /// * `frame_size` - Number of frames to process per call
     /// * `distance_scaler` - Scale factor to convert game units to meters (default: 10.0)
-    pub fn new(sample_rate: u32, frame_size: usize, distance_scaler: f32) -> Result<Self> {
+    /// * `hrtf_path` - Optional path to a custom HRTF SOFA file (None uses default HRTF)
+    pub fn new(
+        sample_rate: u32,
+        frame_size: usize,
+        distance_scaler: f32,
+        hrtf_path: Option<&str>,
+    ) -> Result<Self> {
         log::info!(
             "Initializing Steam Audio spatial processor (sample_rate: {} Hz, frame_size: {}, distance_scaler: {})",
             sample_rate,
@@ -76,8 +82,12 @@ impl SpatialProcessor {
             frame_size,
         };
 
-        // Create HRTF
-        let hrtf = hrtf::create_default_hrtf(&context, &audio_settings)?;
+        // Create HRTF (custom or default)
+        let hrtf = if let Some(path) = hrtf_path {
+            hrtf::create_hrtf_from_file(&context, &audio_settings, path)?
+        } else {
+            hrtf::create_default_hrtf(&context, &audio_settings)?
+        };
 
         // Create ambisonics decode effect (shared across all sources)
         let ambisonics_decode_effect = AmbisonicsDecodeEffect::try_new(

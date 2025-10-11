@@ -110,8 +110,12 @@ impl PetalSonicEngine {
     pub fn new(desc: PetalSonicWorldDesc, world: Arc<PetalSonicWorld>) -> Result<Self> {
         // Initialize spatial processor
         // Use distance_scaler of 10.0 (converts game units to meters, as in reference)
-        let spatial_processor = match SpatialProcessor::new(desc.sample_rate, desc.block_size, 10.0)
-        {
+        let spatial_processor = match SpatialProcessor::new(
+            desc.sample_rate,
+            desc.block_size,
+            10.0,
+            desc.hrtf_path.as_deref(),
+        ) {
             Ok(processor) => {
                 log::info!("Spatial audio processor initialized");
                 Some(Arc::new(Mutex::new(processor)))

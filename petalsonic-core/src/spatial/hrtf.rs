@@ -27,7 +27,6 @@ pub fn create_default_hrtf(context: &Context, audio_settings: &AudioSettings) ->
 /// * `context` - Steam Audio context
 /// * `audio_settings` - Audio settings
 /// * `sofa_path` - Path to the SOFA file
-#[allow(dead_code)]
 pub fn create_hrtf_from_file(
     context: &Context,
     audio_settings: &AudioSettings,

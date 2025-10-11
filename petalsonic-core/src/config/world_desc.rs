@@ -15,6 +15,8 @@ pub struct PetalSonicWorldDesc {
     pub buffer_duration: Duration,
     /// Maximum number of concurrent audio sources
     pub max_sources: usize,
+    /// Optional path to a custom HRTF SOFA file (None uses Steam Audio's default HRTF)
+    pub hrtf_path: Option<String>,
 }
 
 impl Default for PetalSonicWorldDesc {
@@ -25,6 +27,7 @@ impl Default for PetalSonicWorldDesc {
             channels: 2,
             buffer_duration: Duration::from_millis(10),
             max_sources: 64,
+            hrtf_path: None,
         }
     }
 }

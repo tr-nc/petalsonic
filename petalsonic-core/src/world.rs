@@ -33,10 +33,10 @@ impl std::fmt::Display for SourceId {
 /// - **Audio thread**: Receives commands via channels, performs spatialization and playback
 pub struct PetalSonicWorld {
     desc: PetalSonicWorldDesc,
-    audio_data_storage: HashMap<SourceId, Arc<PetalSonicAudioData>>,
+    audio_data_storage: std::sync::Mutex<HashMap<SourceId, Arc<PetalSonicAudioData>>>,
     source_configs: std::sync::Mutex<HashMap<SourceId, SourceConfig>>,
-    listener: PetalSonicAudioListener,
-    next_source_id: u64,
+    listener: std::sync::Mutex<PetalSonicAudioListener>,
+    next_source_id: std::sync::Mutex<u64>,
     command_sender: Sender<PlaybackCommand>,
     command_receiver: Receiver<PlaybackCommand>,
 }
@@ -46,10 +46,10 @@ impl PetalSonicWorld {
         let (command_sender, command_receiver) = crossbeam_channel::unbounded();
         Ok(Self {
             desc: config,
-            audio_data_storage: HashMap::new(),
+            audio_data_storage: std::sync::Mutex::new(HashMap::new()),
             source_configs: std::sync::Mutex::new(HashMap::new()),
-            listener: PetalSonicAudioListener::default(),
-            next_source_id: 0,
+            listener: std::sync::Mutex::new(PetalSonicAudioListener::default()),
+            next_source_id: std::sync::Mutex::new(0),
             command_sender,
             command_receiver,
         })
@@ -69,7 +69,7 @@ impl PetalSonicWorld {
     /// * `audio_data` - The audio data to add
     /// * `config` - Configuration for how the source should be processed (spatial or non-spatial)
     pub fn add_source(
-        &mut self,
+        &self,
         audio_data: Arc<PetalSonicAudioData>,
         config: SourceConfig,
     ) -> Result<SourceId> {
@@ -80,9 +80,15 @@ impl PetalSonicWorld {
             audio_data
         };
 
-        let id = SourceId(self.next_source_id);
-        self.next_source_id += 1;
-        self.audio_data_storage.insert(id, resampled_audio_data);
+        let mut next_id = self.next_source_id.lock().unwrap();
+        let id = SourceId(*next_id);
+        *next_id += 1;
+        drop(next_id);
+
+        self.audio_data_storage
+            .lock()
+            .unwrap()
+            .insert(id, resampled_audio_data);
         self.source_configs.lock().unwrap().insert(id, config);
         Ok(id)
     }
@@ -95,9 +101,9 @@ impl PetalSonicWorld {
     ///
     /// # Returns
     ///
-    /// `Some(&Arc<PetalSonicAudioData>)` if found, `None` otherwise
-    pub fn get_audio_data(&self, id: SourceId) -> Option<&Arc<PetalSonicAudioData>> {
-        self.audio_data_storage.get(&id)
+    /// `Some(Arc<PetalSonicAudioData>)` if found, `None` otherwise
+    pub fn get_audio_data(&self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
+        self.audio_data_storage.lock().unwrap().get(&id).cloned()
     }
 
     /// Removes audio data from the world by its SourceId.
@@ -109,18 +115,23 @@ impl PetalSonicWorld {
     /// # Returns
     ///
     /// The removed audio data if it existed, `None` otherwise
-    pub fn remove_audio_data(&mut self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
+    pub fn remove_audio_data(&self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
         self.source_configs.lock().unwrap().remove(&id);
-        self.audio_data_storage.remove(&id)
+        self.audio_data_storage.lock().unwrap().remove(&id)
     }
 
     /// Returns a list of all audio source IDs currently stored in the world.
     pub fn get_audio_source_ids(&self) -> Vec<SourceId> {
-        self.audio_data_storage.keys().copied().collect()
+        self.audio_data_storage
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn contains_audio(&self, id: SourceId) -> bool {
-        self.audio_data_storage.contains_key(&id)
+        self.audio_data_storage.lock().unwrap().contains_key(&id)
     }
 
     /// Sets the listener pose (position and orientation) for spatial audio.
@@ -131,13 +142,13 @@ impl PetalSonicWorld {
     /// # Arguments
     ///
     /// * `pose` - The new pose for the listener
-    pub fn set_listener_pose(&mut self, pose: Pose) {
-        self.listener.pose = pose;
+    pub fn set_listener_pose(&self, pose: Pose) {
+        self.listener.lock().unwrap().pose = pose;
     }
 
-    /// Returns a reference to the current listener.
-    pub fn listener(&self) -> &PetalSonicAudioListener {
-        &self.listener
+    /// Returns a copy of the current listener.
+    pub fn listener(&self) -> PetalSonicAudioListener {
+        self.listener.lock().unwrap().clone()
     }
 
     /// Updates the configuration for a source (e.g., position, volume).
@@ -321,6 +332,12 @@ impl PetalSonicAudioSource {
 
 pub struct PetalSonicAudioListener {
     pub(crate) pose: Pose,
+}
+
+impl Clone for PetalSonicAudioListener {
+    fn clone(&self) -> Self {
+        Self { pose: self.pose }
+    }
 }
 
 impl Default for PetalSonicAudioListener {

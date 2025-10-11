@@ -10,12 +10,26 @@ use petalsonic_core::{
 };
 use std::sync::Arc;
 
+#[derive(Clone)]
+struct AudioSource {
+    id: SourceId,
+    position: Vec3,
+    file_name: String,
+    loop_mode: LoopMode,
+}
+
 pub struct SpatialAudioDemo {
     world: Arc<PetalSonicWorld>,
     engine: PetalSonicEngine,
-    source_id: SourceId,
-    source_position: Vec3,
+    sources: Vec<AudioSource>,
     grid_size: f32,
+
+    // UI state
+    available_audio_files: Vec<String>,
+    selected_audio_file_index: usize,
+    selected_loop_mode_index: usize,
+    add_source_mode: bool,
+    dragging_source_index: Option<usize>,
 }
 
 impl SpatialAudioDemo {
@@ -24,6 +38,12 @@ impl SpatialAudioDemo {
         env_logger::Builder::from_default_env()
             .filter_level(log::LevelFilter::Info)
             .init();
+
+        // Scan available audio files
+        let available_audio_files = Self::scan_audio_files();
+        if available_audio_files.is_empty() {
+            log::warn!("No audio files found in petalsonic-demo/asset/sound/");
+        }
 
         // Create world description
         let world_desc = PetalSonicWorldDesc {
@@ -34,31 +54,13 @@ impl SpatialAudioDemo {
         };
 
         // Create world
-        let mut world =
+        let world =
             PetalSonicWorld::new(world_desc.clone()).expect("Failed to create PetalSonicWorld");
 
         // Set up listener pose at origin (0, 0, 0) with identity rotation
         let listener_pose = Pose::new(Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY);
         world.set_listener_pose(listener_pose);
         log::info!("Listener pose set to origin");
-
-        // Load audio file and create a spatial source
-        let wav_path = "petalsonic-demo/asset/sound/cicada_test_96k.wav";
-        let audio_data = PetalSonicAudioData::from_path(wav_path)
-            .expect("Failed to load audio file. Make sure petalsonic-demo/asset/sound/cicada_test_96k.wav exists.");
-
-        let initial_position = Vec3::new(0.0, 0.0, -1.0); // 1 meter in front
-        let source_id = world
-            .add_source(
-                audio_data,
-                SourceConfig::spatial_with_volume(initial_position, 1.0),
-            )
-            .expect("Failed to add audio source");
-
-        log::info!(
-            "Spatial audio source added at position {:?}",
-            initial_position
-        );
 
         // Create engine
         let world_arc = Arc::new(world);
@@ -69,19 +71,38 @@ impl SpatialAudioDemo {
         engine.start().expect("Failed to start audio engine");
         log::info!("Audio engine started");
 
-        // Start playback
-        world_arc
-            .play(source_id, LoopMode::Infinite)
-            .expect("Failed to start playback");
-        log::info!("Playback started");
-
         Self {
             world: world_arc,
             engine,
-            source_id,
-            source_position: initial_position,
-            grid_size: 5.0, // 5 meter grid
+            sources: Vec::new(),
+            grid_size: 5.0,
+            available_audio_files,
+            selected_audio_file_index: 0,
+            selected_loop_mode_index: 0, // Once
+            add_source_mode: false,
+            dragging_source_index: None,
         }
+    }
+
+    fn scan_audio_files() -> Vec<String> {
+        let audio_dir = "petalsonic-demo/asset/sound";
+        let mut files = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(audio_dir) {
+            for entry in entries.flatten() {
+                if let Some(file_name) = entry.file_name().to_str() {
+                    if file_name.ends_with(".wav")
+                        || file_name.ends_with(".mp3")
+                        || file_name.ends_with(".ogg")
+                    {
+                        files.push(file_name.to_string());
+                    }
+                }
+            }
+        }
+
+        files.sort();
+        files
     }
 
     fn world_to_screen(&self, world_pos: Vec3, rect: Rect) -> Pos2 {
@@ -163,68 +184,222 @@ impl SpatialAudioDemo {
         );
     }
 
-    fn draw_source(&self, ui: &mut egui::Ui, rect: Rect) {
+    fn draw_sources(&self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter();
-        let source_pos = self.world_to_screen(self.source_position, rect);
 
-        // Draw blue circle for source
-        painter.circle_filled(source_pos, 8.0, Color32::from_rgb(50, 150, 255));
-        painter.circle_stroke(source_pos, 8.0, Stroke::new(2.0, Color32::WHITE));
+        for (_idx, source) in self.sources.iter().enumerate() {
+            let source_pos = self.world_to_screen(source.position, rect);
 
-        // Draw label with distance
-        let distance = self.source_position.length();
-        let label = format!("Source ({:.1}m)", distance);
-        painter.text(
-            source_pos + Vec2::new(0.0, 15.0),
-            egui::Align2::CENTER_TOP,
-            label,
-            egui::FontId::proportional(14.0),
-            Color32::WHITE,
-        );
+            // Draw blue circle for source
+            painter.circle_filled(source_pos, 8.0, Color32::from_rgb(50, 150, 255));
+            painter.circle_stroke(source_pos, 8.0, Stroke::new(2.0, Color32::WHITE));
+
+            // Draw label with file name and distance
+            let distance = source.position.length();
+            let label = format!(
+                "{} ({:.1}m)",
+                source.file_name.trim_end_matches(".wav"),
+                distance
+            );
+            painter.text(
+                source_pos + Vec2::new(0.0, 15.0),
+                egui::Align2::CENTER_TOP,
+                label,
+                egui::FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+        }
     }
 
-    fn handle_mouse_drag(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let response = ui.allocate_rect(rect, egui::Sense::drag());
+    fn handle_mouse_interaction(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
-        // Check if we're currently dragging or if drag just started
-        if response.dragged() || response.drag_started() {
+        // Handle click to add source
+        if self.add_source_mode && response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                // Convert screen position to world position
-                let new_world_pos = self.screen_to_world(pos, rect);
-
-                // Clamp to grid bounds
+                let world_pos = self.screen_to_world(pos, rect);
                 let clamped_pos = Vec3::new(
-                    new_world_pos.x.clamp(-self.grid_size, self.grid_size),
+                    world_pos.x.clamp(-self.grid_size, self.grid_size),
                     0.0,
-                    new_world_pos.z.clamp(-self.grid_size, self.grid_size),
+                    world_pos.z.clamp(-self.grid_size, self.grid_size),
                 );
 
-                // Update source position
-                self.source_position = clamped_pos;
-
-                // Update config in world (which sends command to audio engine)
-                let new_config = SourceConfig::spatial_with_volume(clamped_pos, 1.0);
-                if let Err(e) = self.world.update_source_config(self.source_id, new_config) {
-                    log::error!("Failed to update source config: {}", e);
+                if let Err(e) = self.add_source_at_position(clamped_pos) {
+                    log::error!("Failed to add source: {}", e);
                 }
 
-                if response.drag_started() {
-                    log::info!("Started dragging source");
+                self.add_source_mode = false;
+            }
+            return;
+        }
+
+        // Handle dragging existing sources
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                // Find which source was clicked
+                for (idx, source) in self.sources.iter().enumerate() {
+                    let source_screen_pos = self.world_to_screen(source.position, rect);
+                    let dist = ((pos.x - source_screen_pos.x).powi(2)
+                        + (pos.y - source_screen_pos.y).powi(2))
+                    .sqrt();
+                    if dist < 15.0 {
+                        // Click tolerance
+                        self.dragging_source_index = Some(idx);
+                        log::info!("Started dragging source {}", idx);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if response.dragged() {
+            if let Some(idx) = self.dragging_source_index {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let new_world_pos = self.screen_to_world(pos, rect);
+                    let clamped_pos = Vec3::new(
+                        new_world_pos.x.clamp(-self.grid_size, self.grid_size),
+                        0.0,
+                        new_world_pos.z.clamp(-self.grid_size, self.grid_size),
+                    );
+
+                    if let Some(source) = self.sources.get_mut(idx) {
+                        source.position = clamped_pos;
+                        let new_config = SourceConfig::spatial_with_volume(clamped_pos, 1.0);
+                        if let Err(e) = self.world.update_source_config(source.id, new_config) {
+                            log::error!("Failed to update source config: {}", e);
+                        }
+                    }
                 }
             }
         }
 
         if response.drag_stopped() {
-            log::info!("Stopped dragging source at {:?}", self.source_position);
+            if let Some(idx) = self.dragging_source_index {
+                log::info!("Stopped dragging source {}", idx);
+                self.dragging_source_index = None;
+            }
         }
+    }
+
+    fn add_source_at_position(&mut self, position: Vec3) -> Result<(), String> {
+        if self.available_audio_files.is_empty() {
+            return Err("No audio files available".to_string());
+        }
+
+        let file_name = &self.available_audio_files[self.selected_audio_file_index];
+        let file_path = format!("petalsonic-demo/asset/sound/{}", file_name);
+
+        let audio_data = PetalSonicAudioData::from_path(&file_path)
+            .map_err(|e| format!("Failed to load audio file: {}", e))?;
+
+        let source_id = self
+            .world
+            .add_source(audio_data, SourceConfig::spatial_with_volume(position, 1.0))
+            .map_err(|e| format!("Failed to add source to world: {}", e))?;
+
+        let loop_mode = match self.selected_loop_mode_index {
+            0 => LoopMode::Once,
+            1 => LoopMode::Infinite,
+            2 => LoopMode::Count(3),
+            _ => LoopMode::Once,
+        };
+
+        self.world
+            .play(source_id, loop_mode)
+            .map_err(|e| format!("Failed to start playback: {}", e))?;
+
+        self.sources.push(AudioSource {
+            id: source_id,
+            position,
+            file_name: file_name.clone(),
+            loop_mode,
+        });
+
+        log::info!("Added source '{}' at position {:?}", file_name, position);
+        Ok(())
     }
 }
 
 impl eframe::App for SpatialAudioDemo {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Right panel for controls
+        egui::SidePanel::right("control_panel")
+            .default_width(250.0)
+            .show(ctx, |ui| {
+                ui.heading("Control Panel");
+                ui.separator();
+
+                // Audio file selection
+                ui.label("Select Audio File:");
+                if !self.available_audio_files.is_empty() {
+                    egui::ComboBox::from_label("")
+                        .selected_text(&self.available_audio_files[self.selected_audio_file_index])
+                        .show_ui(ui, |ui| {
+                            for (idx, file) in self.available_audio_files.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_audio_file_index, idx, file);
+                            }
+                        });
+                } else {
+                    ui.label("No audio files found");
+                }
+
+                ui.add_space(10.0);
+
+                // Loop mode selection
+                ui.label("Loop Mode:");
+                let loop_modes = ["Once", "Infinite", "Count(3)"];
+                egui::ComboBox::from_label(" ")
+                    .selected_text(loop_modes[self.selected_loop_mode_index])
+                    .show_ui(ui, |ui| {
+                        for (idx, mode) in loop_modes.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected_loop_mode_index, idx, *mode);
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                // Add source button
+                let button_text = if self.add_source_mode {
+                    "Click on grid to place..."
+                } else {
+                    "Add Source"
+                };
+
+                if ui.button(button_text).clicked() {
+                    self.add_source_mode = !self.add_source_mode;
+                }
+
+                ui.add_space(20.0);
+                ui.separator();
+
+                // Source list
+                ui.label(format!("Active Sources: {}", self.sources.len()));
+                ui.add_space(5.0);
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (idx, source) in self.sources.iter().enumerate() {
+                        ui.group(|ui| {
+                            ui.label(format!("#{}: {}", idx + 1, source.file_name));
+                            ui.label(format!(
+                                "  Pos: ({:.1}, {:.1})",
+                                source.position.x, source.position.z
+                            ));
+                            ui.label(format!("  Loop: {:?}", source.loop_mode));
+                        });
+                    }
+                });
+            });
+
+        // Central panel for visualization
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("PetalSonic Spatial Audio Demo");
-            ui.label("Drag anywhere on the grid to move the audio source");
+
+            let instruction = if self.add_source_mode {
+                "Click anywhere on the grid to add a new audio source"
+            } else {
+                "Drag existing sources to move them around"
+            };
+            ui.label(instruction);
             ui.separator();
 
             // Allocate space for the visualization
@@ -236,16 +411,10 @@ impl eframe::App for SpatialAudioDemo {
             // Draw the grid and elements
             self.draw_grid(ui, rect);
             self.draw_listener(ui, rect);
-            self.draw_source(ui, rect);
+            self.draw_sources(ui, rect);
 
             // Handle mouse input
-            self.handle_mouse_drag(ui, rect);
-
-            ui.separator();
-            ui.label(format!(
-                "Source Position: ({:.2}, {:.2}, {:.2})",
-                self.source_position.x, self.source_position.y, self.source_position.z
-            ));
+            self.handle_mouse_interaction(ui, rect);
         });
 
         // Request continuous repaint for smooth interaction

@@ -1,32 +1,73 @@
 // Mixer module - handles mixing of audio sources
 // This contains the mixing logic for both spatial and non-spatial sources
 
-use crate::playback::{PlayState, PlaybackInstance};
+use crate::playback::{LoopMode, PlayState, PlaybackInstance};
 use crate::spatial::SpatialProcessor;
 use crate::world::SourceId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Result of mixing - contains both the number of frames and loop events
+pub struct MixResult {
+    pub frames_filled: usize,
+    pub completed_sources: Vec<SourceId>,
+    pub looped_sources: Vec<SourceId>,
+}
+
 /// Mix all active playback instances into the buffer
-/// Returns the number of frames filled
+/// Returns MixResult containing:
+/// - The number of frames filled
+/// - Vector of source IDs that completed (LoopMode::Once finished)
+/// - Vector of source IDs that looped (LoopMode::Infinite completed one iteration)
 ///
 /// # Arguments
 /// * `world_buffer` - Output buffer to fill with mixed audio
 /// * `channels` - Number of audio channels (typically 2 for stereo)
 /// * `active_playback` - Map of active playback instances
 /// * `spatial_processor` - Optional spatial processor for 3D audio
+///
+/// # Loop Event Detection
+///
+/// All loop modes emit events when reaching the end of playback:
+/// - `LoopMode::Once`: Emits `SourceCompleted`, stops playing, removed from active_playback
+/// - `LoopMode::Infinite`: Emits `SourceLooped`, continues playing (loops automatically)
 pub fn mix_playback_instances(
     world_buffer: &mut [f32],
     channels: u16,
     active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     spatial_processor: Option<&mut SpatialProcessor>,
-) -> usize {
+) -> MixResult {
     let Ok(mut active_playback) = active_playback.try_lock() else {
         log::warn!("Failed to acquire active playback lock in mixer");
-        return 0;
+        return MixResult {
+            frames_filled: 0,
+            completed_sources: Vec::new(),
+            looped_sources: Vec::new(),
+        };
     };
 
-    // Only keep the instances that are not finished
+    // Collect source IDs that reached the end of playback and their loop modes
+    // This allows us to emit appropriate events (SourceCompleted or SourceLooped)
+    let mut completed_sources = Vec::new();
+    let mut looped_sources = Vec::new();
+
+    for (source_id, instance) in active_playback.iter_mut() {
+        if let Some(loop_mode) = instance.check_and_clear_end_flag() {
+            match loop_mode {
+                LoopMode::Once => {
+                    // Source finished and stopped - will be removed and emit SourceCompleted
+                    completed_sources.push(*source_id);
+                }
+                LoopMode::Infinite => {
+                    // Source looped and continues - emit SourceLooped
+                    looped_sources.push(*source_id);
+                }
+            }
+        }
+    }
+
+    // Only remove instances that are actually finished (stopped playing)
+    // Infinite looping sources continue playing, so don't remove them
     active_playback.retain(|_, instance| !instance.info.is_finished());
 
     // Separate spatial and non-spatial sources
@@ -73,5 +114,9 @@ pub fn mix_playback_instances(
         );
     }
 
-    frames_filled_max
+    MixResult {
+        frames_filled: frames_filled_max,
+        completed_sources,
+        looped_sources,
+    }
 }

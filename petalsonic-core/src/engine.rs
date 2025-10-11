@@ -2,12 +2,14 @@ use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::PetalSonicWorldDesc;
 use crate::error::PetalSonicError;
 use crate::error::Result;
+use crate::events::PetalSonicEvent;
 use crate::mixer;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
 use crate::spatial::SpatialProcessor;
 use crate::world::{PetalSonicWorld, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
+use crossbeam_channel::{Receiver, Sender};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer, Observer, Producer, Split},
@@ -62,6 +64,8 @@ struct RenderThreadContext {
     block_size: usize,
     spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
     world: Arc<PetalSonicWorld>,
+    /// Event sender for emitting playback events (e.g., SourceCompleted)
+    event_sender: Sender<PetalSonicEvent>,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -74,6 +78,7 @@ struct StreamCreationParams {
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     world: Arc<PetalSonicWorld>,
     render_shutdown: Arc<AtomicBool>,
+    event_sender: Sender<PetalSonicEvent>,
 }
 
 /// Callback function type for filling audio samples
@@ -103,6 +108,10 @@ pub struct PetalSonicEngine {
     render_shutdown: Arc<AtomicBool>,
     /// Spatial audio processor
     spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
+    /// Event channel for playback events (e.g., SourceCompleted)
+    /// The sender is cloned to render thread, receiver stays here for polling
+    event_sender: Sender<PetalSonicEvent>,
+    event_receiver: Receiver<PetalSonicEvent>,
 }
 
 impl PetalSonicEngine {
@@ -127,6 +136,10 @@ impl PetalSonicEngine {
             }
         };
 
+        // Create event channel for playback events
+        // Unbounded channel to ensure event emission never blocks the audio thread
+        let (event_sender, event_receiver) = crossbeam_channel::unbounded();
+
         Ok(Self {
             device_sample_rate: desc.sample_rate, // Will be updated when stream starts
             desc,
@@ -139,6 +152,8 @@ impl PetalSonicEngine {
             render_thread: None,
             render_shutdown: Arc::new(AtomicBool::new(false)),
             spatial_processor,
+            event_sender,
+            event_receiver,
         })
     }
 
@@ -245,6 +260,9 @@ impl PetalSonicEngine {
         self.render_shutdown.store(false, Ordering::Relaxed);
         let render_shutdown = self.render_shutdown.clone();
 
+        // Clone event sender for passing to render thread
+        let event_sender = self.event_sender.clone();
+
         let result = match device_config.sample_format() {
             cpal::SampleFormat::F32 => self.create_stream::<f32>(
                 device,
@@ -258,6 +276,7 @@ impl PetalSonicEngine {
                     active_playback,
                     world,
                     render_shutdown,
+                    event_sender,
                 },
             )?,
             cpal::SampleFormat::I16 => self.create_stream::<i16>(
@@ -272,6 +291,7 @@ impl PetalSonicEngine {
                     active_playback,
                     world,
                     render_shutdown,
+                    event_sender,
                 },
             )?,
             cpal::SampleFormat::U16 => self.create_stream::<u16>(
@@ -286,6 +306,7 @@ impl PetalSonicEngine {
                     active_playback,
                     world,
                     render_shutdown,
+                    event_sender,
                 },
             )?,
             _ => {
@@ -335,6 +356,28 @@ impl PetalSonicEngine {
         &self.desc
     }
 
+    /// Poll for playback events (non-blocking)
+    ///
+    /// Returns a vector of all events that have occurred since the last poll.
+    /// This should be called regularly (e.g., each frame) to receive events like
+    /// `SourceCompleted` which indicate when audio sources finish playing.
+    ///
+    /// # Example Flow
+    ///
+    /// 1. Audio finishes playing in render thread
+    /// 2. `SourceCompleted` event is emitted to the channel
+    /// 3. Source is auto-removed from `active_playback` (stops mixing)
+    /// 4. Source remains in world storage for potential replay
+    /// 5. GUI calls `poll_events()` and receives the event
+    /// 6. GUI removes from UI and optionally calls `world.remove_audio_data(id)`
+    pub fn poll_events(&self) -> Vec<PetalSonicEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.event_receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     /// Render thread loop that continuously fills the ring buffer
     fn render_thread_loop(mut ctx: RenderThreadContext) {
         log::info!("Render thread started");
@@ -362,7 +405,7 @@ impl PetalSonicEngine {
 
                 if free_space > 0 {
                     let samples_to_generate = free_space.min(ctx.block_size * 2);
-                    Self::generate_samples(
+                    let (completed_sources, looped_sources) = Self::generate_samples(
                         &mut ctx.ring_buffer_producer,
                         samples_to_generate,
                         ctx.channels as usize,
@@ -372,6 +415,31 @@ impl PetalSonicEngine {
                         ctx.block_size,
                         ctx.spatial_processor.as_ref(),
                     );
+
+                    // Emit SourceCompleted events for sources that finished (LoopMode::Once)
+                    // This is lock-free and non-blocking since we use an unbounded channel
+                    for source_id in completed_sources {
+                        if let Err(e) = ctx
+                            .event_sender
+                            .send(PetalSonicEvent::SourceCompleted { source_id })
+                        {
+                            log::error!("Failed to send SourceCompleted event: {}", e);
+                        } else {
+                            log::debug!("Source {} completed", source_id);
+                        }
+                    }
+
+                    // Emit SourceLooped events for sources that looped (LoopMode::Infinite)
+                    for source_id in looped_sources {
+                        if let Err(e) = ctx.event_sender.send(PetalSonicEvent::SourceLooped {
+                            source_id,
+                            loop_count: 0, // Could track actual loop count if needed
+                        }) {
+                            log::error!("Failed to send SourceLooped event: {}", e);
+                        } else {
+                            log::debug!("Source {} looped", source_id);
+                        }
+                    }
                 }
             }
 
@@ -422,6 +490,7 @@ impl PetalSonicEngine {
             block_size,
             spatial_processor: self.spatial_processor.clone(),
             world: params.world.clone(),
+            event_sender: params.event_sender,
         };
 
         // Spawn render thread
@@ -614,6 +683,7 @@ impl PetalSonicEngine {
     }
 
     /// Generate resampled samples and push to ring buffer
+    /// Returns a tuple of (completed_sources, looped_sources) for event emission
     fn generate_samples(
         producer: &mut impl Producer<Item = StereoFrame>,
         samples_needed: usize,
@@ -623,11 +693,15 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         block_size: usize,
         spatial_processor: Option<&Arc<Mutex<SpatialProcessor>>>,
-    ) {
+    ) -> (Vec<SourceId>, Vec<SourceId>) {
         let Ok(mut resampler) = resampler_arc.try_lock() else {
             log::warn!("Failed to acquire resampler lock in generate_resampled_samples");
-            return;
+            return (Vec::new(), Vec::new());
         };
+
+        // Track all completed and looped sources across all mixing iterations
+        let mut all_completed_sources = Vec::new();
+        let mut all_looped_sources = Vec::new();
 
         // Generate samples in fixed world block_size chunks, output is variable
         let mut total_generated = 0;
@@ -646,12 +720,17 @@ impl PetalSonicEngine {
                 let mut spatial_processor_guard =
                     spatial_processor.and_then(|sp| sp.try_lock().ok());
 
-                mixer::mix_playback_instances(
+                // Mix returns MixResult with completed and looped sources
+                let mix_result = mixer::mix_playback_instances(
                     &mut world_buffer,
                     channels,
                     active_playback,
                     spatial_processor_guard.as_deref_mut(),
                 );
+
+                // Collect completed and looped sources for event emission
+                all_completed_sources.extend(mix_result.completed_sources);
+                all_looped_sources.extend(mix_result.looped_sources);
 
                 RESAMPLED_BUFFER.with(|rbuf| {
                     let mut resampled_buffer = rbuf.borrow_mut();
@@ -698,6 +777,8 @@ impl PetalSonicEngine {
                 break;
             }
         }
+
+        (all_completed_sources, all_looped_sources)
     }
 }
 

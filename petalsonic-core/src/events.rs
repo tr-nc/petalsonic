@@ -1,47 +1,48 @@
 //! Event types for PetalSonic
 
 use crate::math::Vec3;
+use crate::world::SourceId;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PetalSonicEvent {
     SourceCompleted {
-        source_id: u64,
+        source_id: SourceId,
     },
     SourceLooped {
-        source_id: u64,
+        source_id: SourceId,
         loop_count: u32,
     },
     SourceStarted {
-        source_id: u64,
+        source_id: SourceId,
     },
     SourceStopped {
-        source_id: u64,
+        source_id: SourceId,
     },
     BufferUnderrun {
-        source_id: Option<u64>,
+        source_id: Option<SourceId>,
     },
     BufferOverrun {
-        source_id: Option<u64>,
+        source_id: Option<SourceId>,
     },
     DeviceChanged {
         device_name: String,
     },
     SpatializationError {
-        source_id: u64,
+        source_id: SourceId,
         error: String,
     },
     SourceReachedEnd {
-        source_id: u64,
+        source_id: SourceId,
         remaining_duration: Duration,
     },
     SourceVolumeChanged {
-        source_id: u64,
+        source_id: SourceId,
         old_volume: f32,
         new_volume: f32,
     },
     SourcePoseChanged {
-        source_id: u64,
+        source_id: SourceId,
         old_position: Vec3,
         new_position: Vec3,
     },
@@ -57,7 +58,7 @@ pub enum PetalSonicEvent {
 }
 
 impl PetalSonicEvent {
-    pub fn source_id(&self) -> Option<u64> {
+    pub fn source_id(&self) -> Option<SourceId> {
         match self {
             Self::SourceCompleted { source_id }
             | Self::SourceLooped { source_id, .. }
@@ -67,6 +68,7 @@ impl PetalSonicEvent {
             | Self::SourceReachedEnd { source_id, .. }
             | Self::SourceVolumeChanged { source_id, .. }
             | Self::SourcePoseChanged { source_id, .. } => Some(*source_id),
+            Self::BufferUnderrun { source_id } | Self::BufferOverrun { source_id } => *source_id,
             _ => None,
         }
     }

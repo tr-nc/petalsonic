@@ -300,7 +300,6 @@ impl SpatialAudioDemo {
         let loop_mode = match self.selected_loop_mode_index {
             0 => LoopMode::Once,
             1 => LoopMode::Infinite,
-            2 => LoopMode::Count(3),
             _ => LoopMode::Once,
         };
 
@@ -322,6 +321,45 @@ impl SpatialAudioDemo {
 
 impl eframe::App for SpatialAudioDemo {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll for audio events and handle them
+        // This checks for completed sources and removes them from the UI
+        let events = self.engine.poll_events();
+        for event in events {
+            match event {
+                petalsonic_core::PetalSonicEvent::SourceCompleted { source_id } => {
+                    log::info!("Source {} completed, removing from UI", source_id);
+
+                    // Remove from UI sources list
+                    if let Some(pos) = self.sources.iter().position(|s| s.id == source_id) {
+                        let removed = self.sources.remove(pos);
+                        log::info!("Removed source '{}' from UI", removed.file_name);
+                    }
+
+                    // Remove from world storage to free memory
+                    // Note: You could also keep it in world storage if you want to replay it later
+                    if let Some(audio_data) = self.world.remove_audio_data(source_id) {
+                        log::debug!(
+                            "Freed audio data for source {}: {} samples",
+                            source_id,
+                            audio_data.samples().len()
+                        );
+                    }
+                }
+                petalsonic_core::PetalSonicEvent::SourceLooped {
+                    source_id,
+                    loop_count,
+                } => {
+                    // Infinite looping sources emit this event each time they loop
+                    // They continue playing, so we don't remove them
+                    log::debug!("Source {} looped (count: {})", source_id, loop_count);
+                }
+                _ => {
+                    // Handle other events if needed
+                    log::debug!("Received event: {:?}", event);
+                }
+            }
+        }
+
         // Right panel for controls
         egui::SidePanel::right("control_panel")
             .default_width(250.0)
@@ -347,7 +385,7 @@ impl eframe::App for SpatialAudioDemo {
 
                 // Loop mode selection
                 ui.label("Loop Mode:");
-                let loop_modes = ["Once", "Infinite", "Count(3)"];
+                let loop_modes = ["Once", "Infinite"];
                 egui::ComboBox::from_label(" ")
                     .selected_text(loop_modes[self.selected_loop_mode_index])
                     .show_ui(ui, |ui| {

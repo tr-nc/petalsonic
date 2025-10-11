@@ -7,11 +7,11 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopMode {
     /// Play once and stop
+    /// Emits SourceCompleted event when finished
     Once,
     /// Loop infinitely
+    /// Emits SourceLooped event at the end of each iteration
     Infinite,
-    /// Loop a specific number of times
-    Count(u32),
 }
 
 impl Default for LoopMode {
@@ -78,8 +78,8 @@ pub struct PlaybackInstance {
     pub config: SourceConfig,
     /// Loop mode for this playback
     pub loop_mode: LoopMode,
-    /// Remaining loops (only used for LoopMode::Count)
-    loops_remaining: u32,
+    /// Flag to track if we've reached the end this iteration (for event emission)
+    reached_end_this_iteration: bool,
 }
 
 impl PlaybackInstance {
@@ -93,19 +93,13 @@ impl PlaybackInstance {
         let sample_rate = audio_data.sample_rate();
         let info = PlaybackInfo::new(total_frames, sample_rate);
 
-        // Initialize loops_remaining based on loop_mode
-        let loops_remaining = match loop_mode {
-            LoopMode::Count(n) => n,
-            _ => 0,
-        };
-
         Self {
             audio_id,
             audio_data,
             info,
             config,
             loop_mode,
-            loops_remaining,
+            reached_end_this_iteration: false,
         }
     }
 
@@ -114,14 +108,9 @@ impl PlaybackInstance {
         self.info.play_state = PlayState::Playing;
     }
 
-    /// Set the loop mode and reset the loop counter if needed
+    /// Set the loop mode
     pub fn set_loop_mode(&mut self, loop_mode: LoopMode) {
         self.loop_mode = loop_mode;
-        // Reset loops_remaining when loop mode changes
-        self.loops_remaining = match loop_mode {
-            LoopMode::Count(n) => n,
-            _ => 0,
-        };
     }
 
     /// Pause this instance
@@ -150,27 +139,19 @@ impl PlaybackInstance {
 
         for frame_idx in 0..frame_count {
             if self.info.current_frame >= samples.len() {
-                // Reached end of audio - check loop mode
+                // Reached end of audio - mark that we've reached the end this iteration
+                self.reached_end_this_iteration = true;
+
+                // Handle based on loop mode
                 match self.loop_mode {
                     LoopMode::Once => {
-                        // Stop playback
+                        // Stop playback - will emit SourceCompleted event
                         self.info.play_state = PlayState::Stopped;
                         break;
                     }
                     LoopMode::Infinite => {
-                        // Reset to beginning and continue
+                        // Reset to beginning and continue - will emit SourceLooped event
                         self.info.current_frame = 0;
-                    }
-                    LoopMode::Count(_) => {
-                        if self.loops_remaining > 0 {
-                            // Decrement and reset to beginning
-                            self.loops_remaining -= 1;
-                            self.info.current_frame = 0;
-                        } else {
-                            // No more loops, stop playback
-                            self.info.play_state = PlayState::Stopped;
-                            break;
-                        }
                     }
                 }
             }
@@ -193,6 +174,18 @@ impl PlaybackInstance {
         self.info
             .update_position(self.info.current_frame, self.audio_data.sample_rate());
         frames_filled
+    }
+
+    /// Check if this instance reached the end of playback this iteration
+    /// Returns true if reached end, and also returns the loop mode for event determination
+    /// This is used by the mixer to emit appropriate events
+    pub fn check_and_clear_end_flag(&mut self) -> Option<LoopMode> {
+        if self.reached_end_this_iteration {
+            self.reached_end_this_iteration = false;
+            Some(self.loop_mode)
+        } else {
+            None
+        }
     }
 }
 

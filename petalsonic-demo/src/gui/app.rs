@@ -75,7 +75,7 @@ impl SpatialAudioDemo {
             world: world_arc,
             engine,
             sources: Vec::new(),
-            grid_size: 5.0,
+            grid_size: 2.0,
             available_audio_files,
             selected_audio_file_index: 0,
             selected_loop_mode_index: 0, // Once
@@ -227,8 +227,6 @@ impl SpatialAudioDemo {
                 if let Err(e) = self.add_source_at_position(clamped_pos) {
                     log::error!("Failed to add source: {}", e);
                 }
-
-                self.add_source_mode = false;
             }
             return;
         }

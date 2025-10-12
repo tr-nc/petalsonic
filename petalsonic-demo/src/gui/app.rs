@@ -34,6 +34,9 @@ pub struct SpatialAudioDemo {
     add_source_mode: bool,
     dragging_source_index: Option<usize>,
 
+    // Layout configuration
+    control_panel_width_ratio: f32, // Ratio of screen width for control panel (0.0-1.0)
+
     // Performance profiling
     timing_history: VecDeque<RenderTimingEvent>,
     max_history_size: usize,
@@ -98,6 +101,7 @@ impl SpatialAudioDemo {
             selected_loop_mode_index: 0, // Once
             add_source_mode: false,
             dragging_source_index: None,
+            control_panel_width_ratio: 0.4, // 40% of screen width for control panel
             timing_history: VecDeque::with_capacity(100),
             max_history_size: 100,
             max_frame_time_us,
@@ -436,9 +440,13 @@ impl eframe::App for SpatialAudioDemo {
             }
         }
 
+        // Calculate control panel width based on screen size and ratio
+        let screen_width = ctx.screen_rect().width();
+        let panel_width = screen_width * self.control_panel_width_ratio;
+
         // Right panel for controls
         egui::SidePanel::right("control_panel")
-            .default_width(250.0)
+            .default_width(panel_width)
             .show(ctx, |ui| {
                 ui.heading("Control Panel");
                 ui.separator();
@@ -486,21 +494,22 @@ impl eframe::App for SpatialAudioDemo {
                 ui.add_space(20.0);
                 ui.separator();
 
-                // Source list
-                ui.label(format!("Active Sources: {}", self.sources.len()));
-                ui.add_space(5.0);
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, source) in self.sources.iter().enumerate() {
-                        ui.group(|ui| {
-                            ui.label(format!("#{}: {}", idx + 1, source.file_name));
-                            ui.label(format!(
-                                "  Pos: ({:.1}, {:.1})",
-                                source.position.x, source.position.z
-                            ));
-                            ui.label(format!("  Loop: {:?}", source.loop_mode));
+                // Active sources section (collapsible)
+                ui.collapsing(format!("Active Sources ({})", self.sources.len()), |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for (idx, source) in self.sources.iter().enumerate() {
+                                ui.group(|ui| {
+                                    ui.label(format!("#{}: {}", idx + 1, source.file_name));
+                                    ui.label(format!(
+                                        "  Pos: ({:.1}, {:.1})",
+                                        source.position.x, source.position.z
+                                    ));
+                                    ui.label(format!("  Loop: {:?}", source.loop_mode));
+                                });
+                            }
                         });
-                    }
                 });
 
                 ui.add_space(20.0);

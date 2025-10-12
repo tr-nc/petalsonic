@@ -1,6 +1,6 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use petalsonic_core::{
-    SourceConfig,
+    RenderTimingEvent, SourceConfig,
     audio_data::PetalSonicAudioData,
     config::PetalSonicWorldDesc,
     engine::PetalSonicEngine,
@@ -8,7 +8,10 @@ use petalsonic_core::{
     playback::LoopMode,
     world::{PetalSonicWorld, SourceId},
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
+
+use super::profiling;
 
 #[derive(Clone)]
 struct AudioSource {
@@ -30,6 +33,11 @@ pub struct SpatialAudioDemo {
     selected_loop_mode_index: usize,
     add_source_mode: bool,
     dragging_source_index: Option<usize>,
+
+    // Performance profiling
+    timing_history: VecDeque<RenderTimingEvent>,
+    max_history_size: usize,
+    max_frame_time_us: u64, // Hard constraint: block_size / sample_rate in microseconds
 }
 
 impl SpatialAudioDemo {
@@ -64,12 +72,21 @@ impl SpatialAudioDemo {
 
         // Create engine
         let world_arc = Arc::new(world);
-        let mut engine =
-            PetalSonicEngine::new(world_desc, world_arc.clone()).expect("Failed to create engine");
+        let mut engine = PetalSonicEngine::new(world_desc.clone(), world_arc.clone())
+            .expect("Failed to create engine");
 
         // Start the engine
         engine.start().expect("Failed to start audio engine");
         log::info!("Audio engine started");
+
+        // Calculate maximum frame time constraint (block_size / sample_rate)
+        let max_frame_time_us =
+            (world_desc.block_size as f64 / world_desc.sample_rate as f64 * 1_000_000.0) as u64;
+        log::info!(
+            "Performance constraint: {} µs ({:.2} ms) per render iteration",
+            max_frame_time_us,
+            max_frame_time_us as f64 / 1000.0
+        );
 
         Self {
             world: world_arc,
@@ -81,6 +98,9 @@ impl SpatialAudioDemo {
             selected_loop_mode_index: 0, // Once
             add_source_mode: false,
             dragging_source_index: None,
+            timing_history: VecDeque::with_capacity(100),
+            max_history_size: 100,
+            max_frame_time_us,
         }
     }
 
@@ -404,6 +424,18 @@ impl eframe::App for SpatialAudioDemo {
             }
         }
 
+        // Poll for timing events and update history
+        let timing_events = self.engine.poll_timing_events();
+        for timing in timing_events {
+            // Add to history
+            self.timing_history.push_back(timing);
+
+            // Keep history at max size
+            while self.timing_history.len() > self.max_history_size {
+                self.timing_history.pop_front();
+            }
+        }
+
         // Right panel for controls
         egui::SidePanel::right("control_panel")
             .default_width(250.0)
@@ -470,6 +502,12 @@ impl eframe::App for SpatialAudioDemo {
                         });
                     }
                 });
+
+                ui.add_space(20.0);
+                ui.separator();
+
+                // Performance profiling widget
+                profiling::draw_profiling_widget(ui, &self.timing_history, self.max_frame_time_us);
             });
 
         // Central panel for visualization

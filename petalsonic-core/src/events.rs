@@ -4,6 +4,20 @@ use crate::math::Vec3;
 use crate::world::SourceId;
 use std::time::Duration;
 
+/// Timing information for a single render iteration
+/// Used for performance profiling and stress testing
+#[derive(Debug, Clone, Copy)]
+pub struct RenderTimingEvent {
+    /// Time spent mixing audio sources (microseconds)
+    pub mixing_time_us: u64,
+    /// Time spent on spatial processing (microseconds)
+    pub spatial_time_us: u64,
+    /// Time spent on resampling (microseconds)
+    pub resampling_time_us: u64,
+    /// Total time for the entire render iteration (microseconds)
+    pub total_time_us: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PetalSonicEvent {
     SourceCompleted {

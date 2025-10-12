@@ -1,4 +1,5 @@
 mod app;
+pub mod profiling;
 
 pub use app::SpatialAudioDemo;
 

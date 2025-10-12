@@ -12,6 +12,6 @@ pub mod world;
 pub use config::{PetalSonicWorldDesc, SourceConfig};
 pub use engine::{AudioFillCallback, PetalSonicEngine};
 pub use error::PetalSonicError;
-pub use events::PetalSonicEvent;
+pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
 pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};

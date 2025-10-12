@@ -2,7 +2,7 @@ use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::PetalSonicWorldDesc;
 use crate::error::PetalSonicError;
 use crate::error::Result;
-use crate::events::PetalSonicEvent;
+use crate::events::{PetalSonicEvent, RenderTimingEvent};
 use crate::mixer;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
 use crate::spatial::SpatialProcessor;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Stereo frame for ring buffer
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +66,8 @@ struct RenderThreadContext {
     world: Arc<PetalSonicWorld>,
     /// Event sender for emitting playback events (e.g., SourceCompleted)
     event_sender: Sender<PetalSonicEvent>,
+    /// Timing event sender for performance profiling
+    timing_sender: Sender<RenderTimingEvent>,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -79,6 +81,7 @@ struct StreamCreationParams {
     world: Arc<PetalSonicWorld>,
     render_shutdown: Arc<AtomicBool>,
     event_sender: Sender<PetalSonicEvent>,
+    timing_sender: Sender<RenderTimingEvent>,
 }
 
 /// Callback function type for filling audio samples
@@ -112,6 +115,10 @@ pub struct PetalSonicEngine {
     /// The sender is cloned to render thread, receiver stays here for polling
     event_sender: Sender<PetalSonicEvent>,
     event_receiver: Receiver<PetalSonicEvent>,
+    /// Timing channel for performance profiling
+    /// The sender is cloned to render thread, receiver stays here for polling
+    timing_sender: Sender<RenderTimingEvent>,
+    timing_receiver: Receiver<RenderTimingEvent>,
 }
 
 impl PetalSonicEngine {
@@ -140,6 +147,10 @@ impl PetalSonicEngine {
         // Unbounded channel to ensure event emission never blocks the audio thread
         let (event_sender, event_receiver) = crossbeam_channel::unbounded();
 
+        // Create timing channel for performance profiling
+        // Unbounded channel to ensure timing emission never blocks the render thread
+        let (timing_sender, timing_receiver) = crossbeam_channel::unbounded();
+
         Ok(Self {
             device_sample_rate: desc.sample_rate, // Will be updated when stream starts
             desc,
@@ -154,6 +165,8 @@ impl PetalSonicEngine {
             spatial_processor,
             event_sender,
             event_receiver,
+            timing_sender,
+            timing_receiver,
         })
     }
 
@@ -263,6 +276,9 @@ impl PetalSonicEngine {
         // Clone event sender for passing to render thread
         let event_sender = self.event_sender.clone();
 
+        // Clone timing sender for passing to render thread
+        let timing_sender = self.timing_sender.clone();
+
         let result = match device_config.sample_format() {
             cpal::SampleFormat::F32 => self.create_stream::<f32>(
                 device,
@@ -277,6 +293,7 @@ impl PetalSonicEngine {
                     world,
                     render_shutdown,
                     event_sender,
+                    timing_sender,
                 },
             )?,
             cpal::SampleFormat::I16 => self.create_stream::<i16>(
@@ -292,6 +309,7 @@ impl PetalSonicEngine {
                     world,
                     render_shutdown,
                     event_sender,
+                    timing_sender,
                 },
             )?,
             cpal::SampleFormat::U16 => self.create_stream::<u16>(
@@ -307,6 +325,7 @@ impl PetalSonicEngine {
                     world,
                     render_shutdown,
                     event_sender,
+                    timing_sender,
                 },
             )?,
             _ => {
@@ -378,6 +397,24 @@ impl PetalSonicEngine {
         events
     }
 
+    /// Poll for timing events (non-blocking)
+    ///
+    /// Returns a vector of all timing events that have occurred since the last poll.
+    /// This should be called regularly (e.g., each frame) for performance profiling.
+    ///
+    /// Each event contains timing information for a single render iteration:
+    /// - Mixing time (microseconds)
+    /// - Spatial processing time (microseconds)
+    /// - Resampling time (microseconds)
+    /// - Total render time (microseconds)
+    pub fn poll_timing_events(&self) -> Vec<RenderTimingEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.timing_receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     /// Render thread loop that continuously fills the ring buffer
     fn render_thread_loop(mut ctx: RenderThreadContext) {
         log::info!("Render thread started");
@@ -405,7 +442,7 @@ impl PetalSonicEngine {
 
                 if free_space > 0 {
                     let samples_to_generate = free_space.min(ctx.block_size * 2);
-                    let (completed_sources, looped_sources) = Self::generate_samples(
+                    let (completed_sources, looped_sources, timing) = Self::generate_samples(
                         &mut ctx.ring_buffer_producer,
                         samples_to_generate,
                         ctx.channels as usize,
@@ -415,6 +452,11 @@ impl PetalSonicEngine {
                         ctx.block_size,
                         ctx.spatial_processor.as_ref(),
                     );
+
+                    // Send timing event (non-blocking)
+                    if let Err(e) = ctx.timing_sender.send(timing) {
+                        log::error!("Failed to send timing event: {}", e);
+                    }
 
                     // Emit SourceCompleted events for sources that finished (LoopMode::Once)
                     // This is lock-free and non-blocking since we use an unbounded channel
@@ -497,6 +539,7 @@ impl PetalSonicEngine {
             spatial_processor: self.spatial_processor.clone(),
             world: params.world.clone(),
             event_sender: params.event_sender,
+            timing_sender: params.timing_sender,
         };
 
         // Spawn render thread
@@ -728,7 +771,7 @@ impl PetalSonicEngine {
     }
 
     /// Generate resampled samples and push to ring buffer
-    /// Returns a tuple of (completed_sources, looped_sources) for event emission
+    /// Returns a tuple of (completed_sources, looped_sources, timing_event)
     fn generate_samples(
         producer: &mut impl Producer<Item = StereoFrame>,
         samples_needed: usize,
@@ -738,10 +781,24 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         block_size: usize,
         spatial_processor: Option<&Arc<Mutex<SpatialProcessor>>>,
-    ) -> (Vec<SourceId>, Vec<SourceId>) {
+    ) -> (Vec<SourceId>, Vec<SourceId>, RenderTimingEvent) {
+        let total_start = Instant::now();
+        let mut total_mixing_time_us = 0u64;
+        let total_spatial_time_us = 0u64;
+        let mut total_resampling_time_us = 0u64;
+
         let Ok(mut resampler) = resampler_arc.try_lock() else {
             log::warn!("Failed to acquire resampler lock in generate_resampled_samples");
-            return (Vec::new(), Vec::new());
+            return (
+                Vec::new(),
+                Vec::new(),
+                RenderTimingEvent {
+                    mixing_time_us: 0,
+                    spatial_time_us: 0,
+                    resampling_time_us: 0,
+                    total_time_us: 0,
+                },
+            );
         };
 
         // Track all completed and looped sources across all mixing iterations
@@ -760,6 +817,9 @@ impl PetalSonicEngine {
                 world_buffer.resize(world_buffer_size, 0.0f32);
                 world_buffer.fill(0.0f32);
 
+                // Measure mixing time (includes both spatial and non-spatial)
+                let mixing_start = Instant::now();
+
                 // Use the mixer module to mix all playback instances
                 // Pass spatial processor if available
                 let mut spatial_processor_guard =
@@ -773,9 +833,15 @@ impl PetalSonicEngine {
                     spatial_processor_guard.as_deref_mut(),
                 );
 
+                let mixing_elapsed = mixing_start.elapsed();
+
                 // Collect completed and looped sources for event emission
                 all_completed_sources.extend(mix_result.completed_sources);
                 all_looped_sources.extend(mix_result.looped_sources);
+
+                // Note: Spatial processing time is embedded in mixing time
+                // We'll extract it from the mixer in the future if needed
+                total_mixing_time_us += mixing_elapsed.as_micros() as u64;
 
                 RESAMPLED_BUFFER.with(|rbuf| {
                     let mut resampled_buffer = rbuf.borrow_mut();
@@ -786,8 +852,14 @@ impl PetalSonicEngine {
                         ((block_size as f64 * ratio) as usize + 10) * channels_usize;
                     resampled_buffer.resize(expected_output, 0.0f32);
 
+                    // Measure resampling time
+                    let resampling_start = Instant::now();
+
                     match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
                         Ok((frames_out, _frames_in)) => {
+                            let resampling_elapsed = resampling_start.elapsed();
+                            total_resampling_time_us += resampling_elapsed.as_micros() as u64;
+
                             // Push all generated frames to ring buffer
                             let mut pushed = 0;
                             for i in 0..frames_out {
@@ -823,7 +895,18 @@ impl PetalSonicEngine {
             }
         }
 
-        (all_completed_sources, all_looped_sources)
+        let total_elapsed = total_start.elapsed();
+
+        (
+            all_completed_sources,
+            all_looped_sources,
+            RenderTimingEvent {
+                mixing_time_us: total_mixing_time_us,
+                spatial_time_us: total_spatial_time_us, // TODO: Extract from mixer
+                resampling_time_us: total_resampling_time_us,
+                total_time_us: total_elapsed.as_micros() as u64,
+            },
+        )
     }
 }
 

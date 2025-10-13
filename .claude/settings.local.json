@@ -10,7 +10,8 @@
       "WebFetch(domain:github.com)",
       "Bash(git mv:*)",
       "Bash(mkdir:*)",
-      "Bash(mv:*)"
+      "Bash(mv:*)",
+      "Bash(test:*)"
     ],
     "deny": [],
     "ask": []

@@ -2,6 +2,28 @@ use egui::{Color32, Pos2, Stroke, Vec2};
 use petalsonic_core::RenderTimingEvent;
 use std::collections::VecDeque;
 
+/// Format time in microseconds to the most appropriate unit (µs, ms, or s)
+///
+/// # Arguments
+/// * `time_us` - Time in microseconds
+///
+/// # Returns
+/// A string with the time formatted with the most appropriate unit
+fn format_time_auto(time_us: u64) -> String {
+    let time_us_f = time_us as f64;
+
+    if time_us < 1_000 {
+        // Less than 1 ms: display in microseconds
+        format!("{:.2} µs", time_us_f)
+    } else if time_us < 1_000_000 {
+        // Less than 1 second: display in milliseconds
+        format!("{:.2} ms", time_us_f / 1_000.0)
+    } else {
+        // 1 second or more: display in seconds
+        format!("{:.2} s", time_us_f / 1_000_000.0)
+    }
+}
+
 /// Draw a performance profiling widget showing render timing history
 ///
 /// # Arguments
@@ -22,25 +44,29 @@ pub fn draw_profiling_widget(
         // Get the most recent timing event
         let latest = timing_history.back().unwrap();
 
-        // Convert to milliseconds for display
-        let max_frame_time_ms = max_frame_time_us as f32 / 1000.0;
-        let latest_total_ms = latest.total_time_us as f32 / 1000.0;
-        let latest_mixing_ms = latest.mixing_time_us as f32 / 1000.0;
-        let latest_resampling_ms = latest.resampling_time_us as f32 / 1000.0;
-
         // Calculate utilization percentage
         let utilization =
             (latest.total_time_us as f32 / max_frame_time_us as f32 * 100.0).min(999.0);
 
-        // Display current values
+        // Display current values with auto-formatted units
         ui.heading("Current Frame");
         ui.label(format!(
-            "Total: {:.2} ms ({:.1}%)",
-            latest_total_ms, utilization
+            "Total: {} ({:.1}%)",
+            format_time_auto(latest.total_time_us),
+            utilization
         ));
-        ui.label(format!("Mixing: {:.2} ms", latest_mixing_ms));
-        ui.label(format!("Resampling: {:.2} ms", latest_resampling_ms));
-        ui.label(format!("Constraint: {:.2} ms", max_frame_time_ms));
+        ui.label(format!(
+            "Mixing: {}",
+            format_time_auto(latest.mixing_time_us)
+        ));
+        ui.label(format!(
+            "Resampling: {}",
+            format_time_auto(latest.resampling_time_us)
+        ));
+        ui.label(format!(
+            "Constraint: {}",
+            format_time_auto(max_frame_time_us)
+        ));
 
         // Warning if approaching limit
         if utilization > 90.0 {
@@ -52,8 +78,7 @@ pub fn draw_profiling_widget(
         ui.add_space(10.0);
 
         // Draw the graph
-        ui.heading("Timing History");
-        let graph_height = 200.0;
+        let graph_height = 400.0;
         let (response, painter) = ui.allocate_painter(
             Vec2::new(ui.available_width(), graph_height),
             egui::Sense::hover(),
@@ -90,7 +115,7 @@ pub fn draw_profiling_widget(
         painter.text(
             Pos2::new(rect.max.x - 5.0, constraint_y - 5.0),
             egui::Align2::RIGHT_BOTTOM,
-            format!("{:.1}ms", max_frame_time_ms),
+            format_time_auto(max_frame_time_us),
             egui::FontId::proportional(10.0),
             Color32::RED,
         );

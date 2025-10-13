@@ -1,0 +1,23 @@
+[package]
+name = "audionimbus-demo"
+description = "An interactive demo of AudioNimbus."
+version = "0.1.0"
+edition = "2021"
+authors = ["Maxence Maire <maire.maxence@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MaxenceMaire/audionimbus-demo"
+readme = "README.md"
+
+[dependencies]
+audionimbus = { version = "0.8.3", features = ["auto-install"]  }
+bevy = "0.17"
+itertools = "0.14.0"
+rodio = "0.20.1"
+
+[features]
+direct = []
+reverb = []
+
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

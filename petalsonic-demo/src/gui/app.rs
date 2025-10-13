@@ -385,29 +385,12 @@ impl eframe::App for SpatialAudioDemo {
 
                     // Remove from UI sources list
                     if let Some(pos) = self.sources.iter().position(|s| s.id == source_id) {
-                        let removed = self.sources.remove(pos);
-                        log::info!("GUI: Removed source '{}' from UI list", removed.file_name);
-                    } else {
-                        log::warn!(
-                            "GUI: Source {} completed but not found in UI list",
-                            source_id
-                        );
+                        self.sources.remove(pos);
                     }
 
                     // Remove from world storage to free memory
                     // Note: You could also keep it in world storage if you want to replay it later
-                    if let Some(audio_data) = self.world.remove_audio_data(source_id) {
-                        log::info!(
-                            "GUI: Freed audio data for source {}: {} samples",
-                            source_id,
-                            audio_data.samples().len()
-                        );
-                    } else {
-                        log::warn!(
-                            "GUI: Source {} already removed from world storage",
-                            source_id
-                        );
-                    }
+                    self.world.remove_audio_data(source_id);
                 }
                 petalsonic_core::PetalSonicEvent::SourceLooped {
                     source_id,
@@ -523,12 +506,6 @@ impl eframe::App for SpatialAudioDemo {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("PetalSonic Spatial Audio Demo");
 
-            let instruction = if self.add_source_mode {
-                "Click anywhere on the grid to add a new audio source"
-            } else {
-                "Drag existing sources to move them around"
-            };
-            ui.label(instruction);
             ui.separator();
 
             // Allocate space for the visualization

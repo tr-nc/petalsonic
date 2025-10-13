@@ -83,6 +83,21 @@ impl SpatialAudioDemo {
         log::info!("Audio engine started");
 
         // Calculate maximum frame time constraint (block_size / sample_rate)
+        //
+        // This is the hard real-time constraint for audio processing:
+        //
+        // 1. block_size is the number of samples per audio buffer (e.g., 1024 samples)
+        // 2. sample_rate is samples per second (e.g., 48000 Hz)
+        // 3. block_size / sample_rate = time in seconds to process one buffer
+        //    Example: 1024 / 48000 = 0.021333... seconds (~21.33 ms)
+        //
+        // 4. Multiply by 1,000,000 to convert seconds to microseconds
+        //    Example: 0.021333 * 1,000,000 = 21,333 µs
+        //
+        // This represents the absolute deadline: if audio processing takes longer than
+        // this time, the next buffer won't be ready when the audio hardware needs it,
+        // causing audible glitches, clicks, or dropouts. The profiler uses this value
+        // to calculate CPU utilization % and warn when approaching the limit.
         let max_frame_time_us =
             (world_desc.block_size as f64 / world_desc.sample_rate as f64 * 1_000_000.0) as u64;
         log::info!(
@@ -431,75 +446,95 @@ impl eframe::App for SpatialAudioDemo {
         egui::SidePanel::right("control_panel")
             .default_width(panel_width)
             .show(ctx, |ui| {
-                ui.heading("Control Panel");
-                ui.separator();
+                // Wrap entire panel content in a scroll area that supports both directions
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.heading("Control Panel");
+                        ui.separator();
 
-                // Audio file selection
-                ui.label("Select Audio File:");
-                if !self.available_audio_files.is_empty() {
-                    egui::ComboBox::from_label("")
-                        .selected_text(&self.available_audio_files[self.selected_audio_file_index])
-                        .show_ui(ui, |ui| {
-                            for (idx, file) in self.available_audio_files.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_audio_file_index, idx, file);
-                            }
-                        });
-                } else {
-                    ui.label("No audio files found");
-                }
-
-                ui.add_space(10.0);
-
-                // Loop mode selection
-                ui.label("Loop Mode:");
-                let loop_modes = ["Once", "Infinite"];
-                egui::ComboBox::from_label(" ")
-                    .selected_text(loop_modes[self.selected_loop_mode_index])
-                    .show_ui(ui, |ui| {
-                        for (idx, mode) in loop_modes.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_loop_mode_index, idx, *mode);
-                        }
-                    });
-
-                ui.add_space(10.0);
-
-                // Add source button
-                let button_text = if self.add_source_mode {
-                    "Click on grid to place..."
-                } else {
-                    "Add Source"
-                };
-
-                if ui.button(button_text).clicked() {
-                    self.add_source_mode = !self.add_source_mode;
-                }
-
-                ui.add_space(20.0);
-                ui.separator();
-
-                // Active sources section (collapsible)
-                ui.collapsing(format!("Active Sources ({})", self.sources.len()), |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(200.0)
-                        .show(ui, |ui| {
-                            for (idx, source) in self.sources.iter().enumerate() {
-                                ui.group(|ui| {
-                                    ui.label(format!("#{}: {}", idx + 1, source.file_name));
-                                    ui.label(format!(
-                                        "  Pos: ({:.1}, {:.1})",
-                                        source.position.x, source.position.z
-                                    ));
-                                    ui.label(format!("  Loop: {:?}", source.loop_mode));
+                        // Audio file selection
+                        ui.label("Select Audio File:");
+                        if !self.available_audio_files.is_empty() {
+                            egui::ComboBox::from_label("")
+                                .selected_text(
+                                    &self.available_audio_files[self.selected_audio_file_index],
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (idx, file) in self.available_audio_files.iter().enumerate()
+                                    {
+                                        ui.selectable_value(
+                                            &mut self.selected_audio_file_index,
+                                            idx,
+                                            file,
+                                        );
+                                    }
                                 });
-                            }
+                        } else {
+                            ui.label("No audio files found");
+                        }
+
+                        ui.add_space(10.0);
+
+                        // Loop mode selection
+                        ui.label("Loop Mode:");
+                        let loop_modes = ["Once", "Infinite"];
+                        egui::ComboBox::from_label(" ")
+                            .selected_text(loop_modes[self.selected_loop_mode_index])
+                            .show_ui(ui, |ui| {
+                                for (idx, mode) in loop_modes.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.selected_loop_mode_index,
+                                        idx,
+                                        *mode,
+                                    );
+                                }
+                            });
+
+                        ui.add_space(10.0);
+
+                        // Add source button
+                        let button_text = if self.add_source_mode {
+                            "Click on grid to place..."
+                        } else {
+                            "Add Source"
+                        };
+
+                        if ui.button(button_text).clicked() {
+                            self.add_source_mode = !self.add_source_mode;
+                        }
+
+                        ui.add_space(20.0);
+                        ui.separator();
+
+                        // Active sources section (collapsible)
+                        ui.collapsing(format!("Active Sources ({})", self.sources.len()), |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    for (idx, source) in self.sources.iter().enumerate() {
+                                        ui.group(|ui| {
+                                            ui.label(format!("#{}: {}", idx + 1, source.file_name));
+                                            ui.label(format!(
+                                                "  Pos: ({:.1}, {:.1})",
+                                                source.position.x, source.position.z
+                                            ));
+                                            ui.label(format!("  Loop: {:?}", source.loop_mode));
+                                        });
+                                    }
+                                });
                         });
-                });
 
-                ui.add_space(20.0);
-                ui.separator();
+                        ui.add_space(20.0);
+                        ui.separator();
 
-                // Performance profiling widget
-                profiling::draw_profiling_widget(ui, &self.timing_history, self.max_frame_time_us);
+                        // Performance profiling widget
+                        profiling::draw_profiling_widget(
+                            ui,
+                            &self.timing_history,
+                            self.max_frame_time_us,
+                        );
+                    });
             });
 
         // Central panel for visualization

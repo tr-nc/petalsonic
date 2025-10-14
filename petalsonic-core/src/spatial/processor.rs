@@ -78,8 +78,8 @@ impl SpatialProcessor {
         log::info!("Steam Audio context created");
 
         let audio_settings = AudioSettings {
-            sampling_rate: sample_rate as usize,
-            frame_size,
+            sampling_rate: sample_rate,
+            frame_size: frame_size as u32,
         };
 
         // Create HRTF (custom or default)
@@ -107,7 +107,7 @@ impl SpatialProcessor {
 
         // Create simulator
         let mut simulator =
-            Simulator::builder(SceneParams::Default, sample_rate as usize, frame_size)
+            Simulator::builder(SceneParams::Default, sample_rate, frame_size as u32)
                 .with_direct(DirectSimulationSettings {
                     max_num_occlusion_samples: 32,
                 })
@@ -174,8 +174,8 @@ impl SpatialProcessor {
     /// Create effects for a spatial source
     pub fn create_effects_for_source(&mut self, source_id: SourceId) -> Result<()> {
         let audio_settings = AudioSettings {
-            sampling_rate: self.sample_rate as usize,
-            frame_size: self.frame_size,
+            sampling_rate: self.sample_rate,
+            frame_size: self.frame_size as u32,
         };
 
         self.effects_manager.create_effects_for_source(
@@ -315,7 +315,7 @@ impl SpatialProcessor {
 
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &self.cached_input_buf,
-            &AudioBufferSettings {
+            AudioBufferSettings {
                 num_channels: Some(1),
                 ..Default::default()
             },
@@ -326,7 +326,7 @@ impl SpatialProcessor {
 
         let direct_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &mut self.cached_direct_buf,
-            &AudioBufferSettings {
+            AudioBufferSettings {
                 num_channels: Some(1),
                 ..Default::default()
             },
@@ -365,7 +365,7 @@ impl SpatialProcessor {
 
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &self.cached_direct_buf,
-            &AudioBufferSettings {
+            AudioBufferSettings {
                 num_channels: Some(1),
                 ..Default::default()
             },
@@ -376,7 +376,7 @@ impl SpatialProcessor {
 
         let output_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &mut self.cached_ambisonics_encode_buf,
-            &AudioBufferSettings {
+            AudioBufferSettings {
                 num_channels: Some(9), // Order 2 = 9 channels
                 ..Default::default()
             },
@@ -413,7 +413,7 @@ impl SpatialProcessor {
 
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &self.cached_summed_encoded_buf,
-            &AudioBufferSettings {
+            AudioBufferSettings {
                 num_channels: Some(9),
                 ..Default::default()
             },
@@ -424,7 +424,7 @@ impl SpatialProcessor {
 
         let output_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &mut self.cached_ambisonics_decode_buf,
-            &AudioBufferSettings {
+            AudioBufferSettings {
                 num_channels: Some(2), // Stereo
                 ..Default::default()
             },
@@ -442,7 +442,7 @@ impl SpatialProcessor {
         // Interleave to binaural_processed buffer
         let decoded_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &mut self.cached_ambisonics_decode_buf,
-            &AudioBufferSettings {
+            AudioBufferSettings {
                 num_channels: Some(2),
                 ..Default::default()
             },

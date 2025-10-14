@@ -445,9 +445,9 @@ dependencies = [
 
 [[package]]
 name = "audionimbus"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "311c84a35246655dd05c86711530e299d96e8fe15442a28f57cc340003a98d0c"
+checksum = "3c8b9a1987b742c204eefd1f16aa902de99e7a3895d8de3b1a0c6945022d8285"
 dependencies = [
  "audionimbus-sys",
  "bitflags 2.9.4",

@@ -17,111 +17,280 @@ Implement missing Steam Audio features to match reference implementation:
 - [ ] **Reflections** - sound bouncing off surfaces
 - [ ] **Reverb** - ambient room acoustics
 
-### Goal 2: Scene Geometry Management
+### Goal 2: Custom Ray Tracer Integration (PRIORITY - DO THIS FIRST)
 
-Enable users to define acoustic environments:
+Enable users to provide their own ray tracing implementation via callbacks:
 
-- [ ] Add/remove static meshes to the scene
-- [ ] Support different material properties (wood, concrete, glass, etc.)
-- [ ] Runtime geometry updates
-- [ ] Simple API for common room shapes
-
-### Goal 3: Enhanced Source Configuration
-
-Extend `SourceConfig` with more spatial properties:
-
-- [ ] Directivity patterns (omnidirectional, cardioid, dipole)
-- [ ] Per-source occlusion settings
-- [ ] Per-source reflection/reverb mix controls
-
-### Goal 4: Performance Profiling Enhancement
-
-Add spatial-specific profiling:
-
-- [ ] Track reflection computation time separately
-- [ ] Monitor per-source processing cost
-- [ ] Measure geometry complexity impact
-- [ ] Add spatial breakdown to GUI profiler
-
-### Goal 5: API Usability
-
-Make it easier to use spatial audio:
-
-- [ ] Scene builder pattern for quick setups
-- [ ] Preset acoustic environments (room, hall, cathedral)
-- [ ] Helper methods for common operations
+- [ ] Define callback trait for ray intersection queries
+- [ ] Integrate callback-based scene with Steam Audio
+- [ ] Support material properties via callback metadata
 
 ---
 
-## 🔧 Implementation Plan
+## 🔧 Implementation Plan (Just for reference)
 
-### Phase 1: Foundation - Scene Geometry API ⭐ PRIORITY
+### Phase 1: Custom Ray Tracer Callback API ⭐ PRIORITY
 
 **Status:** Not started
 
-**Objective:** Enable users to add 3D geometry to the acoustic scene for reflections and occlusion.
+**Objective:** Enable users to provide their own ray tracing implementation via callbacks, allowing PetalSonic to integrate with existing path tracers.
+
+**Reference:** [Steam Audio Scene API - Custom Ray Tracing](https://valvesoftware.github.io/steam-audio/doc/capi/scene.html#ref-scene)
+
+#### Design
+
+Instead of building scene geometry with Steam Audio's API, we provide a simple callback trait that Steam Audio calls when it needs ray intersection data. This lets users reuse their existing ray tracing infrastructure (e.g., game engines, Embree, custom GPU tracers).
+
+**Workflow:**
+
+1. User creates a `MaterialTable` with desired acoustic materials
+2. User implements `RayTracer` trait, returning material indices in `RayHit`
+3. User calls `world.set_ray_tracer(tracer, materials)`
+4. During audio processing, Steam Audio calls the ray tracer for intersection tests
+5. PetalSonic looks up material properties from the table using the returned index
+
+```rust
+/// Trait for providing custom ray tracing to the spatial audio engine
+pub trait RayTracer: Send + Sync {
+    /// Test if a ray intersects any geometry
+    /// Returns: (hit: bool, distance: f32, material_index: u8, normal: Vec3)
+    fn cast_ray(&self, origin: Vec3, direction: Vec3, max_distance: f32)
+        -> RayHit;
+
+    /// Called once per frame before any ray casts (optional)
+    fn begin_frame(&mut self) {}
+
+    /// Called once per frame after all ray casts (optional)
+    fn end_frame(&mut self) {}
+}
+
+pub struct RayHit {
+    pub hit: bool,
+    pub distance: f32,
+    pub material_index: u8,  // Index into material table
+    pub normal: Vec3,
+}
+```
+
+**Example Usage:**
+
+```rust
+// 1. Create material table
+let mut materials = MaterialTable::new();
+let wall_mat = materials.add(AudioMaterial::CONCRETE);    // index 0
+let floor_mat = materials.add(AudioMaterial::WOOD);       // index 1
+let ceiling_mat = materials.add(AudioMaterial::PLASTER);  // index 2
+
+// 2. Implement custom ray tracer
+struct MyRayTracer {
+    // Your existing scene data...
+}
+
+impl RayTracer for MyRayTracer {
+    fn cast_ray(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> RayHit {
+        // Use your existing ray tracing code here
+        if let Some(hit) = self.my_scene.intersect_ray(origin, direction, max_distance) {
+            RayHit {
+                hit: true,
+                distance: hit.distance,
+                material_index: hit.surface_material_id,  // Map to your material system
+                normal: hit.normal,
+            }
+        } else {
+            RayHit { hit: false, distance: 0.0, material_index: 0, normal: Vec3::ZERO }
+        }
+    }
+}
+
+// 3. Register with PetalSonic
+let tracer = MyRayTracer::new(/* ... */);
+world.set_ray_tracer(tracer, materials)?;
+
+// 4. Audio now uses your ray tracer for reflections and occlusion!
+```
 
 #### Tasks
 
-- [ ] **1.1 Create scene geometry module structure**
+- [ ] **1.1 Create scene callback module**
   - [ ] Create `petalsonic-core/src/scene/mod.rs`
-  - [ ] Create `petalsonic-core/src/scene/geometry.rs`
+  - [ ] Create `petalsonic-core/src/scene/ray_tracer.rs`
   - [ ] Create `petalsonic-core/src/scene/material.rs`
-  - [ ] Create `petalsonic-core/src/scene/builder.rs`
   - [ ] Update `petalsonic-core/src/lib.rs` to expose scene module
 
-- [ ] **1.2 Implement Material types**
-  - [ ] Define `Material` enum with presets (Wood, Concrete, Glass, etc.)
-  - [ ] Add custom material support with absorption coefficients
-  - [ ] Add material conversion to audionimbus types
+- [ ] **1.2 Define RayTracer trait and types**
+  - [ ] Define `RayTracer` trait with `cast_ray()` method
+  - [ ] Define `RayHit` struct
+  - [ ] Define `Vec3` helper type (or re-export from existing)
+  - [ ] Add optional `begin_frame()` and `end_frame()` hooks
 
-- [ ] **1.3 Implement StaticMeshBuilder**
+- [ ] **1.3 Implement Material system**
 
-  ```rust
-  // API design:
-  StaticMeshBuilder::new()
-      .add_box(center, size)
-      .add_plane(position, normal, size)
-      .with_material(Material::CONCRETE)
-      .build()?
-  ```
-
-  - [ ] Basic vertex/triangle API
-  - [ ] Box primitive helper
-  - [ ] Plane primitive helper
-  - [ ] Material assignment per triangle or per mesh
-
-- [ ] **1.4 Integrate with PetalSonicWorld**
+  **Design:** Materials in Steam Audio define acoustic properties across three frequency bands (400 Hz, 2.5 KHz, 15 KHz).
 
   ```rust
-  impl PetalSonicWorld {
-      pub fn add_static_mesh(&self, builder: StaticMeshBuilder) -> Result<MeshId>
-      pub fn remove_static_mesh(&self, mesh_id: MeshId) -> Result<()>
-      pub fn clear_scene(&self) -> Result<()>
+  /// Acoustic properties of a surface material
+  /// Matches IPLMaterial from Steam Audio C API
+  #[derive(Debug, Clone, Copy)]
+  pub struct AudioMaterial {
+      /// Fraction of sound energy absorbed at [low, mid, high] frequencies (0.0 - 1.0)
+      /// Frequency bands: 400 Hz, 2.5 KHz, 15 KHz
+      pub absorption: [f32; 3],
+
+      /// Fraction of sound energy scattered in random direction on reflection (0.0 - 1.0)
+      /// 0.0 = pure specular (mirror-like), 1.0 = pure diffuse (scattered)
+      pub scattering: f32,
+
+      /// Fraction of sound energy transmitted through surface at [low, mid, high] frequencies (0.0 - 1.0)
+      /// Used for direct occlusion calculations
+      pub transmission: [f32; 3],
+  }
+
+  impl AudioMaterial {
+      // Standard material presets
+      pub const GENERIC: Self = Self {
+          absorption: [0.10, 0.20, 0.30],
+          scattering: 0.05,
+          transmission: [0.100, 0.050, 0.030],
+      };
+
+      pub const BRICK: Self = Self {
+          absorption: [0.03, 0.04, 0.07],
+          scattering: 0.05,
+          transmission: [0.015, 0.015, 0.015],
+      };
+
+      pub const CONCRETE: Self = Self {
+          absorption: [0.05, 0.07, 0.08],
+          scattering: 0.05,
+          transmission: [0.015, 0.002, 0.001],
+      };
+
+      pub const CERAMIC: Self = Self {
+          absorption: [0.01, 0.02, 0.02],
+          scattering: 0.05,
+          transmission: [0.060, 0.044, 0.011],
+      };
+
+      pub const GRAVEL: Self = Self {
+          absorption: [0.60, 0.70, 0.80],
+          scattering: 0.05,
+          transmission: [0.031, 0.012, 0.008],
+      };
+
+      pub const CARPET: Self = Self {
+          absorption: [0.24, 0.69, 0.73],
+          scattering: 0.05,
+          transmission: [0.020, 0.005, 0.003],
+      };
+
+      pub const GLASS: Self = Self {
+          absorption: [0.06, 0.03, 0.02],
+          scattering: 0.05,
+          transmission: [0.060, 0.044, 0.011],
+      };
+
+      pub const PLASTER: Self = Self {
+          absorption: [0.12, 0.06, 0.04],
+          scattering: 0.05,
+          transmission: [0.056, 0.056, 0.004],
+      };
+
+      pub const WOOD: Self = Self {
+          absorption: [0.11, 0.07, 0.06],
+          scattering: 0.05,
+          transmission: [0.070, 0.014, 0.005],
+      };
+
+      pub const METAL: Self = Self {
+          absorption: [0.20, 0.07, 0.06],
+          scattering: 0.05,
+          transmission: [0.200, 0.025, 0.010],
+      };
+
+      pub const ROCK: Self = Self {
+          absorption: [0.13, 0.20, 0.24],
+          scattering: 0.05,
+          transmission: [0.015, 0.002, 0.001],
+      };
+  }
+
+  /// Material lookup table for ray tracer callbacks
+  /// Maps material indices (u8) to AudioMaterial properties
+  pub struct MaterialTable {
+      materials: Vec<AudioMaterial>,
+  }
+
+  impl MaterialTable {
+      pub fn new() -> Self { /* ... */ }
+      pub fn add(&mut self, material: AudioMaterial) -> u8 { /* returns index */ }
+      pub fn get(&self, index: u8) -> Option<&AudioMaterial> { /* ... */ }
+
+      /// Create a table with common presets pre-loaded
+      pub fn with_presets() -> Self {
+          let mut table = Self::new();
+          table.add(AudioMaterial::GENERIC);   // index 0
+          table.add(AudioMaterial::BRICK);     // index 1
+          table.add(AudioMaterial::CONCRETE);  // index 2
+          // ... etc
+          table
+      }
   }
   ```
 
-  - [ ] Add scene storage to World
-  - [ ] Add mesh handle type (MeshId)
-  - [ ] Implement add/remove/clear methods
-  - [ ] Pass scene to SpatialProcessor on creation
+  **Implementation tasks:**
+  - [ ] Define `AudioMaterial` struct matching IPLMaterial
+  - [ ] Add all 11 material presets as constants
+  - [ ] Implement `MaterialTable` with add/get methods
+  - [ ] Add `with_presets()` helper for common materials
+  - [ ] Add conversion to audionimbus/Steam Audio types
+  - [ ] Add validation (values must be 0.0-1.0)
 
-- [ ] **1.5 Update SpatialProcessor to use scene**
-  - [ ] Store scene reference in SpatialProcessor
-  - [ ] Call `scene.commit()` after mesh changes
-  - [ ] Update simulator with new scene
+- [ ] **1.4 Create C callback bridge to audionimbus**
 
-- [ ] **1.6 Add tests and examples**
-  - [ ] Unit tests for StaticMeshBuilder
-  - [ ] Integration test for scene management
-  - [ ] Add example to demo showing room with walls
+  Steam Audio's C API expects C function pointers. We need to bridge Rust trait calls:
+
+  - [ ] Create C-compatible callback wrapper functions
+  - [ ] Store RayTracer trait object in scene user data
+  - [ ] Implement `ClosestHitCallback` bridge (calls `cast_ray()`)
+  - [ ] Implement `AnyHitCallback` bridge if needed
+  - [ ] Handle panics and errors safely at FFI boundary
+
+- [ ] **1.5 Integrate with PetalSonicWorld**
+
+  ```rust
+  impl PetalSonicWorld {
+      pub fn set_ray_tracer<T: RayTracer + 'static>(
+          &self,
+          ray_tracer: T,
+          materials: MaterialTable
+      ) -> Result<()>
+
+      pub fn clear_ray_tracer(&self) -> Result<()>
+  }
+  ```
+
+  - [ ] Add scene storage to World (Option<Arc<dyn RayTracer>>)
+  - [ ] Pass ray tracer to SpatialProcessor on creation
+  - [ ] Ensure thread-safety (RayTracer must be Send + Sync)
+
+- [ ] **1.6 Update SpatialProcessor to use callback scene**
+  - [ ] Create audionimbus Scene with custom callbacks
+  - [ ] Pass scene to Simulator on creation
+  - [ ] Store ray tracer reference in processor
+  - [ ] Call `begin_frame()`/`end_frame()` in render loop
+
+- [ ] **1.7 Add tests and simple example ray tracer**
+  - [ ] Implement `SimpleBoxRayTracer` for testing (single box room)
+  - [ ] Unit tests for callback invocation
+  - [ ] Integration test showing rays being cast
+  - [ ] Add example to demo with simple geometry
 
 **Files to create:**
 
 - `petalsonic-core/src/scene/mod.rs`
-- `petalsonic-core/src/scene/geometry.rs`
+- `petalsonic-core/src/scene/ray_tracer.rs`
 - `petalsonic-core/src/scene/material.rs`
-- `petalsonic-core/src/scene/builder.rs`
+- `petalsonic-core/src/scene/simple_box.rs` (example implementation)
 
 **Files to modify:**
 
@@ -129,7 +298,7 @@ Make it easier to use spatial audio:
 - `petalsonic-core/src/world.rs`
 - `petalsonic-core/src/spatial/processor.rs`
 
-**Estimated time:** 2-3 days
+**Estimated time:** 3-4 days (FFI bridge is tricky but worth it)
 
 ---
 
@@ -350,21 +519,18 @@ Make it easier to use spatial audio:
 
 #### Tasks
 
-- [ ] **5.1 Add scene preset methods**
+- [ ] **5.1 Add example ray tracer implementations**
 
   ```rust
-  impl PetalSonicWorld {
-      pub fn create_simple_room(&self, width: f32, height: f32, depth: f32, material: Material) -> Result<Vec<MeshId>>
-      pub fn create_hallway(&self, length: f32, width: f32, height: f32) -> Result<Vec<MeshId>>
-      pub fn create_preset_hall(&self) -> Result<Vec<MeshId>>
-      pub fn create_preset_cathedral(&self) -> Result<Vec<MeshId>>
-  }
+  // Provide ready-to-use ray tracers for common scenarios:
+  - SimpleBoxRayTracer::new(width, height, depth, material)
+  - SimpleRoomRayTracer::with_walls(...)
+  - EmptyRayTracer::new() // No geometry, for testing
   ```
 
-  - [ ] Implement simple_room helper
-  - [ ] Implement hallway helper
-  - [ ] Implement preset acoustic environments
-  - [ ] Return mesh IDs for later removal
+  - [ ] Implement common ray tracer examples
+  - [ ] Document ray tracer implementation guide
+  - [ ] Show how to integrate with popular ray tracing libraries
 
 - [ ] **5.2 Add SourceConfig builder pattern**
 
@@ -419,15 +585,16 @@ Make it easier to use spatial audio:
 - Acceptable quality trade-off for typical use cases
 - Can revisit per-source reflections if needed later
 
-### Scene Geometry Updates
+### Scene Geometry Integration
 
-**Decision:** Immutable scene (rebuild on change)
+**Decision:** Callback-based ray tracing instead of built-in geometry
 **Rationale:**
 
-- Simpler implementation
-- Most use cases have static geometry
-- Can add dynamic updates later if needed
-- Steam Audio scene commit is required anyway
+- Users can integrate their existing ray tracers (game engine, Embree, GPU-based)
+- No need to duplicate scene data in PetalSonic
+- More flexible - works with any ray tracing backend
+- Follows Steam Audio's recommended pattern for advanced use cases
+- Simpler API surface - just implement one trait
 
 ### Reverb Architecture
 
@@ -467,7 +634,7 @@ Make it easier to use spatial audio:
 
 | Phase | Status | Progress | Estimated Time | Notes |
 |-------|--------|----------|----------------|-------|
-| Phase 1: Scene Geometry | 🔴 Not Started | 0% | 2-3 days | Foundation for reflections |
+| Phase 1: Ray Tracer Callbacks | 🔴 Not Started | 0% | 3-4 days | Foundation for custom ray tracers |
 | Phase 2: Reflections & Reverb | 🔴 Not Started | 0% | 4-5 days | Most complex phase |
 | Phase 3: Occlusion & Directivity | 🔴 Not Started | 0% | 2-3 days | Depends on Phase 1 |
 | Phase 4: Profiling | 🔴 Not Started | 0% | 1 day | Can be done anytime |
@@ -484,6 +651,28 @@ Make it easier to use spatial audio:
 
 ## 📝 Technical Notes
 
+### Material System Design
+
+**Frequency Bands:** Steam Audio uses three frequency bands for acoustic simulations:
+
+- **Low (400 Hz)**: Bass/low-frequency sounds
+- **Mid (2.5 KHz)**: Most speech and mid-range content
+- **High (15 KHz)**: High-frequency content and detail
+
+**Properties:**
+
+- **Absorption**: How much sound energy is absorbed (not reflected) by the surface
+  - Higher values = "softer" surface (carpet, fabric absorb more)
+  - Lower values = "harder" surface (metal, glass reflect more)
+- **Scattering**: How diffuse vs. specular the reflection is
+  - 0.0 = perfect mirror reflection (rare in reality)
+  - 1.0 = completely scattered/diffuse reflection
+  - Most materials use 0.05 for slight diffusion
+- **Transmission**: How much sound passes through the material (for occlusion)
+  - Used when sound source is behind an obstacle
+  - Higher values = more transparent (thin wood, glass)
+  - Lower values = more blocking (concrete, metal)
+
 ### Current Architecture Strengths
 
 - ✅ Real-time safe design (lock-free ring buffer)
@@ -494,11 +683,11 @@ Make it easier to use spatial audio:
 
 ### Current Limitations
 
-- ❌ No reflections/reverb (scene is empty)
+- ❌ No reflections/reverb (no ray tracer integration yet)
 - ❌ No occlusion (sources omnidirectional)
 - ❌ No directivity
 - ❌ Basic spatial config (position + volume only)
-- ❌ No scene geometry management
+- ❌ No callback API for custom ray tracers
 
 ### Reference Implementation Advantages
 
@@ -522,11 +711,12 @@ Make it easier to use spatial audio:
 
 ### To begin Phase 1
 
-1. Create the scene module structure
-2. Implement Material types
-3. Build StaticMeshBuilder with primitives
-4. Integrate with World and SpatialProcessor
-5. Test with simple room example
+1. Define the `RayTracer` trait and `RayHit` struct
+2. Implement `Material` and `MaterialTable` types
+3. Create FFI bridge to connect Rust callbacks to Steam Audio's C API
+4. Integrate callback scene with `PetalSonicWorld` and `SpatialProcessor`
+5. Build `SimpleBoxRayTracer` example implementation
+6. Test with reflection-based audio in demo
 
 ### Testing Strategy
 
@@ -541,22 +731,11 @@ Make it easier to use spatial audio:
 ## 📚 References
 
 - [Steam Audio Documentation](https://valvesoftware.github.io/steam-audio/)
+- [Steam Audio Scene API - Custom Ray Tracing](https://valvesoftware.github.io/steam-audio/doc/capi/scene.html#ref-scene)
+- [Steam Audio Material Properties](https://valvesoftware.github.io/steam-audio/doc/capi/material.html)
 - [AudioNimbus Rust Bindings](https://github.com/MaxenceMaire/audionimbus)
 - [Reference Implementation](petalsonic-core/src/reference-audio/)
 - Comparison Analysis - see analysis above
-
----
-
-## 🤝 Contributing
-
-When implementing features:
-
-1. Create a feature branch from `main`
-2. Implement incrementally with tests
-3. Update this TODO with progress
-4. Document breaking changes
-5. Add examples to demo
-6. Submit PR with clear description
 
 ---
 
@@ -566,11 +745,12 @@ When implementing features:
 
 #### Core
 
+- [ ] Built-in scene geometry API (StaticMeshBuilder) as alternative to callbacks
 - [ ] Device switch handling
 - [ ] Per-zone reverb (room transitions)
 - [ ] Baked reflection data support
-- [ ] Path tracing for complex scenes
-- [ ] Dynamic geometry updates
+- [ ] GPU-accelerated ray tracing via Radeon Rays
+- [ ] Integration examples for Embree and other ray tracers
 
 #### Demo
 
@@ -578,8 +758,3 @@ When implementing features:
 - [ ] Interactive drag-and-drop with real-time audio updates
 - [ ] 3D visualization of acoustic scene
 - [ ] Real-time HRTF customization
-
----
-
-**Last Updated:** 2025-10-14
-**Next Review:** After Phase 1 completion

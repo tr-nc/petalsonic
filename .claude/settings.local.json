@@ -11,7 +11,9 @@
       "Bash(git mv:*)",
       "Bash(mkdir:*)",
       "Bash(mv:*)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "WebFetch(domain:valvesoftware.github.io)",
+      "WebFetch(domain:docs.rs)"
     ],
     "deny": [],
     "ask": []

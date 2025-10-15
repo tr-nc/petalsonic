@@ -31,11 +31,44 @@ Enable users to provide their own ray tracing implementation via callbacks:
 
 ### Phase 1: Custom Ray Tracer Callback API ⭐ PRIORITY
 
-**Status:** Not started
+**Status:** In Progress (Design phase)
 
 **Objective:** Enable users to provide their own ray tracing implementation via callbacks, allowing PetalSonic to integrate with existing path tracers.
 
 **Reference:** [Steam Audio Scene API - Custom Ray Tracing](https://valvesoftware.github.io/steam-audio/doc/capi/scene.html#ref-scene)
+
+#### Migration Plan
+
+**IMPORTANT:** This FFI bridge layer is designed to be contributed back to `audionimbus` after testing.
+
+**Current Approach:**
+
+1. Build and test the callback bridge in `petalsonic-core/src/scene/` first
+2. Keep the implementation independent and self-contained
+3. Use audionimbus types (`Point`, `Direction`) directly to minimize friction
+4. Design with migration in mind - clean, well-documented FFI bridge
+
+**Future Migration (Phase 6):**
+
+1. After all integration tests pass in PetalSonic
+2. Upstream the FFI bridge layer to `audionimbus` crate
+3. Add safe wrappers for `SceneSettings::Custom` in audionimbus
+4. Migrate PetalSonic to use the new audionimbus API
+5. Remove our local FFI bridge implementation
+
+**Benefits:**
+
+- Reusable for all audionimbus users, not just PetalSonic
+- Better Steam Audio callback API for the Rust ecosystem
+- Cleaner separation of concerns
+- Can be maintained as part of audionimbus
+
+**Design Constraints:**
+
+- ❌ Do NOT modify audionimbus code during Phase 1-5
+- ✅ Use audionimbus types (`Point`, `Direction`, etc.) directly
+- ✅ Design FFI bridge as a clean, self-contained module
+- ✅ Document thoroughly for future upstreaming
 
 #### Design
 
@@ -50,12 +83,14 @@ Instead of building scene geometry with Steam Audio's API, we provide a simple c
 5. PetalSonic looks up material properties from the table using the returned index
 
 ```rust
+use audionimbus::geometry::{Point, Direction};
+
 /// Trait for providing custom ray tracing to the spatial audio engine
 pub trait RayTracer: Send + Sync {
     /// Test if a ray intersects any geometry
-    /// Returns: (hit: bool, distance: f32, material_index: u8, normal: Vec3)
-    fn cast_ray(&self, origin: Vec3, direction: Vec3, max_distance: f32)
-        -> RayHit;
+    /// Returns: Result containing hit information, or error if ray trace failed
+    fn cast_ray(&self, origin: Point, direction: Direction, max_distance: f32)
+        -> Result<RayHit, Box<dyn Error>>;
 
     /// Called once per frame before any ray casts (optional)
     fn begin_frame(&mut self) {}
@@ -68,13 +103,15 @@ pub struct RayHit {
     pub hit: bool,
     pub distance: f32,
     pub material_index: u8,  // Index into material table
-    pub normal: Vec3,
+    pub normal: Direction,   // Surface normal at hit point
 }
 ```
 
 **Example Usage:**
 
 ```rust
+use audionimbus::geometry::{Point, Direction};
+
 // 1. Create material table
 let mut materials = MaterialTable::new();
 let wall_mat = materials.add(AudioMaterial::CONCRETE);    // index 0
@@ -87,17 +124,24 @@ struct MyRayTracer {
 }
 
 impl RayTracer for MyRayTracer {
-    fn cast_ray(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> RayHit {
+    fn cast_ray(&self, origin: Point, direction: Direction, max_distance: f32)
+        -> Result<RayHit, Box<dyn Error>>
+    {
         // Use your existing ray tracing code here
         if let Some(hit) = self.my_scene.intersect_ray(origin, direction, max_distance) {
-            RayHit {
+            Ok(RayHit {
                 hit: true,
                 distance: hit.distance,
                 material_index: hit.surface_material_id,  // Map to your material system
                 normal: hit.normal,
-            }
+            })
         } else {
-            RayHit { hit: false, distance: 0.0, material_index: 0, normal: Vec3::ZERO }
+            Ok(RayHit {
+                hit: false,
+                distance: 0.0,
+                material_index: 0,
+                normal: Direction::new(0.0, 1.0, 0.0)
+            })
         }
     }
 }
@@ -573,6 +617,66 @@ world.set_ray_tracer(tracer, materials)?;
 
 ---
 
+### Phase 6: Migrate FFI Bridge to AudioNimbus ⭐ CONTRIBUTION
+
+**Status:** Not started (requires Phase 1-5 complete)
+
+**Objective:** Contribute the tested FFI bridge layer back to the audionimbus crate for the broader Rust ecosystem.
+
+**Prerequisites:**
+
+- All Phase 1-5 integration tests passing
+- Ray tracer callback system proven stable in production
+- Performance validated
+- API design finalized
+
+#### Tasks
+
+- [ ] **6.1 Prepare upstream contribution**
+  - [ ] Extract FFI bridge from `petalsonic-core/src/scene/`
+  - [ ] Clean up and document code for audionimbus standards
+  - [ ] Add comprehensive inline documentation
+  - [ ] Write migration guide for audionimbus users
+
+- [ ] **6.2 Contribute to audionimbus**
+  - [ ] Fork audionimbus repository
+  - [ ] Add safe Rust wrappers for `SceneSettings::Custom`
+  - [ ] Add `RayTracer` trait and `RayHit` types
+  - [ ] Add material system (`AudioMaterial`, `MaterialTable`)
+  - [ ] Add FFI callback bridge layer
+  - [ ] Write tests specific to audionimbus
+  - [ ] Submit pull request with detailed description
+
+- [ ] **6.3 Migrate PetalSonic to use upstream audionimbus**
+  - [ ] Wait for audionimbus PR to be merged and released
+  - [ ] Update PetalSonic dependencies to new audionimbus version
+  - [ ] Remove local FFI bridge implementation
+  - [ ] Update imports to use audionimbus types
+  - [ ] Verify all tests still pass
+  - [ ] Update documentation
+
+- [ ] **6.4 Documentation and examples**
+  - [ ] Add examples to audionimbus showing custom ray tracer usage
+  - [ ] Document migration path from raw C API to safe wrappers
+  - [ ] Update Steam Audio integration guide
+
+**Files to contribute to audionimbus:**
+
+- `audionimbus/src/geometry/ray_tracer.rs` (new)
+- `audionimbus/src/geometry/material.rs` (new)
+- `audionimbus/src/geometry/scene.rs` (modify - add safe wrappers)
+- `audionimbus/examples/custom_ray_tracer.rs` (new example)
+
+**Files to remove from PetalSonic (post-migration):**
+
+- `petalsonic-core/src/scene/ray_tracer.rs`
+- `petalsonic-core/src/scene/material.rs`
+- FFI bridge implementation (if entirely moved upstream)
+
+**Estimated time:** 2-3 days
+
+---
+
 ## 🗺️ Architecture Decisions
 
 ### Reflection Effect Allocation
@@ -630,15 +734,16 @@ world.set_ray_tracer(tracer, materials)?;
 
 ## 📊 Progress Tracking
 
-### Overall Progress: 10% Complete
+### Overall Progress: 5% Complete
 
 | Phase | Status | Progress | Estimated Time | Notes |
 |-------|--------|----------|----------------|-------|
-| Phase 1: Ray Tracer Callbacks | 🔴 Not Started | 0% | 3-4 days | Foundation for custom ray tracers |
+| Phase 1: Ray Tracer Callbacks | 🟡 In Progress | 5% | 3-4 days | Foundation for custom ray tracers |
 | Phase 2: Reflections & Reverb | 🔴 Not Started | 0% | 4-5 days | Most complex phase |
 | Phase 3: Occlusion & Directivity | 🔴 Not Started | 0% | 2-3 days | Depends on Phase 1 |
 | Phase 4: Profiling | 🔴 Not Started | 0% | 1 day | Can be done anytime |
 | Phase 5: Convenience API | 🔴 Not Started | 0% | 1 day | Polish and UX |
+| Phase 6: Upstream to AudioNimbus | 🔴 Not Started | 0% | 2-3 days | Contribution phase |
 
 **Legend:**
 

@@ -13,7 +13,9 @@
       "Bash(mv:*)",
       "Bash(test:*)",
       "WebFetch(domain:valvesoftware.github.io)",
-      "WebFetch(domain:docs.rs)"
+      "WebFetch(domain:docs.rs)",
+      "Read(//c/Users/danny/Desktop/projects/audionimbus/**)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []

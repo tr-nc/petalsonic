@@ -1,4 +1,4 @@
-# PetalSonic Core
+# PetalSonic
 
 A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spatialization.
 
@@ -13,7 +13,6 @@ A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spa
 - **Automatic Resampling**: Audio is automatically resampled to match the world's sample rate
 - **Multiple Loop Modes**: Play once, loop infinitely, or loop a specific number of times
 - **Event-Driven**: Get notified of playback events (completion, loops, errors)
-- **Ray Tracing Support**: Optional ray tracing for occlusion, reflections, and reverb
 - **Multiple Audio Formats**: Support for WAV, MP3, FLAC, OGG, and more via Symphonia
 
 ## Quick Start
@@ -176,12 +175,6 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 - **`Pose`**: Position + rotation for listener and sources
 - **`Vec3`**: 3D vector (from `glam` crate)
 - **`Quat`**: Quaternion rotation (from `glam` crate)
-
-### Ray Tracing (Optional)
-
-- **`RayTracer`**: Trait for implementing custom ray tracing
-- **`AudioMaterial`**: Acoustic properties for surfaces
-- **`MaterialTable`**: Collection of materials with presets
 
 ## Configuration Options
 

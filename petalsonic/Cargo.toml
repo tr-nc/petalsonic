@@ -1,7 +1,7 @@
 [package]
 name = "petalsonic"
 description = "Real-time safe spatial audio library for Rust using Steam Audio for 3D spatialization"
-version = "0.1.2"
+version = "0.1.5"
 edition = "2024"
 authors = ["Ruitian Yang <ruitian0716@gmail.com>"]
 license = "MIT"
@@ -10,20 +10,30 @@ categories = ["multimedia::audio", "game-development"]
 repository = "https://github.com/tr-nc/petalsonic"
 readme = "README.md"
 
-[package.metadata.docs.rs]
-rustdoc-args = ["--cfg", "docsrs"]
-
 [dependencies]
 symphonia = "0.5.4"
 cpal = "0.15.3"
 rubato = "0.14.1"
 anyhow = "1.0.89"
 crossbeam-channel = "0.5.13"
-audionimbus = { version = "0.9", features = ["auto-install"] }
+audionimbus = "0.9"
 ringbuf = "0.4.7"
 log = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
 
-[target.'cfg(docsrs)'.dependencies]
-audionimbus = { version = "0.9" }
+[features]
+default = ["auto-install"]
+auto-install = ["audionimbus/auto-install"]
+docsrs = []
+
+[package.metadata.docs.rs]
+# Build for the main target docs.rs uses
+default-target = "x86_64-unknown-linux-gnu"
+
+# Turn *off* the default features (thus disabling steam-audio download).
+no-default-features = true
+
+# Compile with the `docsrs` feature so you can add cfg(doc) gates
+# if you ever need them.
+features = ["docsrs"]

@@ -10,6 +10,9 @@ categories = ["multimedia::audio", "game-development"]
 repository = "https://github.com/tr-nc/petalsonic"
 readme = "README.md"
 
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 symphonia = "0.5.4"
 cpal = "0.15.3"
@@ -21,3 +24,6 @@ ringbuf = "0.4.7"
 log = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(docsrs)'.dependencies]
+audionimbus = { version = "0.9" }

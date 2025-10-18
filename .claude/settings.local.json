@@ -15,7 +15,9 @@
       "WebFetch(domain:valvesoftware.github.io)",
       "WebFetch(domain:docs.rs)",
       "Read(//c/Users/danny/Desktop/projects/audionimbus/**)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(git update-index:*)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

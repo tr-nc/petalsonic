@@ -317,6 +317,16 @@ impl PetalSonicWorld {
     }
 }
 
+/// Represents a 3D audio source in the world.
+///
+/// `PetalSonicAudioSource` contains the spatial properties and state of an audio source.
+/// This struct is primarily used for querying source state rather than direct manipulation.
+/// To update source properties during playback, use [`PetalSonicWorld::update_source_config`].
+///
+/// # Properties
+///
+/// - Position in 3D space (`Vec3`)
+/// - Volume level (0.0 to 1.0+)
 pub struct PetalSonicAudioSource {
     pub(crate) _id: u64,
     pub(crate) position: Vec3,
@@ -324,15 +334,49 @@ pub struct PetalSonicAudioSource {
 }
 
 impl PetalSonicAudioSource {
+    /// Returns the 3D position of the audio source.
+    ///
+    /// # Returns
+    ///
+    /// The position as a `Vec3` (x, y, z coordinates).
     pub fn position(&self) -> Vec3 {
         self.position
     }
 
+    /// Returns the volume level of the audio source.
+    ///
+    /// # Returns
+    ///
+    /// Volume as a float where 1.0 is normal volume, 0.0 is silent, and values > 1.0 amplify.
     pub fn volume(&self) -> f32 {
         self.volume
     }
 }
 
+/// Represents the listener (the "ears") in the 3D audio world.
+///
+/// `PetalSonicAudioListener` defines the position and orientation from which all spatial
+/// audio is perceived. In a typical game or application, this would represent the player's
+/// camera or character position.
+///
+/// # Usage
+///
+/// The listener's pose determines how spatial audio sources are spatialized:
+/// - **Position**: Where the listener is located in 3D space
+/// - **Orientation**: Which direction the listener is facing (affects left/right, front/back audio)
+///
+/// Update the listener position using [`PetalSonicWorld::set_listener_pose`] as the player
+/// or camera moves through the world.
+///
+/// # Example
+///
+/// ```no_run
+/// # use petalsonic_core::*;
+/// # let world = PetalSonicWorld::new(PetalSonicWorldDesc::default()).unwrap();
+/// // Move listener to position (10, 0, 5) facing forward
+/// let pose = Pose::from_position(Vec3::new(10.0, 0.0, 5.0));
+/// world.set_listener_pose(pose);
+/// ```
 pub struct PetalSonicAudioListener {
     pub(crate) pose: Pose,
 }
@@ -352,14 +396,29 @@ impl Default for PetalSonicAudioListener {
 }
 
 impl PetalSonicAudioListener {
+    /// Creates a new audio listener with the given pose.
+    ///
+    /// # Arguments
+    ///
+    /// * `pose` - The initial position and orientation of the listener
     pub fn new(pose: Pose) -> Self {
         Self { pose }
     }
 
+    /// Returns the current pose (position and orientation) of the listener.
+    ///
+    /// # Returns
+    ///
+    /// The listener's `Pose` containing position and rotation.
     pub fn pose(&self) -> Pose {
         self.pose
     }
 
+    /// Sets the pose (position and orientation) of the listener.
+    ///
+    /// # Arguments
+    ///
+    /// * `pose` - The new pose for the listener
     pub fn set_pose(&mut self, pose: Pose) {
         self.pose = pose;
     }

@@ -1,3 +1,26 @@
+//! Audio data loading and management.
+//!
+//! This module provides functionality for loading and processing audio files, including:
+//! - Loading audio from various formats (MP3, WAV, FLAC, OGG, etc.) via [`DefaultAudioLoader`]
+//! - Custom audio loaders through the [`AudioDataLoader`] trait
+//! - Audio data storage in [`PetalSonicAudioData`] with automatic reference counting
+//! - Batch and streaming resampling
+//! - Mono conversion options
+//!
+//! # Examples
+//!
+//! ```no_run
+//! # use petalsonic_core::audio_data::*;
+//! // Load audio with default settings
+//! let audio = PetalSonicAudioData::from_path("music.mp3")?;
+//!
+//! // Load audio and force mono conversion
+//! let options = LoadOptions::new()
+//!     .convert_to_mono(ConvertToMono::ForceMono);
+//! let audio = PetalSonicAudioData::from_path_with_options("music.mp3", &options)?;
+//! # Ok::<(), petalsonic_core::error::PetalSonicError>(())
+//! ```
+
 mod batch_resampler;
 mod default_loader;
 mod load_options;
@@ -17,7 +40,7 @@ pub use streaming_resampler::{ResamplerType, StreamingResampler};
 ///
 /// # Data Format
 /// All audio samples are stored in **INTERLEAVED** format internally.
-/// See [`AudioDataInner`] for details on the data layout.
+/// See the internal documentation for details on the data layout.
 #[derive(Debug, Clone)]
 pub struct PetalSonicAudioData {
     inner: Arc<AudioDataInner>,

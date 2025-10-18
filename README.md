@@ -1,6 +1,93 @@
 # PetalSonic
 
-This library is for helping developers to implement spatial audio in their realtime application, easily.
+A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spatialization.
+
+## Overview
+
+PetalSonic makes it easy to add high-quality 3D spatial audio to your Rust applications and games. Whether you're building a game, virtual reality experience, or any application that needs positioned audio, PetalSonic provides a simple, safe, and powerful API.
+
+## Quick Start
+
+Add PetalSonic to your `Cargo.toml`:
+
+```toml
+[dependencies]
+petalsonic-core = "0.1"
+```
+
+Basic usage example:
+
+```rust
+use petalsonic_core::*;
+
+fn main() -> Result<(), PetalSonicError> {
+    // Create the audio world and engine
+    let config = PetalSonicWorldDesc::default();
+    let world = PetalSonicWorld::new(config.clone())?;
+    let mut engine = PetalSonicEngine::new(config, &world)?;
+    engine.start()?;
+
+    // Load and play a 3D positioned sound
+    let audio = audio_data::PetalSonicAudioData::from_path("sound.wav")?;
+    let source_id = world.register_audio(
+        audio,
+        SourceConfig::spatial(Vec3::new(5.0, 0.0, 0.0), 1.0)
+    )?;
+    world.play(source_id, playback::LoopMode::Once)?;
+
+    // Update listener position in your game loop
+    world.set_listener_pose(Pose::from_position(Vec3::ZERO));
+
+    Ok(())
+}
+```
+
+## Features
+
+- **High-Quality 3D Spatialization**: Powered by Steam Audio with HRTF-based binaural rendering
+- **Real-Time Safe**: Zero allocations and locks in the audio thread
+- **Easy to Use**: Simple world-driven API - just load audio, position sources, and play
+- **Flexible**: Supports both spatial and non-spatial audio in the same world
+- **Event-Driven**: Get notified when sounds complete, loop, or encounter errors
+- **Multiple Formats**: Load WAV, MP3, FLAC, OGG, and more via Symphonia
+- **Ray Tracing**: Optional ray tracing support for occlusion and reverb effects
+- **Cross-Platform**: Works on Windows, macOS, Linux, and more via CPAL
+
+## Project Structure
+
+This project uses a **workspace structure** to separate the core library from demo/example code:
+
+```
+petalsonic/
+├── Cargo.toml              # Workspace manifest
+├── petalsonic-core/        # Pure audio library
+│   ├── Cargo.toml
+│   └── src/                # Core library modules
+└── petalsonic-demo/        # Demo applications and examples
+    ├── Cargo.toml
+    └── src/main.rs         # CLI demo and tests
+```
+
+### PetalSonic Core Library (`petalsonic-core`)
+
+**Purpose**: Pure spatial audio processing library with no UI dependencies
+
+**Contains**: Audio engine, world management, spatialization, data loading
+
+**Dependencies**: Only audio-related crates (cpal, audionimbus, symphonia, etc.)
+
+See the [petalsonic-core README](./petalsonic-core/README.md) for detailed API documentation.
+
+### Demo Crate (`petalsonic-demo`)
+
+**Purpose**: Examples, tests, and future interactive applications
+
+**Contains**: CLI demos, integration tests, future web UI components
+
+**Run the demo**:
+```bash
+cargo run --package petalsonic-demo
+```
 
 ## Basic Codebase Structure
 
@@ -70,3 +157,44 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 - Playback via CPAL, with a lock-free SPSC ring buffer bridging fixed-size producer blocks to variable-size device callbacks.
 - Real-time safe in the audio callback; no allocations/locks on the RT path.
 - One-shot and loop sources, with automatic removal of finished one-shots via events.
+
+## Documentation
+
+- **API Documentation**: Run `cargo doc --open` to generate and view the full API documentation
+- **Core Library README**: See [petalsonic-core/README.md](./petalsonic-core/README.md) for detailed usage guide
+- **Examples**: Check the `petalsonic-demo` crate for working examples
+
+## Development Commands
+
+### Build and Test
+
+```bash
+# Build entire workspace
+cargo build
+
+# Run demo application
+cargo run
+
+# Run tests
+cargo test
+
+# Run clippy on workspace
+cargo clippy
+
+# Generate documentation
+cargo doc --open
+```
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Links
+
+- [Steam Audio](https://valvesoftware.github.io/steam-audio/)
+- [Symphonia](https://github.com/pdeljanov/Symphonia)
+- [CPAL](https://github.com/RustAudio/cpal)

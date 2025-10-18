@@ -1,3 +1,15 @@
+//! Playback control and state management.
+//!
+//! This module provides types and functionality for controlling audio playback:
+//! - [`LoopMode`]: Control how audio loops (once, infinite)
+//! - [`PlayState`]: Current playback state (playing, paused, stopped)
+//! - [`PlaybackInfo`]: Detailed playback position and timing information
+//! - [`PlaybackInstance`]: Active playback instance with state management
+//! - [`PlaybackCommand`]: Commands for controlling playback (internal)
+//!
+//! Most users will interact with playback through [`PetalSonicWorld`](crate::PetalSonicWorld)
+//! methods like `play()`, `pause()`, and `stop()`, rather than using these types directly.
+
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
 use crate::world::SourceId;
@@ -20,11 +32,16 @@ impl Default for LoopMode {
     }
 }
 
-/// Playback state for an audio source
+/// Represents the current playback state of an audio source.
+///
+/// Used to track whether an audio source is currently playing, paused, or stopped.
 #[derive(Debug, Clone)]
 pub enum PlayState {
+    /// Audio is currently playing
     Playing,
+    /// Audio is paused (retains playback position)
     Paused,
+    /// Audio is stopped (playback position may be reset)
     Stopped,
 }
 
@@ -262,12 +279,29 @@ impl PlaybackInstance {
     }
 }
 
-/// Commands that can be sent to the audio engine for playback control
+/// Commands that can be sent to the audio engine for playback control.
+///
+/// These commands are used internally to communicate between the main thread
+/// and the audio processing thread. Most users will interact with playback
+/// through [`PetalSonicWorld`](crate::PetalSonicWorld) methods instead.
+///
+/// # Variants
+///
+/// - `Play`: Start playing an audio source with specified configuration and loop mode
+/// - `Pause`: Pause a playing audio source
+/// - `Stop`: Stop an audio source and reset its position
+/// - `StopAll`: Stop all currently playing audio sources
+/// - `UpdateConfig`: Update the spatial configuration of a playing source
 #[derive(Debug)]
 pub enum PlaybackCommand {
+    /// Play a source with given configuration and loop mode
     Play(SourceId, SourceConfig, LoopMode),
+    /// Pause a specific source
     Pause(SourceId),
+    /// Stop a specific source
     Stop(SourceId),
+    /// Stop all playing sources
     StopAll,
+    /// Update the configuration of a source
     UpdateConfig(SourceId, SourceConfig),
 }

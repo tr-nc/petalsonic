@@ -2,6 +2,16 @@
 name = "petalsonic-core"
 version = "0.1.0"
 edition = "2024"
+authors = ["Ruitian Yang"]
+description = "Real-time safe spatial audio library for Rust using Steam Audio for 3D spatialization"
+license = "MIT"
+repository = "https://github.com/tr-nc/petalsonic"
+homepage = "https://github.com/tr-nc/petalsonic"
+documentation = "https://docs.rs/petalsonic-core"
+keywords = ["audio", "spatial", "3d", "steam-audio", "game"]
+categories = ["multimedia::audio", "game-development"]
+readme = "README.md"
+rust-version = "1.85"
 
 [dependencies]
 symphonia = "0.5.4"

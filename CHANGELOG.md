@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2025-01-XX
 
 ### Added
-- Initial release of PetalSonic Core
+- Initial release of PetalSonic
 - Real-time safe spatial audio engine using Steam Audio
 - World-driven API for managing 3D audio sources
 - Support for spatial and non-spatial audio sources in the same world

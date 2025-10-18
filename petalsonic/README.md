@@ -2,8 +2,8 @@
 
 A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spatialization.
 
-[![Crates.io](https://img.shields.io/crates/v/petalsonic-core.svg)](https://crates.io/crates/petalsonic-core)
-[![Documentation](https://docs.rs/petalsonic-core/badge.svg)](https://docs.rs/petalsonic-core)
+[![Crates.io](https://img.shields.io/crates/v/petalsonic.svg)](https://crates.io/crates/petalsonic)
+[![Documentation](https://docs.rs/petalsonic/badge.svg)](https://docs.rs/petalsonic)
 
 ## Features
 
@@ -22,13 +22,13 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-petalsonic-core = "0.1"
+petalsonic = "0.1"
 ```
 
 ### Basic Example
 
 ```rust
-use petalsonic_core::*;
+use petalsonic::*;
 use std::sync::Arc;
 
 fn main() -> Result<(), PetalSonicError> {
@@ -77,7 +77,7 @@ fn main() -> Result<(), PetalSonicError> {
 ### Non-Spatial Audio Example
 
 ```rust
-use petalsonic_core::*;
+use petalsonic::*;
 
 // Load background music
 let music = audio_data::PetalSonicAudioData::from_path("music.mp3")?;
@@ -95,7 +95,7 @@ world.play(music_id, playback::LoopMode::Infinite)?;
 ### Custom Audio Loading
 
 ```rust
-use petalsonic_core::audio_data::*;
+use petalsonic::audio_data::*;
 
 // Force mono conversion for spatial audio sources
 let options = LoadOptions::new()
@@ -111,7 +111,7 @@ let audio = PetalSonicAudioData::from_path_with_options(
 
 PetalSonic uses a three-layer threading model to ensure real-time safety:
 
-```
+```plaintext
 ┌──────────────────────────────────────────────────────────────┐
 │ Main Thread (World)                                          │
 │ - register_audio(audio_data, SourceConfig)                   │
@@ -186,7 +186,7 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 ## Configuration Options
 
 ```rust
-use petalsonic_core::*;
+use petalsonic::*;
 
 let config = PetalSonicWorldDesc {
     sample_rate: 48000,           // Audio sample rate (Hz)
@@ -203,6 +203,7 @@ let config = PetalSonicWorldDesc {
 ### Real-Time Safety
 
 The audio callback thread is **completely real-time safe**:
+
 - No allocations
 - No locks
 - No blocking operations
@@ -229,31 +230,12 @@ for event in engine.poll_timing_events() {
 
 ## Advanced Features
 
-### Custom Ray Tracing
-
-Implement the `RayTracer` trait to add occlusion, reflections, and reverb:
-
-```rust
-use petalsonic_core::scene::*;
-
-struct MyRayTracer {
-    // Your scene data
-}
-
-impl RayTracer for MyRayTracer {
-    fn cast_ray(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> RayHit {
-        // Your ray casting logic
-        RayHit::miss() // or RayHit::new(distance, material_index, normal)
-    }
-}
-```
-
 ### Custom Audio Loaders
 
 Implement `AudioDataLoader` for custom file formats:
 
 ```rust
-use petalsonic_core::audio_data::*;
+use petalsonic::audio_data::*;
 
 struct MyLoader;
 
@@ -277,6 +259,7 @@ cargo run --package petalsonic-demo
 ## Platform Support
 
 PetalSonic uses:
+
 - **CPAL** for cross-platform audio output (Windows, macOS, Linux, iOS, Android, Web)
 - **Symphonia** for audio decoding (supports most common formats)
 - **Steam Audio** (audionimbus) for spatialization (auto-installs native library)
@@ -291,6 +274,5 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Links
 
-- [Documentation](https://docs.rs/petalsonic-core)
-- [Repository](https://github.com/yourusername/petalsonic)
+- [Documentation](https://docs.rs/petalsonic)
 - [Steam Audio](https://valvesoftware.github.io/steam-audio/)

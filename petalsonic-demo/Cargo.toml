@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-petalsonic-core = { path = "../petalsonic-core" }
+petalsonic = { path = "../petalsonic" }
 env_logger = "0.10"
 log = { workspace = true }
 anyhow = "1.0"

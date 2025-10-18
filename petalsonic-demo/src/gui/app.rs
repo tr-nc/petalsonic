@@ -1,5 +1,5 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
-use petalsonic_core::{
+use petalsonic::{
     RenderTimingEvent, SourceConfig,
     audio_data::PetalSonicAudioData,
     config::PetalSonicWorldDesc,
@@ -392,7 +392,7 @@ impl eframe::App for SpatialAudioDemo {
 
         for event in events {
             match event {
-                petalsonic_core::PetalSonicEvent::SourceCompleted { source_id } => {
+                petalsonic::PetalSonicEvent::SourceCompleted { source_id } => {
                     log::info!(
                         "GUI: Source {} completed, removing from UI and world storage",
                         source_id
@@ -407,7 +407,7 @@ impl eframe::App for SpatialAudioDemo {
                     // Note: You could also keep it in world storage if you want to replay it later
                     self.world.remove_audio_data(source_id);
                 }
-                petalsonic_core::PetalSonicEvent::SourceLooped {
+                petalsonic::PetalSonicEvent::SourceLooped {
                     source_id,
                     loop_count,
                 } => {

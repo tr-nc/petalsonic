@@ -1,5 +1,5 @@
 use egui::{Color32, Pos2, Stroke, Vec2};
-use petalsonic_core::RenderTimingEvent;
+use petalsonic::RenderTimingEvent;
 use std::collections::VecDeque;
 
 /// Format time in microseconds to the most appropriate unit (µs, ms, or s)

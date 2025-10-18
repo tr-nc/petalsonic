@@ -12,13 +12,13 @@ Add PetalSonic to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-petalsonic-core = "0.1"
+petalsonic = "0.1"
 ```
 
 Basic usage example:
 
 ```rust
-use petalsonic_core::*;
+use petalsonic::*;
 
 fn main() -> Result<(), PetalSonicError> {
     // Create the audio world and engine
@@ -60,7 +60,7 @@ This project uses a **workspace structure** to separate the core library from de
 ```
 petalsonic/
 ├── Cargo.toml              # Workspace manifest
-├── petalsonic-core/        # Pure audio library
+├── petalsonic/             # Pure audio library
 │   ├── Cargo.toml
 │   └── src/                # Core library modules
 └── petalsonic-demo/        # Demo applications and examples
@@ -68,7 +68,7 @@ petalsonic/
     └── src/main.rs         # CLI demo and tests
 ```
 
-### PetalSonic Core Library (`petalsonic-core`)
+### PetalSonic Core Library (`petalsonic`)
 
 **Purpose**: Pure spatial audio processing library with no UI dependencies
 
@@ -76,7 +76,7 @@ petalsonic/
 
 **Dependencies**: Only audio-related crates (cpal, audionimbus, symphonia, etc.)
 
-See the [petalsonic-core README](./petalsonic-core/README.md) for detailed API documentation.
+See the [petalsonic README](./petalsonic/README.md) for detailed API documentation.
 
 ### Demo Crate (`petalsonic-demo`)
 
@@ -91,7 +91,7 @@ cargo run --package petalsonic-demo
 
 ## Basic Codebase Structure
 
-### PetalSonic Core Library (petalsonic-core)
+### PetalSonic Core Library (petalsonic)
 
 - Pure spatial audio processing
 - Steam Audio integration
@@ -161,7 +161,7 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 ## Documentation
 
 - **API Documentation**: Run `cargo doc --open` to generate and view the full API documentation
-- **Core Library README**: See [petalsonic-core/README.md](./petalsonic-core/README.md) for detailed usage guide
+- **Core Library README**: See [petalsonic/README.md](./petalsonic/README.md) for detailed usage guide
 - **Examples**: Check the `petalsonic-demo` crate for working examples
 
 ## Development Commands

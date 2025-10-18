@@ -3,6 +3,6 @@ members = ["petalsonic", "petalsonic-demo"]
 resolver = "2"
 
 [workspace.dependencies]
-glam = "0.29.2"
+glam = "0.30.0"
 thiserror = "1.0.69"
 log = "0.4"

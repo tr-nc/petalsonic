@@ -20,6 +20,7 @@ pub struct SpatialProcessor {
     // Steam Audio core objects
     context: Context,
     simulator: Simulator<Direct>,
+    #[allow(dead_code)] // Must be kept alive for simulator lifetime
     scene: Scene,
     hrtf: Hrtf,
 
@@ -521,7 +522,6 @@ impl SpatialProcessor {
                     self.listener_front.y,
                     self.listener_front.z,
                 ),
-                ..Default::default()
             },
             num_rays: 1024,
             num_bounces: 10,

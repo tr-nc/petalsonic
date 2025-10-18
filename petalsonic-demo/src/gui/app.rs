@@ -129,13 +129,12 @@ impl SpatialAudioDemo {
 
         if let Ok(entries) = std::fs::read_dir(audio_dir) {
             for entry in entries.flatten() {
-                if let Some(file_name) = entry.file_name().to_str() {
-                    if file_name.ends_with(".wav")
+                if let Some(file_name) = entry.file_name().to_str()
+                    && (file_name.ends_with(".wav")
                         || file_name.ends_with(".mp3")
-                        || file_name.ends_with(".ogg")
-                    {
-                        files.push(file_name.to_string());
-                    }
+                        || file_name.ends_with(".ogg"))
+                {
+                    files.push(file_name.to_string());
                 }
             }
         }
@@ -226,7 +225,7 @@ impl SpatialAudioDemo {
     fn draw_sources(&self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter();
 
-        for (_idx, source) in self.sources.iter().enumerate() {
+        for source in self.sources.iter() {
             let source_pos = self.world_to_screen(source.position, rect);
 
             // Draw blue circle for source
@@ -254,67 +253,67 @@ impl SpatialAudioDemo {
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
         // Handle click to add source
-        if self.add_source_mode && response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let world_pos = self.screen_to_world(pos, rect);
-                let clamped_pos = Vec3::new(
-                    world_pos.x.clamp(-self.grid_size, self.grid_size),
-                    0.0,
-                    world_pos.z.clamp(-self.grid_size, self.grid_size),
-                );
+        if self.add_source_mode
+            && response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let world_pos = self.screen_to_world(pos, rect);
+            let clamped_pos = Vec3::new(
+                world_pos.x.clamp(-self.grid_size, self.grid_size),
+                0.0,
+                world_pos.z.clamp(-self.grid_size, self.grid_size),
+            );
 
-                if let Err(e) = self.add_source_at_position(clamped_pos) {
-                    log::error!("Failed to add source: {}", e);
-                }
+            if let Err(e) = self.add_source_at_position(clamped_pos) {
+                log::error!("Failed to add source: {}", e);
             }
             return;
         }
 
         // Handle dragging existing sources
-        if response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                // Find which source was clicked
-                for (idx, source) in self.sources.iter().enumerate() {
-                    let source_screen_pos = self.world_to_screen(source.position, rect);
-                    let dist = ((pos.x - source_screen_pos.x).powi(2)
-                        + (pos.y - source_screen_pos.y).powi(2))
-                    .sqrt();
-                    if dist < 15.0 {
-                        // Click tolerance
-                        self.dragging_source_index = Some(idx);
-                        log::info!("Started dragging source {}", idx);
-                        break;
-                    }
+        if response.drag_started()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            // Find which source was clicked
+            for (idx, source) in self.sources.iter().enumerate() {
+                let source_screen_pos = self.world_to_screen(source.position, rect);
+                let dist = ((pos.x - source_screen_pos.x).powi(2)
+                    + (pos.y - source_screen_pos.y).powi(2))
+                .sqrt();
+                if dist < 15.0 {
+                    // Click tolerance
+                    self.dragging_source_index = Some(idx);
+                    log::info!("Started dragging source {}", idx);
+                    break;
                 }
             }
         }
 
-        if response.dragged() {
-            if let Some(idx) = self.dragging_source_index {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let new_world_pos = self.screen_to_world(pos, rect);
-                    let clamped_pos = Vec3::new(
-                        new_world_pos.x.clamp(-self.grid_size, self.grid_size),
-                        0.0,
-                        new_world_pos.z.clamp(-self.grid_size, self.grid_size),
-                    );
+        if response.dragged()
+            && let Some(idx) = self.dragging_source_index
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let new_world_pos = self.screen_to_world(pos, rect);
+            let clamped_pos = Vec3::new(
+                new_world_pos.x.clamp(-self.grid_size, self.grid_size),
+                0.0,
+                new_world_pos.z.clamp(-self.grid_size, self.grid_size),
+            );
 
-                    if let Some(source) = self.sources.get_mut(idx) {
-                        source.position = clamped_pos;
-                        let new_config = SourceConfig::spatial_with_volume(clamped_pos, 1.0);
-                        if let Err(e) = self.world.update_source_config(source.id, new_config) {
-                            log::error!("Failed to update source config: {}", e);
-                        }
-                    }
+            if let Some(source) = self.sources.get_mut(idx) {
+                source.position = clamped_pos;
+                let new_config = SourceConfig::spatial_with_volume(clamped_pos, 1.0);
+                if let Err(e) = self.world.update_source_config(source.id, new_config) {
+                    log::error!("Failed to update source config: {}", e);
                 }
             }
         }
 
-        if response.drag_stopped() {
-            if let Some(idx) = self.dragging_source_index {
-                log::info!("Stopped dragging source {}", idx);
-                self.dragging_source_index = None;
-            }
+        if response.drag_stopped()
+            && let Some(idx) = self.dragging_source_index
+        {
+            log::info!("Stopped dragging source {}", idx);
+            self.dragging_source_index = None;
         }
     }
 

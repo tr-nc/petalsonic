@@ -56,7 +56,6 @@
 //! - **[`SourceConfig`]**: Configuration for spatial vs. non-spatial audio sources
 //! - **[`PetalSonicAudioData`](audio_data::PetalSonicAudioData)**: Audio data loaded from files
 //! - **[`PetalSonicEvent`]**: Events emitted by the engine (completion, errors, etc.)
-//! - **[`RayTracer`]**: Trait for implementing custom ray tracing for occlusion/reverb
 //!
 //! ## Architecture
 //!
@@ -76,7 +75,6 @@
 //! - Automatic resampling to world sample rate
 //! - Loop modes: once, infinite, or counted loops
 //! - Event-driven architecture for playback notifications
-//! - Optional ray tracing for occlusion and reverb effects
 //! - Performance profiling via timing events
 
 pub mod audio_data;

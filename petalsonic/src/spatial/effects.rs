@@ -99,6 +99,7 @@ impl SpatialEffectsManager {
     }
 
     /// Get effects for a source
+    #[allow(dead_code)]
     pub fn get_effects(&self, source_id: SourceId) -> Option<&SpatialSourceEffects> {
         self.effects.get(&source_id)
     }
@@ -114,6 +115,7 @@ impl SpatialEffectsManager {
     }
 
     /// Clear all effects
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.effects.clear();
         log::debug!("Cleared all spatial effects");

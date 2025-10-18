@@ -356,10 +356,10 @@ impl PetalSonicEngine {
         }
 
         // Wait for render thread to finish
-        if let Some(thread) = self.render_thread.take() {
-            if let Err(e) = thread.join() {
-                log::error!("Error joining render thread: {:?}", e);
-            }
+        if let Some(thread) = self.render_thread.take()
+            && let Err(e) = thread.join()
+        {
+            log::error!("Error joining render thread: {:?}", e);
         }
 
         Ok(())
@@ -423,12 +423,12 @@ impl PetalSonicEngine {
 
         while !ctx.shutdown.load(Ordering::Relaxed) {
             // Update listener pose in spatial processor if available
-            if let Some(ref spatial_processor) = ctx.spatial_processor {
-                if let Ok(mut processor) = spatial_processor.try_lock() {
-                    let listener_pose = ctx.world.listener().pose();
-                    if let Err(e) = processor.set_listener_pose(listener_pose) {
-                        log::error!("Failed to update listener pose: {}", e);
-                    }
+            if let Some(ref spatial_processor) = ctx.spatial_processor
+                && let Ok(mut processor) = spatial_processor.try_lock()
+            {
+                let listener_pose = ctx.world.listener().pose();
+                if let Err(e) = processor.set_listener_pose(listener_pose) {
+                    log::error!("Failed to update listener pose: {}", e);
                 }
             }
 
@@ -772,6 +772,7 @@ impl PetalSonicEngine {
 
     /// Generate resampled samples and push to ring buffer
     /// Returns a tuple of (completed_sources, looped_sources, timing_event)
+    #[allow(clippy::too_many_arguments)] // All parameters are necessary for this complex function
     fn generate_samples(
         producer: &mut impl Producer<Item = StereoFrame>,
         samples_needed: usize,

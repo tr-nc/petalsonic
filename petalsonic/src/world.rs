@@ -371,28 +371,15 @@ impl PetalSonicAudioSource {
 /// # Example
 ///
 /// ```no_run
-/// # use petalsonic_core::*;
+/// # use petalsonic::*;
 /// # let world = PetalSonicWorld::new(PetalSonicWorldDesc::default()).unwrap();
 /// // Move listener to position (10, 0, 5) facing forward
 /// let pose = Pose::from_position(Vec3::new(10.0, 0.0, 5.0));
 /// world.set_listener_pose(pose);
 /// ```
+#[derive(Clone, Default)]
 pub struct PetalSonicAudioListener {
     pub(crate) pose: Pose,
-}
-
-impl Clone for PetalSonicAudioListener {
-    fn clone(&self) -> Self {
-        Self { pose: self.pose }
-    }
-}
-
-impl Default for PetalSonicAudioListener {
-    fn default() -> Self {
-        Self {
-            pose: Pose::identity(),
-        }
-    }
 }
 
 impl PetalSonicAudioListener {

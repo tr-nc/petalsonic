@@ -1,7 +1,7 @@
 [package]
 name = "petalsonic"
 description = "Real-time safe spatial audio library for Rust using Steam Audio for 3D spatialization"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Ruitian Yang <ruitian0716@gmail.com>"]
 license = "MIT"

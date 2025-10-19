@@ -237,6 +237,9 @@ impl PlaybackInstance {
         let samples = self.audio_data.samples();
         let mut frames_filled = 0;
 
+        // Get volume from config
+        let volume = self.config.volume();
+
         for frame_idx in 0..frame_count {
             let sample_idx = self.info.current_frame + frame_idx;
 
@@ -247,11 +250,11 @@ impl PlaybackInstance {
 
             let sample = samples[sample_idx];
 
-            // Fill all channels with the same sample (mono to stereo)
+            // Fill all channels with the same sample (mono to stereo), applying volume
             for channel in 0..channels_usize {
                 let buffer_idx = frame_idx * channels_usize + channel;
                 if buffer_idx < buffer.len() {
-                    buffer[buffer_idx] += sample; // Mix into existing buffer
+                    buffer[buffer_idx] += sample * volume; // Mix into existing buffer with volume
                 }
             }
 

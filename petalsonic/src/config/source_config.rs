@@ -4,7 +4,10 @@ use crate::math::Vec3;
 #[derive(Debug, Clone)]
 pub enum SourceConfig {
     /// Non-spatial audio - plays directly without 3D spatialization
-    NonSpatial,
+    NonSpatial {
+        /// Volume multiplier (0.0 = silent, 1.0 = full volume)
+        volume: f32,
+    },
     /// Spatial audio - uses 3D position and Steam Audio for spatialization
     Spatial {
         /// 3D position of the audio source
@@ -16,14 +19,19 @@ pub enum SourceConfig {
 
 impl Default for SourceConfig {
     fn default() -> Self {
-        Self::NonSpatial
+        Self::NonSpatial { volume: 1.0 }
     }
 }
 
 impl SourceConfig {
-    /// Create a non-spatial source configuration
+    /// Create a non-spatial source configuration with default volume
     pub fn non_spatial() -> Self {
-        Self::NonSpatial
+        Self::NonSpatial { volume: 1.0 }
+    }
+
+    /// Create a non-spatial source configuration with custom volume
+    pub fn non_spatial_with_volume(volume: f32) -> Self {
+        Self::NonSpatial { volume }
     }
 
     /// Create a spatial source configuration with the given position
@@ -48,15 +56,15 @@ impl SourceConfig {
     pub fn position(&self) -> Option<Vec3> {
         match self {
             Self::Spatial { position, .. } => Some(*position),
-            Self::NonSpatial => None,
+            Self::NonSpatial { .. } => None,
         }
     }
 
-    /// Returns the volume if this is a spatial source
-    pub fn volume(&self) -> Option<f32> {
+    /// Returns the volume for both spatial and non-spatial sources
+    pub fn volume(&self) -> f32 {
         match self {
-            Self::Spatial { volume, .. } => Some(*volume),
-            Self::NonSpatial => None,
+            Self::Spatial { volume, .. } => *volume,
+            Self::NonSpatial { volume } => *volume,
         }
     }
 }

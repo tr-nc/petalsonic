@@ -206,8 +206,7 @@ impl SpatialProcessor {
         output_buffer: &mut [f32],
     ) -> Result<usize> {
         if instances.is_empty() {
-            // No spatial sources, output silence
-            output_buffer.fill(0.0);
+            // No spatial sources, don't modify the buffer (may contain non-spatial audio)
             return Ok(0);
         }
 
@@ -226,11 +225,11 @@ impl SpatialProcessor {
         // Decode accumulated ambisonics to binaural stereo
         self.apply_ambisonics_decode_effect()?;
 
-        // Copy to output buffer
+        // Add to output buffer (don't overwrite - allow mixing with non-spatial sources)
         let frames_to_copy = (output_buffer.len() / 2).min(self.frame_size);
         for i in 0..frames_to_copy {
-            output_buffer[i * 2] = self.cached_binaural_processed[i * 2];
-            output_buffer[i * 2 + 1] = self.cached_binaural_processed[i * 2 + 1];
+            output_buffer[i * 2] += self.cached_binaural_processed[i * 2];
+            output_buffer[i * 2 + 1] += self.cached_binaural_processed[i * 2 + 1];
         }
 
         Ok(frames_to_copy)

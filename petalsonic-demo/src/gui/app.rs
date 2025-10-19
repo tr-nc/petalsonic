@@ -13,10 +13,23 @@ use std::sync::Arc;
 
 use super::profiling;
 
+#[derive(Clone, Copy, PartialEq)]
+enum SourceType {
+    Spatial,
+    NonSpatial,
+}
+
 #[derive(Clone)]
-struct AudioSource {
+struct SpatialAudioSource {
     id: SourceId,
     position: Vec3,
+    file_name: String,
+    loop_mode: LoopMode,
+}
+
+#[derive(Clone)]
+struct NonSpatialAudioSource {
+    id: SourceId,
     file_name: String,
     loop_mode: LoopMode,
 }
@@ -24,13 +37,15 @@ struct AudioSource {
 pub struct SpatialAudioDemo {
     world: Arc<PetalSonicWorld>,
     engine: PetalSonicEngine,
-    sources: Vec<AudioSource>,
+    spatial_sources: Vec<SpatialAudioSource>,
+    non_spatial_sources: Vec<NonSpatialAudioSource>,
     grid_size: f32,
 
     // UI state
     available_audio_files: Vec<String>,
     selected_audio_file_index: usize,
     selected_loop_mode_index: usize,
+    selected_source_type: SourceType,
     add_source_mode: bool,
     dragging_source_index: Option<usize>,
 
@@ -48,6 +63,7 @@ impl SpatialAudioDemo {
         // Initialize logger
         env_logger::Builder::from_default_env()
             .filter_level(log::LevelFilter::Info)
+            .filter_module("symphonia_core::probe", log::LevelFilter::Warn)
             .init();
 
         // Scan available audio files
@@ -109,11 +125,13 @@ impl SpatialAudioDemo {
         Self {
             world: world_arc,
             engine,
-            sources: Vec::new(),
+            spatial_sources: Vec::new(),
+            non_spatial_sources: Vec::new(),
             grid_size: 2.0,
             available_audio_files,
             selected_audio_file_index: 0,
             selected_loop_mode_index: 0, // Once
+            selected_source_type: SourceType::Spatial,
             add_source_mode: false,
             dragging_source_index: None,
             control_panel_width_ratio: 0.4, // 40% of screen width for control panel
@@ -225,7 +243,7 @@ impl SpatialAudioDemo {
     fn draw_sources(&self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter();
 
-        for source in self.sources.iter() {
+        for source in self.spatial_sources.iter() {
             let source_pos = self.world_to_screen(source.position, rect);
 
             // Draw blue circle for source
@@ -257,25 +275,34 @@ impl SpatialAudioDemo {
             && response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            let world_pos = self.screen_to_world(pos, rect);
-            let clamped_pos = Vec3::new(
-                world_pos.x.clamp(-self.grid_size, self.grid_size),
-                0.0,
-                world_pos.z.clamp(-self.grid_size, self.grid_size),
-            );
+            match self.selected_source_type {
+                SourceType::Spatial => {
+                    let world_pos = self.screen_to_world(pos, rect);
+                    let clamped_pos = Vec3::new(
+                        world_pos.x.clamp(-self.grid_size, self.grid_size),
+                        0.0,
+                        world_pos.z.clamp(-self.grid_size, self.grid_size),
+                    );
 
-            if let Err(e) = self.add_source_at_position(clamped_pos) {
-                log::error!("Failed to add source: {}", e);
+                    if let Err(e) = self.add_spatial_source_at_position(clamped_pos) {
+                        log::error!("Failed to add spatial source: {}", e);
+                    }
+                }
+                SourceType::NonSpatial => {
+                    if let Err(e) = self.add_non_spatial_source() {
+                        log::error!("Failed to add non-spatial source: {}", e);
+                    }
+                }
             }
             return;
         }
 
-        // Handle dragging existing sources
+        // Handle dragging existing spatial sources
         if response.drag_started()
             && let Some(pos) = response.interact_pointer_pos()
         {
             // Find which source was clicked
-            for (idx, source) in self.sources.iter().enumerate() {
+            for (idx, source) in self.spatial_sources.iter().enumerate() {
                 let source_screen_pos = self.world_to_screen(source.position, rect);
                 let dist = ((pos.x - source_screen_pos.x).powi(2)
                     + (pos.y - source_screen_pos.y).powi(2))
@@ -300,7 +327,7 @@ impl SpatialAudioDemo {
                 new_world_pos.z.clamp(-self.grid_size, self.grid_size),
             );
 
-            if let Some(source) = self.sources.get_mut(idx) {
+            if let Some(source) = self.spatial_sources.get_mut(idx) {
                 source.position = clamped_pos;
                 let new_config = SourceConfig::spatial_with_volume(clamped_pos, 1.0);
                 if let Err(e) = self.world.update_source_config(source.id, new_config) {
@@ -317,7 +344,7 @@ impl SpatialAudioDemo {
         }
     }
 
-    fn add_source_at_position(&mut self, position: Vec3) -> Result<(), String> {
+    fn add_spatial_source_at_position(&mut self, position: Vec3) -> Result<(), String> {
         if self.available_audio_files.is_empty() {
             return Err("No audio files available".to_string());
         }
@@ -325,7 +352,7 @@ impl SpatialAudioDemo {
         let file_name = &self.available_audio_files[self.selected_audio_file_index];
         let file_path = format!("petalsonic-demo/asset/sound/{}", file_name);
 
-        log::info!("GUI: Loading audio file: {}", file_path);
+        log::info!("GUI: Loading spatial audio file: {}", file_path);
 
         let audio_data = PetalSonicAudioData::from_path(&file_path)
             .map_err(|e| format!("Failed to load audio file: {}", e))?;
@@ -350,7 +377,7 @@ impl SpatialAudioDemo {
         };
 
         log::info!(
-            "GUI: Starting playback for source {} at position {:?} with loop mode {:?}",
+            "GUI: Starting playback for spatial source {} at position {:?} with loop mode {:?}",
             source_id,
             position,
             loop_mode
@@ -360,7 +387,7 @@ impl SpatialAudioDemo {
             .play(source_id, loop_mode)
             .map_err(|e| format!("Failed to start playback: {}", e))?;
 
-        self.sources.push(AudioSource {
+        self.spatial_sources.push(SpatialAudioSource {
             id: source_id,
             position,
             file_name: file_name.clone(),
@@ -368,12 +395,69 @@ impl SpatialAudioDemo {
         });
 
         log::info!(
-            "GUI: Added source '{}' at position ({:.1}, {:.1}, {:.1}) - total sources: {}",
+            "GUI: Added spatial source '{}' at position ({:.1}, {:.1}, {:.1}) - total spatial sources: {}",
             file_name,
             position.x,
             position.y,
             position.z,
-            self.sources.len()
+            self.spatial_sources.len()
+        );
+
+        Ok(())
+    }
+
+    fn add_non_spatial_source(&mut self) -> Result<(), String> {
+        if self.available_audio_files.is_empty() {
+            return Err("No audio files available".to_string());
+        }
+
+        let file_name = &self.available_audio_files[self.selected_audio_file_index];
+        let file_path = format!("petalsonic-demo/asset/sound/{}", file_name);
+
+        log::info!("GUI: Loading non-spatial audio file: {}", file_path);
+
+        let audio_data = PetalSonicAudioData::from_path(&file_path)
+            .map_err(|e| format!("Failed to load audio file: {}", e))?;
+
+        log::debug!(
+            "GUI: Audio loaded - {} samples at {} Hz",
+            audio_data.samples().len(),
+            audio_data.sample_rate()
+        );
+
+        let source_id = self
+            .world
+            .register_audio(audio_data, SourceConfig::non_spatial())
+            .map_err(|e| format!("Failed to register audio in world: {}", e))?;
+
+        log::debug!("GUI: Audio registered with source ID: {}", source_id);
+
+        let loop_mode = match self.selected_loop_mode_index {
+            0 => LoopMode::Once,
+            1 => LoopMode::Infinite,
+            _ => LoopMode::Once,
+        };
+
+        log::info!(
+            "GUI: Starting playback for non-spatial source {} with loop mode {:?}",
+            source_id,
+            loop_mode
+        );
+
+        self.world
+            .play(source_id, loop_mode)
+            .map_err(|e| format!("Failed to start playback: {}", e))?;
+
+        self.non_spatial_sources.push(NonSpatialAudioSource {
+            id: source_id,
+            file_name: file_name.clone(),
+            loop_mode,
+        });
+
+        log::info!(
+            "GUI: Added non-spatial source '{}' - total non-spatial sources: {}",
+            file_name,
+            self.non_spatial_sources.len()
         );
 
         Ok(())
@@ -397,9 +481,18 @@ impl eframe::App for SpatialAudioDemo {
                         source_id
                     );
 
-                    // Remove from UI sources list
-                    if let Some(pos) = self.sources.iter().position(|s| s.id == source_id) {
-                        self.sources.remove(pos);
+                    // Remove from spatial sources list
+                    if let Some(pos) = self.spatial_sources.iter().position(|s| s.id == source_id) {
+                        self.spatial_sources.remove(pos);
+                    }
+
+                    // Remove from non-spatial sources list
+                    if let Some(pos) = self
+                        .non_spatial_sources
+                        .iter()
+                        .position(|s| s.id == source_id)
+                    {
+                        self.non_spatial_sources.remove(pos);
                     }
 
                     // Remove from world storage to free memory
@@ -475,6 +568,37 @@ impl eframe::App for SpatialAudioDemo {
 
                         ui.add_space(10.0);
 
+                        // Source type selection
+                        ui.label("Source Type:");
+                        let source_types = ["Spatial", "Non-Spatial"];
+                        let current_type_index = match self.selected_source_type {
+                            SourceType::Spatial => 0,
+                            SourceType::NonSpatial => 1,
+                        };
+                        let mut temp_index = current_type_index;
+                        egui::ComboBox::from_label("  ")
+                            .selected_text(source_types[current_type_index])
+                            .show_ui(ui, |ui| {
+                                for (idx, source_type) in source_types.iter().enumerate() {
+                                    ui.selectable_value(&mut temp_index, idx, *source_type);
+                                }
+                            });
+                        let new_source_type = match temp_index {
+                            0 => SourceType::Spatial,
+                            1 => SourceType::NonSpatial,
+                            _ => SourceType::Spatial,
+                        };
+
+                        // Reset add_source_mode when switching to non-spatial
+                        if new_source_type != self.selected_source_type
+                            && new_source_type == SourceType::NonSpatial
+                        {
+                            self.add_source_mode = false;
+                        }
+                        self.selected_source_type = new_source_type;
+
+                        ui.add_space(10.0);
+
                         // Loop mode selection
                         ui.label("Loop Mode:");
                         let loop_modes = ["Once", "Infinite"];
@@ -492,37 +616,86 @@ impl eframe::App for SpatialAudioDemo {
 
                         ui.add_space(10.0);
 
-                        // Add source button
-                        let button_text = if self.add_source_mode {
-                            "Click on grid to place..."
-                        } else {
-                            "Add Source"
+                        // Add source button - different behavior based on source type
+                        let button_text = match self.selected_source_type {
+                            SourceType::Spatial => {
+                                if self.add_source_mode {
+                                    "Click on grid to place..."
+                                } else {
+                                    "Add Source"
+                                }
+                            }
+                            SourceType::NonSpatial => "Add one",
                         };
 
                         if ui.button(button_text).clicked() {
-                            self.add_source_mode = !self.add_source_mode;
+                            match self.selected_source_type {
+                                SourceType::Spatial => {
+                                    // Toggle add mode for spatial sources
+                                    self.add_source_mode = !self.add_source_mode;
+                                }
+                                SourceType::NonSpatial => {
+                                    // Instantly add non-spatial source
+                                    if let Err(e) = self.add_non_spatial_source() {
+                                        log::error!("Failed to add non-spatial source: {}", e);
+                                    }
+                                }
+                            }
                         }
 
                         ui.add_space(20.0);
                         ui.separator();
 
-                        // Active sources section (collapsible)
-                        ui.collapsing(format!("Active Sources ({})", self.sources.len()), |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(200.0)
-                                .show(ui, |ui| {
-                                    for (idx, source) in self.sources.iter().enumerate() {
-                                        ui.group(|ui| {
-                                            ui.label(format!("#{}: {}", idx + 1, source.file_name));
-                                            ui.label(format!(
-                                                "  Pos: ({:.1}, {:.1})",
-                                                source.position.x, source.position.z
-                                            ));
-                                            ui.label(format!("  Loop: {:?}", source.loop_mode));
-                                        });
-                                    }
-                                });
-                        });
+                        // Spatial sources section (collapsible)
+                        ui.collapsing(
+                            format!("Spatial Sources ({})", self.spatial_sources.len()),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(200.0)
+                                    .show(ui, |ui| {
+                                        for (idx, source) in self.spatial_sources.iter().enumerate()
+                                        {
+                                            ui.group(|ui| {
+                                                ui.label(format!(
+                                                    "#{}: {}",
+                                                    idx + 1,
+                                                    source.file_name
+                                                ));
+                                                ui.label(format!(
+                                                    "  Pos: ({:.1}, {:.1})",
+                                                    source.position.x, source.position.z
+                                                ));
+                                                ui.label(format!("  Loop: {:?}", source.loop_mode));
+                                            });
+                                        }
+                                    });
+                            },
+                        );
+
+                        ui.add_space(10.0);
+
+                        // Non-spatial sources section (collapsible)
+                        ui.collapsing(
+                            format!("Non-Spatial Sources ({})", self.non_spatial_sources.len()),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(200.0)
+                                    .show(ui, |ui| {
+                                        for (idx, source) in
+                                            self.non_spatial_sources.iter().enumerate()
+                                        {
+                                            ui.group(|ui| {
+                                                ui.label(format!(
+                                                    "#{}: {}",
+                                                    idx + 1,
+                                                    source.file_name
+                                                ));
+                                                ui.label(format!("  Loop: {:?}", source.loop_mode));
+                                            });
+                                        }
+                                    });
+                            },
+                        );
 
                         ui.add_space(20.0);
                         ui.separator();

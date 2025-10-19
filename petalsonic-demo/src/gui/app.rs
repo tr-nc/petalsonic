@@ -48,6 +48,8 @@ pub struct SpatialAudioDemo {
     selected_source_type: SourceType,
     add_source_mode: bool,
     dragging_source_index: Option<usize>,
+    dragging_listener: bool,
+    listener_position: Vec3,
 
     // Layout configuration
     control_panel_width_ratio: f32, // Ratio of screen width for control panel (0.0-1.0)
@@ -134,6 +136,8 @@ impl SpatialAudioDemo {
             selected_source_type: SourceType::Spatial,
             add_source_mode: false,
             dragging_source_index: None,
+            dragging_listener: false,
+            listener_position: Vec3::new(0.0, 0.0, 0.0),
             control_panel_width_ratio: 0.4, // 40% of screen width for control panel
             timing_history: VecDeque::with_capacity(100),
             max_history_size: 100,
@@ -224,7 +228,7 @@ impl SpatialAudioDemo {
 
     fn draw_listener(&self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter();
-        let listener_pos = self.world_to_screen(Vec3::ZERO, rect);
+        let listener_pos = self.world_to_screen(self.listener_position, rect);
 
         // Draw red circle for listener
         painter.circle_filled(listener_pos, 8.0, Color32::from_rgb(255, 50, 50));
@@ -297,25 +301,55 @@ impl SpatialAudioDemo {
             return;
         }
 
-        // Handle dragging existing spatial sources
+        // Handle dragging - check what was clicked when drag starts
         if response.drag_started()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            // Find which source was clicked
-            for (idx, source) in self.spatial_sources.iter().enumerate() {
-                let source_screen_pos = self.world_to_screen(source.position, rect);
-                let dist = ((pos.x - source_screen_pos.x).powi(2)
-                    + (pos.y - source_screen_pos.y).powi(2))
-                .sqrt();
-                if dist < 15.0 {
-                    // Click tolerance
-                    self.dragging_source_index = Some(idx);
-                    log::info!("Started dragging source {}", idx);
-                    break;
+            // First check if listener was clicked
+            let listener_screen_pos = self.world_to_screen(self.listener_position, rect);
+            let listener_dist = ((pos.x - listener_screen_pos.x).powi(2)
+                + (pos.y - listener_screen_pos.y).powi(2))
+            .sqrt();
+
+            if listener_dist < 15.0 {
+                // Click tolerance
+                self.dragging_listener = true;
+                log::info!("Started dragging listener");
+            } else {
+                // Check if a source was clicked
+                for (idx, source) in self.spatial_sources.iter().enumerate() {
+                    let source_screen_pos = self.world_to_screen(source.position, rect);
+                    let dist = ((pos.x - source_screen_pos.x).powi(2)
+                        + (pos.y - source_screen_pos.y).powi(2))
+                    .sqrt();
+                    if dist < 15.0 {
+                        // Click tolerance
+                        self.dragging_source_index = Some(idx);
+                        log::info!("Started dragging source {}", idx);
+                        break;
+                    }
                 }
             }
         }
 
+        // Handle dragging listener
+        if response.dragged()
+            && self.dragging_listener
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let new_world_pos = self.screen_to_world(pos, rect);
+            let clamped_pos = Vec3::new(
+                new_world_pos.x.clamp(-self.grid_size, self.grid_size),
+                0.0,
+                new_world_pos.z.clamp(-self.grid_size, self.grid_size),
+            );
+
+            self.listener_position = clamped_pos;
+            let listener_pose = Pose::new(clamped_pos, Quat::IDENTITY);
+            self.world.set_listener_pose(listener_pose);
+        }
+
+        // Handle dragging sources
         if response.dragged()
             && let Some(idx) = self.dragging_source_index
             && let Some(pos) = response.interact_pointer_pos()
@@ -336,11 +370,16 @@ impl SpatialAudioDemo {
             }
         }
 
-        if response.drag_stopped()
-            && let Some(idx) = self.dragging_source_index
-        {
-            log::info!("Stopped dragging source {}", idx);
-            self.dragging_source_index = None;
+        // Handle drag stopped
+        if response.drag_stopped() {
+            if self.dragging_listener {
+                log::info!("Stopped dragging listener");
+                self.dragging_listener = false;
+            }
+            if let Some(idx) = self.dragging_source_index {
+                log::info!("Stopped dragging source {}", idx);
+                self.dragging_source_index = None;
+            }
         }
     }
 

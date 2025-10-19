@@ -46,6 +46,11 @@ impl SceneGrid {
         }
     }
 
+    /// Clear all walls
+    fn clear(&mut self) {
+        self.cells.fill(false);
+    }
+
     /// Convert world coordinates to grid cell indices
     /// Returns None if out of bounds
     fn world_to_cell(&self, world_pos: Vec3) -> Option<(usize, usize)> {
@@ -124,6 +129,7 @@ pub struct SpatialAudioDemo {
     selected_source_type: SourceType,
     add_source_mode: bool,
     brush_mode: bool,
+    brush_thickness: usize, // Brush thickness in cells (1 = single cell, 2 = 2x2, etc.)
     brush_last_cell: Option<(usize, usize)>, // Track last painted cell for continuous lines
     dragging_source_index: Option<usize>,
     dragging_listener: bool,
@@ -215,6 +221,7 @@ impl SpatialAudioDemo {
             selected_source_type: SourceType::Spatial,
             add_source_mode: false,
             brush_mode: false,
+            brush_thickness: 1,
             brush_last_cell: None,
             dragging_source_index: None,
             dragging_listener: false,
@@ -286,10 +293,8 @@ impl SpatialAudioDemo {
         let mut y = y0;
 
         loop {
-            // Set the current cell
-            if x >= 0 && y >= 0 {
-                self.scene_grid.set(x as usize, y as usize, occupied);
-            }
+            // Paint with thickness
+            self.paint_cell_with_thickness(x as usize, y as usize, occupied);
 
             // Check if we've reached the end
             if x == x1 && y == y1 {
@@ -304,6 +309,24 @@ impl SpatialAudioDemo {
             if e2 < dx {
                 err += dx;
                 y += sy;
+            }
+        }
+    }
+
+    /// Paint a cell with the current brush thickness
+    /// Paints a square of cells centered on (cx, cy)
+    fn paint_cell_with_thickness(&mut self, cx: usize, cy: usize, occupied: bool) {
+        let thickness = self.brush_thickness as i32;
+        let radius = (thickness - 1) / 2;
+
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let x = cx as i32 + dx;
+                let y = cy as i32 + dy;
+
+                if x >= 0 && y >= 0 {
+                    self.scene_grid.set(x as usize, y as usize, occupied);
+                }
             }
         }
     }
@@ -462,9 +485,8 @@ impl SpatialAudioDemo {
                     if let Some(last_cell) = self.brush_last_cell {
                         self.draw_cell_line(last_cell, current_cell, is_painting);
                     } else {
-                        // First cell in stroke, just paint it
-                        self.scene_grid
-                            .set(current_cell.0, current_cell.1, is_painting);
+                        // First cell in stroke, paint with thickness
+                        self.paint_cell_with_thickness(current_cell.0, current_cell.1, is_painting);
                     }
                     self.brush_last_cell = Some(current_cell);
                 } else {
@@ -898,6 +920,44 @@ impl eframe::App for SpatialAudioDemo {
                             if self.brush_mode {
                                 self.add_source_mode = false;
                             }
+                        }
+
+                        // Brush thickness slider
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Brush size:");
+                            // Map slider value (0 or 1) to thickness (1 or 3)
+                            let mut slider_value = if self.brush_thickness == 1 { 0 } else { 1 };
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut slider_value, 0..=1)
+                                        .custom_formatter(|v, _| {
+                                            if v == 0.0 {
+                                                "1 cell".to_string()
+                                            } else {
+                                                "3 cells".to_string()
+                                            }
+                                        })
+                                        .custom_parser(|s| {
+                                            if s == "1 cell" {
+                                                Some(0.0)
+                                            } else if s == "3 cells" {
+                                                Some(1.0)
+                                            } else {
+                                                None
+                                            }
+                                        }),
+                                )
+                                .changed()
+                            {
+                                self.brush_thickness = if slider_value == 0 { 1 } else { 3 };
+                            }
+                        });
+
+                        // Clear walls button
+                        ui.add_space(5.0);
+                        if ui.button("Clear All Walls").clicked() {
+                            self.scene_grid.clear();
                         }
 
                         ui.add_space(10.0);

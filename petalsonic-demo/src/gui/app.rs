@@ -103,6 +103,7 @@ struct SpatialAudioSource {
     position: Vec3,
     file_name: String,
     loop_mode: LoopMode,
+    volume: f32,
 }
 
 #[derive(Clone)]
@@ -110,6 +111,7 @@ struct NonSpatialAudioSource {
     id: SourceId,
     file_name: String,
     loop_mode: LoopMode,
+    volume: f32,
 }
 
 pub struct SpatialAudioDemo {
@@ -663,6 +665,7 @@ impl SpatialAudioDemo {
             position,
             file_name: file_name.clone(),
             loop_mode,
+            volume: 1.0,
         });
 
         log::info!(
@@ -723,6 +726,7 @@ impl SpatialAudioDemo {
             id: source_id,
             file_name: file_name.clone(),
             loop_mode,
+            volume: 1.0,
         });
 
         log::info!(
@@ -1000,6 +1004,7 @@ impl eframe::App for SpatialAudioDemo {
                         .id_salt("spatial_sources_list")
                         .show(ui, |ui| {
                             let mut source_to_delete: Option<SourceId> = None;
+                            let mut volume_changes: Vec<(SourceId, f32)> = Vec::new();
 
                             egui::ScrollArea::vertical()
                                 .max_height(200.0)
@@ -1021,6 +1026,25 @@ impl eframe::App for SpatialAudioDemo {
                                                         "  Loop: {:?}",
                                                         source.loop_mode
                                                     ));
+
+                                                    // Volume slider
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("  Volume:");
+                                                        let mut volume = source.volume;
+                                                        if ui
+                                                            .add(
+                                                                egui::Slider::new(
+                                                                    &mut volume,
+                                                                    0.0..=1.0,
+                                                                )
+                                                                .show_value(true),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            volume_changes
+                                                                .push((source.id, volume));
+                                                        }
+                                                    });
                                                 });
 
                                                 ui.with_layout(
@@ -1038,6 +1062,28 @@ impl eframe::App for SpatialAudioDemo {
                                     }
                                 });
 
+                            // Apply volume changes
+                            for (source_id, new_volume) in volume_changes {
+                                if let Some(source) =
+                                    self.spatial_sources.iter_mut().find(|s| s.id == source_id)
+                                {
+                                    source.volume = new_volume;
+                                    let new_config = SourceConfig::spatial_with_volume(
+                                        source.position,
+                                        new_volume,
+                                    );
+                                    if let Err(e) =
+                                        self.world.update_source_config(source_id, new_config)
+                                    {
+                                        log::error!(
+                                            "Failed to update volume for source {}: {}",
+                                            source_id,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
                             // Apply deletion after rendering to avoid borrow checker issues
                             if let Some(source_id) = source_to_delete {
                                 self.delete_source(source_id);
@@ -1054,6 +1100,7 @@ impl eframe::App for SpatialAudioDemo {
                         .id_salt("non_spatial_sources_list")
                         .show(ui, |ui| {
                             let mut source_to_delete: Option<SourceId> = None;
+                            let mut volume_changes: Vec<(SourceId, f32)> = Vec::new();
 
                             egui::ScrollArea::vertical()
                                 .max_height(200.0)
@@ -1072,6 +1119,25 @@ impl eframe::App for SpatialAudioDemo {
                                                         "  Loop: {:?}",
                                                         source.loop_mode
                                                     ));
+
+                                                    // Volume slider
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("  Volume:");
+                                                        let mut volume = source.volume;
+                                                        if ui
+                                                            .add(
+                                                                egui::Slider::new(
+                                                                    &mut volume,
+                                                                    0.0..=1.0,
+                                                                )
+                                                                .show_value(true),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            volume_changes
+                                                                .push((source.id, volume));
+                                                        }
+                                                    });
                                                 });
 
                                                 ui.with_layout(
@@ -1088,6 +1154,28 @@ impl eframe::App for SpatialAudioDemo {
                                         });
                                     }
                                 });
+
+                            // Apply volume changes
+                            for (source_id, new_volume) in volume_changes {
+                                if let Some(source) = self
+                                    .non_spatial_sources
+                                    .iter_mut()
+                                    .find(|s| s.id == source_id)
+                                {
+                                    source.volume = new_volume;
+                                    let new_config =
+                                        SourceConfig::non_spatial_with_volume(new_volume);
+                                    if let Err(e) =
+                                        self.world.update_source_config(source_id, new_config)
+                                    {
+                                        log::error!(
+                                            "Failed to update volume for source {}: {}",
+                                            source_id,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
 
                             // Apply deletion after rendering to avoid borrow checker issues
                             if let Some(source_id) = source_to_delete {

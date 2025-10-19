@@ -462,6 +462,39 @@ impl SpatialAudioDemo {
 
         Ok(())
     }
+
+    /// Unified delete logic for both spatial and non-spatial sources
+    fn delete_source(&mut self, source_id: SourceId) {
+        log::info!("GUI: Deleting source {}", source_id);
+
+        // Remove from spatial sources list if present
+        if let Some(pos) = self.spatial_sources.iter().position(|s| s.id == source_id) {
+            let source = self.spatial_sources.remove(pos);
+            log::info!(
+                "GUI: Removed spatial source '{}' at position {:?}",
+                source.file_name,
+                source.position
+            );
+        }
+
+        // Remove from non-spatial sources list if present
+        if let Some(pos) = self
+            .non_spatial_sources
+            .iter()
+            .position(|s| s.id == source_id)
+        {
+            let source = self.non_spatial_sources.remove(pos);
+            log::info!("GUI: Removed non-spatial source '{}'", source.file_name);
+        }
+
+        // Stop playback first (if still playing)
+        if let Err(e) = self.world.stop(source_id) {
+            log::warn!("Failed to stop source {}: {}", source_id, e);
+        }
+
+        // Remove from world storage to free memory
+        self.world.remove_audio_data(source_id);
+    }
 }
 
 impl eframe::App for SpatialAudioDemo {
@@ -481,23 +514,8 @@ impl eframe::App for SpatialAudioDemo {
                         source_id
                     );
 
-                    // Remove from spatial sources list
-                    if let Some(pos) = self.spatial_sources.iter().position(|s| s.id == source_id) {
-                        self.spatial_sources.remove(pos);
-                    }
-
-                    // Remove from non-spatial sources list
-                    if let Some(pos) = self
-                        .non_spatial_sources
-                        .iter()
-                        .position(|s| s.id == source_id)
-                    {
-                        self.non_spatial_sources.remove(pos);
-                    }
-
-                    // Remove from world storage to free memory
-                    // Note: You could also keep it in world storage if you want to replay it later
-                    self.world.remove_audio_data(source_id);
+                    // Use unified delete logic
+                    self.delete_source(source_id);
                 }
                 petalsonic::PetalSonicEvent::SourceLooped {
                     source_id,
@@ -647,55 +665,107 @@ impl eframe::App for SpatialAudioDemo {
                         ui.separator();
 
                         // Spatial sources section (collapsible)
-                        ui.collapsing(
-                            format!("Spatial Sources ({})", self.spatial_sources.len()),
-                            |ui| {
-                                egui::ScrollArea::vertical()
-                                    .max_height(200.0)
-                                    .show(ui, |ui| {
-                                        for (idx, source) in self.spatial_sources.iter().enumerate()
-                                        {
-                                            ui.group(|ui| {
-                                                ui.label(format!(
-                                                    "#{}: {}",
-                                                    idx + 1,
-                                                    source.file_name
-                                                ));
-                                                ui.label(format!(
-                                                    "  Pos: ({:.1}, {:.1})",
-                                                    source.position.x, source.position.z
-                                                ));
-                                                ui.label(format!("  Loop: {:?}", source.loop_mode));
+                        egui::CollapsingHeader::new(format!(
+                            "Spatial Sources ({})",
+                            self.spatial_sources.len()
+                        ))
+                        .id_salt("spatial_sources_list")
+                        .show(ui, |ui| {
+                            let mut source_to_delete: Option<SourceId> = None;
+
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    for (idx, source) in self.spatial_sources.iter().enumerate() {
+                                        ui.group(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.label(format!(
+                                                        "#{}: {}",
+                                                        idx + 1,
+                                                        source.file_name
+                                                    ));
+                                                    ui.label(format!(
+                                                        "  Pos: ({:.1}, {:.1})",
+                                                        source.position.x, source.position.z
+                                                    ));
+                                                    ui.label(format!(
+                                                        "  Loop: {:?}",
+                                                        source.loop_mode
+                                                    ));
+                                                });
+
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if ui.button("Delete").clicked() {
+                                                            source_to_delete = Some(source.id);
+                                                        }
+                                                    },
+                                                );
                                             });
-                                        }
-                                    });
-                            },
-                        );
+                                        });
+                                    }
+                                });
+
+                            // Apply deletion after rendering to avoid borrow checker issues
+                            if let Some(source_id) = source_to_delete {
+                                self.delete_source(source_id);
+                            }
+                        });
 
                         ui.add_space(10.0);
 
                         // Non-spatial sources section (collapsible)
-                        ui.collapsing(
-                            format!("Non-Spatial Sources ({})", self.non_spatial_sources.len()),
-                            |ui| {
-                                egui::ScrollArea::vertical()
-                                    .max_height(200.0)
-                                    .show(ui, |ui| {
-                                        for (idx, source) in
-                                            self.non_spatial_sources.iter().enumerate()
-                                        {
-                                            ui.group(|ui| {
-                                                ui.label(format!(
-                                                    "#{}: {}",
-                                                    idx + 1,
-                                                    source.file_name
-                                                ));
-                                                ui.label(format!("  Loop: {:?}", source.loop_mode));
+                        egui::CollapsingHeader::new(format!(
+                            "Non-Spatial Sources ({})",
+                            self.non_spatial_sources.len()
+                        ))
+                        .id_salt("non_spatial_sources_list")
+                        .show(ui, |ui| {
+                            let mut source_to_delete: Option<SourceId> = None;
+
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    for (idx, source) in self.non_spatial_sources.iter().enumerate()
+                                    {
+                                        ui.group(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.label(format!(
+                                                        "#{}: {}",
+                                                        idx + 1,
+                                                        source.file_name
+                                                    ));
+                                                    ui.label(format!(
+                                                        "  Loop: {:?}",
+                                                        source.loop_mode
+                                                    ));
+                                                });
+
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if ui.button("Delete").clicked() {
+                                                            source_to_delete = Some(source.id);
+                                                        }
+                                                    },
+                                                );
                                             });
-                                        }
-                                    });
-                            },
-                        );
+                                        });
+                                    }
+                                });
+
+                            // Apply deletion after rendering to avoid borrow checker issues
+                            if let Some(source_id) = source_to_delete {
+                                self.delete_source(source_id);
+                            }
+                        });
 
                         ui.add_space(20.0);
                         ui.separator();

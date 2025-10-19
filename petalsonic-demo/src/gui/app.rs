@@ -620,12 +620,12 @@ impl eframe::App for SpatialAudioDemo {
                         let button_text = match self.selected_source_type {
                             SourceType::Spatial => {
                                 if self.add_source_mode {
-                                    "Click on grid to place..."
+                                    "Click on grid to place"
                                 } else {
                                     "Add Source"
                                 }
                             }
-                            SourceType::NonSpatial => "Add one",
+                            SourceType::NonSpatial => "Add source",
                         };
 
                         if ui.button(button_text).clicked() {

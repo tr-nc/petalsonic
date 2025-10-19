@@ -13,6 +13,79 @@ use std::sync::Arc;
 
 use super::profiling;
 
+/// Fixed-size grid for scene geometry (walls)
+/// Each cell represents a 1m x 1m area in world space
+struct SceneGrid {
+    width: usize,
+    height: usize,
+    cell_size: f32,
+    cells: Vec<bool>, // Row-major: cells[y * width + x]
+}
+
+impl SceneGrid {
+    fn new(width: usize, height: usize, cell_size: f32) -> Self {
+        Self {
+            width,
+            height,
+            cell_size,
+            cells: vec![false; width * height],
+        }
+    }
+
+    fn get(&self, x: usize, y: usize) -> bool {
+        if x < self.width && y < self.height {
+            self.cells[y * self.width + x]
+        } else {
+            false
+        }
+    }
+
+    fn set(&mut self, x: usize, y: usize, occupied: bool) {
+        if x < self.width && y < self.height {
+            self.cells[y * self.width + x] = occupied;
+        }
+    }
+
+    /// Convert world coordinates to grid cell indices
+    /// Returns None if out of bounds
+    fn world_to_cell(&self, world_pos: Vec3) -> Option<(usize, usize)> {
+        // World origin is at center of grid
+        let half_world_size = (self.width as f32 * self.cell_size) / 2.0;
+
+        let cell_x_float = (world_pos.x + half_world_size) / self.cell_size;
+        let cell_y_float = (world_pos.z + half_world_size) / self.cell_size;
+
+        let cell_x = cell_x_float.floor() as i32;
+        let cell_y = cell_y_float.floor() as i32;
+
+        // Clamp to valid range (handle edge cases where we're exactly at the boundary)
+        if cell_x >= 0 && cell_y >= 0 {
+            let clamped_x = (cell_x as usize).min(self.width - 1);
+            let clamped_y = (cell_y as usize).min(self.height - 1);
+
+            // Only accept if original values were within reasonable bounds
+            if cell_x <= self.width as i32 && cell_y <= self.height as i32 {
+                Some((clamped_x, clamped_y))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Convert grid cell indices to world coordinates (cell center)
+    fn cell_to_world(&self, x: usize, y: usize) -> Vec3 {
+        let half_world_size = (self.width as f32 * self.cell_size) / 2.0;
+
+        Vec3::new(
+            (x as f32 + 0.5) * self.cell_size - half_world_size,
+            0.0,
+            (y as f32 + 0.5) * self.cell_size - half_world_size,
+        )
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SourceType {
     Spatial,
@@ -41,12 +114,17 @@ pub struct SpatialAudioDemo {
     non_spatial_sources: Vec<NonSpatialAudioSource>,
     grid_size: f32,
 
+    // Scene geometry
+    scene_grid: SceneGrid,
+
     // UI state
     available_audio_files: Vec<String>,
     selected_audio_file_index: usize,
     selected_loop_mode_index: usize,
     selected_source_type: SourceType,
     add_source_mode: bool,
+    brush_mode: bool,
+    brush_last_cell: Option<(usize, usize)>, // Track last painted cell for continuous lines
     dragging_source_index: Option<usize>,
     dragging_listener: bool,
     listener_position: Vec3,
@@ -129,12 +207,15 @@ impl SpatialAudioDemo {
             engine,
             spatial_sources: Vec::new(),
             non_spatial_sources: Vec::new(),
-            grid_size: 2.0,
+            grid_size: 2.0,                             // Show 4m x 4m area (-2 to +2)
+            scene_grid: SceneGrid::new(100, 100, 0.04), // 100x100 grid, 0.04m (4cm) per cell
             available_audio_files,
             selected_audio_file_index: 0,
             selected_loop_mode_index: 0, // Once
             selected_source_type: SourceType::Spatial,
             add_source_mode: false,
+            brush_mode: false,
+            brush_last_cell: None,
             dragging_source_index: None,
             dragging_listener: false,
             listener_position: Vec3::new(0.0, 0.0, 0.0),
@@ -190,6 +271,43 @@ impl SpatialAudioDemo {
         )
     }
 
+    /// Draw a line of cells between two grid positions using Bresenham's algorithm
+    fn draw_cell_line(&mut self, from: (usize, usize), to: (usize, usize), occupied: bool) {
+        let (x0, y0) = (from.0 as i32, from.1 as i32);
+        let (x1, y1) = (to.0 as i32, to.1 as i32);
+
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx - dy;
+
+        let mut x = x0;
+        let mut y = y0;
+
+        loop {
+            // Set the current cell
+            if x >= 0 && y >= 0 {
+                self.scene_grid.set(x as usize, y as usize, occupied);
+            }
+
+            // Check if we've reached the end
+            if x == x1 && y == y1 {
+                break;
+            }
+
+            let e2 = 2 * err;
+            if e2 > -dy {
+                err -= dy;
+                x += sx;
+            }
+            if e2 < dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
     fn draw_grid(&self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter();
 
@@ -203,12 +321,12 @@ impl SpatialAudioDemo {
             // Vertical lines (constant X)
             let top = self.world_to_screen(Vec3::new(offset, 0.0, self.grid_size), rect);
             let bottom = self.world_to_screen(Vec3::new(offset, 0.0, -self.grid_size), rect);
-            painter.line_segment([top, bottom], Stroke::new(1.0, Color32::from_gray(80)));
+            painter.line_segment([top, bottom], Stroke::new(1.0, Color32::from_gray(60)));
 
             // Horizontal lines (constant Z)
             let left = self.world_to_screen(Vec3::new(-self.grid_size, 0.0, offset), rect);
             let right = self.world_to_screen(Vec3::new(self.grid_size, 0.0, offset), rect);
-            painter.line_segment([left, right], Stroke::new(1.0, Color32::from_gray(80)));
+            painter.line_segment([left, right], Stroke::new(1.0, Color32::from_gray(60)));
         }
 
         // Draw axes (thicker, colored)
@@ -224,6 +342,56 @@ impl SpatialAudioDemo {
             [origin, z_axis_end],
             Stroke::new(2.0, Color32::from_rgb(100, 100, 255)), // Z axis - blue
         );
+    }
+
+    fn draw_wall_cells(&self, ui: &mut egui::Ui, rect: Rect) {
+        let painter = ui.painter();
+
+        // Only draw cells that are in the visible area
+        // Calculate visible cell range based on grid_size
+        let visible_world_min = Vec3::new(-self.grid_size, 0.0, -self.grid_size);
+        let visible_world_max = Vec3::new(self.grid_size, 0.0, self.grid_size);
+
+        // Convert to cell coordinates
+        let min_cell = self.scene_grid.world_to_cell(visible_world_min);
+        let max_cell = self.scene_grid.world_to_cell(visible_world_max);
+
+        if let (Some((min_x, min_y)), Some((max_x, max_y))) = (min_cell, max_cell) {
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    if self.scene_grid.get(x, y) {
+                        // Draw occupied cell as filled rectangle
+                        let cell_world_pos = self.scene_grid.cell_to_world(x, y);
+                        let half_cell = self.scene_grid.cell_size / 2.0;
+
+                        // Get the four corners of the cell in world coordinates
+                        let corner1 = self.world_to_screen(
+                            Vec3::new(
+                                cell_world_pos.x - half_cell,
+                                0.0,
+                                cell_world_pos.z - half_cell,
+                            ),
+                            rect,
+                        );
+                        let corner2 = self.world_to_screen(
+                            Vec3::new(
+                                cell_world_pos.x + half_cell,
+                                0.0,
+                                cell_world_pos.z + half_cell,
+                            ),
+                            rect,
+                        );
+
+                        let cell_rect = Rect::from_two_pos(corner1, corner2);
+                        painter.rect_filled(
+                            cell_rect,
+                            0.0,
+                            Color32::from_rgba_unmultiplied(200, 200, 200, 150),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn draw_listener(&self, ui: &mut egui::Ui, rect: Rect) {
@@ -273,6 +441,48 @@ impl SpatialAudioDemo {
 
     fn handle_mouse_interaction(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+        // Handle brush mode painting/erasing
+        if self.brush_mode {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let world_pos = self.screen_to_world(pos, rect);
+
+                // Check if we should paint or erase
+                let is_primary_down = ui.input(|i| i.pointer.primary_down());
+                let is_secondary_down = ui.input(|i| i.pointer.secondary_down());
+                let is_shift = ui.input(|i| i.modifiers.shift);
+
+                let is_painting = is_primary_down && !is_shift;
+                let is_erasing = is_secondary_down || (is_primary_down && is_shift);
+
+                if (is_painting || is_erasing)
+                    && let Some(current_cell) = self.scene_grid.world_to_cell(world_pos)
+                {
+                    // Draw line from last cell to current cell for continuous strokes
+                    if let Some(last_cell) = self.brush_last_cell {
+                        self.draw_cell_line(last_cell, current_cell, is_painting);
+                    } else {
+                        // First cell in stroke, just paint it
+                        self.scene_grid
+                            .set(current_cell.0, current_cell.1, is_painting);
+                    }
+                    self.brush_last_cell = Some(current_cell);
+                } else {
+                    // Mouse button released or out of bounds, reset last cell
+                    self.brush_last_cell = None;
+                }
+            } else {
+                // No pointer position, reset last cell
+                self.brush_last_cell = None;
+            }
+
+            // Reset last cell when buttons are released
+            if !ui.input(|i| i.pointer.primary_down() || i.pointer.secondary_down()) {
+                self.brush_last_cell = None;
+            }
+
+            return; // Don't process other interactions in brush mode
+        }
 
         // Handle click to add source
         if self.add_source_mode
@@ -672,6 +882,25 @@ impl eframe::App for SpatialAudioDemo {
                             });
 
                         ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+
+                        // Brush mode toggle
+                        ui.label("Scene Editing:");
+                        let brush_button_text = if self.brush_mode {
+                            "Edit Mode: ON (painting walls)"
+                        } else {
+                            "Edit Mode: OFF"
+                        };
+                        if ui.button(brush_button_text).clicked() {
+                            self.brush_mode = !self.brush_mode;
+                            // Exit add source mode when entering brush mode
+                            if self.brush_mode {
+                                self.add_source_mode = false;
+                            }
+                        }
+
+                        ui.add_space(10.0);
 
                         // Add source button - different behavior based on source type
                         let button_text = match self.selected_source_type {
@@ -832,6 +1061,7 @@ impl eframe::App for SpatialAudioDemo {
 
             // Draw the grid and elements
             self.draw_grid(ui, rect);
+            self.draw_wall_cells(ui, rect);
             self.draw_listener(ui, rect);
             self.draw_sources(ui, rect);
 

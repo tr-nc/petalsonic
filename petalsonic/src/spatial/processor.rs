@@ -243,7 +243,7 @@ impl SpatialProcessor {
     ) -> Result<()> {
         // Get spatial configuration
         let (position, volume) = match &instance.config {
-            SourceConfig::Spatial { position, volume } => (*position, *volume),
+            SourceConfig::Spatial { pose, volume } => (pose.position, *volume),
             _ => return Ok(()), // Not a spatial source, skip
         };
 
@@ -471,7 +471,7 @@ impl SpatialProcessor {
         // Set simulation inputs for each source
         for (source_id, instance) in instances.iter() {
             let position = match &instance.config {
-                SourceConfig::Spatial { position, .. } => *position,
+                SourceConfig::Spatial { pose, .. } => pose.position,
                 _ => continue,
             };
 

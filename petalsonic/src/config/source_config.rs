@@ -1,4 +1,4 @@
-use crate::math::Vec3;
+use crate::math::{Pose, Vec3};
 
 /// Configuration for how an audio source should be processed
 #[derive(Debug, Clone)]
@@ -8,10 +8,10 @@ pub enum SourceConfig {
         /// Volume multiplier (0.0 = silent, 1.0 = full volume)
         volume: f32,
     },
-    /// Spatial audio - uses 3D position and Steam Audio for spatialization
+    /// Spatial audio - uses 3D pose (position + orientation) and Steam Audio for spatialization
     Spatial {
-        /// 3D position of the audio source
-        position: Vec3,
+        /// 3D pose (position and orientation) of the audio source
+        pose: Pose,
         /// Volume multiplier (0.0 = silent, 1.0 = full volume)
         volume: f32,
     },
@@ -34,17 +34,30 @@ impl SourceConfig {
         Self::NonSpatial { volume }
     }
 
-    /// Create a spatial source configuration with the given position
-    pub fn spatial(position: Vec3) -> Self {
+    /// Create a spatial source configuration with the given pose
+    pub fn spatial(pose: Pose) -> Self {
+        Self::Spatial { pose, volume: 1.0 }
+    }
+
+    /// Create a spatial source configuration with pose and volume
+    pub fn spatial_with_volume(pose: Pose, volume: f32) -> Self {
+        Self::Spatial { pose, volume }
+    }
+
+    /// Create a spatial source configuration from a position (with identity rotation)
+    pub fn spatial_from_position(position: Vec3) -> Self {
         Self::Spatial {
-            position,
+            pose: Pose::from_position(position),
             volume: 1.0,
         }
     }
 
-    /// Create a spatial source configuration with position and volume
-    pub fn spatial_with_volume(position: Vec3, volume: f32) -> Self {
-        Self::Spatial { position, volume }
+    /// Create a spatial source configuration from a position and volume (with identity rotation)
+    pub fn spatial_from_position_with_volume(position: Vec3, volume: f32) -> Self {
+        Self::Spatial {
+            pose: Pose::from_position(position),
+            volume,
+        }
     }
 
     /// Returns true if this is a spatial source
@@ -52,10 +65,18 @@ impl SourceConfig {
         matches!(self, Self::Spatial { .. })
     }
 
+    /// Returns the pose if this is a spatial source
+    pub fn pose(&self) -> Option<Pose> {
+        match self {
+            Self::Spatial { pose, .. } => Some(*pose),
+            Self::NonSpatial { .. } => None,
+        }
+    }
+
     /// Returns the position if this is a spatial source
     pub fn position(&self) -> Option<Vec3> {
         match self {
-            Self::Spatial { position, .. } => Some(*position),
+            Self::Spatial { pose, .. } => Some(pose.position),
             Self::NonSpatial { .. } => None,
         }
     }

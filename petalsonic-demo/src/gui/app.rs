@@ -597,7 +597,7 @@ impl SpatialAudioDemo {
 
             if let Some(source) = self.spatial_sources.get_mut(idx) {
                 source.position = clamped_pos;
-                let new_config = SourceConfig::spatial_with_volume(clamped_pos, 1.0);
+                let new_config = SourceConfig::spatial_from_position_with_volume(clamped_pos, 1.0);
                 if let Err(e) = self.world.update_source_config(source.id, new_config) {
                     log::error!("Failed to update source config: {}", e);
                 }
@@ -638,7 +638,10 @@ impl SpatialAudioDemo {
 
         let source_id = self
             .world
-            .register_audio(audio_data, SourceConfig::spatial_with_volume(position, 1.0))
+            .register_audio(
+                audio_data,
+                SourceConfig::spatial_from_position_with_volume(position, 1.0),
+            )
             .map_err(|e| format!("Failed to register audio in world: {}", e))?;
 
         log::debug!("GUI: Audio registered with source ID: {}", source_id);
@@ -1068,10 +1071,11 @@ impl eframe::App for SpatialAudioDemo {
                                     self.spatial_sources.iter_mut().find(|s| s.id == source_id)
                                 {
                                     source.volume = new_volume;
-                                    let new_config = SourceConfig::spatial_with_volume(
-                                        source.position,
-                                        new_volume,
-                                    );
+                                    let new_config =
+                                        SourceConfig::spatial_from_position_with_volume(
+                                            source.position,
+                                            new_volume,
+                                        );
                                     if let Err(e) =
                                         self.world.update_source_config(source_id, new_config)
                                     {

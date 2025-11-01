@@ -175,7 +175,6 @@ impl SpatialAudioDemo {
         // Set up listener pose at origin (0, 0, 0) with identity rotation
         let listener_pose = Pose::new(Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY);
         world.set_listener_pose(listener_pose);
-        log::info!("Listener pose set to origin");
 
         // Create engine
         let world_arc = Arc::new(world);
@@ -184,7 +183,6 @@ impl SpatialAudioDemo {
 
         // Start the engine
         engine.start().expect("Failed to start audio engine");
-        log::info!("Audio engine started");
 
         // Calculate maximum frame time constraint (block_size / sample_rate)
         //

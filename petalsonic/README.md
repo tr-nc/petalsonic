@@ -185,7 +185,6 @@ let config = PetalSonicWorldDesc {
     sample_rate: 48000,           // Audio sample rate (Hz)
     block_size: 512,              // Render block size (frames)
     channels: 2,                  // Output channels (stereo)
-    buffer_duration: 0.1,         // Ring buffer duration (seconds)
     max_sources: 64,              // Maximum simultaneous sources
     hrtf_path: None,              // Optional custom HRTF data path
 };
@@ -205,7 +204,6 @@ The audio callback thread is **completely real-time safe**:
 ### Buffer Sizing
 
 - **`block_size`**: Smaller = lower latency, higher CPU usage (typical: 256-1024)
-- **`buffer_duration`**: Ring buffer size in seconds (typical: 0.1-0.5)
 - Balance latency vs. robustness based on your target platform
 
 ### Performance Monitoring

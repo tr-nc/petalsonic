@@ -750,7 +750,6 @@ impl PetalSonicEngine {
                     }
                 }
                 PlaybackCommand::StopAll => {
-                    let count = active_playback.len();
                     active_playback.clear();
                 }
             }

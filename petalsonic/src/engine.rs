@@ -45,20 +45,30 @@ thread_local! {
 }
 
 /// Context for audio callback - groups related parameters to reduce argument count
+///
+/// The audio callback runs on the real-time audio thread and must be extremely fast
+/// and lock-free to avoid audio glitches. It simply consumes pre-rendered samples
+/// from the ring buffer.
 struct AudioCallbackContext {
     is_running: Arc<AtomicBool>,
     frames_processed: Arc<AtomicUsize>,
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     world: Arc<PetalSonicWorld>,
+    /// Consumer end of ring buffer - reads pre-rendered audio samples (lock-free)
     ring_buffer_consumer: HeapCons<StereoFrame>,
     channels: u16,
 }
 
 /// Context for render thread
+///
+/// The render thread runs independently from the audio callback, generating audio
+/// samples ahead of time and pushing them to the ring buffer. This decoupling allows
+/// the audio callback to remain simple and fast (lock-free consumption only).
 struct RenderThreadContext {
     shutdown: Arc<AtomicBool>,
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     resampler: Arc<Mutex<StreamingResampler>>,
+    /// Producer end of ring buffer - writes pre-rendered audio samples (lock-free)
     ring_buffer_producer: HeapProd<StereoFrame>,
     channels: u16,
     block_size: usize,
@@ -416,9 +426,14 @@ impl PetalSonicEngine {
     }
 
     /// Render thread loop that continuously fills the ring buffer
+    ///
+    /// This thread runs independently from the audio callback, generating audio samples
+    /// ahead of time. It monitors the ring buffer fill level and generates more samples
+    /// when space is available, keeping the buffer topped up to prevent audio underruns.
     fn render_thread_loop(mut ctx: RenderThreadContext) {
         log::info!("Render thread started");
 
+        // Target fill level: Keep ring buffer at least this full to prevent underruns
         let target_buffer_fill = ctx.block_size * 4;
 
         while !ctx.shutdown.load(Ordering::Relaxed) {
@@ -516,9 +531,33 @@ impl PetalSonicEngine {
             block_size,
         )?;
 
+        // ============================================================================
+        // Ring Buffer Setup: Lock-Free Audio Thread Communication
+        // ============================================================================
+        // The ring buffer decouples audio generation from audio consumption:
+        //
+        // - RENDER THREAD (producer): Generates audio samples at its own pace, mixing
+        //   and spatializing audio sources, then pushes samples to the ring buffer.
+        //   Can take locks and perform complex processing without blocking audio.
+        //
+        // - AUDIO CALLBACK (consumer): Runs on real-time audio thread with strict
+        //   timing requirements. Simply pops pre-rendered samples from ring buffer
+        //   (lock-free operation). If buffer is empty, outputs silence (underrun).
+        //
+        // Benefits:
+        // - Real-time safety: Audio callback never blocks on locks or complex processing
+        // - Buffer against timing jitter: Render thread can work ahead to prevent underruns
+        // - Performance isolation: Expensive processing happens off the audio thread
+        //
+        // The ring buffer stores frames at the device sample rate (after
+        // resampling), not the world sample rate.
+        //
+        // Size calculation: Must be large enough to buffer during render thread delays,
+        // but not so large that it introduces noticeable latency.
+
         // TODO: the audio callback may need even more samples at a time, we should consider that too,
         // otherwise when that exceeds the ring buffer size, we will never be able to fill enough samples
-        const RING_BUFFER_SIZE_MIN: usize = 100000;
+        const RING_BUFFER_SIZE_MIN: usize = 100000; // Minimum 100k frames buffer
         let ring_buffer_size = RING_BUFFER_SIZE_MIN.max(block_size * 8);
         let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
 
@@ -614,7 +653,13 @@ impl PetalSonicEngine {
     }
 
     /// Main audio callback that fills the output buffer
-    /// This is a real-time safe callback that only consumes from the ring buffer (lock-free!)
+    ///
+    /// CRITICAL: This runs on the real-time audio thread with strict timing requirements.
+    /// It MUST complete quickly and MUST NOT block on locks or perform heavy processing.
+    ///
+    /// This callback only consumes pre-rendered samples from the ring buffer (lock-free
+    /// operation). If the ring buffer is empty, it outputs silence and logs an underrun
+    /// warning. All actual audio processing happens in the separate render thread.
     fn audio_callback<T>(data: &mut [T], ctx: &mut AudioCallbackContext)
     where
         T: SizedSample + FromSample<f32>,
@@ -633,6 +678,7 @@ impl PetalSonicEngine {
         let device_frames = data.len() / channels_usize;
 
         // Consume samples from ring buffer to fill output (lock-free!)
+        // This is the only audio generation that happens on the real-time thread
         let mut samples_consumed = 0;
         for i in 0..device_frames {
             if let Some(frame) = ctx.ring_buffer_consumer.try_pop() {

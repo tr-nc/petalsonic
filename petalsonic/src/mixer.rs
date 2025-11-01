@@ -131,19 +131,9 @@ pub fn mix_playback_instances(
             );
             match loop_mode {
                 LoopMode::Once => {
-                    // Source finished - will be removed and emit SourceCompleted
-                    log::info!(
-                        "Mixer: Source {} completed (Once mode), will be removed",
-                        source_id
-                    );
                     completed_sources.push(*source_id);
                 }
                 LoopMode::Infinite => {
-                    // Source reached end - explicitly restart from beginning
-                    log::info!(
-                        "Mixer: Source {} reached end (Infinite mode), restarting from beginning",
-                        source_id
-                    );
                     instance.play_from_beginning();
                     looped_sources.push(*source_id);
                 }

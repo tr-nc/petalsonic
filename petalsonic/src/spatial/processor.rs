@@ -64,19 +64,10 @@ impl SpatialProcessor {
         distance_scaler: f32,
         hrtf_path: Option<&str>,
     ) -> Result<Self> {
-        log::info!(
-            "Initializing Steam Audio spatial processor (sample_rate: {} Hz, frame_size: {}, distance_scaler: {})",
-            sample_rate,
-            frame_size,
-            distance_scaler
-        );
-
         // Create Steam Audio context
         let context = Context::try_new(&audionimbus::ContextSettings::default()).map_err(|e| {
             PetalSonicError::SpatialAudio(format!("Failed to create Steam Audio context: {}", e))
         })?;
-
-        log::info!("Steam Audio context created");
 
         let audio_settings = AudioSettings {
             sampling_rate: sample_rate,
@@ -104,8 +95,6 @@ impl SpatialProcessor {
             PetalSonicError::SpatialAudio(format!("Failed to create AmbisonicsDecodeEffect: {}", e))
         })?;
 
-        log::info!("Created shared AmbisonicsDecodeEffect");
-
         // Create simulator
         let mut simulator =
             Simulator::builder(SceneParams::Default, sample_rate, frame_size as u32)
@@ -117,16 +106,12 @@ impl SpatialProcessor {
                     PetalSonicError::SpatialAudio(format!("Failed to create simulator: {}", e))
                 })?;
 
-        log::info!("Created Steam Audio simulator");
-
         // Create scene
         let scene = Scene::try_new(&context, &SceneSettings::default())
             .map_err(|e| PetalSonicError::SpatialAudio(format!("Failed to create scene: {}", e)))?;
 
         simulator.set_scene(&scene);
         simulator.commit(); // Must be called after set_scene
-
-        log::info!("Created Steam Audio scene");
 
         // Pre-allocate buffers
         let cached_input_buf = vec![0.0; frame_size];

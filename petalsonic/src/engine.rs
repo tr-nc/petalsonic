@@ -142,10 +142,7 @@ impl PetalSonicEngine {
             10.0,
             desc.hrtf_path.as_deref(),
         ) {
-            Ok(processor) => {
-                log::info!("Spatial audio processor initialized");
-                Some(Arc::new(Mutex::new(processor)))
-            }
+            Ok(processor) => Some(Arc::new(Mutex::new(processor))),
             Err(e) => {
                 log::warn!("Failed to initialize spatial audio processor: {}", e);
                 log::warn!("Spatial audio will be disabled");
@@ -203,7 +200,6 @@ impl PetalSonicEngine {
         let device_sample_rate = device_config.sample_rate().0;
 
         self.device_sample_rate = device_sample_rate;
-        self.log_sample_rate_info(device_sample_rate);
 
         // Use default buffer size - let the device decide
         let buffer_size = cpal::BufferSize::Default;
@@ -232,23 +228,6 @@ impl PetalSonicEngine {
         })?;
 
         Ok((device, device_config))
-    }
-
-    /// Log information about sample rates
-    fn log_sample_rate_info(&self, device_sample_rate: u32) {
-        log::info!(
-            "Audio engine: world sample rate = {} Hz, device sample rate = {} Hz",
-            self.desc.sample_rate,
-            device_sample_rate
-        );
-
-        if self.desc.sample_rate != device_sample_rate {
-            log::info!(
-                "Sample rate mismatch detected. Will use real-time resampling: {} Hz -> {} Hz",
-                self.desc.sample_rate,
-                device_sample_rate
-            );
-        }
     }
 
     /// Create the stream configuration
@@ -431,8 +410,6 @@ impl PetalSonicEngine {
     /// ahead of time. It monitors the ring buffer fill level and generates more samples
     /// when space is available, keeping the buffer topped up to prevent audio underruns.
     fn render_thread_loop(mut ctx: RenderThreadContext) {
-        log::info!("Render thread started");
-
         // Target fill level: Keep ring buffer at least this full to prevent underruns
         let target_buffer_fill = ctx.block_size * 4;
 
@@ -481,11 +458,6 @@ impl PetalSonicEngine {
                             .send(PetalSonicEvent::SourceCompleted { source_id })
                         {
                             log::error!("Failed to send SourceCompleted event: {}", e);
-                        } else {
-                            log::info!(
-                                "RenderThread: Emitted SourceCompleted event for source {}",
-                                source_id
-                            );
                         }
                     }
 
@@ -496,11 +468,6 @@ impl PetalSonicEngine {
                             loop_count: 0, // Could track actual loop count if needed
                         }) {
                             log::error!("Failed to send SourceLooped event: {}", e);
-                        } else {
-                            log::info!(
-                                "RenderThread: Emitted SourceLooped event for source {}",
-                                source_id
-                            );
                         }
                     }
                 }
@@ -509,8 +476,6 @@ impl PetalSonicEngine {
             // Small sleep to avoid busy-waiting
             thread::sleep(Duration::from_micros(500));
         }
-
-        log::info!("Render thread stopped");
     }
 
     /// Create a typed audio stream
@@ -561,8 +526,6 @@ impl PetalSonicEngine {
         let ring_buffer_size = RING_BUFFER_SIZE_MIN.max(block_size * 8);
         let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
 
-        log::info!("Created ring buffer with size: {} frames", ring_buffer_size);
-
         // Split ring buffer into producer (for render thread) and consumer (for audio callback)
         // This is lock-free! Each thread gets exclusive ownership of its half.
         let (producer, consumer) = ring_buffer.split();
@@ -590,8 +553,6 @@ impl PetalSonicEngine {
             .map_err(|e| {
                 PetalSonicError::AudioDevice(format!("Failed to spawn render thread: {}", e))
             })?;
-
-        log::info!("Spawned render thread");
 
         // Create context for audio callback (simplified - just consumes from ring buffer)
         let mut context = AudioCallbackContext {
@@ -633,22 +594,6 @@ impl PetalSonicEngine {
             world_block_size,
             Some(ResamplerType::Fast),
         )?;
-
-        if world_sample_rate == device_sample_rate {
-            log::info!(
-                "Created streaming resampler in bypass mode: {} Hz (world block size: {} frames)",
-                world_sample_rate,
-                world_block_size
-            );
-        } else {
-            log::info!(
-                "Created streaming resampler: {} Hz -> {} Hz (world block size: {} frames)",
-                world_sample_rate,
-                device_sample_rate,
-                world_block_size
-            );
-        }
-
         Ok(Arc::new(Mutex::new(resampler)))
     }
 
@@ -806,10 +751,6 @@ impl PetalSonicEngine {
                 }
                 PlaybackCommand::StopAll => {
                     let count = active_playback.len();
-                    log::info!(
-                        "Engine: Received StopAll command, stopping {} sources",
-                        count
-                    );
                     active_playback.clear();
                 }
             }

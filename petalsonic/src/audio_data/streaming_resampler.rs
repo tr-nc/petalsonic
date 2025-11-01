@@ -96,14 +96,6 @@ impl StreamingResampler {
         let resample_ratio = target_sample_rate as f64 / source_sample_rate as f64;
         let resampler_type = resampler_type.unwrap_or_default();
 
-        log::info!(
-            "Creating {:?} resampler: {} Hz -> {} Hz (fixed input: {} frames)",
-            resampler_type,
-            source_sample_rate,
-            target_sample_rate,
-            input_frames
-        );
-
         let resampler = match resampler_type {
             ResamplerType::Fast => {
                 let fast = FastFixedIn::new(

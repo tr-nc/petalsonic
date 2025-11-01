@@ -16,8 +16,6 @@ pub fn create_default_hrtf(context: &Context, audio_settings: &AudioSettings) ->
         },
     )
     .map_err(|e| PetalSonicError::SpatialAudio(format!("Failed to create HRTF: {}", e)))?;
-
-    log::info!("Created default HRTF");
     Ok(hrtf)
 }
 
@@ -47,7 +45,5 @@ pub fn create_hrtf_from_file(
     .map_err(|e| {
         PetalSonicError::SpatialAudio(format!("Failed to create HRTF from file: {}", e))
     })?;
-
-    log::info!("Created HRTF from file: {}", sofa_path);
     Ok(hrtf)
 }

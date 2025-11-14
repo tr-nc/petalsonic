@@ -180,6 +180,38 @@ impl PlaybackInstance {
         self.info.play_state = PlayState::Stopped;
     }
 
+    /// Seek to a specific progress position (0.0 = start, 1.0 = end)
+    ///
+    /// # Arguments
+    /// * `progress` - Playback progress in range [0.0, 1.0]
+    ///
+    /// # Behavior
+    /// - Clamps progress to valid range
+    /// - Converts progress to frame position
+    /// - Updates current_frame and current_time
+    /// - Clears the end flag (in case we were at the end)
+    /// - Works for both playing and paused sources
+    pub fn seek(&mut self, progress: f32) {
+        let progress_clamped = progress.clamp(0.0, 1.0);
+        let total_frames = self.audio_data.samples().len();
+        let target_frame = (total_frames as f32 * progress_clamped) as usize;
+
+        log::debug!(
+            "Source {} seeking to progress {:.2}% (frame {}/{})",
+            self.audio_id,
+            progress_clamped * 100.0,
+            target_frame,
+            total_frames
+        );
+
+        self.info.current_frame = target_frame.min(total_frames);
+        self.info
+            .update_position(self.info.current_frame, self.audio_data.sample_rate());
+
+        // Clear end flag in case we were at the end
+        self.reached_end_this_iteration = false;
+    }
+
     /// Advance playback cursor and check for completion
     ///
     /// This is the **single source of truth** for frame advancement and completion checking.
@@ -295,6 +327,7 @@ impl PlaybackInstance {
 /// - `Stop`: Stop an audio source and reset its position
 /// - `StopAll`: Stop all currently playing audio sources
 /// - `UpdateConfig`: Update the spatial configuration of a playing source
+/// - `Seek`: Seek to a specific position in the audio (0.0 = start, 1.0 = end)
 #[derive(Debug)]
 pub enum PlaybackCommand {
     /// Play a source with given configuration and loop mode
@@ -307,4 +340,6 @@ pub enum PlaybackCommand {
     StopAll,
     /// Update the configuration of a source
     UpdateConfig(SourceId, SourceConfig),
+    /// Seek to a specific position (progress in range [0.0, 1.0])
+    Seek(SourceId, f32),
 }

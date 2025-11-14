@@ -303,6 +303,53 @@ impl PetalSonicWorld {
         Ok(())
     }
 
+    /// Seeks to a specific position in an audio source's playback.
+    ///
+    /// Sends a seek command to the audio engine thread. The playback position will
+    /// be updated to the specified progress value. This works for both playing and
+    /// paused sources.
+    ///
+    /// # Arguments
+    ///
+    /// * `audio_id` - SourceId of the audio source to seek
+    /// * `progress` - Playback progress in range [0.0, 1.0] where 0.0 is the start and 1.0 is the end
+    ///
+    /// # Behavior
+    ///
+    /// - Progress is automatically clamped to [0.0, 1.0]
+    /// - Only affects sources currently in active playback
+    /// - Position is updated immediately on the next audio callback
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command fails to send to the audio engine.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use petalsonic::*;
+    /// # let world = PetalSonicWorld::new(PetalSonicWorldDesc::default()).unwrap();
+    /// # let source_id = SourceId::from(0);
+    /// // Seek to 50% through the audio
+    /// world.seek(source_id, 0.5)?;
+    ///
+    /// // Jump to the beginning
+    /// world.seek(source_id, 0.0)?;
+    ///
+    /// // Jump to near the end
+    /// world.seek(source_id, 0.95)?;
+    /// # Ok::<(), PetalSonicError>(())
+    /// ```
+    pub fn seek(&self, audio_id: SourceId, progress: f32) -> Result<()> {
+        self.command_sender
+            .send(PlaybackCommand::Seek(audio_id, progress))
+            .map_err(|e| {
+                crate::error::PetalSonicError::Engine(format!("Failed to send seek command: {}", e))
+            })?;
+
+        Ok(())
+    }
+
     /// Returns a reference to the command receiver for the audio engine.
     ///
     /// This receiver is used by the audio engine thread to poll for playback commands

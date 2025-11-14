@@ -129,6 +129,7 @@ pub struct SpatialAudioDemo {
     selected_audio_file_index: usize,
     selected_loop_mode_index: usize,
     selected_source_type: SourceType,
+    initial_progress: f32, // Initial playback progress for new sources (0.0-1.0)
     add_source_mode: bool,
     brush_mode: bool,
     brush_thickness: usize, // Brush thickness in cells (1 = single cell, 2 = 2x2, etc.)
@@ -219,6 +220,7 @@ impl SpatialAudioDemo {
             selected_audio_file_index: 0,
             selected_loop_mode_index: 0, // Once
             selected_source_type: SourceType::Spatial,
+            initial_progress: 0.0, // Start from beginning by default
             add_source_mode: false,
             brush_mode: false,
             brush_thickness: 1,
@@ -661,6 +663,18 @@ impl SpatialAudioDemo {
             .play(source_id, loop_mode)
             .map_err(|e| format!("Failed to start playback: {}", e))?;
 
+        // Apply initial progress if set to non-zero
+        if self.initial_progress > 0.0 {
+            log::info!(
+                "GUI: Seeking spatial source {} to initial progress {:.0}%",
+                source_id,
+                self.initial_progress * 100.0
+            );
+            self.world
+                .seek(source_id, self.initial_progress)
+                .map_err(|e| format!("Failed to seek to initial progress: {}", e))?;
+        }
+
         self.spatial_sources.push(SpatialAudioSource {
             id: source_id,
             position,
@@ -723,6 +737,18 @@ impl SpatialAudioDemo {
             .play(source_id, loop_mode)
             .map_err(|e| format!("Failed to start playback: {}", e))?;
 
+        // Apply initial progress if set to non-zero
+        if self.initial_progress > 0.0 {
+            log::info!(
+                "GUI: Seeking non-spatial source {} to initial progress {:.0}%",
+                source_id,
+                self.initial_progress * 100.0
+            );
+            self.world
+                .seek(source_id, self.initial_progress)
+                .map_err(|e| format!("Failed to seek to initial progress: {}", e))?;
+        }
+
         self.non_spatial_sources.push(NonSpatialAudioSource {
             id: source_id,
             file_name: file_name.clone(),
@@ -740,7 +766,11 @@ impl SpatialAudioDemo {
     }
 
     /// Unified delete logic for both spatial and non-spatial sources
-    fn delete_source(&mut self, source_id: SourceId) {
+    ///
+    /// # Arguments
+    /// * `source_id` - The source to delete
+    /// * `should_stop` - Whether to send a stop command (false if already stopped/completed)
+    fn delete_source(&mut self, source_id: SourceId, should_stop: bool) {
         log::info!("GUI: Deleting source {}", source_id);
 
         // Remove from spatial sources list if present
@@ -763,8 +793,8 @@ impl SpatialAudioDemo {
             log::info!("GUI: Removed non-spatial source '{}'", source.file_name);
         }
 
-        // Stop playback first (if still playing)
-        if let Err(e) = self.world.stop(source_id) {
+        // Only stop playback if explicitly requested (not for naturally completed sources)
+        if should_stop && let Err(e) = self.world.stop(source_id) {
             log::warn!("Failed to stop source {}: {}", source_id, e);
         }
 
@@ -790,8 +820,8 @@ impl eframe::App for SpatialAudioDemo {
                         source_id
                     );
 
-                    // Use unified delete logic
-                    self.delete_source(source_id);
+                    // Source already stopped by mixer, don't send stop command
+                    self.delete_source(source_id, false);
                 }
                 petalsonic::PetalSonicEvent::SourceLooped {
                     source_id,
@@ -907,6 +937,27 @@ impl eframe::App for SpatialAudioDemo {
                                     );
                                 }
                             });
+
+                        ui.add_space(10.0);
+
+                        // Initial progress slider
+                        ui.label("Initial Progress:");
+                        ui.add(
+                            egui::Slider::new(&mut self.initial_progress, 0.0..=1.0)
+                                .text("%")
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .custom_parser(|s| {
+                                    s.trim_end_matches('%')
+                                        .parse::<f64>()
+                                        .ok()
+                                        .map(|v| v / 100.0)
+                                }),
+                        );
+                        ui.label(
+                            egui::RichText::new("New sources will start at this position")
+                                .small()
+                                .italics(),
+                        );
 
                         ui.add_space(10.0);
                         ui.separator();
@@ -1088,7 +1139,8 @@ impl eframe::App for SpatialAudioDemo {
 
                             // Apply deletion after rendering to avoid borrow checker issues
                             if let Some(source_id) = source_to_delete {
-                                self.delete_source(source_id);
+                                // User explicitly deleted, send stop command
+                                self.delete_source(source_id, true);
                             }
                         });
 
@@ -1181,7 +1233,8 @@ impl eframe::App for SpatialAudioDemo {
 
                             // Apply deletion after rendering to avoid borrow checker issues
                             if let Some(source_id) = source_to_delete {
-                                self.delete_source(source_id);
+                                // User explicitly deleted, send stop command
+                                self.delete_source(source_id, true);
                             }
                         });
 

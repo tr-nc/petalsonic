@@ -749,6 +749,21 @@ impl PetalSonicEngine {
                         );
                     }
                 }
+                PlaybackCommand::Seek(audio_id, progress) => {
+                    log::debug!(
+                        "Engine: Received Seek command for source {} to {:.2}%",
+                        audio_id,
+                        progress * 100.0
+                    );
+                    if let Some(instance) = active_playback.get_mut(&audio_id) {
+                        instance.seek(progress);
+                    } else {
+                        log::warn!(
+                            "Engine: Cannot seek, source {} not in active playback",
+                            audio_id
+                        );
+                    }
+                }
                 PlaybackCommand::StopAll => {
                     active_playback.clear();
                 }

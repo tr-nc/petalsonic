@@ -34,6 +34,7 @@ pub struct SpatialProcessor {
     frame_size: usize,
     sample_rate: u32,
     distance_scaler: f32,
+    hrtf_gain: f32,
 
     // Cached buffers to avoid allocations
     cached_input_buf: Vec<f32>,             // Input mono samples
@@ -58,11 +59,13 @@ impl SpatialProcessor {
     /// * `frame_size` - Number of frames to process per call
     /// * `distance_scaler` - Scale factor to convert game units to meters (default: 10.0)
     /// * `hrtf_path` - Optional path to a custom HRTF SOFA file (None uses default HRTF)
+    /// * `hrtf_gain` - Scale factor applied to HRTF output (default: 1.0)
     pub fn new(
         sample_rate: u32,
         frame_size: usize,
         distance_scaler: f32,
         hrtf_path: Option<&str>,
+        hrtf_gain: f32,
     ) -> Result<Self> {
         // Create Steam Audio context
         let context = Context::try_new(&audionimbus::ContextSettings::default()).map_err(|e| {
@@ -131,6 +134,7 @@ impl SpatialProcessor {
             frame_size,
             sample_rate,
             distance_scaler,
+            hrtf_gain,
             cached_input_buf,
             cached_direct_buf,
             cached_summed_encoded_buf,
@@ -480,6 +484,13 @@ impl SpatialProcessor {
         })?;
 
         decoded_buf.interleave(&self.context, &mut self.cached_binaural_processed);
+
+        // Apply HRTF gain compensation
+        if self.hrtf_gain != 1.0 {
+            for sample in self.cached_binaural_processed.iter_mut() {
+                *sample *= self.hrtf_gain;
+            }
+        }
 
         Ok(())
     }

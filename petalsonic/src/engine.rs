@@ -141,6 +141,7 @@ impl PetalSonicEngine {
             desc.block_size,
             10.0,
             desc.hrtf_path.as_deref(),
+            desc.hrtf_gain,
         ) {
             Ok(processor) => Some(Arc::new(Mutex::new(processor))),
             Err(e) => {

@@ -14,6 +14,11 @@ pub struct PetalSonicWorldDesc {
     pub max_sources: usize,
     /// Optional path to a custom HRTF SOFA file (None uses Steam Audio's default HRTF)
     pub hrtf_path: Option<String>,
+    /// Scale factor applied to HRTF output (default: 1.0, no scaling)
+    ///
+    /// Different HRTF datasets can have different overall gain levels.
+    /// Use this to compensate for volume differences between HRTFs.
+    pub hrtf_gain: f32,
 }
 
 impl Default for PetalSonicWorldDesc {
@@ -24,6 +29,7 @@ impl Default for PetalSonicWorldDesc {
             channels: 2,
             max_sources: 2048,
             hrtf_path: None,
+            hrtf_gain: 1.0,
         }
     }
 }

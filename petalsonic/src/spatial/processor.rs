@@ -59,7 +59,7 @@ impl SpatialProcessor {
     /// * `frame_size` - Number of frames to process per call
     /// * `distance_scaler` - Scale factor to convert game units to meters (default: 10.0)
     /// * `hrtf_path` - Optional path to a custom HRTF SOFA file (None uses default HRTF)
-    /// * `hrtf_gain` - Scale factor applied to HRTF output (default: 1.0)
+    /// * `hrtf_gain` - HRTF gain compensation in decibels (default: 0.0 dB = no change)
     pub fn new(
         sample_rate: u32,
         frame_size: usize,
@@ -485,10 +485,11 @@ impl SpatialProcessor {
 
         decoded_buf.interleave(&self.context, &mut self.cached_binaural_processed);
 
-        // Apply HRTF gain compensation
-        if self.hrtf_gain != 1.0 {
+        // Apply HRTF gain compensation (convert dB to linear gain)
+        if self.hrtf_gain != 0.0 {
+            let linear_gain = 10f32.powf(self.hrtf_gain / 20.0);
             for sample in self.cached_binaural_processed.iter_mut() {
-                *sample *= self.hrtf_gain;
+                *sample *= linear_gain;
             }
         }
 

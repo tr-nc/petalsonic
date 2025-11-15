@@ -255,19 +255,62 @@ impl SpatialProcessor {
         self.cached_input_buf.fill(0.0);
 
         let samples = instance.audio_data.samples();
+        let total_frames = samples.len();
         let current_frame = instance.info.current_frame;
 
-        // Read samples for this block
+        // Read samples for this block with wraparound support for infinite looping
         for i in 0..self.frame_size {
-            let sample_idx = current_frame + i;
-            if sample_idx < samples.len() {
-                self.cached_input_buf[i] = samples[sample_idx] * volume;
+            let mut sample_idx = current_frame + i;
+
+            // Handle wraparound for infinite looping
+            if sample_idx >= total_frames {
+                if matches!(instance.loop_mode, crate::playback::LoopMode::Infinite) {
+                    // Mark that we reached end (for event emission)
+                    if !instance.reached_end_this_iteration {
+                        instance.reached_end_this_iteration = true;
+                    }
+                    // Wrap around to beginning
+                    sample_idx %= total_frames;
+                } else {
+                    // LoopMode::Once - stop reading samples
+                    break;
+                }
+            }
+
+            self.cached_input_buf[i] = samples[sample_idx] * volume;
+        }
+
+        // Advance cursor and check for completion with wraparound support
+        // This ensures both spatial and non-spatial paths use identical completion logic
+        self.advance_instance_with_wrap(instance);
+    }
+
+    /// Advance playback instance with wraparound support (for spatial processing)
+    fn advance_instance_with_wrap(&mut self, instance: &mut PlaybackInstance) {
+        let total_frames = instance.audio_data.samples().len();
+        instance.info.current_frame += self.frame_size;
+
+        // Check if we've reached or passed the end
+        if instance.info.current_frame >= total_frames {
+            match instance.loop_mode {
+                crate::playback::LoopMode::Infinite => {
+                    // Wrap around - keep playing
+                    instance.info.current_frame %= total_frames;
+                    // Note: reached_end_this_iteration already set in fill_input_buffer
+                    // State remains Playing
+                }
+                crate::playback::LoopMode::Once => {
+                    // Stop playback
+                    instance.reached_end_this_iteration = true;
+                    instance.info.play_state = crate::playback::PlayState::Stopped;
+                }
             }
         }
 
-        // Advance cursor and check for completion (single source of truth!)
-        // This ensures both spatial and non-spatial paths use identical completion logic
-        instance.advance_and_check_completion(self.frame_size);
+        instance.info.update_position(
+            instance.info.current_frame,
+            instance.audio_data.sample_rate(),
+        );
     }
 
     /// Apply direct effect to the input buffer

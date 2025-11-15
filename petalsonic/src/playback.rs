@@ -212,11 +212,10 @@ impl PlaybackInstance {
         self.reached_end_this_iteration = false;
     }
 
-    /// Advance playback cursor and check for completion
+    /// Advance playback cursor and check for completion with wraparound support
     ///
-    /// This is the **single source of truth** for frame advancement and completion checking.
-    /// Call this whenever you consume frames from the audio data, whether in regular
-    /// fill_buffer() or in the spatial processor.
+    /// This is the **single source of truth** for frame advancement and completion checking
+    /// in the new wraparound implementation. Call this from fill_buffer().
     ///
     /// # Arguments
     /// * `frames_consumed` - Number of frames consumed from audio data
@@ -224,31 +223,43 @@ impl PlaybackInstance {
     /// # Behavior
     /// - Updates current_frame and timing info
     /// - If reached end of audio data:
-    ///   - Sets `reached_end_this_iteration` flag for event emission
-    ///   - Sets state to Stopped (for BOTH Once and Infinite modes)
-    ///   - The mixer will handle restart for Infinite mode
-    pub(crate) fn advance_and_check_completion(&mut self, frames_consumed: usize) {
+    ///   - For LoopMode::Infinite: Wraps current_frame to beginning, keeps playing
+    ///   - For LoopMode::Once: Sets state to Stopped
+    ///   - Sets `reached_end_this_iteration` flag for event emission in both cases
+    fn advance_and_check_completion_with_wrap(&mut self, frames_consumed: usize) {
+        let total_frames = self.audio_data.samples().len();
         self.info.current_frame += frames_consumed;
+
+        // Check if we've reached or passed the end
+        if self.info.current_frame >= total_frames {
+            match self.loop_mode {
+                LoopMode::Infinite => {
+                    // Wrap around - keep playing
+                    self.info.current_frame %= total_frames;
+                    // Note: reached_end_this_iteration already set in fill_buffer
+                    // State remains Playing
+                    log::debug!(
+                        "Source {} wrapped around to frame {} (Infinite loop)",
+                        self.audio_id,
+                        self.info.current_frame
+                    );
+                }
+                LoopMode::Once => {
+                    // Stop playback
+                    self.reached_end_this_iteration = true;
+                    self.info.play_state = PlayState::Stopped;
+                    log::debug!(
+                        "Source {} reached end at frame {}/{} (Once mode)",
+                        self.audio_id,
+                        self.info.current_frame,
+                        total_frames
+                    );
+                }
+            }
+        }
+
         self.info
             .update_position(self.info.current_frame, self.audio_data.sample_rate());
-
-        // Check if we've reached the end
-        if self.info.current_frame >= self.audio_data.samples().len() {
-            log::debug!(
-                "Source {} reached end at frame {}/{} (loop mode: {:?}, consumed {} frames)",
-                self.audio_id,
-                self.info.current_frame,
-                self.audio_data.samples().len(),
-                self.loop_mode,
-                frames_consumed
-            );
-
-            // Mark that we reached the end this iteration (for event emission)
-            self.reached_end_this_iteration = true;
-
-            // Stop playback - mixer will handle restart for Infinite mode
-            self.info.play_state = PlayState::Stopped;
-        }
     }
 
     /// Fill audio buffer for this instance
@@ -256,9 +267,8 @@ impl PlaybackInstance {
     ///
     /// # Behavior
     /// When reaching the end of audio data:
-    /// - Calls advance_and_check_completion() which handles all completion logic
-    /// - For BOTH Once and Infinite modes, playback stops
-    /// - Infinite mode will be explicitly restarted by the mixer
+    /// - For LoopMode::Infinite: Wraps around to beginning seamlessly within the same buffer
+    /// - For LoopMode::Once: Stops filling and sets state to Stopped
     pub fn fill_buffer(&mut self, buffer: &mut [f32], channels: u16) -> usize {
         if !matches!(self.info.play_state, PlayState::Playing) {
             return 0;
@@ -267,17 +277,28 @@ impl PlaybackInstance {
         let channels_usize = channels as usize;
         let frame_count = buffer.len() / channels_usize;
         let samples = self.audio_data.samples();
+        let total_frames = samples.len();
         let mut frames_filled = 0;
 
         // Get volume from config
         let volume = self.config.volume();
 
         for frame_idx in 0..frame_count {
-            let sample_idx = self.info.current_frame + frame_idx;
+            let mut sample_idx = self.info.current_frame + frame_idx;
 
-            if sample_idx >= samples.len() {
-                // Reached end - stop here
-                break;
+            // Handle wraparound for infinite looping
+            if sample_idx >= total_frames {
+                if matches!(self.loop_mode, LoopMode::Infinite) {
+                    // Mark that we reached end (for event emission)
+                    if !self.reached_end_this_iteration {
+                        self.reached_end_this_iteration = true;
+                    }
+                    // Wrap around to beginning
+                    sample_idx %= total_frames;
+                } else {
+                    // LoopMode::Once - stop here
+                    break;
+                }
             }
 
             let sample = samples[sample_idx];
@@ -293,9 +314,9 @@ impl PlaybackInstance {
             frames_filled += 1;
         }
 
-        // Advance cursor and check for completion (single source of truth!)
+        // Advance cursor and check for completion with wraparound
         if frames_filled > 0 {
-            self.advance_and_check_completion(frames_filled);
+            self.advance_and_check_completion_with_wrap(frames_filled);
         }
 
         frames_filled

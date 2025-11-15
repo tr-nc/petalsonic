@@ -134,7 +134,7 @@ pub fn mix_playback_instances(
                     completed_sources.push(*source_id);
                 }
                 LoopMode::Infinite => {
-                    instance.play_from_beginning();
+                    // No longer need to restart - wraparound already handled in fill_buffer
                     looped_sources.push(*source_id);
                 }
             }
@@ -142,7 +142,7 @@ pub fn mix_playback_instances(
     }
 
     // Only remove instances that are actually finished (stopped playing)
-    // Infinite looping sources were explicitly restarted, so they keep playing
+    // Infinite looping sources wrap around automatically, so they keep playing
     let removed_count = active_playback.len();
     active_playback.retain(|_, instance| !instance.info.is_finished());
     let removed = removed_count - active_playback.len();

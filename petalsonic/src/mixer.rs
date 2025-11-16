@@ -38,7 +38,7 @@ pub fn mix_playback_instances(
     spatial_processor: Option<&mut SpatialProcessor>,
 ) -> MixResult {
     let Ok(mut active_playback) = active_playback.try_lock() else {
-        log::warn!("Failed to acquire active playback lock in mixer");
+        log::debug!("Failed to acquire active playback lock in mixer");
         return MixResult {
             frames_filled: 0,
             completed_sources: Vec::new(),

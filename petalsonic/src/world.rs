@@ -373,11 +373,11 @@ impl PetalSonicWorld {
 /// # Properties
 ///
 /// - Position in 3D space (`Vec3`)
-/// - Volume level (0.0 to 1.0+)
+/// - Volume level in decibels (0.0 dB = unity, negative attenuates, positive amplifies)
 pub struct PetalSonicAudioSource {
     pub(crate) _id: u64,
     pub(crate) position: Vec3,
-    pub(crate) volume: f32,
+    pub(crate) volume_db: f32,
 }
 
 impl PetalSonicAudioSource {
@@ -390,13 +390,14 @@ impl PetalSonicAudioSource {
         self.position
     }
 
-    /// Returns the volume level of the audio source.
+    /// Returns the volume level of the audio source in decibels.
     ///
     /// # Returns
     ///
-    /// Volume as a float where 1.0 is normal volume, 0.0 is silent, and values > 1.0 amplify.
-    pub fn volume(&self) -> f32 {
-        self.volume
+    /// Volume in decibels where 0.0 dB is unity, negative values attenuate, and
+    /// positive values amplify.
+    pub fn volume_db(&self) -> f32 {
+        self.volume_db
     }
 }
 

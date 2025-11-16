@@ -103,7 +103,8 @@ struct SpatialAudioSource {
     position: Vec3,
     file_name: String,
     loop_mode: LoopMode,
-    volume: f32,
+    /// Volume in decibels for this spatial source.
+    volume_db: f32,
 }
 
 #[derive(Clone)]
@@ -111,7 +112,8 @@ struct NonSpatialAudioSource {
     id: SourceId,
     file_name: String,
     loop_mode: LoopMode,
-    volume: f32,
+    /// Volume in decibels for this non-spatial source.
+    volume_db: f32,
 }
 
 pub struct SpatialAudioDemo {
@@ -598,7 +600,9 @@ impl SpatialAudioDemo {
 
             if let Some(source) = self.spatial_sources.get_mut(idx) {
                 source.position = clamped_pos;
-                let new_config = SourceConfig::spatial_from_position_with_volume(clamped_pos, 1.0);
+                // Preserve current volume in dB when moving the source.
+                let new_config =
+                    SourceConfig::spatial_from_position_with_volume_db(clamped_pos, source.volume_db);
                 if let Err(e) = self.world.update_source_config(source.id, new_config) {
                     log::error!("Failed to update source config: {}", e);
                 }
@@ -641,7 +645,8 @@ impl SpatialAudioDemo {
             .world
             .register_audio(
                 audio_data,
-                SourceConfig::spatial_from_position_with_volume(position, 1.0),
+                // Start spatial sources at 0 dB (unity gain).
+                SourceConfig::spatial_from_position_with_volume_db(position, 0.0),
             )
             .map_err(|e| format!("Failed to register audio in world: {}", e))?;
 
@@ -681,7 +686,7 @@ impl SpatialAudioDemo {
             position,
             file_name: file_name.clone(),
             loop_mode,
-            volume: 1.0,
+            volume_db: 0.0,
         });
 
         log::info!(
@@ -754,7 +759,7 @@ impl SpatialAudioDemo {
             id: source_id,
             file_name: file_name.clone(),
             loop_mode,
-            volume: 1.0,
+            volume_db: 0.0,
         });
 
         log::info!(
@@ -1057,6 +1062,7 @@ impl eframe::App for SpatialAudioDemo {
                         .id_salt("spatial_sources_list")
                         .show(ui, |ui| {
                             let mut source_to_delete: Option<SourceId> = None;
+                            // Store new volumes in dB for each non-spatial source.
                             let mut volume_changes: Vec<(SourceId, f32)> = Vec::new();
 
                             egui::ScrollArea::vertical()
@@ -1080,22 +1086,23 @@ impl eframe::App for SpatialAudioDemo {
                                                         source.loop_mode
                                                     ));
 
-                                                    // Volume slider
+                                                    // Volume slider (dB scale)
                                                     ui.horizontal(|ui| {
-                                                        ui.label("  Volume:");
-                                                        let mut volume = source.volume;
+                                                        ui.label("  Volume (dB):");
+                                                        let mut volume_db = source.volume_db;
                                                         if ui
                                                             .add(
                                                                 egui::Slider::new(
-                                                                    &mut volume,
-                                                                    0.0..=1.0,
+                                                                    &mut volume_db,
+                                                                    -60.0..=12.0,
                                                                 )
+                                                                .suffix(" dB")
                                                                 .show_value(true),
                                                             )
                                                             .changed()
                                                         {
                                                             volume_changes
-                                                                .push((source.id, volume));
+                                                                .push((source.id, volume_db));
                                                         }
                                                     });
                                                 });
@@ -1115,16 +1122,16 @@ impl eframe::App for SpatialAudioDemo {
                                     }
                                 });
 
-                            // Apply volume changes
-                            for (source_id, new_volume) in volume_changes {
+                            // Apply volume changes (in dB)
+                            for (source_id, new_volume_db) in volume_changes {
                                 if let Some(source) =
                                     self.spatial_sources.iter_mut().find(|s| s.id == source_id)
                                 {
-                                    source.volume = new_volume;
+                                    source.volume_db = new_volume_db;
                                     let new_config =
-                                        SourceConfig::spatial_from_position_with_volume(
+                                        SourceConfig::spatial_from_position_with_volume_db(
                                             source.position,
-                                            new_volume,
+                                            new_volume_db,
                                         );
                                     if let Err(e) =
                                         self.world.update_source_config(source_id, new_config)
@@ -1175,22 +1182,23 @@ impl eframe::App for SpatialAudioDemo {
                                                         source.loop_mode
                                                     ));
 
-                                                    // Volume slider
+                                                    // Volume slider (dB scale)
                                                     ui.horizontal(|ui| {
-                                                        ui.label("  Volume:");
-                                                        let mut volume = source.volume;
+                                                        ui.label("  Volume (dB):");
+                                                        let mut volume_db = source.volume_db;
                                                         if ui
                                                             .add(
                                                                 egui::Slider::new(
-                                                                    &mut volume,
-                                                                    0.0..=1.0,
+                                                                    &mut volume_db,
+                                                                    -60.0..=12.0,
                                                                 )
+                                                                .suffix(" dB")
                                                                 .show_value(true),
                                                             )
                                                             .changed()
                                                         {
                                                             volume_changes
-                                                                .push((source.id, volume));
+                                                                .push((source.id, volume_db));
                                                         }
                                                     });
                                                 });
@@ -1210,16 +1218,16 @@ impl eframe::App for SpatialAudioDemo {
                                     }
                                 });
 
-                            // Apply volume changes
-                            for (source_id, new_volume) in volume_changes {
+                            // Apply volume changes (in dB)
+                            for (source_id, new_volume_db) in volume_changes {
                                 if let Some(source) = self
                                     .non_spatial_sources
                                     .iter_mut()
                                     .find(|s| s.id == source_id)
                                 {
-                                    source.volume = new_volume;
+                                    source.volume_db = new_volume_db;
                                     let new_config =
-                                        SourceConfig::non_spatial_with_volume(new_volume);
+                                        SourceConfig::non_spatial_with_volume_db(new_volume_db);
                                     if let Err(e) =
                                         self.world.update_source_config(source_id, new_config)
                                     {

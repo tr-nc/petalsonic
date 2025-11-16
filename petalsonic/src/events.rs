@@ -52,8 +52,10 @@ pub enum PetalSonicEvent {
     },
     SourceVolumeChanged {
         source_id: SourceId,
-        old_volume: f32,
-        new_volume: f32,
+        /// Old volume in decibels.
+        old_volume_db: f32,
+        /// New volume in decibels.
+        new_volume_db: f32,
     },
     SourcePoseChanged {
         source_id: SourceId,

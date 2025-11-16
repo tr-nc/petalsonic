@@ -1,4 +1,5 @@
 use crate::config::SourceConfig;
+use crate::gain;
 use crate::error::{PetalSonicError, Result};
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackInstance;
@@ -34,7 +35,11 @@ pub struct SpatialProcessor {
     frame_size: usize,
     sample_rate: u32,
     distance_scaler: f32,
-    hrtf_gain: f32,
+    /// HRTF gain in decibels (for introspection / debugging).
+    #[allow(dead_code)] // Only used for debugging / future introspection
+    hrtf_gain_db: f32,
+    /// HRTF gain as linear multiplier (derived from `hrtf_gain_db`).
+    hrtf_gain_linear: f32,
 
     // Cached buffers to avoid allocations
     cached_input_buf: Vec<f32>,             // Input mono samples
@@ -124,6 +129,10 @@ impl SpatialProcessor {
         let cached_ambisonics_decode_buf = vec![0.0; frame_size * 2]; // Stereo
         let cached_binaural_processed = vec![0.0; frame_size * 2];
 
+        // Pre-compute HRTF gain in linear space for efficient application.
+        let hrtf_gain_db = hrtf_gain;
+        let hrtf_gain_linear = gain::db_to_linear(hrtf_gain_db);
+
         Ok(Self {
             context,
             simulator,
@@ -134,7 +143,8 @@ impl SpatialProcessor {
             frame_size,
             sample_rate,
             distance_scaler,
-            hrtf_gain,
+            hrtf_gain_db,
+            hrtf_gain_linear,
             cached_input_buf,
             cached_direct_buf,
             cached_summed_encoded_buf,
@@ -230,11 +240,14 @@ impl SpatialProcessor {
         source_id: SourceId,
         instance: &mut PlaybackInstance,
     ) -> Result<()> {
-        // Get spatial configuration
-        let (position, volume) = match &instance.config {
-            SourceConfig::Spatial { pose, volume } => (pose.position, *volume),
+        // Get spatial configuration (position + per-source volume)
+        let position = match &instance.config {
+            SourceConfig::Spatial { pose, .. } => pose.position,
             _ => return Ok(()), // Not a spatial source, skip
         };
+
+        // Convert dB volume from config to linear gain once per block.
+        let volume = instance.config.volume();
 
         // Check if effects exist for this source
         if !self.effects_manager.has_effects(source_id) {
@@ -485,11 +498,10 @@ impl SpatialProcessor {
 
         decoded_buf.interleave(&self.context, &mut self.cached_binaural_processed);
 
-        // Apply HRTF gain compensation (convert dB to linear gain)
-        if self.hrtf_gain != 0.0 {
-            let linear_gain = 10f32.powf(self.hrtf_gain / 20.0);
+        // Apply HRTF gain compensation (linear multiplier derived from dB)
+        if self.hrtf_gain_linear != 1.0 {
             for sample in self.cached_binaural_processed.iter_mut() {
-                *sample *= linear_gain;
+                *sample *= self.hrtf_gain_linear;
             }
         }
 

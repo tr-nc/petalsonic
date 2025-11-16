@@ -451,7 +451,10 @@ impl SpatialAudioDemo {
             painter.circle_stroke(source_pos, 8.0, Stroke::new(2.0, Color32::WHITE));
 
             // Draw label with file name and distance
-            let distance = source.position.length();
+            let distance_world = source.position.length();
+            // Convert world units to meters using the world's distance scaler so
+            // the UI reflects the same physical scale as the spatial simulation.
+            let distance = distance_world * self.engine.config().distance_scaler;
             let label = format!(
                 "{} ({:.1}m)",
                 source.file_name.trim_end_matches(".wav"),

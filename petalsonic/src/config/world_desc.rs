@@ -26,6 +26,15 @@ pub struct PetalSonicWorldDesc {
     /// - `3.0`: Modest increase (~40% louder)
     /// - `-20.0`: Very quiet (1/10th perceived loudness)
     pub hrtf_gain: f32,
+    /// Distance scale factor to convert world units to meters for spatialization.
+    ///
+    /// Steam Audio operates in meters. This factor controls how your application's
+    /// coordinate system maps to real-world meters when running the spatial
+    /// simulation.
+    ///
+    /// - `1.0`: 1 world unit = 1 meter
+    /// - `10.0`: 1 world unit = 10 meters (larger-scale worlds)
+    pub distance_scaler: f32,
 }
 
 impl Default for PetalSonicWorldDesc {
@@ -37,6 +46,7 @@ impl Default for PetalSonicWorldDesc {
             max_sources: 2048,
             hrtf_path: None,
             hrtf_gain: 0.0,
+            distance_scaler: 10.0,
         }
     }
 }

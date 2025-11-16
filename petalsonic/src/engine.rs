@@ -135,11 +135,11 @@ impl PetalSonicEngine {
     /// Create a new audio engine with the given configuration and world
     pub fn new(desc: PetalSonicWorldDesc, world: Arc<PetalSonicWorld>) -> Result<Self> {
         // Initialize spatial processor
-        // Use distance_scaler of 10.0 (converts game units to meters, as in reference)
+        // Use distance_scaler from world configuration (converts world units to meters)
         let spatial_processor = match SpatialProcessor::new(
             desc.sample_rate,
             desc.block_size,
-            10.0,
+            desc.distance_scaler,
             desc.hrtf_path.as_deref(),
             desc.hrtf_gain,
         ) {

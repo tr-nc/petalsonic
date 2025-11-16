@@ -187,6 +187,8 @@ let config = PetalSonicWorldDesc {
     channels: 2,                  // Output channels (stereo)
     max_sources: 64,              // Maximum simultaneous sources
     hrtf_path: None,              // Optional custom HRTF data path
+    hrtf_gain: 0.0,               // HRTF gain compensation (dB)
+    distance_scaler: 10.0,        // 1 world unit = 10 meters in spatial simulation
 };
 ```
 

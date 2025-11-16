@@ -678,11 +678,17 @@ impl PetalSonicEngine {
         world: &Arc<PetalSonicWorld>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
     ) {
-        while let Ok(command) = world.command_receiver().try_recv() {
-            let Ok(mut active_playback) = active_playback.try_lock() else {
-                continue;
-            };
+        // Important real-time rule:
+        // - Never dequeue a command unless we *already* hold the active_playback lock.
+        //   Otherwise, if locking fails after dequeue, the command would be lost.
+        let Ok(mut active_playback) = active_playback.try_lock() else {
+            // Can't safely mutate playback map this callback; leave commands queued.
+            // They'll be processed on a later callback when the lock is available.
+            log::debug!("Engine: Skipping command processing - active playback lock busy");
+            return;
+        };
 
+        while let Ok(command) = world.command_receiver().try_recv() {
             match command {
                 PlaybackCommand::Play(audio_id, config, loop_mode) => {
                     log::debug!(

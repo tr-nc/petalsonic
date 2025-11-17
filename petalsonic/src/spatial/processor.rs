@@ -1,6 +1,6 @@
 use crate::config::SourceConfig;
-use crate::gain;
 use crate::error::{PetalSonicError, Result};
+use crate::gain;
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackInstance;
 use crate::spatial::effects::SpatialEffectsManager;

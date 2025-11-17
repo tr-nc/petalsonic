@@ -604,8 +604,10 @@ impl SpatialAudioDemo {
             if let Some(source) = self.spatial_sources.get_mut(idx) {
                 source.position = clamped_pos;
                 // Preserve current volume in dB when moving the source.
-                let new_config =
-                    SourceConfig::spatial_from_position_with_volume_db(clamped_pos, source.volume_db);
+                let new_config = SourceConfig::spatial_from_position_with_volume_db(
+                    clamped_pos,
+                    source.volume_db,
+                );
                 if let Err(e) = self.world.update_source_config(source.id, new_config) {
                     log::error!("Failed to update source config: {}", e);
                 }

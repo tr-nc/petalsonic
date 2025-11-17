@@ -1,5 +1,18 @@
 # PetalSonic realtime-safety plan (jitter when adding sources)
 
+## Status: Short-term fix IMPLEMENTED ✓
+
+The minimal fix described in section 3.1 has been successfully implemented:
+- Playback command processing moved from audio_callback to render_thread_loop
+- AudioCallbackContext cleaned up to remove unused world and active_playback references
+- The audio callback is now realtime-safe: it only consumes from the ring buffer
+
+### Changes made:
+1. Added `process_playback_commands` call in `render_thread_loop` (before `generate_samples`)
+2. Removed `process_playback_commands` call from `audio_callback`
+3. Removed `active_playback` and `world` from `AudioCallbackContext` struct
+4. Updated documentation to reflect the new realtime-safe design
+
 ## 1. Problem statement
 
 When adding sources to the world on the fly (e.g. via the demo GUI), audible
@@ -217,4 +230,3 @@ These are nice-to-haves once the core jitter issue is solved:
 Once the short-term fix is implemented and validated, we can revisit the
 medium-term design steps and decide how much decoupling we want in the first
 release that addresses this jitter issue.
-

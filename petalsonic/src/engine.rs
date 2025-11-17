@@ -52,8 +52,6 @@ thread_local! {
 struct AudioCallbackContext {
     is_running: Arc<AtomicBool>,
     frames_processed: Arc<AtomicUsize>,
-    active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
-    world: Arc<PetalSonicWorld>,
     /// Consumer end of ring buffer - reads pre-rendered audio samples (lock-free)
     ring_buffer_consumer: HeapCons<StereoFrame>,
     channels: u16,
@@ -429,6 +427,11 @@ impl PetalSonicEngine {
             let occupied = ctx.ring_buffer_producer.occupied_len();
             let should_generate = occupied < target_buffer_fill;
 
+            // Process playback commands (moved from audio_callback for realtime safety)
+            // This is safe to do here because the render thread can afford to block briefly
+            // on world locks, whereas the audio callback cannot
+            Self::process_playback_commands(&ctx.world, &ctx.active_playback);
+
             if should_generate {
                 // Generate samples to fill the buffer (lock-free!)
                 let free_space = ctx.ring_buffer_producer.vacant_len();
@@ -559,8 +562,6 @@ impl PetalSonicEngine {
         let mut context = AudioCallbackContext {
             is_running: params.is_running,
             frames_processed: params.frames_processed,
-            active_playback: params.active_playback,
-            world: params.world,
             ring_buffer_consumer: consumer,
             channels: params.channels,
         };
@@ -606,6 +607,9 @@ impl PetalSonicEngine {
     /// This callback only consumes pre-rendered samples from the ring buffer (lock-free
     /// operation). If the ring buffer is empty, it outputs silence and logs an underrun
     /// warning. All actual audio processing happens in the separate render thread.
+    ///
+    /// Playback command processing has been moved to the render thread to avoid blocking
+    /// on world locks in this realtime-critical callback.
     fn audio_callback<T>(data: &mut [T], ctx: &mut AudioCallbackContext)
     where
         T: SizedSample + FromSample<f32>,
@@ -617,9 +621,6 @@ impl PetalSonicEngine {
             Self::fill_silence(data);
             return;
         }
-
-        // Process playback commands (stop/pause/play)
-        Self::process_playback_commands(&ctx.world, &ctx.active_playback);
 
         let device_frames = data.len() / channels_usize;
 

@@ -1,237 +1,220 @@
-# Seamless Loop Implementation Plan
+# PetalSonic realtime-safety plan (jitter when adding sources)
 
-## Problem Analysis
+## 1. Problem statement
 
-Currently, looping audio has an audible seam/gap when transitioning from the end back to the beginning. This occurs because:
+When adding sources to the world on the fly (e.g. via the demo GUI), audible
+glitches / jitter occur in the currently playing audio. This points to one or
+both of:
 
-1. When a source reaches the end, it stops playback (`PlayState::Stopped`)
-2. The mixer detects the end on the **next iteration**
-3. The mixer then calls `play_from_beginning()` to restart
-4. Between these steps, there are one or more audio buffer cycles where the source outputs silence
+- the realtime audio callback doing work that can block or be delayed, and/or
+- the render thread failing to keep the ring buffer sufficiently full when the
+  world is modified and new sources are added.
 
-This creates an audible gap/click at the loop point.
+From the current code:
 
-## Current Flow (Problematic)
+- `PetalSonicWorld` owns `audio_data_storage` and `source_configs` behind
+  `std::sync::Mutex`.
+- `PetalSonicEngine::audio_callback` calls
+  `Self::process_playback_commands(&ctx.world, &ctx.active_playback);`.
+- `process_playback_commands`:
+  - acquires `active_playback` via `try_lock()` (good),
+  - then, for `PlaybackCommand::Play`, calls `world.get_audio_data(audio_id)`,
+  - which does a **blocking** `Mutex::lock()` on `audio_data_storage`.
+- The demo GUI adds sources by calling `world.register_audio(...); world.play(...)`
+  from the main/UI thread.
+- The render thread uses `world.listener()` (blocking lock on `listener`) and
+  `mixer::mix_playback_instances` with `active_playback`.
 
-```
-Buffer N:   [... sample 9997, 9998, 9999] → reached_end_flag = true, state = Stopped
-Buffer N+1: [silence...] → mixer detects end, calls play_from_beginning()
-Buffer N+2: [sample 0, 1, 2, ...] → playback resumes
-           ↑ GAP/SEAM HERE
-```
+So today the realtime callback thread can block on a `Mutex` that is shared
+with non-realtime code (world registration, deletion, etc.) exactly when new
+sources are being added – explaining the jitter observed while adding sources.
 
-## Solution: Wraparound Fill (Option 1)
+## 2. Goals
 
-Implement sample-accurate wraparound when filling buffers in `LoopMode::Infinite`. When we reach the end of the audio data while filling a buffer, immediately wrap around to frame 0 and continue filling the rest of the buffer.
+1. Make the audio callback **hard realtime friendly**:
+   - no blocking locks,
+   - no calls into `PetalSonicWorld`,
+   - no heap allocation or heavy work.
+2. Ensure adding/removing sources or updating configs from the main thread does
+   not cause glitches in already playing audio.
+3. Keep the render thread design (ring buffer producer) but ensure it can
+   absorb jitter from world / GUI interactions.
+4. Maintain current public APIs (`PetalSonicWorld`, `PetalSonicEngine`) and
+   behaviour as much as possible.
 
-### Design Flow (Seamless)
+## 3. Short-term fix (minimal structural change)
 
-```
-Buffer N: [... sample 9997, 9998, 9999, 0, 1, 2, ...] → seamless wraparound
-         ↑ end of data              ↑ wrapped to start
-         → reached_end_flag = true for event emission
-         → but state remains Playing
-```
+### 3.1 Move playback command processing off the audio callback
 
-## Implementation Changes
+Today:
 
-### 1. Modify `PlaybackInstance::fill_buffer()` (playback.rs)
+- `audio_callback`:
+  - checks `is_running`,
+  - calls `process_playback_commands(&ctx.world, &ctx.active_playback)`,
+  - consumes frames from ring buffer.
+- `render_thread_loop`:
+  - updates listener pose in spatial processor (`world.listener()`),
+  - checks ring buffer fill level,
+  - calls `generate_samples(...)` to mix/resample and push to ring buffer.
 
-**Current behavior:**
+Plan:
 
-- Stops filling when reaching end
-- Calls `advance_and_check_completion()` which sets state to Stopped
+1. Move the call to `process_playback_commands` from the audio callback into
+   the render thread loop, *before* generating samples.
+   - Add a call in `render_thread_loop` after computing `should_generate` and
+     before `generate_samples(...)`, passing `ctx.world` and
+     `ctx.active_playback`.
+   - Remove the call from `audio_callback` entirely.
+2. Keep the logic of `process_playback_commands` as-is:
+   - it already uses `active_playback.try_lock()` (non-blocking from the
+     render thread’s perspective),
+   - it can safely call `world.get_audio_data(...)` because the render thread
+     is not realtime-critical; if it blocks briefly, the ring buffer should
+     have enough headroom.
+3. Confirm `active_playback` is only used on render and audio threads:
+   - after removing the call in `audio_callback`, the only remaining usages
+     should be:
+     - render thread (`render_thread_loop` / `generate_samples`),
+     - mixer module (called from render thread).
+   - This means all mutation of `active_playback` happens on the render thread,
+     under the `Mutex` that it already owns, and the audio callback never
+     touches it.
+4. Verify that `audio_callback` becomes effectively:
+   - check `is_running`,
+   - compute `device_frames`,
+   - `try_pop` from `ring_buffer_consumer` into output buffer,
+   - fill remaining with silence if underrun,
+   - update `frames_processed`.
 
-**New behavior:**
+Impact:
 
-- When `LoopMode::Infinite` and reaching end:
-  - Wrap current_frame back to 0
-  - Continue filling the buffer
-  - Set `reached_end_this_iteration = true` for event emission
-  - Keep state as `Playing` (don't stop)
+- Removes `PetalSonicWorld` access and blocking locks from the realtime
+  callback.
+- All world / playback command logic moves to the render thread, which is
+  decoupled by the ring buffer.
+- Existing public API remains unchanged.
 
-**Changes needed:**
+### 3.2 Slightly increase robustness of render thread loop
 
-```rust
-pub fn fill_buffer(&mut self, buffer: &mut [f32], channels: u16) -> usize {
-    if !matches!(self.info.play_state, PlayState::Playing) {
-        return 0;
-    }
+While touching the render thread:
 
-    let channels_usize = channels as usize;
-    let frame_count = buffer.len() / channels_usize;
-    let samples = self.audio_data.samples();
-    let total_frames = samples.len();
-    let mut frames_filled = 0;
-    let volume = self.config.volume();
+1. Ensure `render_thread_loop` can skip work if it fails to acquire locks:
+   - `generate_samples` already uses `try_lock` on `resampler` and
+     `spatial_processor`; it logs and returns if it cannot acquire locks.
+   - `mixer::mix_playback_instances` uses `try_lock` on `active_playback` and
+     returns zero frames if it fails.
+2. Make sure `process_playback_commands` is tolerant of lock contention:
+   - it already returns early if `active_playback.try_lock()` fails, leaving
+     commands queued for the next iteration.
+3. Optionally tune ring buffer size / target fill level:
+   - keep `RING_BUFFER_SIZE_MIN` large enough (currently 100k frames) to
+     survive brief render thread stalls when adding many sources.
+   - consider raising `target_buffer_fill` (currently `block_size * 4`) if we
+     see underruns in profiling when adding lots of sources.
 
-    for frame_idx in 0..frame_count {
-        let mut sample_idx = self.info.current_frame + frame_idx;
+Short-term success criteria:
 
-        // Handle wraparound for infinite looping
-        if sample_idx >= total_frames {
-            if matches!(self.loop_mode, LoopMode::Infinite) {
-                // Mark that we reached end (for event emission)
-                if !self.reached_end_this_iteration {
-                    self.reached_end_this_iteration = true;
-                }
-                // Wrap around to beginning
-                sample_idx = sample_idx % total_frames;
-            } else {
-                // LoopMode::Once - stop here
-                break;
-            }
-        }
+- No audible glitches when adding a small number of sources at runtime.
+- Under high load (many sources added rapidly), jitter is much reduced and
+  correlates only with ring buffer underruns, not with world locks in the
+  audio callback.
 
-        let sample = samples[sample_idx];
+## 4. Medium-term design: decouple engine from world locks
 
-        // Fill all channels with volume applied
-        for channel in 0..channels_usize {
-            let buffer_idx = frame_idx * channels_usize + channel;
-            if buffer_idx < buffer.len() {
-                buffer[buffer_idx] += sample * volume;
-            }
-        }
+Once the minimal fix is in and validated, we can further harden the design by
+reducing how often the render thread touches `PetalSonicWorld` at all.
 
-        frames_filled += 1;
-    }
+### 4.1 Stop looking up audio data via `world.get_audio_data` on Play
 
-    // Advance cursor and check for completion
-    if frames_filled > 0 {
-        self.advance_and_check_completion_with_wrap(frames_filled);
-    }
+Current flow for `PlaybackCommand::Play`:
 
-    frames_filled
-}
-```
+- world side:
+  - `register_audio`:
+    - resamples if needed (no lock),
+    - inserts `Arc<PetalSonicAudioData>` into `audio_data_storage` under
+      `SourceId`.
+  - `play(source_id, loop_mode)`:
+    - validates `contains_audio`,
+    - looks up `SourceConfig`,
+    - sends `PlaybackCommand::Play(source_id, config, loop_mode)` over channel.
+- engine side:
+  - `process_playback_commands` receives `Play` and calls
+    `world.get_audio_data(audio_id)` to get `Arc<PetalSonicAudioData>`.
 
-### 2. Create New Method: `advance_and_check_completion_with_wrap()`
+This forces the engine to depend on the world’s internal locks.
 
-Replace the current `advance_and_check_completion()` with a version that handles wraparound:
+Plan:
 
-```rust
-fn advance_and_check_completion_with_wrap(&mut self, frames_consumed: usize) {
-    let total_frames = self.audio_data.samples().len();
-    self.info.current_frame += frames_consumed;
+1. Extend `PlaybackCommand::Play` to carry `Arc<PetalSonicAudioData>`:
+   - e.g. `Play(SourceId, Arc<PetalSonicAudioData>, SourceConfig, LoopMode)`.
+2. Change `PetalSonicWorld::play` to:
+   - look up `Arc<PetalSonicAudioData>` from `audio_data_storage` on the
+     **world thread** (where blocking is fine),
+   - send a `Play` command that already includes the `Arc`, so the engine does
+     not call back into `world.get_audio_data`.
+3. Update `process_playback_commands` to drop the `world` dependency:
+   - it will only need `active_playback` and the command payload.
+4. After this, the render thread no longer needs `PetalSonicWorld` at all for
+   playback control; only for listener pose updates in the spatial processor.
 
-    // Check if we've reached or passed the end
-    if self.info.current_frame >= total_frames {
-        match self.loop_mode {
-            LoopMode::Infinite => {
-                // Wrap around - keep playing
-                self.info.current_frame = self.info.current_frame % total_frames;
-                // Note: reached_end_this_iteration already set in fill_buffer
-                // State remains Playing
-            }
-            LoopMode::Once => {
-                // Stop playback
-                self.reached_end_this_iteration = true;
-                self.info.play_state = PlayState::Stopped;
-            }
-        }
-    }
+Benefits:
 
-    self.info.update_position(self.info.current_frame, self.audio_data.sample_rate());
-}
-```
+- Playback command handling is completely decoupled from world storage locks.
+- Engine can eventually be reused with different front-ends, as it only
+  depends on a command stream and not directly on the world object.
 
-### 3. Update Spatial Processor (spatial.rs)
+### 4.2 Decouple listener pose updates from world lock
 
-The spatial processor also consumes frames directly. We need to apply the same wraparound logic there.
+Currently `render_thread_loop` calls `ctx.world.listener().pose()` every
+iteration, which locks `listener` under `Mutex`. This is not realtime-critical
+but still couples the render thread to the world’s locking behaviour.
 
-**Find:** The code that reads samples from `instance.audio_data.samples()` in the spatial processing loop
-**Modify:** Apply the same wraparound logic when reading samples
+Plan:
 
-### 4. Update Mixer Logic (mixer.rs)
+1. Introduce a small `Arc<Mutex<Pose>>` or `Arc<Atomic*`-backed representation
+   owned by the engine for the listener pose.
+2. Expose a method on `PetalSonicEngine` to set the listener pose, which can
+   be called whenever `PetalSonicWorld::set_listener_pose` is called (or vice
+   versa).
+3. In `render_thread_loop`, read from this engine-owned pose representation,
+   eliminating the need to lock `PetalSonicWorld` from the render thread.
 
-**Current behavior:**
+This is optional but moves us toward a cleaner separation: the world is a
+front-end; the engine is the realtime core.
 
-- When `LoopMode::Infinite`, calls `instance.play_from_beginning()`
+## 5. Long-term enhancements (optional)
 
-**New behavior:**
+These are nice-to-haves once the core jitter issue is solved:
 
-- For `LoopMode::Infinite`, no longer needs to restart (already wrapped)
-- Just emit the event, don't call `play_from_beginning()`
+1. Introduce an explicit engine command API:
+   - treat `PlaybackCommand` as a public or semi-public type exposed by the
+     engine, with the world acting as one producer.
+   - allow other producers (e.g. games, tools) to talk to the engine without
+     going through `PetalSonicWorld`.
+2. Make `active_playback` single-threaded:
+   - move it behind a structure that is only ever accessed from the render
+     thread, avoiding `Mutex` entirely for that map.
+3. Finer-grained profiling of render vs spatial vs resampling:
+   - `RenderTimingEvent` already carries timing fields; we can extend the
+     mixer and spatial processor to report their own contributions.
+   - use the existing GUI profiling panel to visualise worst-case spikes when
+     adding/removing sources.
 
-```rust
-// In mixer.rs around line 136
-LoopMode::Infinite => {
-    // No longer need to restart - wraparound already handled in fill_buffer
-    // instance.play_from_beginning(); // REMOVE THIS
-    looped_sources.push(*source_id);
-}
-```
+## 6. Testing and validation plan
 
-### 5. Update `seek()` Method
+1. Add a regression test scenario in the demo:
+   - script or manual steps: start a looping spatial source, then repeatedly
+     add new sources at random positions while listening for glitches.
+2. Enable `log::debug!` for engine and mixer modules:
+   - confirm that, after the short-term fix, the audio callback logs no
+     messages involving `PetalSonicWorld` or `Mutex` locks.
+3. Monitor underrun logs (`Ring buffer underrun`) while stress-adding sources:
+   - expect underruns to be rare unless we deliberately overload the CPU.
+4. Verify behaviour across devices / sample rates:
+   - especially devices where `device_sample_rate != world.sample_rate`
+     (resampler is active and render thread does more work).
 
-Ensure seeking still works correctly and clears the end flag when seeking:
+Once the short-term fix is implemented and validated, we can revisit the
+medium-term design steps and decide how much decoupling we want in the first
+release that addresses this jitter issue.
 
-```rust
-pub fn seek(&mut self, progress: f32) {
-    // ... existing seek logic ...
-
-    // Clear end flag in case we were at the end
-    self.reached_end_this_iteration = false;
-
-    // If we were stopped due to Once mode, allow seeking to re-enable playback?
-    // (Design decision - discuss if needed)
-}
-```
-
-## Alternative Approaches Considered
-
-### Option 2: Pre-restart on Last Buffer
-
-- Detect when we're about to finish and pre-restart
-- **Rejected:** Still has timing uncertainty, may loop early
-
-### Option 3: Crossfade at Loop Point
-
-- Add 5-20ms crossfade between end and beginning
-- **Rejected:** More complex, requires extra buffering, not truly seamless
-
-### Option 4: Double-buffered Loop Region
-
-- Keep buffer of both end and beginning samples
-- **Rejected:** Memory overhead and complex state management
-
-## Benefits of Wraparound Approach
-
-1. **Sample-accurate looping** - no gap between iterations
-2. **Zero latency** - immediate wraparound within same buffer
-3. **Works with existing architecture** - minimal changes
-4. **Standard approach** - used by most audio engines (FMOD, Wwise, etc.)
-5. **No memory overhead** - uses existing audio data
-6. **Event emission preserved** - still fires `SourceLooped` event for tracking
-
-## Testing Plan
-
-1. **Basic loop test:** Play short audio file in Infinite mode, verify no audible seam
-2. **Buffer boundary test:** Use audio length that doesn't align with buffer size
-3. **Multiple sources test:** Ensure multiple looping sources work correctly
-4. **Seek during loop test:** Seek while looping and verify it continues seamlessly
-5. **Event test:** Verify `SourceLooped` events still fire correctly
-6. **Spatial loop test:** Test with spatial sources to ensure wraparound works in spatial processor
-
-## Potential Edge Cases
-
-1. **Audio shorter than one buffer:** Need to handle multiple wraps per buffer
-2. **Seek to end then loop:** Ensure wraparound still works after seeking
-3. **Switch from Once to Infinite:** If stopped at end, what happens?
-4. **Thread safety:** Ensure loop_mode changes are properly synchronized
-
-## Files to Modify
-
-1. `petalsonic/src/playback.rs` - Main fill_buffer and advance logic
-2. `petalsonic/src/spatial.rs` - Spatial processor sample consumption
-3. `petalsonic/src/mixer.rs` - Remove play_from_beginning call for Infinite mode
-4. `petalsonic/src/playback.rs` - Update seek method if needed
-
-## Success Criteria
-
-- [ ] No audible gap/seam when looping in Infinite mode
-- [ ] Sample-accurate loop point (verified with test audio with distinct end/start)
-- [ ] `SourceLooped` events still fire correctly
-- [ ] Works with both spatial and non-spatial sources
-- [ ] Works with various audio lengths and buffer sizes
-- [ ] No regression in Once mode behavior

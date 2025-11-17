@@ -1,17 +1,56 @@
 # PetalSonic realtime-safety plan (jitter when adding sources)
 
-## Status: Short-term fix IMPLEMENTED ✓
+## Status: Medium-term improvements COMPLETED ✓
 
 The minimal fix described in section 3.1 has been successfully implemented:
+
 - Playback command processing moved from audio_callback to render_thread_loop
 - AudioCallbackContext cleaned up to remove unused world and active_playback references
 - The audio callback is now realtime-safe: it only consumes from the ring buffer
 
-### Changes made:
+Additionally, medium-term improvements from section 4 have been completed:
+
+- Section 4.1 ✓: Audio data lookup decoupled from world locks
+- Section 4.2 ✓: Listener pose decoupled from world lock
+- The render thread no longer accesses world locks for playback or spatial processing
+
+### Changes made
+
+#### Section 3.1 (Short-term fix)
+
 1. Added `process_playback_commands` call in `render_thread_loop` (before `generate_samples`)
 2. Removed `process_playback_commands` call from `audio_callback`
 3. Removed `active_playback` and `world` from `AudioCallbackContext` struct
 4. Updated documentation to reflect the new realtime-safe design
+
+#### Section 3.2 (Robustness improvements)
+
+All recommended improvements were already present in the codebase:
+
+1. `generate_samples()` uses `try_lock()` on resampler and returns early if lock fails
+2. `mix_playback_instances()` uses `try_lock()` on active_playback and returns empty result if lock fails
+3. `process_playback_commands()` uses `try_lock()` and returns early if lock fails
+4. Ring buffer size (`RING_BUFFER_SIZE_MIN = 100000`) and target fill level (`block_size * 4`) are already adequate
+
+#### Section 4.1 (Audio data decoupling)
+
+1. Extended `PlaybackCommand::Play` to carry `Arc<PetalSonicAudioData>` directly
+2. Modified `PetalSonicWorld::play()` to look up audio data on the world thread and include it in the command
+3. Updated `process_playback_commands()` to use the audio data from the command instead of calling back into world
+4. Eliminated blocking world lock access from the render thread during playback command processing
+
+#### Section 4.2 (Listener pose decoupling)
+
+1. Added `listener_pose: Arc<Mutex<Pose>>` to `PetalSonicEngine` struct
+2. Added `listener_pose` field to `RenderThreadContext` (replacing direct world access)
+3. Added `command_receiver` field to `RenderThreadContext` (replacing world reference)
+4. Implemented `PetalSonicEngine::set_listener_pose()` for advanced use cases
+5. Modified `render_thread_loop()` to use engine-owned listener pose instead of calling into world
+6. Modified `process_playback_commands()` to take command receiver directly instead of world reference
+7. The render thread now has zero dependencies on world locks
+8. **Automatic synchronization**: Added `connect_engine_listener()` to establish link between world and engine
+9. `PetalSonicWorld::set_listener_pose()` now automatically updates the engine's listener pose
+10. **Single API call**: Users only need to call `world.set_listener_pose()` - no manual synchronization required
 
 ## 1. Problem statement
 

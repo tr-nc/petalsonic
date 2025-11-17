@@ -3,6 +3,7 @@ use crate::config::PetalSonicWorldDesc;
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
+use crate::math::Pose;
 use crate::mixer;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
 use crate::spatial::SpatialProcessor;
@@ -71,7 +72,10 @@ struct RenderThreadContext {
     channels: u16,
     block_size: usize,
     spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
-    world: Arc<PetalSonicWorld>,
+    /// Command receiver for playback commands (decoupled from world)
+    command_receiver: Receiver<PlaybackCommand>,
+    /// Engine-owned listener pose (decoupled from world lock)
+    listener_pose: Arc<Mutex<Pose>>,
     /// Event sender for emitting playback events (e.g., SourceCompleted)
     event_sender: Sender<PetalSonicEvent>,
     /// Timing event sender for performance profiling
@@ -119,6 +123,8 @@ pub struct PetalSonicEngine {
     render_shutdown: Arc<AtomicBool>,
     /// Spatial audio processor
     spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
+    /// Engine-owned listener pose (decoupled from world lock for render thread access)
+    listener_pose: Arc<Mutex<Pose>>,
     /// Event channel for playback events (e.g., SourceCompleted)
     /// The sender is cloned to render thread, receiver stays here for polling
     event_sender: Sender<PetalSonicEvent>,
@@ -157,6 +163,15 @@ impl PetalSonicEngine {
         // Unbounded channel to ensure timing emission never blocks the render thread
         let (timing_sender, timing_receiver) = crossbeam_channel::unbounded();
 
+        // Initialize engine-owned listener pose from world
+        // This decouples the render thread from world locks
+        let initial_pose = world.listener().pose();
+        let listener_pose = Arc::new(Mutex::new(initial_pose));
+
+        // Connect the engine's listener pose to the world for automatic synchronization
+        // This allows world.set_listener_pose() to automatically update the engine
+        world.connect_engine_listener(listener_pose.clone());
+
         Ok(Self {
             device_sample_rate: desc.sample_rate, // Will be updated when stream starts
             desc,
@@ -169,11 +184,27 @@ impl PetalSonicEngine {
             render_thread: None,
             render_shutdown: Arc::new(AtomicBool::new(false)),
             spatial_processor,
+            listener_pose,
             event_sender,
             event_receiver,
             timing_sender,
             timing_receiver,
         })
+    }
+
+    /// Set the listener pose for spatial audio processing
+    ///
+    /// **Note**: In most cases, you should use `world.set_listener_pose()` instead,
+    /// which automatically synchronizes with the engine. This method is provided for
+    /// advanced use cases where the engine is used without a world.
+    ///
+    /// # Arguments
+    ///
+    /// * `pose` - The new pose for the listener
+    pub fn set_listener_pose(&self, pose: Pose) {
+        if let Ok(mut listener) = self.listener_pose.lock() {
+            *listener = pose;
+        }
     }
 
     /// Set the callback function that will be called to fill audio buffers
@@ -414,13 +445,13 @@ impl PetalSonicEngine {
 
         while !ctx.shutdown.load(Ordering::Relaxed) {
             // Update listener pose in spatial processor if available
+            // Uses engine-owned listener pose (decoupled from world lock)
             if let Some(ref spatial_processor) = ctx.spatial_processor
                 && let Ok(mut processor) = spatial_processor.try_lock()
+                && let Ok(listener_pose) = ctx.listener_pose.try_lock()
+                && let Err(e) = processor.set_listener_pose(*listener_pose)
             {
-                let listener_pose = ctx.world.listener().pose();
-                if let Err(e) = processor.set_listener_pose(listener_pose) {
-                    log::error!("Failed to update listener pose: {}", e);
-                }
+                log::error!("Failed to update listener pose: {}", e);
             }
 
             // Check ring buffer occupancy (lock-free!)
@@ -430,7 +461,8 @@ impl PetalSonicEngine {
             // Process playback commands (moved from audio_callback for realtime safety)
             // This is safe to do here because the render thread can afford to block briefly
             // on world locks, whereas the audio callback cannot
-            Self::process_playback_commands(&ctx.world, &ctx.active_playback);
+            // Now uses command receiver directly - no world dependency
+            Self::process_playback_commands(&ctx.command_receiver, &ctx.active_playback);
 
             if should_generate {
                 // Generate samples to fill the buffer (lock-free!)
@@ -543,7 +575,8 @@ impl PetalSonicEngine {
             channels: params.channels,
             block_size,
             spatial_processor: self.spatial_processor.clone(),
-            world: params.world.clone(),
+            command_receiver: params.world.command_receiver().clone(),
+            listener_pose: self.listener_pose.clone(),
             event_sender: params.event_sender,
             timing_sender: params.timing_sender,
         };
@@ -675,8 +708,11 @@ impl PetalSonicEngine {
     }
 
     /// Process playback commands from the world and updates the active playback instances.
+    ///
+    /// Now takes the command receiver directly instead of the world, eliminating the need
+    /// for the render thread to access world locks.
     fn process_playback_commands(
-        world: &Arc<PetalSonicWorld>,
+        command_receiver: &Receiver<PlaybackCommand>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
     ) {
         // Important real-time rule:
@@ -689,20 +725,16 @@ impl PetalSonicEngine {
             return;
         };
 
-        while let Ok(command) = world.command_receiver().try_recv() {
+        while let Ok(command) = command_receiver.try_recv() {
             match command {
-                PlaybackCommand::Play(audio_id, config, loop_mode) => {
+                PlaybackCommand::Play(audio_id, audio_data, config, loop_mode) => {
                     log::debug!(
                         "Engine: Received Play command for source {} (loop mode: {:?})",
                         audio_id,
                         loop_mode
                     );
 
-                    let Some(audio_data) = world.get_audio_data(audio_id) else {
-                        log::warn!("Engine: Audio data not found for source {}", audio_id);
-                        continue;
-                    };
-
+                    // Audio data is now passed directly in the command - no need to call back into world
                     let instance = active_playback.entry(audio_id).or_insert_with(|| {
                         log::debug!(
                             "Engine: Creating new PlaybackInstance for source {}",

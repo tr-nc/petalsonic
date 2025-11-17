@@ -352,7 +352,8 @@ impl PlaybackInstance {
 #[derive(Debug)]
 pub enum PlaybackCommand {
     /// Play a source with given configuration and loop mode
-    Play(SourceId, SourceConfig, LoopMode),
+    /// Carries the audio data directly to avoid requiring engine to call back into world
+    Play(SourceId, Arc<PetalSonicAudioData>, SourceConfig, LoopMode),
     /// Pause a specific source
     Pause(SourceId),
     /// Stop a specific source

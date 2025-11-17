@@ -5,7 +5,7 @@ use crate::math::{Pose, Vec3};
 use crate::playback::{LoopMode, PlaybackCommand};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Lightweight, type-safe handle for audio sources.
 ///
@@ -39,6 +39,10 @@ pub struct PetalSonicWorld {
     next_source_id: std::sync::Mutex<u64>,
     command_sender: Sender<PlaybackCommand>,
     command_receiver: Receiver<PlaybackCommand>,
+    /// Optional reference to engine's listener pose for automatic synchronization
+    /// This is set by the engine when it's created, allowing the world to
+    /// automatically update the engine's listener when set_listener_pose is called
+    engine_listener_pose: std::sync::Mutex<Option<Arc<Mutex<Pose>>>>,
 }
 
 impl PetalSonicWorld {
@@ -52,6 +56,7 @@ impl PetalSonicWorld {
             next_source_id: std::sync::Mutex::new(0),
             command_sender,
             command_receiver,
+            engine_listener_pose: std::sync::Mutex::new(None),
         })
     }
 
@@ -142,11 +147,36 @@ impl PetalSonicWorld {
     /// The listener represents the position and orientation of the "ears" in the 3D world.
     /// All spatial audio sources will be spatialized relative to this listener.
     ///
+    /// If an engine has been connected via `connect_engine_listener`, this automatically
+    /// synchronizes the pose to the engine, ensuring the render thread uses the updated
+    /// position without additional API calls.
+    ///
     /// # Arguments
     ///
     /// * `pose` - The new pose for the listener
     pub fn set_listener_pose(&self, pose: Pose) {
         self.listener.lock().unwrap().pose = pose;
+
+        // Automatically synchronize with engine if connected
+        if let Ok(engine_pose_opt) = self.engine_listener_pose.lock()
+            && let Some(engine_pose) = engine_pose_opt.as_ref()
+            && let Ok(mut engine_listener) = engine_pose.lock()
+        {
+            *engine_listener = pose;
+        }
+    }
+
+    /// Internal method to connect the engine's listener pose for automatic synchronization.
+    ///
+    /// This is called by the engine when it's created, establishing a link that allows
+    /// the world to automatically update the engine's listener pose whenever
+    /// `set_listener_pose` is called.
+    ///
+    /// # Arguments
+    ///
+    /// * `engine_pose` - Reference to the engine's listener pose
+    pub(crate) fn connect_engine_listener(&self, engine_pose: Arc<Mutex<Pose>>) {
+        *self.engine_listener_pose.lock().unwrap() = Some(engine_pose);
     }
 
     /// Returns a copy of the current listener.
@@ -200,6 +230,10 @@ impl PetalSonicWorld {
     /// Sends a play command to the audio engine thread. The audio will begin playing
     /// from its current position (or from the beginning if not yet played).
     ///
+    /// This method looks up the audio data and configuration on the world thread (where
+    /// blocking on locks is acceptable) and sends both to the engine, eliminating the
+    /// need for the engine to call back into world storage during playback processing.
+    ///
     /// # Arguments
     ///
     /// * `audio_id` - SourceId of the audio source to play
@@ -210,12 +244,13 @@ impl PetalSonicWorld {
     /// Returns an error if the audio source ID is not found in the world storage
     /// or if the command fails to send to the audio engine.
     pub fn play(&self, audio_id: SourceId, loop_mode: LoopMode) -> Result<()> {
-        if !self.contains_audio(audio_id) {
-            return Err(crate::error::PetalSonicError::Engine(format!(
+        // Look up audio data on the world thread (blocking is fine here)
+        let audio_data = self.get_audio_data(audio_id).ok_or_else(|| {
+            crate::error::PetalSonicError::Engine(format!(
                 "Audio data with ID {:?} not found",
                 audio_id
-            )));
-        }
+            ))
+        })?;
 
         // Get the source config for this audio source
         let config = self
@@ -226,8 +261,11 @@ impl PetalSonicWorld {
             .cloned()
             .unwrap_or_default();
 
+        // Send command with audio data included - engine no longer needs to call back into world
         self.command_sender
-            .send(PlaybackCommand::Play(audio_id, config, loop_mode))
+            .send(PlaybackCommand::Play(
+                audio_id, audio_data, config, loop_mode,
+            ))
             .map_err(|e| {
                 crate::error::PetalSonicError::Engine(format!("Failed to send play command: {}", e))
             })?;

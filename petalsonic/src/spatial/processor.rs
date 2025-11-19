@@ -104,8 +104,9 @@ impl SpatialProcessor {
         })?;
 
         // Create simulator
+        // The max order is unused for now, just a placeholder.
         let mut simulator =
-            Simulator::builder(SceneParams::Default, sample_rate, frame_size as u32)
+            Simulator::builder(SceneParams::Default, sample_rate, frame_size as u32, 4)
                 .with_direct(DirectSimulationSettings {
                     max_num_occlusion_samples: 32,
                 })

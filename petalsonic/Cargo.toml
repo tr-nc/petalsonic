@@ -16,7 +16,7 @@ cpal = "0.15.3"
 rubato = "0.14.1"
 anyhow = "1.0.89"
 crossbeam-channel = "0.5.13"
-audionimbus = "0.9"
+audionimbus = "0.10.0"
 ringbuf = "0.4.7"
 log = { workspace = true }
 glam = { workspace = true }

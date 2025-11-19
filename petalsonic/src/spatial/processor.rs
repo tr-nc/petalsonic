@@ -261,12 +261,6 @@ impl SpatialProcessor {
         // Convert dB volume from config to linear gain once per block.
         let volume = instance.config.volume();
 
-        // Check if effects exist for this source
-        if !self.effects_manager.has_effects(source_id) {
-            // Create effects if they don't exist
-            self.create_effects_for_source(source_id)?;
-        }
-
         // Fill input buffer with audio samples
         self.fill_input_buffer(instance, volume);
 

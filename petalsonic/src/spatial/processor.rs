@@ -209,6 +209,18 @@ impl SpatialProcessor {
             return Ok(0);
         }
 
+        // Ensure all spatial sources have effects created before running simulation.
+        // This guarantees newly played spatial sources participate in the very first
+        // simulation pass, avoiding a "first block louder" case where distance
+        // attenuation / air absorption would still be at their default values.
+        for (source_id, instance) in instances.iter() {
+            if matches!(instance.config, SourceConfig::Spatial { .. })
+                && !self.effects_manager.has_effects(*source_id)
+            {
+                self.create_effects_for_source(*source_id)?;
+            }
+        }
+
         // Clear accumulation buffer
         self.cached_summed_encoded_buf.fill(0.0);
         self.cached_binaural_processed.fill(0.0);

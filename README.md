@@ -185,6 +185,39 @@ cargo clippy
 cargo doc --open
 ```
 
+## Publishing to crates.io
+
+To publish the `petalsonic` core library to crates.io:
+
+```bash
+# 1. Ensure you're logged in to crates.io
+cargo login
+
+# 2. Navigate to the core library directory
+cd petalsonic
+
+# 3. Update version in Cargo.toml if needed
+# Edit petalsonic/Cargo.toml and increment the version number
+
+# 4. Verify the package contents
+cargo package --list
+
+# 5. Do a dry run to check for issues
+cargo publish --dry-run
+
+# 6. Publish to crates.io
+cargo publish
+
+# 7. Return to workspace root
+cd ..
+```
+
+**Important notes:**
+- Only the `petalsonic` core library is published (not `petalsonic-demo`)
+- Ensure all dependencies have compatible versions
+- Update CHANGELOG.md and documentation before publishing
+- Tag the release in git: `git tag -a v0.1.0 -m "Release v0.1.0"`
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.

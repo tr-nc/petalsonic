@@ -826,7 +826,11 @@ impl PetalSonicEngine {
     ) -> (Vec<SourceId>, Vec<SourceId>, RenderTimingEvent) {
         let total_start = Instant::now();
         let mut total_mixing_time_us = 0u64;
-        let total_spatial_time_us = 0u64;
+        let mut total_spatial_time_us = 0u64;
+        let mut total_direct_mixing_time_us = 0u64;
+        let mut total_spatial_simulation_time_us = 0u64;
+        let mut total_ambisonics_encoding_time_us = 0u64;
+        let mut total_ambisonics_decoding_time_us = 0u64;
         let mut total_resampling_time_us = 0u64;
 
         let Ok(mut resampler) = resampler_arc.try_lock() else {
@@ -837,6 +841,10 @@ impl PetalSonicEngine {
                 RenderTimingEvent {
                     mixing_time_us: 0,
                     spatial_time_us: 0,
+                    direct_mixing_time_us: 0,
+                    spatial_simulation_time_us: 0,
+                    ambisonics_encoding_time_us: 0,
+                    ambisonics_decoding_time_us: 0,
                     resampling_time_us: 0,
                     total_time_us: 0,
                 },
@@ -868,7 +876,7 @@ impl PetalSonicEngine {
                     spatial_processor.and_then(|sp| sp.try_lock().ok());
 
                 // Mix returns MixResult with completed and looped sources
-                let mix_result = mixer::mix_playback_instances(
+                let (mix_result, mix_profiling) = mixer::mix_playback_instances_with_metrics(
                     &mut world_buffer,
                     channels,
                     active_playback,
@@ -881,9 +889,17 @@ impl PetalSonicEngine {
                 all_completed_sources.extend(mix_result.completed_sources);
                 all_looped_sources.extend(mix_result.looped_sources);
 
-                // Note: Spatial processing time is embedded in mixing time
-                // We'll extract it from the mixer in the future if needed
+                // Capture coarse mixing time plus the detailed stage breakdown reported by the mixer
                 total_mixing_time_us += mixing_elapsed.as_micros() as u64;
+                total_direct_mixing_time_us += mix_profiling.direct_mix_time_us;
+                total_spatial_time_us += mix_profiling.spatial_mix_time_us;
+                if let Some(spatial_metrics) = mix_profiling.spatial_metrics {
+                    total_spatial_simulation_time_us += spatial_metrics.physics_simulation_time_us;
+                    total_ambisonics_encoding_time_us +=
+                        spatial_metrics.ambisonics_encoding_time_us;
+                    total_ambisonics_decoding_time_us +=
+                        spatial_metrics.ambisonics_decoding_time_us;
+                }
 
                 RESAMPLED_BUFFER.with(|rbuf| {
                     let mut resampled_buffer = rbuf.borrow_mut();
@@ -944,7 +960,11 @@ impl PetalSonicEngine {
             all_looped_sources,
             RenderTimingEvent {
                 mixing_time_us: total_mixing_time_us,
-                spatial_time_us: total_spatial_time_us, // TODO: Extract from mixer
+                spatial_time_us: total_spatial_time_us,
+                direct_mixing_time_us: total_direct_mixing_time_us,
+                spatial_simulation_time_us: total_spatial_simulation_time_us,
+                ambisonics_encoding_time_us: total_ambisonics_encoding_time_us,
+                ambisonics_decoding_time_us: total_ambisonics_decoding_time_us,
                 resampling_time_us: total_resampling_time_us,
                 total_time_us: total_elapsed.as_micros() as u64,
             },

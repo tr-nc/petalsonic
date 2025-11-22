@@ -2,16 +2,25 @@
 // This contains the mixing logic for both spatial and non-spatial sources
 
 use crate::playback::{LoopMode, PlayState, PlaybackInstance};
-use crate::spatial::SpatialProcessor;
+use crate::spatial::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
 use crate::world::SourceId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Result of mixing - contains both the number of frames and loop events
 pub struct MixResult {
     pub frames_filled: usize,
     pub completed_sources: Vec<SourceId>,
     pub looped_sources: Vec<SourceId>,
+}
+
+/// Per-frame timing breakdown emitted by the mixer.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MixProfilingSummary {
+    pub direct_mix_time_us: u64,
+    pub spatial_mix_time_us: u64,
+    pub spatial_metrics: Option<SpatialProcessingMetrics>,
 }
 
 /// Mix all active playback instances into the buffer
@@ -37,13 +46,27 @@ pub fn mix_playback_instances(
     active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     spatial_processor: Option<&mut SpatialProcessor>,
 ) -> MixResult {
+    mix_playback_instances_with_metrics(world_buffer, channels, active_playback, spatial_processor)
+        .0
+}
+
+/// Same as [`mix_playback_instances`] but also returns timing metrics used for profiling.
+pub fn mix_playback_instances_with_metrics(
+    world_buffer: &mut [f32],
+    channels: u16,
+    active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    spatial_processor: Option<&mut SpatialProcessor>,
+) -> (MixResult, MixProfilingSummary) {
     let Ok(mut active_playback) = active_playback.try_lock() else {
         log::debug!("Failed to acquire active playback lock in mixer");
-        return MixResult {
-            frames_filled: 0,
-            completed_sources: Vec::new(),
-            looped_sources: Vec::new(),
-        };
+        return (
+            MixResult {
+                frames_filled: 0,
+                completed_sources: Vec::new(),
+                looped_sources: Vec::new(),
+            },
+            MixProfilingSummary::default(),
+        );
     };
 
     // Separate spatial and non-spatial sources FIRST
@@ -83,18 +106,30 @@ pub fn mix_playback_instances(
 
     let mut frames_filled_max = 0;
 
+    let mut profiling = MixProfilingSummary::default();
+
     // Process non-spatial sources first
+    let direct_start = Instant::now();
     for instance in non_spatial_instances {
         let frames_filled = instance.fill_buffer(world_buffer, channels);
         frames_filled_max = frames_filled_max.max(frames_filled);
     }
+    profiling.direct_mix_time_us = direct_start.elapsed().as_micros() as u64;
 
     // Process spatial sources if spatial processor is available
     if let Some(processor) = spatial_processor {
         if !spatial_instances.is_empty() {
-            match processor.process_spatial_sources(&mut spatial_instances, world_buffer) {
-                Ok(frames_filled) => {
-                    frames_filled_max = frames_filled_max.max(frames_filled);
+            let spatial_start = Instant::now();
+            match processor
+                .process_spatial_sources_with_metrics(&mut spatial_instances, world_buffer)
+            {
+                Ok(SpatialProcessingSummary {
+                    frames_processed,
+                    metrics,
+                }) => {
+                    frames_filled_max = frames_filled_max.max(frames_processed);
+                    profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
+                    profiling.spatial_metrics = Some(metrics);
                 }
                 Err(e) => {
                     log::error!("Error processing spatial sources: {}", e);
@@ -153,9 +188,12 @@ pub fn mix_playback_instances(
         );
     }
 
-    MixResult {
-        frames_filled: frames_filled_max,
-        completed_sources,
-        looped_sources,
-    }
+    (
+        MixResult {
+            frames_filled: frames_filled_max,
+            completed_sources,
+            looped_sources,
+        },
+        profiling,
+    )
 }

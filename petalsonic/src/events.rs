@@ -12,6 +12,14 @@ pub struct RenderTimingEvent {
     pub mixing_time_us: u64,
     /// Time spent on spatial processing (microseconds)
     pub spatial_time_us: u64,
+    /// Time spent mixing non-spatial (direct) sources (microseconds)
+    pub direct_mixing_time_us: u64,
+    /// Time spent running the spatial physics simulation step (microseconds)
+    pub spatial_simulation_time_us: u64,
+    /// Time spent encoding sources into the ambisonics field (microseconds)
+    pub ambisonics_encoding_time_us: u64,
+    /// Time spent decoding ambisonics back to listener channels (microseconds)
+    pub ambisonics_decoding_time_us: u64,
     /// Time spent on resampling (microseconds)
     pub resampling_time_us: u64,
     /// Total time for the entire render iteration (microseconds)

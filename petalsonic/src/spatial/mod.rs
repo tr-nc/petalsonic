@@ -8,4 +8,4 @@ mod hrtf;
 mod processor;
 
 // Public API
-pub use processor::SpatialProcessor;
+pub use processor::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};

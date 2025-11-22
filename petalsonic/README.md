@@ -213,9 +213,14 @@ The audio callback thread is **completely real-time safe**:
 ```rust
 // Get timing information for performance profiling
 for event in engine.poll_timing_events() {
-    println!("Mixing: {}μs, Spatial: {}μs, Total: {}μs",
+    println!(
+        "Mixing: {}μs (direct {}μs, spatial {}μs), physics {}μs, encode {}μs, decode {}μs, total {}μs",
         event.mixing_time_us,
+        event.direct_mixing_time_us,
         event.spatial_time_us,
+        event.spatial_simulation_time_us,
+        event.ambisonics_encoding_time_us,
+        event.ambisonics_decoding_time_us,
         event.total_time_us
     );
 }

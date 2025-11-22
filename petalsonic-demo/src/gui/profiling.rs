@@ -68,6 +68,31 @@ pub fn draw_profiling_widget(
             format_time_auto(max_frame_time_us)
         ));
 
+        ui.add_space(4.0);
+        ui.label("Detailed Breakdown:");
+        ui.indent("profiling_breakdown", |ui| {
+            ui.label(format!(
+                "Spatial mixing: {}",
+                format_time_auto(latest.spatial_time_us)
+            ));
+            ui.label(format!(
+                "Direct mixing: {}",
+                format_time_auto(latest.direct_mixing_time_us)
+            ));
+            ui.label(format!(
+                "Physics sim: {}",
+                format_time_auto(latest.spatial_simulation_time_us)
+            ));
+            ui.label(format!(
+                "Ambisonics encode: {}",
+                format_time_auto(latest.ambisonics_encoding_time_us)
+            ));
+            ui.label(format!(
+                "Ambisonics decode: {}",
+                format_time_auto(latest.ambisonics_decoding_time_us)
+            ));
+        });
+
         // Warning if approaching limit
         if utilization > 90.0 {
             ui.colored_label(Color32::RED, "⚠ WARNING: Approaching performance limit!");
@@ -151,6 +176,34 @@ pub fn draw_profiling_widget(
             );
         }
 
+        // Draw direct mixing time (green line)
+        let mut direct_points = Vec::new();
+        for (i, timing) in timing_history.iter().enumerate() {
+            let x = rect.min.x + i as f32 * x_step;
+            let y =
+                rect.max.y - (timing.direct_mixing_time_us as f32 / max_y_value) * rect.height();
+            direct_points.push(Pos2::new(x, y));
+        }
+
+        for window in direct_points.windows(2) {
+            painter.line_segment([window[0], window[1]], Stroke::new(1.2, Color32::GREEN));
+        }
+
+        // Draw spatial mixing time (magenta line)
+        let mut spatial_points = Vec::new();
+        for (i, timing) in timing_history.iter().enumerate() {
+            let x = rect.min.x + i as f32 * x_step;
+            let y = rect.max.y - (timing.spatial_time_us as f32 / max_y_value) * rect.height();
+            spatial_points.push(Pos2::new(x, y));
+        }
+
+        for window in spatial_points.windows(2) {
+            painter.line_segment(
+                [window[0], window[1]],
+                Stroke::new(1.2, Color32::from_rgb(198, 120, 221)),
+            );
+        }
+
         // Draw resampling time (yellow line)
         let mut resampling_points = Vec::new();
         for (i, timing) in timing_history.iter().enumerate() {
@@ -210,6 +263,37 @@ pub fn draw_profiling_widget(
             "Resampling",
             egui::FontId::proportional(10.0),
             Color32::YELLOW,
+        );
+
+        painter.line_segment(
+            [
+                Pos2::new(legend_x, legend_y + 45.0),
+                Pos2::new(legend_x + 20.0, legend_y + 45.0),
+            ],
+            Stroke::new(1.2, Color32::GREEN),
+        );
+        painter.text(
+            Pos2::new(legend_x + 25.0, legend_y + 45.0),
+            egui::Align2::LEFT_CENTER,
+            "Direct",
+            egui::FontId::proportional(10.0),
+            Color32::GREEN,
+        );
+
+        let magenta = Color32::from_rgb(198, 120, 221);
+        painter.line_segment(
+            [
+                Pos2::new(legend_x, legend_y + 60.0),
+                Pos2::new(legend_x + 20.0, legend_y + 60.0),
+            ],
+            Stroke::new(1.2, magenta),
+        );
+        painter.text(
+            Pos2::new(legend_x + 25.0, legend_y + 60.0),
+            egui::Align2::LEFT_CENTER,
+            "Spatial",
+            egui::FontId::proportional(10.0),
+            magenta,
         );
 
         // Draw Y-axis labels

@@ -15,6 +15,7 @@ use audionimbus::{
     SimulationSharedInputs, Simulator, SpeakerLayout, Vector3,
     audio_buffer::AudioBuffer as AudioNimbusAudioBuffer, geometry,
 };
+use std::time::Instant;
 
 /// Spatial audio processor that manages Steam Audio integration
 pub struct SpatialProcessor {
@@ -54,6 +55,24 @@ pub struct SpatialProcessor {
     listener_up: Vec3,
     listener_front: Vec3,
     listener_right: Vec3,
+}
+
+/// Detailed timing metrics captured for a single spatial processing pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SpatialProcessingMetrics {
+    /// Time spent running the spatial simulation (Steam Audio) step.
+    pub physics_simulation_time_us: u64,
+    /// Time spent encoding all spatial sources into the ambisonics field.
+    pub ambisonics_encoding_time_us: u64,
+    /// Time spent decoding ambisonics data back to listener channels.
+    pub ambisonics_decoding_time_us: u64,
+}
+
+/// Summary of spatial processing output including the number of frames produced.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SpatialProcessingSummary {
+    pub frames_processed: usize,
+    pub metrics: SpatialProcessingMetrics,
 }
 
 impl SpatialProcessor {
@@ -205,10 +224,23 @@ impl SpatialProcessor {
         instances: &mut [(SourceId, &mut PlaybackInstance)],
         output_buffer: &mut [f32],
     ) -> Result<usize> {
+        Ok(self
+            .process_spatial_sources_with_metrics(instances, output_buffer)?
+            .frames_processed)
+    }
+
+    /// Same as [`process_spatial_sources`] but also returns detailed timing metrics.
+    pub fn process_spatial_sources_with_metrics(
+        &mut self,
+        instances: &mut [(SourceId, &mut PlaybackInstance)],
+        output_buffer: &mut [f32],
+    ) -> Result<SpatialProcessingSummary> {
         if instances.is_empty() {
             // No spatial sources, don't modify the buffer (may contain non-spatial audio)
-            return Ok(0);
+            return Ok(SpatialProcessingSummary::default());
         }
+
+        let mut metrics = SpatialProcessingMetrics::default();
 
         // Ensure all spatial sources have effects created before running simulation.
         // This guarantees newly played spatial sources participate in the very first
@@ -227,15 +259,20 @@ impl SpatialProcessor {
         self.cached_binaural_processed.fill(0.0);
 
         // Run simulation for all sources
+        let simulation_start = Instant::now();
         self.simulate(instances)?;
+        metrics.physics_simulation_time_us = simulation_start.elapsed().as_micros() as u64;
 
-        // Process each spatial source
+        // Process each spatial source and accumulate encoding time
         for (source_id, instance) in instances.iter_mut() {
-            self.process_single_source(*source_id, instance)?;
+            metrics.ambisonics_encoding_time_us +=
+                self.process_single_source(*source_id, instance)?;
         }
 
         // Decode accumulated ambisonics to binaural stereo
+        let decoding_start = Instant::now();
         self.apply_ambisonics_decode_effect()?;
+        metrics.ambisonics_decoding_time_us = decoding_start.elapsed().as_micros() as u64;
 
         // Add to output buffer (don't overwrite - allow mixing with non-spatial sources)
         let frames_to_copy = (output_buffer.len() / 2).min(self.frame_size);
@@ -244,7 +281,10 @@ impl SpatialProcessor {
             output_buffer[i * 2 + 1] += self.cached_binaural_processed[i * 2 + 1];
         }
 
-        Ok(frames_to_copy)
+        Ok(SpatialProcessingSummary {
+            frames_processed: frames_to_copy,
+            metrics,
+        })
     }
 
     /// Process a single spatial source
@@ -252,11 +292,11 @@ impl SpatialProcessor {
         &mut self,
         source_id: SourceId,
         instance: &mut PlaybackInstance,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // Get spatial configuration (position + per-source volume)
         let position = match &instance.config {
             SourceConfig::Spatial { pose, .. } => pose.position,
-            _ => return Ok(()), // Not a spatial source, skip
+            _ => return Ok(0), // Not a spatial source, skip
         };
 
         // Convert dB volume from config to linear gain once per block.
@@ -268,10 +308,12 @@ impl SpatialProcessor {
         // Apply direct effect (distance attenuation + air absorption)
         self.apply_direct_effect(source_id)?;
 
-        // Apply ambisonics encode effect
+        // Apply ambisonics encode effect and capture timing
+        let encode_start = Instant::now();
         self.apply_ambisonics_encode_effect(source_id, position)?;
+        let encode_elapsed = encode_start.elapsed().as_micros() as u64;
 
-        Ok(())
+        Ok(encode_elapsed)
     }
 
     /// Fill input buffer from playback instance

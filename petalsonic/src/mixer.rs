@@ -5,8 +5,8 @@ use crate::playback::{LoopMode, PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
 use crate::world::SourceId;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -236,10 +236,6 @@ fn update_global_peak(block_peak: f32) {
             Ordering::Relaxed,
         ) {
             Ok(_) => {
-                log::info!(
-                    "PetalSonic new all-time peak amplitude (pre-clamp): {:.6}",
-                    block_peak
-                );
                 return;
             }
             Err(observed_bits) => {

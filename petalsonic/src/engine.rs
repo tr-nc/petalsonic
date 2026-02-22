@@ -341,7 +341,7 @@ impl PetalSonicEngine {
 
     #[cfg(target_os = "linux")]
     fn platform_default_buffer_size() -> Option<u32> {
-        Some(256)
+        Some(128)
     }
 
     #[cfg(not(target_os = "linux"))]

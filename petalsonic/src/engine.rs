@@ -357,6 +357,10 @@ impl PetalSonicEngine {
 
     #[cfg(target_os = "linux")]
     fn platform_default_buffer_size() -> Option<u32> {
+        // Keep Linux fallback at 256 frames. Smaller fixed periods (e.g. 128 at 44.1 kHz)
+        // can push ALSA/bridge backends over their scheduling budget, which may trigger
+        // backend XRUN recovery artifacts (echo/phasey repeats, crackles) even when our
+        // own ring buffer does not report an underrun.
         Some(256)
     }
 

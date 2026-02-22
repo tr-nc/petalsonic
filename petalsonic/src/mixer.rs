@@ -5,8 +5,8 @@ use crate::playback::{LoopMode, PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
 use crate::world::SourceId;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 

@@ -566,9 +566,8 @@ impl PetalSonicEngine {
 
                 if free_space > 0 {
                     let frames_to_high_watermark = high_watermark.saturating_sub(occupied);
-                    let samples_to_generate = free_space
-                        .min(refill_chunk)
-                        .min(frames_to_high_watermark);
+                    let samples_to_generate =
+                        free_space.min(refill_chunk).min(frames_to_high_watermark);
 
                     if samples_to_generate == 0 {
                         thread::sleep(Duration::from_micros(500));
@@ -1038,10 +1037,10 @@ impl PetalSonicEngine {
                             for i in 0..frames_out {
                                 let left_idx = i * channels_usize;
                                 let right_idx = left_idx + 1;
-                                    let frame = StereoFrame {
-                                        left: *resampled_buffer.get(left_idx).unwrap_or(&0.0),
-                                        right: *resampled_buffer.get(right_idx).unwrap_or(&0.0),
-                                    };
+                                let frame = StereoFrame {
+                                    left: *resampled_buffer.get(left_idx).unwrap_or(&0.0),
+                                    right: *resampled_buffer.get(right_idx).unwrap_or(&0.0),
+                                };
                                 if producer.try_push(frame).is_ok() {
                                     pushed += 1;
                                 } else {

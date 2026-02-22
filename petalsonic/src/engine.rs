@@ -532,8 +532,11 @@ impl PetalSonicEngine {
     /// ahead of time. It monitors the ring buffer fill level and generates more samples
     /// when space is available, keeping the buffer topped up to prevent audio underruns.
     fn render_thread_loop(mut ctx: RenderThreadContext) {
-        // Target fill level: Keep ring buffer at least this full to prevent underruns
-        let target_buffer_fill = ctx.block_size * 4;
+        // Watermark policy (in frames): keep buffer between 2-3 blocks.
+        // This lowers end-to-end latency while preserving headroom for scheduling jitter.
+        let low_watermark = ctx.block_size * 2;
+        let high_watermark = ctx.block_size * 3;
+        let refill_chunk = ctx.block_size;
 
         while !ctx.shutdown.load(Ordering::Relaxed) {
             // Update listener pose in spatial processor if available
@@ -548,7 +551,7 @@ impl PetalSonicEngine {
 
             // Check ring buffer occupancy (lock-free!)
             let occupied = ctx.ring_buffer_producer.occupied_len();
-            let should_generate = occupied < target_buffer_fill;
+            let should_generate = occupied < low_watermark;
 
             // Process playback commands (moved from audio_callback for realtime safety)
             // This is safe to do here because the render thread can afford to block briefly
@@ -561,7 +564,16 @@ impl PetalSonicEngine {
                 let free_space = ctx.ring_buffer_producer.vacant_len();
 
                 if free_space > 0 {
-                    let samples_to_generate = free_space.min(ctx.block_size * 2);
+                    let frames_to_high_watermark = high_watermark.saturating_sub(occupied);
+                    let samples_to_generate = free_space
+                        .min(refill_chunk)
+                        .min(frames_to_high_watermark);
+
+                    if samples_to_generate == 0 {
+                        thread::sleep(Duration::from_micros(500));
+                        continue;
+                    }
+
                     let (completed_sources, looped_sources, timing) = Self::generate_samples(
                         &mut ctx.ring_buffer_producer,
                         samples_to_generate,
@@ -649,10 +661,10 @@ impl PetalSonicEngine {
         // Size calculation: Must be large enough to buffer during render thread delays,
         // but not so large that it introduces noticeable latency.
 
-        // TODO: the audio callback may need even more samples at a time, we should consider that too,
-        // otherwise when that exceeds the ring buffer size, we will never be able to fill enough samples
-        const RING_BUFFER_SIZE_MIN: usize = 100000; // Minimum 100k frames buffer
-        let ring_buffer_size = RING_BUFFER_SIZE_MIN.max(block_size * 8);
+        // Capacity target: 8 blocks of headroom.
+        // Steady-state fill is controlled separately by the render thread's 2-3 block
+        // low/high watermarks.
+        let ring_buffer_size = block_size * 8;
         let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
 
         // Split ring buffer into producer (for render thread) and consumer (for audio callback)

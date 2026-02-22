@@ -532,11 +532,12 @@ impl PetalSonicEngine {
     /// ahead of time. It monitors the ring buffer fill level and generates more samples
     /// when space is available, keeping the buffer topped up to prevent audio underruns.
     fn render_thread_loop(mut ctx: RenderThreadContext) {
-        // Watermark policy (in frames): keep buffer between 2-3 blocks.
-        // This lowers end-to-end latency while preserving headroom for scheduling jitter.
-        let low_watermark = ctx.block_size * 2;
+        // Watermark policy (in frames): keep buffer between 1-3 blocks,
+        // refilling in 2-block chunks when under the low watermark.
+        // This further reduces queue latency while retaining burst headroom.
+        let low_watermark = ctx.block_size;
         let high_watermark = ctx.block_size * 3;
-        let refill_chunk = ctx.block_size;
+        let refill_chunk = ctx.block_size * 2;
 
         while !ctx.shutdown.load(Ordering::Relaxed) {
             // Update listener pose in spatial processor if available

@@ -231,8 +231,7 @@ impl PetalSonicEngine {
 
         self.device_sample_rate = device_sample_rate;
 
-        // Use default buffer size - let the device decide
-        let buffer_size = cpal::BufferSize::Default;
+        let buffer_size = Self::select_buffer_size(&device_config);
         let config =
             Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
 
@@ -257,6 +256,26 @@ impl PetalSonicEngine {
             PetalSonicError::AudioDevice(format!("Failed to get default config: {}", e))
         })?;
 
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "Unknown output device".to_string());
+        let buffer_size = match device_config.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                format!("range {}..{} frames", min, max)
+            }
+            cpal::SupportedBufferSize::Unknown => "unknown".to_string(),
+        };
+
+        log::info!(
+            "PetalSonic output device: host={:?}, name='{}', sample_rate={} Hz, channels={}, format={:?}, buffer_size={}",
+            host.id(),
+            device_name,
+            device_config.sample_rate().0,
+            device_config.channels(),
+            device_config.sample_format(),
+            buffer_size
+        );
+
         Ok((device, device_config))
     }
 
@@ -271,6 +290,63 @@ impl PetalSonicEngine {
             sample_rate: cpal::SampleRate(device_sample_rate),
             buffer_size,
         }
+    }
+
+    fn select_buffer_size(device_config: &cpal::SupportedStreamConfig) -> cpal::BufferSize {
+        let Some(requested) = Self::requested_buffer_size() else {
+            log::info!("PetalSonic using default output buffer size");
+            return cpal::BufferSize::Default;
+        };
+
+        let chosen = match device_config.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                let clamped = requested.clamp(*min, *max);
+                if clamped != requested {
+                    log::warn!(
+                        "PetalSonic output buffer size {} frames outside supported range {}..{}, clamping to {}",
+                        requested,
+                        min,
+                        max,
+                        clamped
+                    );
+                }
+                clamped
+            }
+            cpal::SupportedBufferSize::Unknown => requested,
+        };
+
+        log::info!("PetalSonic forcing output buffer size: {} frames", chosen);
+        cpal::BufferSize::Fixed(chosen)
+    }
+
+    fn requested_buffer_size() -> Option<u32> {
+        const ENV_KEY: &str = "PETALSONIC_BUFFER_SIZE";
+
+        if let Ok(value) = std::env::var(ENV_KEY) {
+            if let Ok(parsed) = value.parse::<u32>() {
+                if parsed > 0 {
+                    return Some(parsed);
+                }
+            }
+
+            log::warn!(
+                "Invalid {} value '{}', falling back to platform defaults",
+                ENV_KEY,
+                value
+            );
+        }
+
+        Self::platform_default_buffer_size()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn platform_default_buffer_size() -> Option<u32> {
+        Some(256)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn platform_default_buffer_size() -> Option<u32> {
+        None
     }
 
     /// Build and start the audio stream

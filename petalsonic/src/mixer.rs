@@ -5,6 +5,8 @@ use crate::playback::{LoopMode, PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
 use crate::world::SourceId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -143,6 +145,8 @@ pub fn mix_playback_instances_with_metrics(
         );
     }
 
+    track_mix_peak(world_buffer);
+
     // NOW check for sources that reached the end during this mix iteration
     // This must happen AFTER fill_buffer() has been called on all sources
     let mut completed_sources = Vec::new();
@@ -196,4 +200,56 @@ pub fn mix_playback_instances_with_metrics(
         },
         profiling,
     )
+}
+
+fn track_mix_peak(world_buffer: &[f32]) {
+    let mut block_peak = 0.0f32;
+
+    for sample in world_buffer {
+        let abs = sample.abs();
+        if abs > block_peak {
+            block_peak = abs;
+        }
+    }
+
+    update_global_peak(block_peak);
+}
+
+fn update_global_peak(block_peak: f32) {
+    if !block_peak.is_finite() {
+        return;
+    }
+
+    let global_peak = global_peak_amplitude();
+    let mut current_bits = global_peak.load(Ordering::Relaxed);
+
+    loop {
+        let current_peak = f32::from_bits(current_bits);
+        if block_peak <= current_peak {
+            return;
+        }
+
+        match global_peak.compare_exchange_weak(
+            current_bits,
+            block_peak.to_bits(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                log::info!(
+                    "PetalSonic new all-time peak amplitude (pre-clamp): {:.6}",
+                    block_peak
+                );
+                return;
+            }
+            Err(observed_bits) => {
+                current_bits = observed_bits;
+            }
+        }
+    }
+}
+
+fn global_peak_amplitude() -> &'static AtomicU32 {
+    static PEAK: OnceLock<AtomicU32> = OnceLock::new();
+    PEAK.get_or_init(|| AtomicU32::new(0.0f32.to_bits()))
 }

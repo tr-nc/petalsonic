@@ -45,6 +45,8 @@ thread_local! {
     static RESAMPLED_BUFFER: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
+const MASTER_HEADROOM_DB: f32 = -6.0;
+
 /// Context for audio callback - groups related parameters to reduce argument count
 ///
 /// The audio callback runs on the real-time audio thread and must be extremely fast
@@ -80,6 +82,7 @@ struct RenderThreadContext {
     event_sender: Sender<PetalSonicEvent>,
     /// Timing event sender for performance profiling
     timing_sender: Sender<RenderTimingEvent>,
+    master_gain_linear: f32,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -133,6 +136,8 @@ pub struct PetalSonicEngine {
     /// The sender is cloned to render thread, receiver stays here for polling
     timing_sender: Sender<RenderTimingEvent>,
     timing_receiver: Receiver<RenderTimingEvent>,
+    master_headroom_db: f32,
+    master_gain_linear: f32,
 }
 
 impl PetalSonicEngine {
@@ -172,6 +177,9 @@ impl PetalSonicEngine {
         // This allows world.set_listener_pose() to automatically update the engine
         world.connect_engine_listener(listener_pose.clone());
 
+        let master_headroom_db = MASTER_HEADROOM_DB;
+        let master_gain_linear = crate::gain::db_to_linear(master_headroom_db);
+
         Ok(Self {
             device_sample_rate: desc.sample_rate, // Will be updated when stream starts
             desc,
@@ -189,6 +197,8 @@ impl PetalSonicEngine {
             event_receiver,
             timing_sender,
             timing_receiver,
+            master_headroom_db,
+            master_gain_linear,
         })
     }
 
@@ -230,6 +240,12 @@ impl PetalSonicEngine {
         let device_sample_rate = device_config.sample_rate().0;
 
         self.device_sample_rate = device_sample_rate;
+
+        log::info!(
+            "PetalSonic master headroom: {} dB (linear gain {:.3})",
+            self.master_headroom_db,
+            self.master_gain_linear
+        );
 
         let buffer_size = Self::select_buffer_size(&device_config);
         let config =
@@ -551,6 +567,7 @@ impl PetalSonicEngine {
                         samples_to_generate,
                         ctx.channels as usize,
                         ctx.channels,
+                        ctx.master_gain_linear,
                         &ctx.resampler,
                         &ctx.active_playback,
                         ctx.block_size,
@@ -655,6 +672,7 @@ impl PetalSonicEngine {
             listener_pose: self.listener_pose.clone(),
             event_sender: params.event_sender,
             timing_sender: params.timing_sender,
+            master_gain_linear: self.master_gain_linear,
         };
 
         // Spawn render thread
@@ -895,6 +913,7 @@ impl PetalSonicEngine {
         samples_needed: usize,
         channels_usize: usize,
         channels: u16,
+        master_gain_linear: f32,
         resampler_arc: &Arc<Mutex<StreamingResampler>>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         block_size: usize,
@@ -994,15 +1013,22 @@ impl PetalSonicEngine {
                             let resampling_elapsed = resampling_start.elapsed();
                             total_resampling_time_us += resampling_elapsed.as_micros() as u64;
 
+                            apply_master_gain_and_limit(
+                                &mut resampled_buffer,
+                                frames_out,
+                                channels_usize,
+                                master_gain_linear,
+                            );
+
                             // Push all generated frames to ring buffer
                             let mut pushed = 0;
                             for i in 0..frames_out {
                                 let left_idx = i * channels_usize;
                                 let right_idx = left_idx + 1;
-                                let frame = StereoFrame {
-                                    left: *resampled_buffer.get(left_idx).unwrap_or(&0.0),
-                                    right: *resampled_buffer.get(right_idx).unwrap_or(&0.0),
-                                };
+                                    let frame = StereoFrame {
+                                        left: *resampled_buffer.get(left_idx).unwrap_or(&0.0),
+                                        right: *resampled_buffer.get(right_idx).unwrap_or(&0.0),
+                                    };
                                 if producer.try_push(frame).is_ok() {
                                     pushed += 1;
                                 } else {
@@ -1051,5 +1077,41 @@ impl PetalSonicEngine {
 impl Drop for PetalSonicEngine {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+fn apply_master_gain_and_limit(
+    buffer: &mut [f32],
+    frames_out: usize,
+    channels_usize: usize,
+    master_gain_linear: f32,
+) {
+    let sample_count = frames_out * channels_usize;
+    if sample_count == 0 {
+        return;
+    }
+
+    let mut peak_after_gain = 0.0f32;
+    for sample in buffer.iter_mut().take(sample_count) {
+        let scaled = *sample * master_gain_linear;
+        let abs = scaled.abs();
+        if abs > peak_after_gain {
+            peak_after_gain = abs;
+        }
+
+        if scaled > 1.0 {
+            *sample = 1.0;
+        } else if scaled < -1.0 {
+            *sample = -1.0;
+        } else {
+            *sample = scaled;
+        }
+    }
+
+    if peak_after_gain > 1.0 {
+        log::warn!(
+            "PetalSonic output clipped after master gain, peak amplitude: {:.6}",
+            peak_after_gain
+        );
     }
 }

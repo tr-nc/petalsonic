@@ -1,29 +1,32 @@
 use crate::error::{PetalSonicError, Result};
 use crate::world::SourceId;
 use audionimbus::{
-    AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings, AudioSettings, Context, DirectEffect,
-    DirectEffectSettings, SimulationFlags, Simulator, Source, SourceSettings,
+    AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings, AudioSettings, Context,
+    DefaultRayTracer, Direct, DirectEffect, DirectEffectSettings, SimulationFlags, Simulator,
+    Source, SourceSettings,
 };
 use std::collections::HashMap;
 
 /// Per-source spatial effects (DirectEffect + AmbisonicsEncodeEffect)
 pub struct SpatialSourceEffects {
     /// Steam Audio source object for simulation
-    pub source: Source,
+    pub source: Source<'static, Direct>,
     /// Direct effect (distance attenuation, air absorption)
     pub direct_effect: DirectEffect,
     /// Ambisonics encode effect (spatial encoding)
     pub ambisonics_encode_effect: AmbisonicsEncodeEffect,
 }
 
+unsafe impl Send for SpatialSourceEffects {}
+
 impl SpatialSourceEffects {
     /// Create effects for a new spatial source
     pub fn new(
         context: &Context,
-        simulator: &Simulator<audionimbus::Direct>,
+        simulator: &Simulator<'static, DefaultRayTracer, Direct>,
         audio_settings: &AudioSettings,
     ) -> Result<Self> {
-        let source = Source::try_new(
+        let source: Source<'static, Direct> = Source::try_new(
             simulator,
             &SourceSettings {
                 flags: SimulationFlags::DIRECT,
@@ -74,7 +77,7 @@ impl SpatialEffectsManager {
         &mut self,
         source_id: SourceId,
         context: &Context,
-        simulator: &mut Simulator<audionimbus::Direct>,
+        simulator: &mut Simulator<'static, DefaultRayTracer, Direct>,
         audio_settings: &AudioSettings,
     ) -> Result<()> {
         if self.effects.contains_key(&source_id) {

@@ -7,23 +7,26 @@ use crate::spatial::effects::SpatialEffectsManager;
 use crate::spatial::hrtf;
 use crate::world::SourceId;
 use audionimbus::{
-    AirAbsorptionModel, AmbisonicsDecodeEffect, AmbisonicsDecodeEffectParams,
-    AmbisonicsDecodeEffectSettings, AmbisonicsEncodeEffectParams, AudioBufferSettings,
-    AudioSettings, Context, CoordinateSystem, Direct, DirectEffectParams,
-    DirectSimulationParameters, DirectSimulationSettings, Direction, DistanceAttenuationModel,
-    Equalizer, Hrtf, Point, Scene, SceneParams, SceneSettings, SimulationFlags, SimulationInputs,
+    audio_buffer::AudioBuffer as AudioNimbusAudioBuffer, AirAbsorptionModel,
+    AmbisonicsDecodeEffect, AmbisonicsDecodeEffectParams, AmbisonicsDecodeEffectSettings,
+    AmbisonicsEncodeEffectParams, AudioBufferSettings, AudioSettings, Context, CoordinateSystem,
+    DefaultRayTracer, Direct, DirectEffectParams, DirectSimulationParameters,
+    DirectSimulationSettings, Direction, DistanceAttenuationModel, Equalizer, Hrtf, Point,
+    Rendering, Scene, SimulationFlags, SimulationInputs, SimulationSettings,
     SimulationSharedInputs, Simulator, SpeakerLayout, Vector3,
-    audio_buffer::AudioBuffer as AudioNimbusAudioBuffer, geometry,
 };
 use std::time::Instant;
+
+type SpatialSimulator = Simulator<'static, DefaultRayTracer, Direct>;
+type SpatialScene = Scene<'static, DefaultRayTracer>;
 
 /// Spatial audio processor that manages Steam Audio integration
 pub struct SpatialProcessor {
     // Steam Audio core objects
     context: Context,
-    simulator: Simulator<Direct>,
+    simulator: SpatialSimulator,
     #[allow(dead_code)] // Must be kept alive for simulator lifetime
-    scene: Scene,
+    scene: SpatialScene,
     hrtf: Hrtf,
 
     // Shared ambisonics decode effect (used for all sources)
@@ -116,6 +119,7 @@ impl SpatialProcessor {
                 max_order: 2,
                 speaker_layout: SpeakerLayout::Stereo,
                 hrtf: &hrtf,
+                rendering: Rendering::Binaural,
             },
         )
         .map_err(|e| {
@@ -124,18 +128,18 @@ impl SpatialProcessor {
 
         // Create simulator
         // The max order is unused for now, just a placeholder.
-        let mut simulator =
-            Simulator::builder(SceneParams::Default, sample_rate, frame_size as u32, 4)
-                .with_direct(DirectSimulationSettings {
-                    max_num_occlusion_samples: 32,
-                })
-                .try_build(&context)
-                .map_err(|e| {
-                    PetalSonicError::SpatialAudio(format!("Failed to create simulator: {}", e))
-                })?;
+        let simulation_settings = SimulationSettings::new(sample_rate, frame_size as u32, 4)
+            .with_direct(DirectSimulationSettings {
+                max_num_occlusion_samples: 32,
+            });
+
+        let mut simulator: SpatialSimulator = Simulator::try_new(&context, &simulation_settings)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!("Failed to create simulator: {}", e))
+            })?;
 
         // Create scene
-        let scene = Scene::try_new(&context, &SceneSettings::default())
+        let scene = Scene::try_new(&context)
             .map_err(|e| PetalSonicError::SpatialAudio(format!("Failed to create scene: {}", e)))?;
 
         simulator.set_scene(&scene);
@@ -389,7 +393,12 @@ impl SpatialProcessor {
             })?;
 
         // Get simulation results
-        let outputs = effects.source.get_outputs(SimulationFlags::DIRECT);
+        let outputs = effects
+            .source
+            .get_outputs(SimulationFlags::DIRECT)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!("Failed to get direct outputs: {}", e))
+            })?;
         let direct_outputs = outputs.direct();
 
         let distance_attenuation = direct_outputs.distance_attenuation.unwrap_or(1.0);
@@ -431,7 +440,10 @@ impl SpatialProcessor {
 
         effects
             .direct_effect
-            .apply(&direct_effect_params, &input_buf, &direct_buf);
+            .apply(&direct_effect_params, &input_buf, &direct_buf)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!("Failed to apply DirectEffect: {}", e))
+            })?;
 
         Ok(())
     }
@@ -479,11 +491,15 @@ impl SpatialProcessor {
             PetalSonicError::SpatialAudio(format!("Failed to create output buffer: {}", e))
         })?;
 
-        effects.ambisonics_encode_effect.apply(
-            &ambisonics_encode_effect_params,
-            &input_buf,
-            &output_buf,
-        );
+        effects
+            .ambisonics_encode_effect
+            .apply(&ambisonics_encode_effect_params, &input_buf, &output_buf)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!(
+                    "Failed to apply AmbisonicsEncodeEffect: {}",
+                    e
+                ))
+            })?;
 
         // Accumulate encoded output to summed buffer
         for i in 0..self.cached_ambisonics_encode_buf.len() {
@@ -502,7 +518,6 @@ impl SpatialProcessor {
                 ahead: Vector3::new(0.0, 0.0, -1.0),
                 ..Default::default()
             },
-            binaural: true,
         };
 
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
@@ -527,11 +542,14 @@ impl SpatialProcessor {
             PetalSonicError::SpatialAudio(format!("Failed to create output buffer: {}", e))
         })?;
 
-        self.ambisonics_decode_effect.apply(
-            &ambisonics_decode_effect_params,
-            &input_buf,
-            &output_buf,
-        );
+        self.ambisonics_decode_effect
+            .apply(&ambisonics_decode_effect_params, &input_buf, &output_buf)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!(
+                    "Failed to apply AmbisonicsDecodeEffect: {}",
+                    e
+                ))
+            })?;
 
         // Interleave to binaural_processed buffer
         let decoded_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
@@ -545,7 +563,11 @@ impl SpatialProcessor {
             PetalSonicError::SpatialAudio(format!("Failed to create decoded buffer: {}", e))
         })?;
 
-        decoded_buf.interleave(&self.context, &mut self.cached_binaural_processed);
+        decoded_buf
+            .interleave(&self.context, &mut self.cached_binaural_processed)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!("Failed to interleave decoded audio: {}", e))
+            })?;
 
         // Apply HRTF gain compensation (linear multiplier derived from dB)
         if self.hrtf_gain_linear != 1.0 {
@@ -577,26 +599,27 @@ impl SpatialProcessor {
             };
 
             let scaled_position = position * self.distance_scaler;
-            let simulation_inputs = SimulationInputs {
-                source: geometry::CoordinateSystem {
-                    origin: Point::new(scaled_position.x, scaled_position.y, scaled_position.z),
-                    ..Default::default()
-                },
-                direct_simulation: Some(DirectSimulationParameters {
-                    distance_attenuation: Some(DistanceAttenuationModel::Default),
-                    air_absorption: Some(AirAbsorptionModel::Default),
-                    directivity: None,
-                    occlusion: None,
-                }),
-                reflections_simulation: None,
-                pathing_simulation: None,
-            };
+            let simulation_inputs = SimulationInputs::new(CoordinateSystem {
+                origin: Point::new(scaled_position.x, scaled_position.y, scaled_position.z),
+                ..Default::default()
+            })
+            .with_direct(
+                DirectSimulationParameters::new()
+                    .with_distance_attenuation(DistanceAttenuationModel::Default)
+                    .with_air_absorption(AirAbsorptionModel::Default),
+            );
 
             // Get the source and set inputs - need mutable access
             if let Some(effects) = self.effects_manager.get_effects_mut(*source_id) {
                 effects
                     .source
-                    .set_inputs(SimulationFlags::DIRECT, simulation_inputs);
+                    .set_inputs(SimulationFlags::DIRECT, simulation_inputs)
+                    .map_err(|e| {
+                        PetalSonicError::SpatialAudio(format!(
+                            "Failed to set source simulation inputs: {}",
+                            e
+                        ))
+                    })?;
             }
         }
 
@@ -604,35 +627,30 @@ impl SpatialProcessor {
 
         // Set shared listener inputs
         let scaled_listener_position = self.listener_position * self.distance_scaler;
-        let simulation_shared_inputs = SimulationSharedInputs {
-            listener: geometry::CoordinateSystem {
-                origin: Point::new(
-                    scaled_listener_position.x,
-                    scaled_listener_position.y,
-                    scaled_listener_position.z,
-                ),
-                right: Vector3::new(
-                    self.listener_right.x,
-                    self.listener_right.y,
-                    self.listener_right.z,
-                ),
-                up: Vector3::new(self.listener_up.x, self.listener_up.y, self.listener_up.z),
-                ahead: Vector3::new(
-                    self.listener_front.x,
-                    self.listener_front.y,
-                    self.listener_front.z,
-                ),
-            },
-            num_rays: 1024,
-            num_bounces: 10,
-            duration: 3.0,
-            order: 2,
-            irradiance_min_distance: 1.0,
-            pathing_visualization_callback: None,
-        };
+        let simulation_shared_inputs = SimulationSharedInputs::new(CoordinateSystem {
+            origin: Point::new(
+                scaled_listener_position.x,
+                scaled_listener_position.y,
+                scaled_listener_position.z,
+            ),
+            right: Vector3::new(
+                self.listener_right.x,
+                self.listener_right.y,
+                self.listener_right.z,
+            ),
+            up: Vector3::new(self.listener_up.x, self.listener_up.y, self.listener_up.z),
+            ahead: Vector3::new(
+                self.listener_front.x,
+                self.listener_front.y,
+                self.listener_front.z,
+            ),
+        });
 
         self.simulator
-            .set_shared_inputs(SimulationFlags::DIRECT, &simulation_shared_inputs);
+            .set_shared_inputs(SimulationFlags::DIRECT, &simulation_shared_inputs)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!("Failed to set shared inputs: {}", e))
+            })?;
         self.simulator.run_direct();
 
         Ok(())

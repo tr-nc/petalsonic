@@ -445,19 +445,20 @@ dependencies = [
 
 [[package]]
 name = "audionimbus"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bc59cc8cc5f033c837ddd4f3ab55d2e8eef21d8b8848b55aa98e9c32b4192b1"
+checksum = "405091240e14e08b9bea46bb13413974c6cc6c66debfa374d02c19b5f07b887d"
 dependencies = [
  "audionimbus-sys",
  "bitflags 2.10.0",
+ "slotmap",
 ]
 
 [[package]]
 name = "audionimbus-sys"
-version = "4.7.1-rc.1"
+version = "4.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "967b141aca90344513a2680e0c71cbb2c737c9840e4882cd2c53d6e333160554"
+checksum = "111aaefa0bd5af1de99eae6baff76fd3a98bee1d458fc23cc6c3da4a284e8722"
 dependencies = [
  "bindgen 0.71.1",
  "zip",
@@ -3096,9 +3097,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slotmap"
-version = "1.0.7"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbff4acf519f630b3a3ddcfaea6c06b42174d9a44bc70c620e9ed1649d58b82a"
+checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
 dependencies = [
  "version_check",
 ]

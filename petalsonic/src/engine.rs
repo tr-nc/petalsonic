@@ -361,7 +361,7 @@ impl PetalSonicEngine {
         // can push ALSA/bridge backends over their scheduling budget, which may trigger
         // backend XRUN recovery artifacts (echo/phasey repeats, crackles) even when our
         // own ring buffer does not report an underrun.
-        Some(256)
+        Some(1024)
     }
 
     #[cfg(not(target_os = "linux"))]

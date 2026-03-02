@@ -339,7 +339,9 @@ impl PetalSonicEngine {
         const ENV_KEY: &str = "PETALSONIC_BUFFER_SIZE";
 
         if let Ok(value) = std::env::var(ENV_KEY) {
-            if let Ok(parsed) = value.parse::<u32>() && parsed > 0 {
+            if let Ok(parsed) = value.parse::<u32>()
+                && parsed > 0
+            {
                 return Some(parsed);
             }
 

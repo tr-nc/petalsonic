@@ -7,13 +7,13 @@ use crate::spatial::effects::SpatialEffectsManager;
 use crate::spatial::hrtf;
 use crate::world::SourceId;
 use audionimbus::{
-    audio_buffer::AudioBuffer as AudioNimbusAudioBuffer, AirAbsorptionModel,
-    AmbisonicsDecodeEffect, AmbisonicsDecodeEffectParams, AmbisonicsDecodeEffectSettings,
-    AmbisonicsEncodeEffectParams, AudioBufferSettings, AudioSettings, Context, CoordinateSystem,
-    DefaultRayTracer, Direct, DirectEffectParams, DirectSimulationParameters,
-    DirectSimulationSettings, Direction, DistanceAttenuationModel, Equalizer, Hrtf, Point,
-    Rendering, Scene, SimulationFlags, SimulationInputs, SimulationSettings,
-    SimulationSharedInputs, Simulator, SpeakerLayout, Vector3,
+    AirAbsorptionModel, AmbisonicsDecodeEffect, AmbisonicsDecodeEffectParams,
+    AmbisonicsDecodeEffectSettings, AmbisonicsEncodeEffectParams, AudioBufferSettings,
+    AudioSettings, Context, CoordinateSystem, DefaultRayTracer, Direct, DirectEffectParams,
+    DirectSimulationParameters, DirectSimulationSettings, Direction, DistanceAttenuationModel,
+    Equalizer, Hrtf, Point, Rendering, Scene, SimulationFlags, SimulationInputs,
+    SimulationSettings, SimulationSharedInputs, Simulator, SpeakerLayout, Vector3,
+    audio_buffer::AudioBuffer as AudioNimbusAudioBuffer,
 };
 use std::time::Instant;
 

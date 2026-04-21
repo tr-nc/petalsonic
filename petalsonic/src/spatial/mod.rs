@@ -8,4 +8,7 @@ mod hrtf;
 mod processor;
 
 // Public API
-pub use processor::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
+pub use processor::{
+    DirectPathOverride, DirectPathTransmission, SpatialProcessingMetrics,
+    SpatialProcessingSummary, SpatialProcessor,
+};

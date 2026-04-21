@@ -899,6 +899,20 @@ impl PetalSonicEngine {
                         );
                     }
                 }
+                PlaybackCommand::UpdateDirectPathOverride(audio_id, direct_path_override) => {
+                    log::debug!(
+                        "Engine: Received UpdateDirectPathOverride command for source {}",
+                        audio_id
+                    );
+                    if let Some(instance) = active_playback.get_mut(&audio_id) {
+                        instance.direct_path_override = direct_path_override;
+                    } else {
+                        log::warn!(
+                            "Engine: Cannot update direct-path override, source {} not in active playback",
+                            audio_id
+                        );
+                    }
+                }
                 PlaybackCommand::Seek(audio_id, progress) => {
                     log::debug!(
                         "Engine: Received Seek command for source {} to {:.2}%",

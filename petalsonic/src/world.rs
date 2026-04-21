@@ -3,6 +3,7 @@ use crate::config::{PetalSonicWorldDesc, SourceConfig};
 use crate::error::Result;
 use crate::math::{Pose, Vec3};
 use crate::playback::{LoopMode, PlaybackCommand};
+use crate::spatial::DirectPathOverride;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -218,6 +219,37 @@ impl PetalSonicWorld {
             .map_err(|e| {
                 crate::error::PetalSonicError::Engine(format!(
                     "Failed to send update config command: {}",
+                    e
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    /// Updates host-provided direct-path data for a spatial source.
+    ///
+    /// This lets applications feed externally computed occlusion / transmission
+    /// into Steam Audio's direct effect stage.
+    pub fn update_source_direct_path_override(
+        &self,
+        audio_id: SourceId,
+        direct_path_override: Option<DirectPathOverride>,
+    ) -> Result<()> {
+        if !self.contains_audio(audio_id) {
+            return Err(crate::error::PetalSonicError::Engine(format!(
+                "Audio data with ID {:?} not found",
+                audio_id
+            )));
+        }
+
+        self.command_sender
+            .send(PlaybackCommand::UpdateDirectPathOverride(
+                audio_id,
+                direct_path_override,
+            ))
+            .map_err(|e| {
+                crate::error::PetalSonicError::Engine(format!(
+                    "Failed to send direct-path override command: {}",
                     e
                 ))
             })?;

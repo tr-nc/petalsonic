@@ -12,6 +12,7 @@
 
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
+use crate::spatial::DirectPathOverride;
 use crate::world::SourceId;
 use std::sync::Arc;
 
@@ -95,6 +96,8 @@ pub struct PlaybackInstance {
     pub config: SourceConfig,
     /// Loop mode for this playback
     pub loop_mode: LoopMode,
+    /// Optional host-provided direct-path override used during spatial processing.
+    pub direct_path_override: Option<DirectPathOverride>,
     /// Flag to track if we've reached the end this iteration (for event emission)
     pub(crate) reached_end_this_iteration: bool,
 }
@@ -116,6 +119,7 @@ impl PlaybackInstance {
             info,
             config,
             loop_mode,
+            direct_path_override: None,
             reached_end_this_iteration: false,
         }
     }
@@ -348,6 +352,7 @@ impl PlaybackInstance {
 /// - `Stop`: Stop an audio source and reset its position
 /// - `StopAll`: Stop all currently playing audio sources
 /// - `UpdateConfig`: Update the spatial configuration of a playing source
+/// - `UpdateDirectPathOverride`: Update host-provided direct-path data for a playing source
 /// - `Seek`: Seek to a specific position in the audio (0.0 = start, 1.0 = end)
 #[derive(Debug)]
 pub enum PlaybackCommand {
@@ -362,6 +367,8 @@ pub enum PlaybackCommand {
     StopAll,
     /// Update the configuration of a source
     UpdateConfig(SourceId, SourceConfig),
+    /// Update host-provided direct-path override data for a source.
+    UpdateDirectPathOverride(SourceId, Option<DirectPathOverride>),
     /// Seek to a specific position (progress in range [0.0, 1.0])
     Seek(SourceId, f32),
 }

@@ -95,4 +95,5 @@ pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};
 pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
+pub use spatial::{DirectPathOverride, DirectPathTransmission};
 pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};

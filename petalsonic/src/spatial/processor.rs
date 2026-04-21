@@ -12,10 +12,24 @@ use audionimbus::{
     AudioSettings, Context, CoordinateSystem, DefaultRayTracer, Direct, DirectEffectParams,
     DirectSimulationParameters, DirectSimulationSettings, Direction, DistanceAttenuationModel,
     Equalizer, Hrtf, Point, Rendering, Scene, SimulationFlags, SimulationInputs,
-    SimulationSettings, SimulationSharedInputs, Simulator, SpeakerLayout, Vector3,
+    SimulationSettings, SimulationSharedInputs, Simulator, SpeakerLayout, Transmission, Vector3,
     audio_buffer::AudioBuffer as AudioNimbusAudioBuffer,
 };
 use std::time::Instant;
+
+/// Host-provided direct-path override applied on top of Steam Audio simulation output.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct DirectPathOverride {
+    pub occlusion: Option<f32>,
+    pub transmission: Option<DirectPathTransmission>,
+}
+
+/// Transmission override for the direct sound path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DirectPathTransmission {
+    FrequencyIndependent([f32; 3]),
+    FrequencyDependent([f32; 3]),
+}
 
 type SpatialSimulator = Simulator<'static, DefaultRayTracer, Direct>;
 type SpatialScene = Scene<'static, DefaultRayTracer>;
@@ -310,7 +324,7 @@ impl SpatialProcessor {
         self.fill_input_buffer(instance, volume);
 
         // Apply direct effect (distance attenuation + air absorption)
-        self.apply_direct_effect(source_id)?;
+        self.apply_direct_effect(source_id, instance)?;
 
         // Apply ambisonics encode effect and capture timing
         let encode_start = Instant::now();
@@ -384,7 +398,7 @@ impl SpatialProcessor {
     }
 
     /// Apply direct effect to the input buffer
-    fn apply_direct_effect(&mut self, source_id: SourceId) -> Result<()> {
+    fn apply_direct_effect(&mut self, source_id: SourceId, instance: &PlaybackInstance) -> Result<()> {
         let effects = self
             .effects_manager
             .get_effects_mut(source_id)
@@ -408,13 +422,30 @@ impl SpatialProcessor {
             .map(|eq| Equalizer([eq[0], eq[1], eq[2]]))
             .unwrap_or(Equalizer([1.0, 1.0, 1.0]));
 
-        let direct_effect_params = DirectEffectParams {
+        let mut direct_effect_params = DirectEffectParams {
             distance_attenuation: Some(distance_attenuation),
             air_absorption: Some(air_absorption),
             directivity: None,
             occlusion: None,
             transmission: None,
         };
+
+        if let Some(direct_path_override) = instance.direct_path_override {
+            if let Some(occlusion) = direct_path_override.occlusion {
+                direct_effect_params.occlusion = Some(occlusion);
+            }
+
+            if let Some(transmission) = direct_path_override.transmission {
+                direct_effect_params.transmission = Some(match transmission {
+                    DirectPathTransmission::FrequencyIndependent(bands) => {
+                        Transmission::FrequencyIndependent(Equalizer(bands))
+                    }
+                    DirectPathTransmission::FrequencyDependent(bands) => {
+                        Transmission::FrequencyDependent(Equalizer(bands))
+                    }
+                });
+            }
+        }
 
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &self.cached_input_buf,

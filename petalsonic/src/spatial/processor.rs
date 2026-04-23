@@ -653,13 +653,13 @@ impl SpatialProcessor {
             0.0
         };
 
-        log::info!(
-            "PetalSonic direct occlusion: samples={} avg={:.3} min={:.3} max={:.3}",
-            self.direct_debug.sample_count,
-            avg,
-            self.direct_debug.occlusion_min,
-            self.direct_debug.occlusion_max,
-        );
+        //log::info!(
+        //    "PetalSonic direct occlusion: samples={} avg={:.3} min={:.3} max={:.3}",
+        //    self.direct_debug.sample_count,
+        //    avg,
+        //    self.direct_debug.occlusion_min,
+        //    self.direct_debug.occlusion_max,
+        //);
     }
 
     pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {

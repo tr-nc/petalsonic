@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Stereo frame for ring buffer
 #[derive(Clone, Copy, Debug)]
@@ -765,14 +765,19 @@ impl PetalSonicEngine {
         T: SizedSample + FromSample<f32>,
     {
         let channels_usize = ctx.channels as usize;
+        let device_frames = data.len() / channels_usize;
+
+        log_audio_timing_event(&format!(
+            "PetalSonic requires audio samples ({} frames)",
+            device_frames
+        ));
 
         // If not running, fill silence
         if !ctx.is_running.load(Ordering::Relaxed) {
             Self::fill_silence(data);
+            log_audio_timing_event("PetalSonic audio feeding done (silence)");
             return;
         }
-
-        let device_frames = data.len() / channels_usize;
 
         // Consume samples from ring buffer to fill output (lock-free!)
         // This is the only audio generation that happens on the real-time thread
@@ -812,6 +817,10 @@ impl PetalSonicEngine {
 
         ctx.frames_processed
             .fetch_add(samples_consumed, Ordering::Relaxed);
+        log_audio_timing_event(&format!(
+            "PetalSonic audio feeding done ({} / {} frames)",
+            samples_consumed, device_frames
+        ));
     }
 
     /// Fill buffer with silence
@@ -1151,4 +1160,16 @@ fn apply_master_gain_and_limit(
             peak_after_gain
         );
     }
+}
+
+fn log_audio_timing_event(message: &str) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    println!(
+        "[audio-timing] {} at {}.{:03}",
+        message,
+        timestamp.as_secs(),
+        timestamp.subsec_millis()
+    );
 }

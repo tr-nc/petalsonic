@@ -74,10 +74,6 @@ pub enum PetalSonicEvent {
         old_position: Vec3,
         new_position: Vec3,
     },
-    OcclusionRefreshRequested {
-        listener_position: Vec3,
-        sources: Vec<(SourceId, Vec3)>,
-    },
     EngineStarted,
     EngineStopped,
     EngineError {

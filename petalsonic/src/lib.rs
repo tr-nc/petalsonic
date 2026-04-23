@@ -77,6 +77,7 @@
 //! - Event-driven architecture for playback notifications
 //! - Performance profiling via timing events
 
+pub mod acoustics;
 pub mod audio_data;
 pub mod config;
 pub mod engine;
@@ -89,11 +90,12 @@ pub mod playback;
 pub mod spatial;
 pub mod world;
 
+pub use acoustics::{AcousticRay, BatchedAnyHitRayTracer};
 pub use config::{PetalSonicWorldDesc, SourceConfig};
 pub use engine::{AudioFillCallback, PetalSonicEngine};
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};
 pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
-pub use spatial::{DirectPathOverride, DirectPathTransmission};
+pub use spatial::{DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission};
 pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};

@@ -1,5 +1,8 @@
+use crate::acoustics::BatchedAnyHitRayTracer;
+use std::sync::Arc;
+
 /// Configuration descriptor for a PetalSonic world
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PetalSonicWorldDesc {
     /// Sample rate for the world processing (may differ from device sample rate)
     pub sample_rate: u32,
@@ -35,6 +38,8 @@ pub struct PetalSonicWorldDesc {
     /// - `1.0`: 1 world unit = 1 meter
     /// - `10.0`: 1 world unit = 10 meters (larger-scale worlds)
     pub distance_scaler: f32,
+    /// Optional host-provided batched ray tracing backend for direct acoustics.
+    pub batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
 }
 
 impl Default for PetalSonicWorldDesc {
@@ -47,6 +52,25 @@ impl Default for PetalSonicWorldDesc {
             hrtf_path: None,
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
+            batched_any_hit_ray_tracer: None,
         }
+    }
+}
+
+impl std::fmt::Debug for PetalSonicWorldDesc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PetalSonicWorldDesc")
+            .field("sample_rate", &self.sample_rate)
+            .field("block_size", &self.block_size)
+            .field("channels", &self.channels)
+            .field("max_sources", &self.max_sources)
+            .field("hrtf_path", &self.hrtf_path)
+            .field("hrtf_gain", &self.hrtf_gain)
+            .field("distance_scaler", &self.distance_scaler)
+            .field(
+                "batched_any_hit_ray_tracer",
+                &self.batched_any_hit_ray_tracer.as_ref().map(|_| "<custom>"),
+            )
+            .finish()
     }
 }

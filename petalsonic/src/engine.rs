@@ -6,7 +6,7 @@ use crate::events::{PetalSonicEvent, RenderTimingEvent};
 use crate::math::Pose;
 use crate::mixer;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
-use crate::spatial::SpatialProcessor;
+use crate::spatial::{DirectOcclusionDebugSnapshot, SpatialProcessor};
 use crate::world::{PetalSonicWorld, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -83,10 +83,7 @@ struct RenderThreadContext {
     /// Timing event sender for performance profiling
     timing_sender: Sender<RenderTimingEvent>,
     master_gain_linear: f32,
-    last_occlusion_request: Option<Instant>,
 }
-
-const OCCLUSION_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
 struct StreamCreationParams {
@@ -154,6 +151,7 @@ impl PetalSonicEngine {
             desc.distance_scaler,
             desc.hrtf_path.as_deref(),
             desc.hrtf_gain,
+            desc.batched_any_hit_ray_tracer.clone(),
         ) {
             Ok(processor) => Some(Arc::new(Mutex::new(processor))),
             Err(e) => {
@@ -493,6 +491,12 @@ impl PetalSonicEngine {
         &self.desc
     }
 
+    pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {
+        let spatial_processor = self.spatial_processor.as_ref()?;
+        let processor = spatial_processor.lock().ok()?;
+        processor.direct_occlusion_debug_snapshot()
+    }
+
     /// Poll for playback events (non-blocking)
     ///
     /// Returns a vector of all events that have occurred since the last poll.
@@ -566,8 +570,6 @@ impl PetalSonicEngine {
             // on world locks, whereas the audio callback cannot
             // Now uses command receiver directly - no world dependency
             Self::process_playback_commands(&ctx.command_receiver, &ctx.active_playback);
-
-            Self::maybe_emit_occlusion_request(&mut ctx);
 
             if should_generate {
                 // Generate samples to fill the buffer (lock-free!)
@@ -694,7 +696,6 @@ impl PetalSonicEngine {
             event_sender: params.event_sender,
             timing_sender: params.timing_sender,
             master_gain_linear: self.master_gain_linear,
-            last_occlusion_request: None,
         };
 
         // Spawn render thread
@@ -939,45 +940,6 @@ impl PetalSonicEngine {
                 }
             }
         }
-    }
-
-    fn maybe_emit_occlusion_request(ctx: &mut RenderThreadContext) {
-        let should_refresh = ctx
-            .last_occlusion_request
-            .is_none_or(|last| last.elapsed() >= OCCLUSION_REQUEST_INTERVAL);
-        if !should_refresh {
-            return;
-        }
-
-        let Ok(active_playback) = ctx.active_playback.try_lock() else {
-            return;
-        };
-
-        let mut sources = Vec::new();
-        for (source_id, instance) in active_playback.iter() {
-            if let crate::config::SourceConfig::Spatial { pose, .. } = &instance.config {
-                sources.push((*source_id, pose.position));
-            }
-        }
-        drop(active_playback);
-
-        if sources.is_empty() {
-            return;
-        }
-
-        let Ok(listener_pose) = ctx.listener_pose.try_lock() else {
-            return;
-        };
-
-        if let Err(err) = ctx.event_sender.send(PetalSonicEvent::OcclusionRefreshRequested {
-            listener_position: listener_pose.position,
-            sources,
-        }) {
-            log::error!("Failed to send occlusion refresh request: {}", err);
-            return;
-        }
-
-        ctx.last_occlusion_request = Some(Instant::now());
     }
 
     /// Generate resampled samples and push to ring buffer

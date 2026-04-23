@@ -2,8 +2,8 @@ use crate::error::{PetalSonicError, Result};
 use crate::world::SourceId;
 use audionimbus::{
     AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings, AudioSettings, Context,
-    DefaultRayTracer, Direct, DirectEffect, DirectEffectSettings, SimulationFlags, Simulator,
-    Source, SourceSettings,
+    CustomRayTracer, Direct, DirectEffect, DirectEffectSettings, SimulationFlags, Simulator, Source,
+    SourceSettings,
 };
 use std::collections::HashMap;
 
@@ -23,7 +23,7 @@ impl SpatialSourceEffects {
     /// Create effects for a new spatial source
     pub fn new(
         context: &Context,
-        simulator: &Simulator<'static, DefaultRayTracer, Direct>,
+        simulator: &Simulator<'static, CustomRayTracer, Direct>,
         audio_settings: &AudioSettings,
     ) -> Result<Self> {
         let source: Source<'static, Direct> = Source::try_new(
@@ -77,7 +77,7 @@ impl SpatialEffectsManager {
         &mut self,
         source_id: SourceId,
         context: &Context,
-        simulator: &mut Simulator<'static, DefaultRayTracer, Direct>,
+        simulator: &mut Simulator<'static, CustomRayTracer, Direct>,
         audio_settings: &AudioSettings,
     ) -> Result<()> {
         if self.effects.contains_key(&source_id) {

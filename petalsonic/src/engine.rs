@@ -611,6 +611,17 @@ impl PetalSonicEngine {
     }
 
     fn pump_render_state(ctx: &mut PumpState) {
+        // Bounded refill policy:
+        // - aim to keep roughly 3 blocks buffered
+        // - do at most 1 block of work per normal pump
+        // - allow up to 2 blocks only when buffer occupancy is critically low
+        // This avoids the positive-feedback loop where a slow frame causes a larger refill,
+        // which then makes the next frame even slower.
+        let target_occupancy = ctx.block_size * 3;
+        let critical_occupancy = ctx.block_size;
+        let normal_chunk = ctx.block_size;
+        let catch_up_chunk = ctx.block_size * 2;
+
         // Update listener pose in spatial processor if available.
         if let Some(ref spatial_processor) = ctx.spatial_processor
             && let Ok(mut processor) = spatial_processor.try_lock()
@@ -622,14 +633,31 @@ impl PetalSonicEngine {
 
         Self::process_playback_commands(&ctx.command_receiver, &ctx.active_playback);
 
+        let occupied = ctx.ring_buffer_producer.occupied_len();
+        if occupied >= target_occupancy {
+            return;
+        }
+
         let free_space = ctx.ring_buffer_producer.vacant_len();
         if free_space == 0 {
             return;
         }
 
+        let deficit = target_occupancy.saturating_sub(occupied);
+        let max_chunk = if occupied < critical_occupancy {
+            catch_up_chunk
+        } else {
+            normal_chunk
+        };
+        let samples_to_generate = free_space.min(deficit).min(max_chunk);
+
+        if samples_to_generate == 0 {
+            return;
+        }
+
         let (completed_sources, looped_sources, timing) = Self::generate_samples(
             &mut ctx.ring_buffer_producer,
-            free_space,
+            samples_to_generate,
             ctx.channels as usize,
             ctx.channels,
             ctx.master_gain_linear,

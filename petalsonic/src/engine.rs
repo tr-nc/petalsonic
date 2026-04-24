@@ -546,6 +546,18 @@ impl PetalSonicEngine {
         events
     }
 
+    pub fn pump_audio(&mut self) -> Result<()> {
+        let pump_state = self.pump_state.as_ref().ok_or_else(|| {
+            PetalSonicError::Engine("Audio pump is not initialized".into())
+        })?;
+        let mut pump_state = pump_state
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Audio pump state is poisoned".into()))?;
+
+        Self::pump_render_state(&mut pump_state);
+        Ok(())
+    }
+
     /// Render thread loop that continuously fills the ring buffer
     ///
     /// This thread runs independently from the audio callback, generating audio samples

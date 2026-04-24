@@ -60,13 +60,7 @@ struct AudioCallbackContext {
     channels: u16,
 }
 
-/// Context for render thread
-///
-/// The render thread runs independently from the audio callback, generating audio
-/// samples ahead of time and pushing them to the ring buffer. This decoupling allows
-/// the audio callback to remain simple and fast (lock-free consumption only).
-struct RenderThreadContext {
-    shutdown: Arc<AtomicBool>,
+struct PumpState {
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     resampler: Arc<Mutex<StreamingResampler>>,
     /// Producer end of ring buffer - writes pre-rendered audio samples (lock-free)
@@ -83,6 +77,16 @@ struct RenderThreadContext {
     /// Timing event sender for performance profiling
     timing_sender: Sender<RenderTimingEvent>,
     master_gain_linear: f32,
+}
+
+/// Context for render thread
+///
+/// The render thread runs independently from the audio callback, generating audio
+/// samples ahead of time and pushing them to the ring buffer. This decoupling allows
+/// the audio callback to remain simple and fast (lock-free consumption only).
+struct RenderThreadContext {
+    shutdown: Arc<AtomicBool>,
+    pump_state: Arc<Mutex<PumpState>>,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -124,6 +128,7 @@ pub struct PetalSonicEngine {
     render_thread: Option<thread::JoinHandle<()>>,
     /// Shutdown signal for render thread
     render_shutdown: Arc<AtomicBool>,
+    pump_state: Option<Arc<Mutex<PumpState>>>,
     /// Spatial audio processor
     spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
     /// Engine-owned listener pose (decoupled from world lock for render thread access)
@@ -192,6 +197,7 @@ impl PetalSonicEngine {
             active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
             render_thread: None,
             render_shutdown: Arc::new(AtomicBool::new(false)),
+            pump_state: None,
             spatial_processor,
             listener_pose,
             event_sender,
@@ -252,10 +258,11 @@ impl PetalSonicEngine {
         let config =
             Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
 
-        let (stream, render_thread) =
+        let (stream, pump_state, render_thread) =
             self.build_and_start_stream(&device, &device_config, &config, device_sample_rate)?;
 
         self.stream = Some(stream);
+        self.pump_state = Some(pump_state);
         self.render_thread = Some(render_thread);
         self.is_running.store(true, Ordering::Relaxed);
 
@@ -377,7 +384,7 @@ impl PetalSonicEngine {
         device_config: &cpal::SupportedStreamConfig,
         config: &cpal::StreamConfig,
         device_sample_rate: u32,
-    ) -> Result<(cpal::Stream, thread::JoinHandle<()>)> {
+    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>, thread::JoinHandle<()>)> {
         let is_running = self.is_running.clone();
         let frames_processed = self.frames_processed.clone();
         let world_sample_rate = self.desc.sample_rate;
@@ -451,13 +458,13 @@ impl PetalSonicEngine {
             }
         };
 
-        let (stream, render_thread) = result;
+        let (stream, pump_state, render_thread) = result;
 
         stream
             .play()
             .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to start stream: {}", e)))?;
 
-        Ok((stream, render_thread))
+        Ok((stream, pump_state, render_thread))
     }
 
     /// Stop the audio engine
@@ -470,6 +477,8 @@ impl PetalSonicEngine {
             self.is_running.store(false, Ordering::Relaxed);
             drop(stream); // This stops the stream
         }
+
+        self.pump_state = None;
 
         // Wait for render thread to finish
         if let Some(thread) = self.render_thread.take()
@@ -542,87 +551,10 @@ impl PetalSonicEngine {
     /// This thread runs independently from the audio callback, generating audio samples
     /// ahead of time. It monitors the ring buffer fill level and generates more samples
     /// when space is available, keeping the buffer topped up to prevent audio underruns.
-    fn render_thread_loop(mut ctx: RenderThreadContext) {
-        // Watermark policy (in frames): keep buffer between 1-3 blocks,
-        // refilling in 2-block chunks when under the low watermark.
-        // This further reduces queue latency while retaining burst headroom.
-        let low_watermark = ctx.block_size;
-        let high_watermark = ctx.block_size * 3;
-        let refill_chunk = ctx.block_size * 2;
-
+    fn render_thread_loop(ctx: RenderThreadContext) {
         while !ctx.shutdown.load(Ordering::Relaxed) {
-            // Update listener pose in spatial processor if available
-            // Uses engine-owned listener pose (decoupled from world lock)
-            if let Some(ref spatial_processor) = ctx.spatial_processor
-                && let Ok(mut processor) = spatial_processor.try_lock()
-                && let Ok(listener_pose) = ctx.listener_pose.try_lock()
-                && let Err(e) = processor.set_listener_pose(*listener_pose)
-            {
-                log::error!("Failed to update listener pose: {}", e);
-            }
-
-            // Check ring buffer occupancy (lock-free!)
-            let occupied = ctx.ring_buffer_producer.occupied_len();
-            let should_generate = occupied < low_watermark;
-
-            // Process playback commands (moved from audio_callback for realtime safety)
-            // This is safe to do here because the render thread can afford to block briefly
-            // on world locks, whereas the audio callback cannot
-            // Now uses command receiver directly - no world dependency
-            Self::process_playback_commands(&ctx.command_receiver, &ctx.active_playback);
-
-            if should_generate {
-                // Generate samples to fill the buffer (lock-free!)
-                let free_space = ctx.ring_buffer_producer.vacant_len();
-
-                if free_space > 0 {
-                    let frames_to_high_watermark = high_watermark.saturating_sub(occupied);
-                    let samples_to_generate =
-                        free_space.min(refill_chunk).min(frames_to_high_watermark);
-
-                    if samples_to_generate == 0 {
-                        thread::sleep(Duration::from_micros(500));
-                        continue;
-                    }
-
-                    let (completed_sources, looped_sources, timing) = Self::generate_samples(
-                        &mut ctx.ring_buffer_producer,
-                        samples_to_generate,
-                        ctx.channels as usize,
-                        ctx.channels,
-                        ctx.master_gain_linear,
-                        &ctx.resampler,
-                        &ctx.active_playback,
-                        ctx.block_size,
-                        ctx.spatial_processor.as_ref(),
-                    );
-
-                    // Send timing event (non-blocking)
-                    if let Err(e) = ctx.timing_sender.send(timing) {
-                        log::error!("Failed to send timing event: {}", e);
-                    }
-
-                    // Emit SourceCompleted events for sources that finished (LoopMode::Once)
-                    // This is lock-free and non-blocking since we use an unbounded channel
-                    for source_id in completed_sources {
-                        if let Err(e) = ctx
-                            .event_sender
-                            .send(PetalSonicEvent::SourceCompleted { source_id })
-                        {
-                            log::error!("Failed to send SourceCompleted event: {}", e);
-                        }
-                    }
-
-                    // Emit SourceLooped events for sources that looped (LoopMode::Infinite)
-                    for source_id in looped_sources {
-                        if let Err(e) = ctx.event_sender.send(PetalSonicEvent::SourceLooped {
-                            source_id,
-                            loop_count: 0, // Could track actual loop count if needed
-                        }) {
-                            log::error!("Failed to send SourceLooped event: {}", e);
-                        }
-                    }
-                }
+            if let Ok(mut pump_state) = ctx.pump_state.try_lock() {
+                Self::pump_render_state(&mut pump_state);
             }
 
             // Small sleep to avoid busy-waiting
@@ -636,7 +568,7 @@ impl PetalSonicEngine {
         device: &cpal::Device,
         config: &cpal::StreamConfig,
         params: StreamCreationParams,
-    ) -> Result<(cpal::Stream, thread::JoinHandle<()>)>
+    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>, thread::JoinHandle<()>)>
     where
         T: SizedSample + FromSample<f32>,
     {
@@ -683,8 +615,7 @@ impl PetalSonicEngine {
         let (producer, consumer) = ring_buffer.split();
 
         // Create context for render thread
-        let render_ctx = RenderThreadContext {
-            shutdown: params.render_shutdown,
+        let pump_state = Arc::new(Mutex::new(PumpState {
             active_playback: params.active_playback.clone(),
             resampler: resampler.clone(),
             ring_buffer_producer: producer,
@@ -696,6 +627,11 @@ impl PetalSonicEngine {
             event_sender: params.event_sender,
             timing_sender: params.timing_sender,
             master_gain_linear: self.master_gain_linear,
+        }));
+
+        let render_ctx = RenderThreadContext {
+            shutdown: params.render_shutdown,
+            pump_state: pump_state.clone(),
         };
 
         // Spawn render thread
@@ -729,7 +665,80 @@ impl PetalSonicEngine {
             )
             .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to build stream: {}", e)))?;
 
-        Ok((stream, render_thread))
+        Ok((stream, pump_state, render_thread))
+    }
+
+    fn pump_render_state(ctx: &mut PumpState) {
+        // Watermark policy (in frames): keep buffer between 1-3 blocks,
+        // refilling in 2-block chunks when under the low watermark.
+        // This further reduces queue latency while retaining burst headroom.
+        let low_watermark = ctx.block_size;
+        let high_watermark = ctx.block_size * 3;
+        let refill_chunk = ctx.block_size * 2;
+
+        // Update listener pose in spatial processor if available.
+        if let Some(ref spatial_processor) = ctx.spatial_processor
+            && let Ok(mut processor) = spatial_processor.try_lock()
+            && let Ok(listener_pose) = ctx.listener_pose.try_lock()
+            && let Err(e) = processor.set_listener_pose(*listener_pose)
+        {
+            log::error!("Failed to update listener pose: {}", e);
+        }
+
+        let occupied = ctx.ring_buffer_producer.occupied_len();
+        let should_generate = occupied < low_watermark;
+
+        Self::process_playback_commands(&ctx.command_receiver, &ctx.active_playback);
+
+        if !should_generate {
+            return;
+        }
+
+        let free_space = ctx.ring_buffer_producer.vacant_len();
+        if free_space == 0 {
+            return;
+        }
+
+        let frames_to_high_watermark = high_watermark.saturating_sub(occupied);
+        let samples_to_generate = free_space.min(refill_chunk).min(frames_to_high_watermark);
+
+        if samples_to_generate == 0 {
+            return;
+        }
+
+        let (completed_sources, looped_sources, timing) = Self::generate_samples(
+            &mut ctx.ring_buffer_producer,
+            samples_to_generate,
+            ctx.channels as usize,
+            ctx.channels,
+            ctx.master_gain_linear,
+            &ctx.resampler,
+            &ctx.active_playback,
+            ctx.block_size,
+            ctx.spatial_processor.as_ref(),
+        );
+
+        if let Err(e) = ctx.timing_sender.send(timing) {
+            log::error!("Failed to send timing event: {}", e);
+        }
+
+        for source_id in completed_sources {
+            if let Err(e) = ctx
+                .event_sender
+                .send(PetalSonicEvent::SourceCompleted { source_id })
+            {
+                log::error!("Failed to send SourceCompleted event: {}", e);
+            }
+        }
+
+        for source_id in looped_sources {
+            if let Err(e) = ctx.event_sender.send(PetalSonicEvent::SourceLooped {
+                source_id,
+                loop_count: 0,
+            }) {
+                log::error!("Failed to send SourceLooped event: {}", e);
+            }
+        }
     }
 
     /// Create a resampler (always created, handles identical sample rates internally)

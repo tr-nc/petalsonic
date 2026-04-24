@@ -611,13 +611,6 @@ impl PetalSonicEngine {
     }
 
     fn pump_render_state(ctx: &mut PumpState) {
-        // Watermark policy (in frames): keep buffer between 1-3 blocks,
-        // refilling in 2-block chunks when under the low watermark.
-        // This further reduces queue latency while retaining burst headroom.
-        let low_watermark = ctx.block_size;
-        let high_watermark = ctx.block_size * 3;
-        let refill_chunk = ctx.block_size * 2;
-
         // Update listener pose in spatial processor if available.
         if let Some(ref spatial_processor) = ctx.spatial_processor
             && let Ok(mut processor) = spatial_processor.try_lock()
@@ -627,30 +620,16 @@ impl PetalSonicEngine {
             log::error!("Failed to update listener pose: {}", e);
         }
 
-        let occupied = ctx.ring_buffer_producer.occupied_len();
-        let should_generate = occupied < low_watermark;
-
         Self::process_playback_commands(&ctx.command_receiver, &ctx.active_playback);
-
-        if !should_generate {
-            return;
-        }
 
         let free_space = ctx.ring_buffer_producer.vacant_len();
         if free_space == 0 {
             return;
         }
 
-        let frames_to_high_watermark = high_watermark.saturating_sub(occupied);
-        let samples_to_generate = free_space.min(refill_chunk).min(frames_to_high_watermark);
-
-        if samples_to_generate == 0 {
-            return;
-        }
-
         let (completed_sources, looped_sources, timing) = Self::generate_samples(
             &mut ctx.ring_buffer_producer,
-            samples_to_generate,
+            free_space,
             ctx.channels as usize,
             ctx.channels,
             ctx.master_gain_linear,

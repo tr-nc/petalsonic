@@ -20,8 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // Stereo frame for ring buffer
 #[derive(Clone, Copy, Debug)]
@@ -79,16 +78,6 @@ struct PumpState {
     master_gain_linear: f32,
 }
 
-/// Context for render thread
-///
-/// The render thread runs independently from the audio callback, generating audio
-/// samples ahead of time and pushing them to the ring buffer. This decoupling allows
-/// the audio callback to remain simple and fast (lock-free consumption only).
-struct RenderThreadContext {
-    shutdown: Arc<AtomicBool>,
-    pump_state: Arc<Mutex<PumpState>>,
-}
-
 /// Parameters for stream creation - groups related parameters to reduce argument count
 struct StreamCreationParams {
     is_running: Arc<AtomicBool>,
@@ -98,7 +87,6 @@ struct StreamCreationParams {
     channels: u16,
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     world: Arc<PetalSonicWorld>,
-    render_shutdown: Arc<AtomicBool>,
     event_sender: Sender<PetalSonicEvent>,
     timing_sender: Sender<RenderTimingEvent>,
 }
@@ -124,10 +112,6 @@ pub struct PetalSonicEngine {
     active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
     /// The actual sample rate used by the audio device (may differ from desc.sample_rate)
     device_sample_rate: u32,
-    /// Render thread handle
-    render_thread: Option<thread::JoinHandle<()>>,
-    /// Shutdown signal for render thread
-    render_shutdown: Arc<AtomicBool>,
     pump_state: Option<Arc<Mutex<PumpState>>>,
     /// Spatial audio processor
     spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
@@ -195,8 +179,6 @@ impl PetalSonicEngine {
             fill_callback: None,
             world,
             active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            render_thread: None,
-            render_shutdown: Arc::new(AtomicBool::new(false)),
             pump_state: None,
             spatial_processor,
             listener_pose,
@@ -258,12 +240,11 @@ impl PetalSonicEngine {
         let config =
             Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
 
-        let (stream, pump_state, render_thread) =
+        let (stream, pump_state) =
             self.build_and_start_stream(&device, &device_config, &config, device_sample_rate)?;
 
         self.stream = Some(stream);
         self.pump_state = Some(pump_state);
-        self.render_thread = Some(render_thread);
         self.is_running.store(true, Ordering::Relaxed);
 
         Ok(())
@@ -384,7 +365,7 @@ impl PetalSonicEngine {
         device_config: &cpal::SupportedStreamConfig,
         config: &cpal::StreamConfig,
         device_sample_rate: u32,
-    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>, thread::JoinHandle<()>)> {
+    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>)> {
         let is_running = self.is_running.clone();
         let frames_processed = self.frames_processed.clone();
         let world_sample_rate = self.desc.sample_rate;
@@ -392,14 +373,7 @@ impl PetalSonicEngine {
         let active_playback = self.active_playback.clone();
         let world = self.world.clone();
 
-        // Reset shutdown signal
-        self.render_shutdown.store(false, Ordering::Relaxed);
-        let render_shutdown = self.render_shutdown.clone();
-
-        // Clone event sender for passing to render thread
         let event_sender = self.event_sender.clone();
-
-        // Clone timing sender for passing to render thread
         let timing_sender = self.timing_sender.clone();
 
         let result = match device_config.sample_format() {
@@ -414,7 +388,6 @@ impl PetalSonicEngine {
                     channels,
                     active_playback,
                     world,
-                    render_shutdown,
                     event_sender,
                     timing_sender,
                 },
@@ -430,7 +403,6 @@ impl PetalSonicEngine {
                     channels,
                     active_playback,
                     world,
-                    render_shutdown,
                     event_sender,
                     timing_sender,
                 },
@@ -446,7 +418,6 @@ impl PetalSonicEngine {
                     channels,
                     active_playback,
                     world,
-                    render_shutdown,
                     event_sender,
                     timing_sender,
                 },
@@ -458,20 +429,17 @@ impl PetalSonicEngine {
             }
         };
 
-        let (stream, pump_state, render_thread) = result;
+        let (stream, pump_state) = result;
 
         stream
             .play()
             .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to start stream: {}", e)))?;
 
-        Ok((stream, pump_state, render_thread))
+        Ok((stream, pump_state))
     }
 
     /// Stop the audio engine
     pub fn stop(&mut self) -> Result<()> {
-        // Signal render thread to shutdown
-        self.render_shutdown.store(true, Ordering::Relaxed);
-
         // Stop the audio stream
         if let Some(stream) = self.stream.take() {
             self.is_running.store(false, Ordering::Relaxed);
@@ -479,13 +447,6 @@ impl PetalSonicEngine {
         }
 
         self.pump_state = None;
-
-        // Wait for render thread to finish
-        if let Some(thread) = self.render_thread.take()
-            && let Err(e) = thread.join()
-        {
-            log::error!("Error joining render thread: {:?}", e);
-        }
 
         Ok(())
     }
@@ -547,9 +508,10 @@ impl PetalSonicEngine {
     }
 
     pub fn pump_audio(&mut self) -> Result<()> {
-        let pump_state = self.pump_state.as_ref().ok_or_else(|| {
-            PetalSonicError::Engine("Audio pump is not initialized".into())
-        })?;
+        let pump_state = self
+            .pump_state
+            .as_ref()
+            .ok_or_else(|| PetalSonicError::Engine("Audio pump is not initialized".into()))?;
         let mut pump_state = pump_state
             .lock()
             .map_err(|_| PetalSonicError::Engine("Audio pump state is poisoned".into()))?;
@@ -558,29 +520,13 @@ impl PetalSonicEngine {
         Ok(())
     }
 
-    /// Render thread loop that continuously fills the ring buffer
-    ///
-    /// This thread runs independently from the audio callback, generating audio samples
-    /// ahead of time. It monitors the ring buffer fill level and generates more samples
-    /// when space is available, keeping the buffer topped up to prevent audio underruns.
-    fn render_thread_loop(ctx: RenderThreadContext) {
-        while !ctx.shutdown.load(Ordering::Relaxed) {
-            if let Ok(mut pump_state) = ctx.pump_state.try_lock() {
-                Self::pump_render_state(&mut pump_state);
-            }
-
-            // Small sleep to avoid busy-waiting
-            thread::sleep(Duration::from_micros(500));
-        }
-    }
-
     /// Create a typed audio stream
     fn create_stream<T>(
         &self,
         device: &cpal::Device,
         config: &cpal::StreamConfig,
         params: StreamCreationParams,
-    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>, thread::JoinHandle<()>)>
+    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>)>
     where
         T: SizedSample + FromSample<f32>,
     {
@@ -617,16 +563,15 @@ impl PetalSonicEngine {
         // but not so large that it introduces noticeable latency.
 
         // Capacity target: 8 blocks of headroom.
-        // Steady-state fill is controlled separately by the render thread's 2-3 block
+        // Steady-state fill is controlled separately by the pump's 2-3 block
         // low/high watermarks.
         let ring_buffer_size = block_size * 8;
         let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
 
-        // Split ring buffer into producer (for render thread) and consumer (for audio callback)
+        // Split ring buffer into producer (for pump_audio) and consumer (for audio callback)
         // This is lock-free! Each thread gets exclusive ownership of its half.
         let (producer, consumer) = ring_buffer.split();
 
-        // Create context for render thread
         let pump_state = Arc::new(Mutex::new(PumpState {
             active_playback: params.active_playback.clone(),
             resampler: resampler.clone(),
@@ -640,21 +585,6 @@ impl PetalSonicEngine {
             timing_sender: params.timing_sender,
             master_gain_linear: self.master_gain_linear,
         }));
-
-        let render_ctx = RenderThreadContext {
-            shutdown: params.render_shutdown,
-            pump_state: pump_state.clone(),
-        };
-
-        // Spawn render thread
-        let render_thread = thread::Builder::new()
-            .name("petalsonic-render".to_string())
-            .spawn(move || {
-                Self::render_thread_loop(render_ctx);
-            })
-            .map_err(|e| {
-                PetalSonicError::AudioDevice(format!("Failed to spawn render thread: {}", e))
-            })?;
 
         // Create context for audio callback (simplified - just consumes from ring buffer)
         let mut context = AudioCallbackContext {
@@ -677,7 +607,7 @@ impl PetalSonicEngine {
             )
             .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to build stream: {}", e)))?;
 
-        Ok((stream, pump_state, render_thread))
+        Ok((stream, pump_state))
     }
 
     fn pump_render_state(ctx: &mut PumpState) {

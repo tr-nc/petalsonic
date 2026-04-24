@@ -203,7 +203,7 @@ impl SpatialProcessor {
         let simulation_settings = SimulationSettings::new(sample_rate, frame_size as u32, 4)
             .with_custom_ray_tracer(256)
             .with_direct(DirectSimulationSettings {
-                max_num_occlusion_samples: 32,
+                max_num_occlusion_samples: 1,
             });
 
         let mut simulator: SpatialSimulator = Simulator::try_new(&context, &simulation_settings)

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 // Stereo frame for ring buffer
 #[derive(Clone, Copy, Debug)]
@@ -1114,13 +1114,5 @@ fn apply_master_gain_and_limit(
 }
 
 fn log_audio_timing_event(message: &str) {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    println!(
-        "[audio-timing] {} at {}.{:03}",
-        message,
-        timestamp.as_secs(),
-        timestamp.subsec_millis()
-    );
+    log::trace!("[audio-timing] {}", message);
 }

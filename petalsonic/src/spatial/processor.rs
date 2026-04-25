@@ -83,7 +83,6 @@ pub struct SpatialProcessor {
 }
 
 struct DirectDebugStats {
-    last_log_at: Instant,
     sample_count: usize,
     occlusion_sum: f32,
     occlusion_min: f32,
@@ -101,7 +100,6 @@ pub struct DirectOcclusionDebugSnapshot {
 impl Default for DirectDebugStats {
     fn default() -> Self {
         Self {
-            last_log_at: Instant::now(),
             sample_count: 0,
             occlusion_sum: 0.0,
             occlusion_min: f32::INFINITY,
@@ -215,7 +213,6 @@ impl SpatialProcessor {
 
         // Create scene
         let any_hit_backend = batched_any_hit_ray_tracer.clone();
-        let distance_scaler = distance_scaler;
         let any_hit_single_callback = AnyHitCallback::new(move |ray, min_distance, max_distance| {
             let Some(backend) = &any_hit_backend else {
                 return false;
@@ -248,7 +245,6 @@ impl SpatialProcessor {
         });
 
         let any_hit_backend = batched_any_hit_ray_tracer.clone();
-        let distance_scaler = distance_scaler;
         let any_hit_callback = BatchedAnyHitCallback::new(move |rays, min_distances, max_distances| {
             let Some(backend) = &any_hit_backend else {
                 return vec![false; rays.len()];
@@ -646,23 +642,6 @@ impl SpatialProcessor {
         self.direct_debug.occlusion_min = self.direct_debug.occlusion_min.min(occlusion);
         self.direct_debug.occlusion_max = self.direct_debug.occlusion_max.max(occlusion);
 
-        if self.direct_debug.last_log_at.elapsed() < std::time::Duration::from_secs(1) {
-            return;
-        }
-
-        let avg = if self.direct_debug.sample_count > 0 {
-            self.direct_debug.occlusion_sum / self.direct_debug.sample_count as f32
-        } else {
-            0.0
-        };
-
-        //log::info!(
-        //    "PetalSonic direct occlusion: samples={} avg={:.3} min={:.3} max={:.3}",
-        //    self.direct_debug.sample_count,
-        //    avg,
-        //    self.direct_debug.occlusion_min,
-        //    self.direct_debug.occlusion_max,
-        //);
     }
 
     pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {

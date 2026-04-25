@@ -17,20 +17,15 @@ use crate::world::SourceId;
 use std::sync::Arc;
 
 /// Loop mode for audio playback
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoopMode {
     /// Play once and stop
     /// Emits SourceCompleted event when finished
+    #[default]
     Once,
     /// Loop infinitely
     /// Emits SourceLooped event at the end of each iteration
     Infinite,
-}
-
-impl Default for LoopMode {
-    fn default() -> Self {
-        Self::Once
-    }
 }
 
 /// Represents the current playback state of an audio source.

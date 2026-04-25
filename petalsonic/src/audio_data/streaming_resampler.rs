@@ -5,18 +5,13 @@ use rubato::{
 };
 
 /// Type of resampler algorithm to use
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResamplerType {
     /// Fast polynomial resampler - lower quality but faster
     Fast,
     /// Sinc interpolation resampler - higher quality but slower
+    #[default]
     Sinc,
-}
-
-impl Default for ResamplerType {
-    fn default() -> Self {
-        Self::Sinc
-    }
 }
 
 enum ResamplerImpl {

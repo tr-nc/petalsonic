@@ -90,7 +90,10 @@ pub mod playback;
 pub mod spatial;
 pub mod world;
 
-pub use acoustics::{AcousticRay, BatchedAnyHitRayTracer};
+pub use acoustics::{
+    AcousticHit, AcousticMaterial, AcousticRay, BatchedAnyHitRayTracer,
+    BatchedClosestHitRayTracer,
+};
 pub use config::{PetalSonicWorldDesc, SourceConfig};
 pub use engine::{AudioFillCallback, PetalSonicEngine};
 pub use error::PetalSonicError;

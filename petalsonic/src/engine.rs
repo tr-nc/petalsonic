@@ -141,6 +141,7 @@ impl PetalSonicEngine {
             desc.hrtf_path.as_deref(),
             desc.hrtf_gain,
             desc.batched_any_hit_ray_tracer.clone(),
+            desc.batched_closest_hit_ray_tracer.clone(),
         ) {
             Ok(processor) => Some(Arc::new(Mutex::new(processor))),
             Err(e) => {

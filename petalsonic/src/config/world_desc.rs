@@ -1,4 +1,4 @@
-use crate::acoustics::BatchedAnyHitRayTracer;
+use crate::acoustics::{BatchedAnyHitRayTracer, BatchedClosestHitRayTracer};
 use std::sync::Arc;
 
 /// Configuration descriptor for a PetalSonic world
@@ -40,6 +40,8 @@ pub struct PetalSonicWorldDesc {
     pub distance_scaler: f32,
     /// Optional host-provided batched ray tracing backend for direct acoustics.
     pub batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
+    /// Optional host-provided batched ray tracing backend for closest-hit reflections.
+    pub batched_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
 }
 
 impl Default for PetalSonicWorldDesc {
@@ -53,6 +55,7 @@ impl Default for PetalSonicWorldDesc {
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
             batched_any_hit_ray_tracer: None,
+            batched_closest_hit_ray_tracer: None,
         }
     }
 }
@@ -70,6 +73,10 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field(
                 "batched_any_hit_ray_tracer",
                 &self.batched_any_hit_ray_tracer.as_ref().map(|_| "<custom>"),
+            )
+            .field(
+                "batched_closest_hit_ray_tracer",
+                &self.batched_closest_hit_ray_tracer.as_ref().map(|_| "<custom>"),
             )
             .finish()
     }

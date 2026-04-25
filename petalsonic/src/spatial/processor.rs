@@ -58,6 +58,7 @@ pub struct SpatialProcessor {
     frame_size: usize,
     sample_rate: u32,
     distance_scaler: f32,
+    direct_occlusion_enabled: bool,
     /// HRTF gain in decibels (for introspection / debugging).
     #[allow(dead_code)] // Only used for debugging / future introspection
     hrtf_gain_db: f32,
@@ -210,6 +211,7 @@ impl SpatialProcessor {
             .map_err(|e| {
                 PetalSonicError::SpatialAudio(format!("Failed to create simulator: {}", e))
             })?;
+        let direct_occlusion_enabled = batched_any_hit_ray_tracer.is_some();
 
         // Create scene
         let any_hit_backend = batched_any_hit_ray_tracer.clone();
@@ -317,6 +319,7 @@ impl SpatialProcessor {
             frame_size,
             sample_rate,
             distance_scaler,
+            direct_occlusion_enabled,
             hrtf_gain_db,
             hrtf_gain_linear,
             cached_input_buf,
@@ -817,16 +820,20 @@ impl SpatialProcessor {
             };
 
             let scaled_position = position * self.distance_scaler;
+            let mut direct_params = DirectSimulationParameters::new()
+                .with_distance_attenuation(DistanceAttenuationModel::Default)
+                .with_air_absorption(AirAbsorptionModel::Default);
+
+            if self.direct_occlusion_enabled {
+                direct_params =
+                    direct_params.with_occlusion(Occlusion::new(OcclusionAlgorithm::Raycast));
+            }
+
             let simulation_inputs = SimulationInputs::new(CoordinateSystem {
                 origin: Point::new(scaled_position.x, scaled_position.y, scaled_position.z),
                 ..Default::default()
             })
-            .with_direct(
-                DirectSimulationParameters::new()
-                    .with_distance_attenuation(DistanceAttenuationModel::Default)
-                    .with_air_absorption(AirAbsorptionModel::Default)
-                    .with_occlusion(Occlusion::new(OcclusionAlgorithm::Raycast)),
-            );
+            .with_direct(direct_params);
 
             // Get the source and set inputs - need mutable access
             if let Some(effects) = self.effects_manager.get_effects_mut(*source_id) {

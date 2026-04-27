@@ -45,6 +45,7 @@ thread_local! {
 }
 
 const MASTER_HEADROOM_DB: f32 = -6.0;
+const STARTUP_UNDERRUN_GRACE_CALLBACKS: usize = 8;
 
 /// Context for audio callback - groups related parameters to reduce argument count
 ///
@@ -57,6 +58,7 @@ struct AudioCallbackContext {
     /// Consumer end of ring buffer - reads pre-rendered audio samples (lock-free)
     ring_buffer_consumer: HeapCons<StereoFrame>,
     channels: u16,
+    startup_underrun_callbacks_remaining: usize,
 }
 
 struct PumpState {
@@ -593,6 +595,7 @@ impl PetalSonicEngine {
             frames_processed: params.frames_processed,
             ring_buffer_consumer: consumer,
             channels: params.channels,
+            startup_underrun_callbacks_remaining: STARTUP_UNDERRUN_GRACE_CALLBACKS,
         };
 
         let stream = device
@@ -755,11 +758,15 @@ impl PetalSonicEngine {
             } else {
                 // Not enough samples in ring buffer, fill rest with silence
                 // This indicates the render thread is falling behind
-                log::warn!(
-                    "Ring buffer underrun: only {} of {} frames available",
-                    samples_consumed,
-                    device_frames
-                );
+                if ctx.startup_underrun_callbacks_remaining > 0 {
+                    ctx.startup_underrun_callbacks_remaining -= 1;
+                } else {
+                    log::warn!(
+                        "Ring buffer underrun: only {} of {} frames available",
+                        samples_consumed,
+                        device_frames
+                    );
+                }
                 for j in i..device_frames {
                     let left_idx = j * channels_usize;
                     let right_idx = left_idx + 1;

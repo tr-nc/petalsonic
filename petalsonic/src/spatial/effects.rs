@@ -1,18 +1,27 @@
 use crate::error::{PetalSonicError, Result};
 use crate::world::SourceId;
 use audionimbus::{
-    AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings, AudioSettings, Context,
-    DefaultRayTracer, Direct, DirectEffect, DirectEffectSettings, SimulationFlags, Simulator,
-    Source, SourceSettings,
+    num_ambisonics_channels, AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings,
+    AudioSettings, Context, Convolution, CustomRayTracer, Direct, DirectEffect,
+    DirectEffectSettings, ReflectionEffect, ReflectionEffectSettings, Reflections,
+    SimulationFlags, Simulator, Source, SourceSettings,
 };
 use std::collections::HashMap;
+
+const REFLECTIONS_ORDER: u32 = 2;
+const REFLECTION_IR_DURATION_SECONDS: u32 = 2;
+
+type SpatialSimulator = Simulator<'static, CustomRayTracer, Direct, Reflections>;
+type SpatialSource = Source<'static, Direct, Reflections>;
 
 /// Per-source spatial effects (DirectEffect + AmbisonicsEncodeEffect)
 pub struct SpatialSourceEffects {
     /// Steam Audio source object for simulation
-    pub source: Source<'static, Direct>,
+    pub source: SpatialSource,
     /// Direct effect (distance attenuation, air absorption)
     pub direct_effect: DirectEffect,
+    /// Reflection effect (ambisonics reverb / early reflections)
+    pub reflection_effect: ReflectionEffect<Convolution>,
     /// Ambisonics encode effect (spatial encoding)
     pub ambisonics_encode_effect: AmbisonicsEncodeEffect,
 }
@@ -23,13 +32,13 @@ impl SpatialSourceEffects {
     /// Create effects for a new spatial source
     pub fn new(
         context: &Context,
-        simulator: &Simulator<'static, DefaultRayTracer, Direct>,
+        simulator: &SpatialSimulator,
         audio_settings: &AudioSettings,
     ) -> Result<Self> {
-        let source: Source<'static, Direct> = Source::try_new(
+        let source: SpatialSource = Source::try_new(
             simulator,
             &SourceSettings {
-                flags: SimulationFlags::DIRECT,
+                flags: SimulationFlags::DIRECT | SimulationFlags::REFLECTIONS,
             },
         )
         .map_err(|e| PetalSonicError::SpatialAudio(format!("Failed to create source: {}", e)))?;
@@ -43,10 +52,24 @@ impl SpatialSourceEffects {
             PetalSonicError::SpatialAudio(format!("Failed to create DirectEffect: {}", e))
         })?;
 
+        let reflection_effect = ReflectionEffect::<Convolution>::try_new(
+            context,
+            audio_settings,
+            &ReflectionEffectSettings {
+                impulse_response_size: audio_settings.sampling_rate * REFLECTION_IR_DURATION_SECONDS,
+                num_channels: num_ambisonics_channels(REFLECTIONS_ORDER),
+            },
+        )
+        .map_err(|e| {
+            PetalSonicError::SpatialAudio(format!("Failed to create ReflectionEffect: {}", e))
+        })?;
+
         let ambisonics_encode_effect = AmbisonicsEncodeEffect::try_new(
             context,
             audio_settings,
-            &AmbisonicsEncodeEffectSettings { max_order: 2 }, // Order 2 ambisonics (9 channels)
+            &AmbisonicsEncodeEffectSettings {
+                max_order: REFLECTIONS_ORDER,
+            }, // Order 2 ambisonics (9 channels)
         )
         .map_err(|e| {
             PetalSonicError::SpatialAudio(format!("Failed to create AmbisonicsEncodeEffect: {}", e))
@@ -55,6 +78,7 @@ impl SpatialSourceEffects {
         Ok(Self {
             source,
             direct_effect,
+            reflection_effect,
             ambisonics_encode_effect,
         })
     }
@@ -77,7 +101,7 @@ impl SpatialEffectsManager {
         &mut self,
         source_id: SourceId,
         context: &Context,
-        simulator: &mut Simulator<'static, DefaultRayTracer, Direct>,
+        simulator: &mut SpatialSimulator,
         audio_settings: &AudioSettings,
     ) -> Result<()> {
         if self.effects.contains_key(&source_id) {

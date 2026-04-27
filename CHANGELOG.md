@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-28
+
+### Added
+- Added an explicit audio pump API for caller-driven audio buffer refills.
+- Added direct path override support and occlusion refresh events.
+- Added reflection processing support with bounded realtime settings.
+
+### Changed
+- Removed the internal audio render thread in favor of engine-owned pump state.
+- Bounded per-frame audio refill work and topped off the audio buffer on each pump.
+- Reduced startup underrun warning noise while the audio buffer is warming up.
+
 ## [0.1.0] - 2025-01-XX
 
 ### Added
@@ -34,5 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RayTracer` trait - Custom ray tracing implementation support
 - Three-layer threading model (main thread, render thread, audio callback)
 
-[Unreleased]: https://github.com/yourusername/petalsonic/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/yourusername/petalsonic/releases/tag/v0.1.0
+[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/tr-nc/petalsonic/compare/v0.1.0...v0.4.0
+[0.1.0]: https://github.com/tr-nc/petalsonic/releases/tag/v0.1.0

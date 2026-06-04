@@ -9,17 +9,18 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use petalsonic_core::*;
+//! use petalsonic::*;
+//! use petalsonic::math::{Pose, Vec3};
 //! use std::sync::Arc;
 //!
 //! // Create a world configuration
 //! let config = PetalSonicWorldDesc::default();
 //!
 //! // Create the audio world
-//! let world = PetalSonicWorld::new(config.clone())?;
+//! let world = Arc::new(PetalSonicWorld::new(config.clone())?);
 //!
 //! // Create and start the audio engine
-//! let mut engine = PetalSonicEngine::new(config, &world)?;
+//! let mut engine = PetalSonicEngine::new(config, world.clone())?;
 //! engine.start()?;
 //!
 //! // Load audio data
@@ -28,7 +29,7 @@
 //! // Register audio with spatial configuration
 //! let source_id = world.register_audio(
 //!     audio_data,
-//!     SourceConfig::spatial(Vec3::new(5.0, 0.0, 0.0), 1.0)
+//!     SourceConfig::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
 //! )?;
 //!
 //! // Play the audio
@@ -87,6 +88,7 @@ pub mod gain;
 pub mod math;
 pub mod mixer;
 pub mod playback;
+pub mod procedural;
 pub mod spatial;
 pub mod world;
 
@@ -100,5 +102,6 @@ pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};
 pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
+pub use procedural::{ProceduralAudioFactory, ProceduralAudioSource};
 pub use spatial::{DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission};
 pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};

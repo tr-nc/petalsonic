@@ -25,14 +25,14 @@ pub enum ConvertToMono {
 /// # Examples
 ///
 /// ```no_run
-/// # use petalsonic_core::audio_data::{LoadOptions, ConvertToMono};
+/// # use petalsonic::audio_data::{LoadOptions, ConvertToMono};
 /// // Load audio and force conversion to mono
 /// let options = LoadOptions::new()
 ///     .convert_to_mono(ConvertToMono::ForceMono);
 /// ```
 ///
 /// ```no_run
-/// # use petalsonic_core::audio_data::{LoadOptions, ConvertToMono};
+/// # use petalsonic::audio_data::{LoadOptions, ConvertToMono};
 /// // Keep original channels (default)
 /// let options = LoadOptions::default();
 /// ```
@@ -71,7 +71,7 @@ impl LoadOptions {
     /// # Example
     ///
     /// ```no_run
-    /// # use petalsonic_core::audio_data::{LoadOptions, ConvertToMono};
+    /// # use petalsonic::audio_data::{LoadOptions, ConvertToMono};
     /// let options = LoadOptions::new()
     ///     .convert_to_mono(ConvertToMono::ForceMono);
     /// ```

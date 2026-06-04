@@ -92,11 +92,12 @@ pub fn mix_playback_instances_with_metrics(
         }
 
         log::debug!(
-            "Mixer: Processing source {} - frame {}/{} (spatial: {})",
+            "Mixer: Processing source {} - frame {}/{} (spatial: {}, procedural: {})",
             source_id,
             instance.info.current_frame,
-            instance.audio_data.samples().len(),
-            instance.config.is_spatial()
+            instance.total_frames(),
+            instance.config.is_spatial(),
+            instance.is_procedural()
         );
 
         if instance.config.is_spatial() {

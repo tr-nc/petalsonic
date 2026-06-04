@@ -12,8 +12,10 @@
 
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
+use crate::procedural::{ProceduralAudioFactory, ProceduralAudioSource};
 use crate::spatial::DirectPathOverride;
 use crate::world::SourceId;
+use std::fmt;
 use std::sync::Arc;
 
 /// Loop mode for audio playback
@@ -78,13 +80,61 @@ impl PlaybackInfo {
     }
 }
 
+/// Registered source payload sent from the world thread to the render thread.
+#[derive(Clone)]
+#[doc(hidden)]
+pub enum PlaybackSource {
+    Static(Arc<PetalSonicAudioData>),
+    Procedural {
+        factory: Arc<dyn ProceduralAudioFactory>,
+        sample_rate: u32,
+    },
+}
+
+impl fmt::Debug for PlaybackSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static(audio_data) => f
+                .debug_struct("Static")
+                .field("sample_rate", &audio_data.sample_rate())
+                .field("channels", &audio_data.channels())
+                .field("total_frames", &audio_data.total_frames())
+                .finish(),
+            Self::Procedural { sample_rate, .. } => f
+                .debug_struct("Procedural")
+                .field("sample_rate", sample_rate)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// Render-thread-owned playback content.
+pub enum PlaybackContent {
+    Static(Arc<PetalSonicAudioData>),
+    Procedural(Box<dyn ProceduralAudioSource>),
+}
+
+impl fmt::Debug for PlaybackContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static(audio_data) => f
+                .debug_struct("Static")
+                .field("sample_rate", &audio_data.sample_rate())
+                .field("channels", &audio_data.channels())
+                .field("total_frames", &audio_data.total_frames())
+                .finish(),
+            Self::Procedural(_) => f.write_str("Procedural(..)"),
+        }
+    }
+}
+
 /// Active playback instance
 #[derive(Debug)]
 pub struct PlaybackInstance {
     /// SourceId of the audio data being played
     pub audio_id: SourceId,
-    /// Reference to the audio data
-    pub audio_data: Arc<PetalSonicAudioData>,
+    /// Render-thread-owned static or procedural content.
+    pub content: PlaybackContent,
     /// Current playback information
     pub info: PlaybackInfo,
     /// Source configuration (spatial/non-spatial)
@@ -95,6 +145,8 @@ pub struct PlaybackInstance {
     pub direct_path_override: Option<DirectPathOverride>,
     /// Flag to track if we've reached the end this iteration (for event emission)
     pub(crate) reached_end_this_iteration: bool,
+    sample_rate: u32,
+    mono_scratch: Vec<f32>,
 }
 
 impl PlaybackInstance {
@@ -104,19 +156,55 @@ impl PlaybackInstance {
         config: SourceConfig,
         loop_mode: LoopMode,
     ) -> Self {
-        let total_frames = audio_data.samples().len();
-        let sample_rate = audio_data.sample_rate();
+        Self::from_source(audio_id, PlaybackSource::Static(audio_data), config, loop_mode)
+    }
+
+    pub(crate) fn from_source(
+        audio_id: SourceId,
+        source: PlaybackSource,
+        config: SourceConfig,
+        loop_mode: LoopMode,
+    ) -> Self {
+        let (content, total_frames, sample_rate) = match source {
+            PlaybackSource::Static(audio_data) => {
+                let total_frames = audio_data.total_frames();
+                let sample_rate = audio_data.sample_rate();
+                (PlaybackContent::Static(audio_data), total_frames, sample_rate)
+            }
+            PlaybackSource::Procedural {
+                factory,
+                sample_rate,
+            } => (
+                PlaybackContent::Procedural(factory.create(sample_rate)),
+                usize::MAX,
+                sample_rate,
+            ),
+        };
         let info = PlaybackInfo::new(total_frames, sample_rate);
 
         Self {
             audio_id,
-            audio_data,
+            content,
             info,
             config,
             loop_mode,
             direct_path_override: None,
             reached_end_this_iteration: false,
+            sample_rate,
+            mono_scratch: Vec::new(),
         }
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn total_frames(&self) -> usize {
+        self.info.total_frames
+    }
+
+    pub fn is_procedural(&self) -> bool {
+        matches!(self.content, PlaybackContent::Procedural(_))
     }
 
     /// Resume playing from current position
@@ -135,6 +223,10 @@ impl PlaybackInstance {
         log::debug!("Source {} resetting cursor to beginning", self.audio_id);
         self.info.current_frame = 0;
         self.info.current_time = 0.0;
+        self.reached_end_this_iteration = false;
+        if let PlaybackContent::Procedural(source) = &mut self.content {
+            source.reset();
+        }
     }
 
     /// Play from the beginning (reset + resume)
@@ -181,62 +273,61 @@ impl PlaybackInstance {
 
     /// Seek to a specific progress position (0.0 = start, 1.0 = end)
     ///
-    /// # Arguments
-    /// * `progress` - Playback progress in range [0.0, 1.0]
-    ///
-    /// # Behavior
-    /// - Clamps progress to valid range
-    /// - Converts progress to frame position
-    /// - Updates current_frame and current_time
-    /// - Clears the end flag (in case we were at the end)
-    /// - Works for both playing and paused sources
+    /// Procedural sources are unbounded streams. Seeking them resets generator
+    /// state and playback time to the beginning.
     pub fn seek(&mut self, progress: f32) {
         let progress_clamped = progress.clamp(0.0, 1.0);
-        let total_frames = self.audio_data.samples().len();
-        let target_frame = (total_frames as f32 * progress_clamped) as usize;
 
-        log::debug!(
-            "Source {} seeking to progress {:.2}% (frame {}/{})",
-            self.audio_id,
-            progress_clamped * 100.0,
-            target_frame,
-            total_frames
-        );
+        match &mut self.content {
+            PlaybackContent::Static(audio_data) => {
+                let total_frames = audio_data.total_frames();
+                let target_frame = (total_frames as f32 * progress_clamped) as usize;
 
-        self.info.current_frame = target_frame.min(total_frames);
-        self.info
-            .update_position(self.info.current_frame, self.audio_data.sample_rate());
+                log::debug!(
+                    "Source {} seeking to progress {:.2}% (frame {}/{})",
+                    self.audio_id,
+                    progress_clamped * 100.0,
+                    target_frame,
+                    total_frames
+                );
 
-        // Clear end flag in case we were at the end
+                self.info.current_frame = target_frame.min(total_frames);
+                self.info
+                    .update_position(self.info.current_frame, audio_data.sample_rate());
+            }
+            PlaybackContent::Procedural(source) => {
+                log::debug!(
+                    "Source {} resetting procedural stream for seek to {:.2}%",
+                    self.audio_id,
+                    progress_clamped * 100.0
+                );
+                source.reset();
+                self.info.current_frame = 0;
+                self.info.current_time = 0.0;
+            }
+        }
+
         self.reached_end_this_iteration = false;
     }
 
-    /// Advance playback cursor and check for completion with wraparound support
-    ///
-    /// This is the **single source of truth** for frame advancement and completion checking
-    /// in the new wraparound implementation. Call this from fill_buffer().
-    ///
-    /// # Arguments
-    /// * `frames_consumed` - Number of frames consumed from audio data
-    ///
-    /// # Behavior
-    /// - Updates current_frame and timing info
-    /// - If reached end of audio data:
-    ///   - For LoopMode::Infinite: Wraps current_frame to beginning, keeps playing
-    ///   - For LoopMode::Once: Sets state to Stopped
-    ///   - Sets `reached_end_this_iteration` flag for event emission in both cases
-    fn advance_and_check_completion_with_wrap(&mut self, frames_consumed: usize) {
-        let total_frames = self.audio_data.samples().len();
-        self.info.current_frame += frames_consumed;
+    fn advance_static(&mut self, frames_consumed: usize) {
+        let total_frames = match &self.content {
+            PlaybackContent::Static(audio_data) => audio_data.total_frames(),
+            PlaybackContent::Procedural(_) => return,
+        };
 
-        // Check if we've reached or passed the end
+        if total_frames == 0 {
+            self.reached_end_this_iteration = true;
+            self.info.play_state = PlayState::Stopped;
+            return;
+        }
+
+        self.info.current_frame = self.info.current_frame.saturating_add(frames_consumed);
+
         if self.info.current_frame >= total_frames {
             match self.loop_mode {
                 LoopMode::Infinite => {
-                    // Wrap around - keep playing
                     self.info.current_frame %= total_frames;
-                    // Note: reached_end_this_iteration already set in fill_buffer
-                    // State remains Playing
                     log::debug!(
                         "Source {} wrapped around to frame {} (Infinite loop)",
                         self.audio_id,
@@ -244,7 +335,6 @@ impl PlaybackInstance {
                     );
                 }
                 LoopMode::Once => {
-                    // Stop playback
                     self.reached_end_this_iteration = true;
                     self.info.play_state = PlayState::Stopped;
                     log::debug!(
@@ -258,66 +348,111 @@ impl PlaybackInstance {
         }
 
         self.info
-            .update_position(self.info.current_frame, self.audio_data.sample_rate());
+            .update_position(self.info.current_frame, self.sample_rate);
     }
 
-    /// Fill audio buffer for this instance
-    /// Returns the number of frames actually filled
-    ///
-    /// # Behavior
-    /// When reaching the end of audio data:
-    /// - For LoopMode::Infinite: Wraps around to beginning seamlessly within the same buffer
-    /// - For LoopMode::Once: Stops filling and sets state to Stopped
-    pub fn fill_buffer(&mut self, buffer: &mut [f32], channels: u16) -> usize {
+    fn advance_procedural(&mut self, frames_consumed: usize) {
+        self.info.current_frame = self.info.current_frame.saturating_add(frames_consumed);
+        self.info
+            .update_position(self.info.current_frame, self.sample_rate);
+    }
+
+    /// Fill a mono buffer for this instance and apply `volume`.
+    pub fn fill_mono_buffer(&mut self, buffer: &mut [f32], volume: f32) -> usize {
+        buffer.fill(0.0);
+
         if !matches!(self.info.play_state, PlayState::Playing) {
             return 0;
         }
 
-        let channels_usize = channels as usize;
-        let frame_count = buffer.len() / channels_usize;
-        let samples = self.audio_data.samples();
-        let total_frames = samples.len();
-        let mut frames_filled = 0;
-
-        // Get volume from config
-        let volume = self.config.volume();
-
-        for frame_idx in 0..frame_count {
-            let mut sample_idx = self.info.current_frame + frame_idx;
-
-            // Handle wraparound for infinite looping
-            if sample_idx >= total_frames {
-                if matches!(self.loop_mode, LoopMode::Infinite) {
-                    // Mark that we reached end (for event emission)
-                    if !self.reached_end_this_iteration {
-                        self.reached_end_this_iteration = true;
-                    }
-                    // Wrap around to beginning
-                    sample_idx %= total_frames;
-                } else {
-                    // LoopMode::Once - stop here
-                    break;
+        match &mut self.content {
+            PlaybackContent::Static(audio_data) => {
+                let samples = audio_data.samples();
+                let channels = audio_data.channels().max(1) as usize;
+                let total_frames = audio_data.total_frames();
+                if total_frames == 0 {
+                    self.reached_end_this_iteration = true;
+                    self.info.play_state = PlayState::Stopped;
+                    return 0;
                 }
+
+                let current_frame = self.info.current_frame;
+                let mut frames_filled = 0;
+
+                for (frame_idx, out_sample) in buffer.iter_mut().enumerate() {
+                    let mut source_frame = current_frame + frame_idx;
+
+                    if source_frame >= total_frames {
+                        if matches!(self.loop_mode, LoopMode::Infinite) {
+                            if !self.reached_end_this_iteration {
+                                self.reached_end_this_iteration = true;
+                            }
+                            source_frame %= total_frames;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let base_idx = source_frame * channels;
+                    let mut mono = 0.0;
+                    for channel in 0..channels {
+                        mono += samples.get(base_idx + channel).copied().unwrap_or(0.0);
+                    }
+                    *out_sample = (mono / channels as f32) * volume;
+                    frames_filled += 1;
+                }
+
+                if frames_filled > 0 {
+                    self.advance_static(frames_filled);
+                }
+
+                frames_filled
             }
+            PlaybackContent::Procedural(source) => {
+                source.render_mono(buffer);
+                if volume != 1.0 {
+                    for sample in buffer.iter_mut() {
+                        *sample *= volume;
+                    }
+                }
+                let frames_filled = buffer.len();
+                self.advance_procedural(frames_filled);
+                frames_filled
+            }
+        }
+    }
 
-            let sample = samples[sample_idx];
+    /// Fill audio buffer for this instance.
+    /// Returns the number of frames actually filled.
+    pub fn fill_buffer(&mut self, buffer: &mut [f32], channels: u16) -> usize {
+        let channels_usize = channels as usize;
+        if channels_usize == 0 {
+            return 0;
+        }
+        let frame_count = buffer.len() / channels_usize;
+        if frame_count == 0 {
+            return 0;
+        }
 
-            // Fill all channels with the same sample (mono to stereo), applying volume
+        let mut scratch = std::mem::take(&mut self.mono_scratch);
+        if scratch.len() < frame_count {
+            scratch.resize(frame_count, 0.0);
+        }
+
+        let volume = self.config.volume();
+        let frames_filled = self.fill_mono_buffer(&mut scratch[..frame_count], volume);
+
+        for frame_idx in 0..frames_filled {
+            let sample = scratch[frame_idx];
             for channel in 0..channels_usize {
                 let buffer_idx = frame_idx * channels_usize + channel;
                 if buffer_idx < buffer.len() {
-                    buffer[buffer_idx] += sample * volume; // Mix into existing buffer with volume
+                    buffer[buffer_idx] += sample;
                 }
             }
-
-            frames_filled += 1;
         }
 
-        // Advance cursor and check for completion with wraparound
-        if frames_filled > 0 {
-            self.advance_and_check_completion_with_wrap(frames_filled);
-        }
-
+        self.mono_scratch = scratch;
         frames_filled
     }
 
@@ -349,11 +484,10 @@ impl PlaybackInstance {
 /// - `UpdateConfig`: Update the spatial configuration of a playing source
 /// - `UpdateDirectPathOverride`: Update host-provided direct-path data for a playing source
 /// - `Seek`: Seek to a specific position in the audio (0.0 = start, 1.0 = end)
-#[derive(Debug)]
 pub enum PlaybackCommand {
-    /// Play a source with given configuration and loop mode
-    /// Carries the audio data directly to avoid requiring engine to call back into world
-    Play(SourceId, Arc<PetalSonicAudioData>, SourceConfig, LoopMode),
+    /// Play a source with given configuration and loop mode.
+    /// Carries the source payload directly to avoid requiring engine to call back into world.
+    Play(SourceId, PlaybackSource, SourceConfig, LoopMode),
     /// Pause a specific source
     Pause(SourceId),
     /// Stop a specific source
@@ -366,4 +500,109 @@ pub enum PlaybackCommand {
     UpdateDirectPathOverride(SourceId, Option<DirectPathOverride>),
     /// Seek to a specific position (progress in range [0.0, 1.0])
     Seek(SourceId, f32),
+}
+
+impl fmt::Debug for PlaybackCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Play(source_id, source, config, loop_mode) => f
+                .debug_tuple("Play")
+                .field(source_id)
+                .field(source)
+                .field(config)
+                .field(loop_mode)
+                .finish(),
+            Self::Pause(source_id) => f.debug_tuple("Pause").field(source_id).finish(),
+            Self::Stop(source_id) => f.debug_tuple("Stop").field(source_id).finish(),
+            Self::StopAll => f.write_str("StopAll"),
+            Self::UpdateConfig(source_id, config) => f
+                .debug_tuple("UpdateConfig")
+                .field(source_id)
+                .field(config)
+                .finish(),
+            Self::UpdateDirectPathOverride(source_id, direct_path_override) => f
+                .debug_tuple("UpdateDirectPathOverride")
+                .field(source_id)
+                .field(direct_path_override)
+                .finish(),
+            Self::Seek(source_id, progress) => f
+                .debug_tuple("Seek")
+                .field(source_id)
+                .field(progress)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SourceConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingSource {
+        next: f32,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl ProceduralAudioSource for CountingSource {
+        fn render_mono(&mut self, out: &mut [f32]) {
+            for sample in out {
+                *sample = self.next;
+                self.next += 1.0;
+            }
+        }
+
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+            self.next = 0.0;
+        }
+    }
+
+    struct CountingFactory {
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl ProceduralAudioFactory for CountingFactory {
+        fn create(&self, _sample_rate: u32) -> Box<dyn ProceduralAudioSource> {
+            Box::new(CountingSource {
+                next: 0.0,
+                resets: self.resets.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn procedural_source_fills_non_spatial_buffer_and_resets() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut instance = PlaybackInstance::from_source(
+            SourceId::from(7),
+            PlaybackSource::Procedural {
+                factory: Arc::new(CountingFactory {
+                    resets: resets.clone(),
+                }),
+                sample_rate: 48_000,
+            },
+            SourceConfig::non_spatial(),
+            LoopMode::Infinite,
+        );
+
+        instance.play_from_beginning();
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        let mut stereo = [0.0; 8];
+        let frames = instance.fill_buffer(&mut stereo, 2);
+        assert_eq!(frames, 4);
+        assert_eq!(stereo, [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        assert_eq!(instance.info.current_frame, 4);
+
+        instance.seek(0.5);
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
+        assert_eq!(instance.info.current_frame, 0);
+
+        let mut mono = [0.0; 3];
+        let frames = instance.fill_mono_buffer(&mut mono, 0.5);
+        assert_eq!(frames, 3);
+        assert_eq!(mono, [0.0, 0.5, 1.0]);
+    }
 }

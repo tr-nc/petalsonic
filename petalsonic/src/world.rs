@@ -2,7 +2,8 @@ use crate::audio_data::PetalSonicAudioData;
 use crate::config::{PetalSonicWorldDesc, SourceConfig};
 use crate::error::Result;
 use crate::math::{Pose, Vec3};
-use crate::playback::{LoopMode, PlaybackCommand};
+use crate::playback::{LoopMode, PlaybackCommand, PlaybackSource};
+use crate::procedural::ProceduralAudioFactory;
 use crate::spatial::DirectPathOverride;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
@@ -21,6 +22,12 @@ impl std::fmt::Display for SourceId {
     }
 }
 
+impl From<u64> for SourceId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// Main world object that manages 3D audio sources and playback.
 ///
 /// `PetalSonicWorld` is the central API for PetalSonic. It runs on the main thread
@@ -34,7 +41,7 @@ impl std::fmt::Display for SourceId {
 /// - **Audio thread**: Receives commands via channels, performs spatialization and playback
 pub struct PetalSonicWorld {
     desc: PetalSonicWorldDesc,
-    audio_data_storage: std::sync::Mutex<HashMap<SourceId, Arc<PetalSonicAudioData>>>,
+    source_storage: std::sync::Mutex<HashMap<SourceId, PlaybackSource>>,
     source_configs: std::sync::Mutex<HashMap<SourceId, SourceConfig>>,
     listener: std::sync::Mutex<PetalSonicAudioListener>,
     next_source_id: std::sync::Mutex<u64>,
@@ -51,7 +58,7 @@ impl PetalSonicWorld {
         let (command_sender, command_receiver) = crossbeam_channel::unbounded();
         Ok(Self {
             desc: config,
-            audio_data_storage: std::sync::Mutex::new(HashMap::new()),
+            source_storage: std::sync::Mutex::new(HashMap::new()),
             source_configs: std::sync::Mutex::new(HashMap::new()),
             listener: std::sync::Mutex::new(PetalSonicAudioListener::default()),
             next_source_id: std::sync::Mutex::new(0),
@@ -94,10 +101,35 @@ impl PetalSonicWorld {
         *next_id += 1;
         drop(next_id);
 
-        self.audio_data_storage
+        self.source_storage
             .lock()
             .unwrap()
-            .insert(id, resampled_audio_data);
+            .insert(id, PlaybackSource::Static(resampled_audio_data));
+        self.source_configs.lock().unwrap().insert(id, config);
+        Ok(id)
+    }
+
+    /// Registers a procedural audio source factory and returns a SourceId handle.
+    ///
+    /// The factory is retained on the world thread. When playback starts, PetalSonic
+    /// creates a fresh render-thread-owned source instance at the world sample rate.
+    pub fn register_procedural(
+        &self,
+        factory: Arc<dyn ProceduralAudioFactory>,
+        config: SourceConfig,
+    ) -> Result<SourceId> {
+        let mut next_id = self.next_source_id.lock().unwrap();
+        let id = SourceId(*next_id);
+        *next_id += 1;
+        drop(next_id);
+
+        self.source_storage.lock().unwrap().insert(
+            id,
+            PlaybackSource::Procedural {
+                factory,
+                sample_rate: self.desc.sample_rate,
+            },
+        );
         self.source_configs.lock().unwrap().insert(id, config);
         Ok(id)
     }
@@ -112,7 +144,10 @@ impl PetalSonicWorld {
     ///
     /// `Some(Arc<PetalSonicAudioData>)` if found, `None` otherwise
     pub fn get_audio_data(&self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
-        self.audio_data_storage.lock().unwrap().get(&id).cloned()
+        match self.source_storage.lock().unwrap().get(&id) {
+            Some(PlaybackSource::Static(audio_data)) => Some(audio_data.clone()),
+            _ => None,
+        }
     }
 
     /// Removes audio data from the world by its SourceId.
@@ -126,21 +161,25 @@ impl PetalSonicWorld {
     /// The removed audio data if it existed, `None` otherwise
     pub fn remove_audio_data(&self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
         self.source_configs.lock().unwrap().remove(&id);
-        self.audio_data_storage.lock().unwrap().remove(&id)
+        match self.source_storage.lock().unwrap().remove(&id) {
+            Some(PlaybackSource::Static(audio_data)) => Some(audio_data),
+            _ => None,
+        }
+    }
+
+    /// Removes any registered source type from the world by its SourceId.
+    pub fn remove_source(&self, id: SourceId) -> bool {
+        self.source_configs.lock().unwrap().remove(&id);
+        self.source_storage.lock().unwrap().remove(&id).is_some()
     }
 
     /// Returns a list of all audio source IDs currently stored in the world.
     pub fn get_audio_source_ids(&self) -> Vec<SourceId> {
-        self.audio_data_storage
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .collect()
+        self.source_storage.lock().unwrap().keys().copied().collect()
     }
 
     pub fn contains_audio(&self, id: SourceId) -> bool {
-        self.audio_data_storage.lock().unwrap().contains_key(&id)
+        self.source_storage.lock().unwrap().contains_key(&id)
     }
 
     /// Sets the listener pose (position and orientation) for spatial audio.
@@ -276,13 +315,19 @@ impl PetalSonicWorld {
     /// Returns an error if the audio source ID is not found in the world storage
     /// or if the command fails to send to the audio engine.
     pub fn play(&self, audio_id: SourceId, loop_mode: LoopMode) -> Result<()> {
-        // Look up audio data on the world thread (blocking is fine here)
-        let audio_data = self.get_audio_data(audio_id).ok_or_else(|| {
-            crate::error::PetalSonicError::Engine(format!(
-                "Audio data with ID {:?} not found",
-                audio_id
-            ))
-        })?;
+        // Look up source payload on the world thread (blocking is fine here)
+        let source = self
+            .source_storage
+            .lock()
+            .unwrap()
+            .get(&audio_id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::error::PetalSonicError::Engine(format!(
+                    "Audio source with ID {:?} not found",
+                    audio_id
+                ))
+            })?;
 
         // Get the source config for this audio source
         let config = self
@@ -293,11 +338,9 @@ impl PetalSonicWorld {
             .cloned()
             .unwrap_or_default();
 
-        // Send command with audio data included - engine no longer needs to call back into world
+        // Send command with source payload included - engine no longer needs to call back into world
         self.command_sender
-            .send(PlaybackCommand::Play(
-                audio_id, audio_data, config, loop_mode,
-            ))
+            .send(PlaybackCommand::Play(audio_id, source, config, loop_mode))
             .map_err(|e| {
                 crate::error::PetalSonicError::Engine(format!("Failed to send play command: {}", e))
             })?;
@@ -490,6 +533,7 @@ impl PetalSonicAudioSource {
 ///
 /// ```no_run
 /// # use petalsonic::*;
+/// # use petalsonic::math::{Pose, Vec3};
 /// # let world = PetalSonicWorld::new(PetalSonicWorldDesc::default()).unwrap();
 /// // Move listener to position (10, 0, 5) facing forward
 /// let pose = Pose::from_position(Vec3::new(10.0, 0.0, 5.0));

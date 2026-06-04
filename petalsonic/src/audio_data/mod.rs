@@ -10,7 +10,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! # use petalsonic_core::audio_data::*;
+//! # use petalsonic::audio_data::*;
 //! // Load audio with default settings
 //! let audio = PetalSonicAudioData::from_path("music.mp3")?;
 //!
@@ -18,7 +18,7 @@
 //! let options = LoadOptions::new()
 //!     .convert_to_mono(ConvertToMono::ForceMono);
 //! let audio = PetalSonicAudioData::from_path_with_options("music.mp3", &options)?;
-//! # Ok::<(), petalsonic_core::error::PetalSonicError>(())
+//! # Ok::<(), petalsonic::error::PetalSonicError>(())
 //! ```
 
 mod batch_resampler;

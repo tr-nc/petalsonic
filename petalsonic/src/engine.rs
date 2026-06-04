@@ -819,7 +819,7 @@ impl PetalSonicEngine {
 
         while let Ok(command) = command_receiver.try_recv() {
             match command {
-                PlaybackCommand::Play(audio_id, audio_data, config, loop_mode) => {
+                PlaybackCommand::Play(audio_id, source, config, loop_mode) => {
                     log::debug!(
                         "Engine: Received Play command for source {} (loop mode: {:?})",
                         audio_id,
@@ -832,9 +832,9 @@ impl PetalSonicEngine {
                             "Engine: Creating new PlaybackInstance for source {}",
                             audio_id
                         );
-                        PlaybackInstance::new(
+                        PlaybackInstance::from_source(
                             audio_id,
-                            audio_data.clone(),
+                            source.clone(),
                             config.clone(),
                             loop_mode,
                         )

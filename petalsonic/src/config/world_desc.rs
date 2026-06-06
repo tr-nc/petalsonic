@@ -14,10 +14,20 @@ pub enum DirectPathBackend {
 /// Backend used for binaural/HRTF rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HrtfBackend {
-    /// Use Steam Audio ambisonics decode with Steam Audio HRTF data.
+    /// Use Steam Audio HRTF data and binaural rendering.
     #[default]
     SteamAudio,
     /// Use PetalSonic's native `.petalhrtf` table and FIR renderer.
+    Native,
+}
+
+/// Backend used to encode sources into an Ambisonics field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AmbisonicsBackend {
+    /// Use Steam Audio's Ambisonics encode effect.
+    #[default]
+    SteamAudio,
+    /// Use PetalSonic's native real spherical-harmonic encoder.
     Native,
 }
 
@@ -35,13 +45,22 @@ pub struct PetalSonicWorldDesc {
     pub channels: u16,
     /// Maximum number of concurrent audio sources
     pub max_sources: usize,
-    /// Optional path to HRTF data.
+    /// Optional backend-specific path to HRTF data.
     ///
-    /// With [`HrtfBackend::SteamAudio`], this is a SOFA file path and `None` uses Steam Audio's
-    /// default HRTF. With [`HrtfBackend::Native`], this must be a `.petalhrtf` file.
+    /// Prefer [`Self::steam_hrtf_path`] and [`Self::native_hrtf_path`] when both backends may be
+    /// used at runtime. This legacy field is still used as a fallback for the initially selected
+    /// backend: SOFA for [`HrtfBackend::SteamAudio`], `.petalhrtf` for [`HrtfBackend::Native`].
     pub hrtf_path: Option<String>,
+    /// Optional SOFA path used by Steam Audio HRTF rendering.
+    pub steam_hrtf_path: Option<String>,
+    /// Optional `.petalhrtf` path used by native HRTF rendering.
+    pub native_hrtf_path: Option<String>,
     /// Backend used for binaural/HRTF rendering.
     pub hrtf_backend: HrtfBackend,
+    /// Whether spatial sources should first be summed into an Ambisonics field before HRTF decode.
+    pub use_ambisonics: bool,
+    /// Backend used for Ambisonics encoding when [`Self::use_ambisonics`] is true.
+    pub ambisonics_backend: AmbisonicsBackend,
     /// HRTF gain compensation in decibels (default: 0.0 dB = no change)
     ///
     /// Different HRTF datasets can have different overall gain levels.
@@ -79,7 +98,11 @@ impl Default for PetalSonicWorldDesc {
             channels: 2,
             max_sources: 2048,
             hrtf_path: None,
+            steam_hrtf_path: None,
+            native_hrtf_path: None,
             hrtf_backend: HrtfBackend::default(),
+            use_ambisonics: true,
+            ambisonics_backend: AmbisonicsBackend::default(),
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
             direct_path_backend: DirectPathBackend::default(),
@@ -97,7 +120,11 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("channels", &self.channels)
             .field("max_sources", &self.max_sources)
             .field("hrtf_path", &self.hrtf_path)
+            .field("steam_hrtf_path", &self.steam_hrtf_path)
+            .field("native_hrtf_path", &self.native_hrtf_path)
             .field("hrtf_backend", &self.hrtf_backend)
+            .field("use_ambisonics", &self.use_ambisonics)
+            .field("ambisonics_backend", &self.ambisonics_backend)
             .field("hrtf_gain", &self.hrtf_gain)
             .field("distance_scaler", &self.distance_scaler)
             .field("direct_path_backend", &self.direct_path_backend)

@@ -2,6 +2,7 @@ use crate::error::{PetalSonicError, Result};
 use crate::math::Vec3;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 const DEFAULT_DIRECTION: Vec3 = Vec3::Z;
 const PETALHRTF_MAGIC: &[u8; 8] = b"PETHRTF\0";
@@ -207,11 +208,22 @@ impl NativeHrtfTable {
     }
 }
 
+/// Detailed timing metrics for native HRTF rendering.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeHrtfRenderMetrics {
+    /// Time spent selecting the HRTF direction.
+    pub direction_lookup_time_us: u64,
+    /// Time spent running FIR convolution.
+    pub convolution_time_us: u64,
+}
+
 /// Per-source convolution state for native HRTF rendering.
 #[derive(Debug, Clone)]
 pub struct NativeHrtfSourceState {
     delay_line: Vec<f32>,
     write_index: usize,
+    cached_direction: Vec3,
+    cached_direction_index: Option<usize>,
 }
 
 impl NativeHrtfSourceState {
@@ -219,12 +231,16 @@ impl NativeHrtfSourceState {
         Self {
             delay_line: vec![0.0; taps],
             write_index: 0,
+            cached_direction: DEFAULT_DIRECTION,
+            cached_direction_index: None,
         }
     }
 
     pub fn reset(&mut self) {
         self.delay_line.fill(0.0);
         self.write_index = 0;
+        self.cached_direction = DEFAULT_DIRECTION;
+        self.cached_direction_index = None;
     }
 }
 
@@ -275,20 +291,71 @@ impl NativeHrtfRenderer {
             *state = self.create_source_state();
         }
 
-        let direction_index = self.table.nearest_direction_index(direction);
+        self.render_source_with_metrics(state, direction, input, output_interleaved)?;
+        Ok(())
+    }
+
+    /// Render a mono source block and return timing metrics for profiling.
+    pub fn render_source_with_metrics(
+        &self,
+        state: &mut NativeHrtfSourceState,
+        direction: Vec3,
+        input: &[f32],
+        output_interleaved: &mut [f32],
+    ) -> Result<NativeHrtfRenderMetrics> {
+        let frames = input.len();
+        if output_interleaved.len() < frames * 2 {
+            return Err(PetalSonicError::Configuration(format!(
+                "native HRTF output buffer too small: need {}, got {} samples",
+                frames * 2,
+                output_interleaved.len()
+            )));
+        }
+
+        if state.delay_line.len() != self.table.taps {
+            *state = self.create_source_state();
+        }
+
+        let normalized_direction = normalize_direction(direction);
+        let lookup_start = Instant::now();
+        let direction_index = if let Some(cached_index) = state.cached_direction_index {
+            if normalized_direction.dot(state.cached_direction) > 0.999_5 {
+                cached_index
+            } else {
+                let index = self.table.nearest_direction_index(normalized_direction);
+                state.cached_direction = normalized_direction;
+                state.cached_direction_index = Some(index);
+                index
+            }
+        } else {
+            let index = self.table.nearest_direction_index(normalized_direction);
+            state.cached_direction = normalized_direction;
+            state.cached_direction_index = Some(index);
+            index
+        };
+        let direction_lookup_time_us = lookup_start.elapsed().as_micros() as u64;
+
         let hrir = &self.table.directions[direction_index];
         let taps = self.table.taps;
+        let convolution_start = Instant::now();
 
         for (frame_index, input_sample) in input.iter().copied().enumerate() {
             state.delay_line[state.write_index] = input_sample;
 
             let mut left = 0.0f32;
             let mut right = 0.0f32;
-            for tap in 0..taps {
-                let delay_index = (state.write_index + taps - tap) % taps;
+            let mut tap = 0usize;
+            for delay_index in (0..=state.write_index).rev() {
                 let delayed = state.delay_line[delay_index];
                 left += delayed * hrir.left[tap];
                 right += delayed * hrir.right[tap];
+                tap += 1;
+            }
+            for delay_index in (state.write_index + 1..taps).rev() {
+                let delayed = state.delay_line[delay_index];
+                left += delayed * hrir.left[tap];
+                right += delayed * hrir.right[tap];
+                tap += 1;
             }
 
             let out_index = frame_index * 2;
@@ -298,7 +365,10 @@ impl NativeHrtfRenderer {
             state.write_index = (state.write_index + 1) % taps;
         }
 
-        Ok(())
+        Ok(NativeHrtfRenderMetrics {
+            direction_lookup_time_us,
+            convolution_time_us: convolution_start.elapsed().as_micros() as u64,
+        })
     }
 }
 

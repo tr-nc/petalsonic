@@ -1,5 +1,5 @@
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::{DirectPathBackend, HrtfBackend, PetalSonicWorldDesc};
+use crate::config::{AmbisonicsBackend, DirectPathBackend, HrtfBackend, PetalSonicWorldDesc};
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
@@ -141,9 +141,13 @@ impl PetalSonicEngine {
             desc.block_size,
             desc.distance_scaler,
             desc.hrtf_path.as_deref(),
+            desc.steam_hrtf_path.as_deref(),
+            desc.native_hrtf_path.as_deref(),
             desc.hrtf_gain,
             desc.hrtf_backend,
             desc.direct_path_backend,
+            desc.use_ambisonics,
+            desc.ambisonics_backend,
             desc.batched_any_hit_ray_tracer.clone(),
             desc.batched_closest_hit_ray_tracer.clone(),
         ) {
@@ -475,16 +479,40 @@ impl PetalSonicEngine {
         hrtf_backend: HrtfBackend,
         direct_path_backend: DirectPathBackend,
     ) -> Result<()> {
+        self.set_spatial_rendering(
+            hrtf_backend,
+            direct_path_backend,
+            self.desc.use_ambisonics,
+            self.desc.ambisonics_backend,
+        )
+    }
+
+    pub fn set_spatial_rendering(
+        &mut self,
+        hrtf_backend: HrtfBackend,
+        direct_path_backend: DirectPathBackend,
+        use_ambisonics: bool,
+        ambisonics_backend: AmbisonicsBackend,
+    ) -> Result<()> {
         if let Some(spatial_processor) = &self.spatial_processor {
             let mut processor = spatial_processor.lock().map_err(|_| {
                 PetalSonicError::Engine("Spatial processor lock is poisoned".into())
             })?;
-            processor.set_spatial_backends(hrtf_backend, direct_path_backend)?;
+            processor.set_spatial_rendering(
+                hrtf_backend,
+                direct_path_backend,
+                use_ambisonics,
+                ambisonics_backend,
+            )?;
             self.desc.hrtf_backend = processor.hrtf_backend();
             self.desc.direct_path_backend = processor.direct_path_backend();
+            self.desc.use_ambisonics = processor.use_ambisonics();
+            self.desc.ambisonics_backend = processor.ambisonics_backend();
         } else {
             self.desc.hrtf_backend = hrtf_backend;
             self.desc.direct_path_backend = direct_path_backend;
+            self.desc.use_ambisonics = use_ambisonics;
+            self.desc.ambisonics_backend = ambisonics_backend;
         }
 
         Ok(())
@@ -492,6 +520,15 @@ impl PetalSonicEngine {
 
     pub fn spatial_backends(&self) -> (HrtfBackend, DirectPathBackend) {
         (self.desc.hrtf_backend, self.desc.direct_path_backend)
+    }
+
+    pub fn spatial_rendering(&self) -> (HrtfBackend, DirectPathBackend, bool, AmbisonicsBackend) {
+        (
+            self.desc.hrtf_backend,
+            self.desc.direct_path_backend,
+            self.desc.use_ambisonics,
+            self.desc.ambisonics_backend,
+        )
     }
 
     pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {
@@ -965,9 +1002,14 @@ impl PetalSonicEngine {
         let mut total_mixing_time_us = 0u64;
         let mut total_spatial_time_us = 0u64;
         let mut total_direct_mixing_time_us = 0u64;
+        let mut total_spatial_source_count = 0usize;
         let mut total_spatial_simulation_time_us = 0u64;
+        let mut total_direct_processing_time_us = 0u64;
         let mut total_ambisonics_encoding_time_us = 0u64;
         let mut total_ambisonics_decoding_time_us = 0u64;
+        let mut total_hrtf_rendering_time_us = 0u64;
+        let mut total_native_hrtf_direction_lookup_time_us = 0u64;
+        let mut total_native_hrtf_convolution_time_us = 0u64;
         let mut total_resampling_time_us = 0u64;
 
         let Ok(mut resampler) = resampler_arc.try_lock() else {
@@ -979,9 +1021,14 @@ impl PetalSonicEngine {
                     mixing_time_us: 0,
                     spatial_time_us: 0,
                     direct_mixing_time_us: 0,
+                    spatial_source_count: 0,
                     spatial_simulation_time_us: 0,
+                    direct_processing_time_us: 0,
                     ambisonics_encoding_time_us: 0,
                     ambisonics_decoding_time_us: 0,
+                    hrtf_rendering_time_us: 0,
+                    native_hrtf_direction_lookup_time_us: 0,
+                    native_hrtf_convolution_time_us: 0,
                     resampling_time_us: 0,
                     total_time_us: 0,
                 },
@@ -1031,11 +1078,18 @@ impl PetalSonicEngine {
                 total_direct_mixing_time_us += mix_profiling.direct_mix_time_us;
                 total_spatial_time_us += mix_profiling.spatial_mix_time_us;
                 if let Some(spatial_metrics) = mix_profiling.spatial_metrics {
+                    total_spatial_source_count += spatial_metrics.spatial_source_count;
                     total_spatial_simulation_time_us += spatial_metrics.physics_simulation_time_us;
+                    total_direct_processing_time_us += spatial_metrics.direct_processing_time_us;
                     total_ambisonics_encoding_time_us +=
                         spatial_metrics.ambisonics_encoding_time_us;
                     total_ambisonics_decoding_time_us +=
                         spatial_metrics.ambisonics_decoding_time_us;
+                    total_hrtf_rendering_time_us += spatial_metrics.hrtf_rendering_time_us;
+                    total_native_hrtf_direction_lookup_time_us +=
+                        spatial_metrics.native_hrtf_direction_lookup_time_us;
+                    total_native_hrtf_convolution_time_us +=
+                        spatial_metrics.native_hrtf_convolution_time_us;
                 }
 
                 RESAMPLED_BUFFER.with(|rbuf| {
@@ -1106,9 +1160,14 @@ impl PetalSonicEngine {
                 mixing_time_us: total_mixing_time_us,
                 spatial_time_us: total_spatial_time_us,
                 direct_mixing_time_us: total_direct_mixing_time_us,
+                spatial_source_count: total_spatial_source_count,
                 spatial_simulation_time_us: total_spatial_simulation_time_us,
+                direct_processing_time_us: total_direct_processing_time_us,
                 ambisonics_encoding_time_us: total_ambisonics_encoding_time_us,
                 ambisonics_decoding_time_us: total_ambisonics_decoding_time_us,
+                hrtf_rendering_time_us: total_hrtf_rendering_time_us,
+                native_hrtf_direction_lookup_time_us: total_native_hrtf_direction_lookup_time_us,
+                native_hrtf_convolution_time_us: total_native_hrtf_convolution_time_us,
                 resampling_time_us: total_resampling_time_us,
                 total_time_us: total_elapsed.as_micros() as u64,
             },

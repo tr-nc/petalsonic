@@ -10,6 +10,39 @@ use std::time::Instant;
 pub const DEFAULT_NATIVE_AMBISONICS_ORDER: u32 = 2;
 const MAX_NATIVE_AMBISONICS_ORDER: u32 = 2;
 const MAX_NATIVE_AMBISONICS_CHANNELS: usize = 9;
+const STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT: usize = 24;
+const STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT: f32 =
+    4.0 * PI / STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT as f32;
+
+// Steam Audio uses this 24-point spherical design to precompute Ambisonics HRTFs.
+// Keeping the same decode projection avoids the overly smooth/high-frequency-dull
+// result that came from equally averaging every native HRTF table entry.
+const STEAM_AMBISONICS_VIRTUAL_SPEAKERS: [[f32; 3]; STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT] = [
+    [0.866_246_8, 0.422_518_64, 0.266_635_4],
+    [0.866_246_8, -0.422_518_64, -0.266_635_4],
+    [0.866_246_8, 0.266_635_4, -0.422_518_64],
+    [0.866_246_8, -0.266_635_4, 0.422_518_64],
+    [-0.866_246_8, 0.422_518_64, -0.266_635_4],
+    [-0.866_246_8, -0.422_518_64, 0.266_635_4],
+    [-0.866_246_8, 0.266_635_4, 0.422_518_64],
+    [-0.866_246_8, -0.266_635_4, -0.422_518_64],
+    [0.266_635_4, 0.866_246_8, 0.422_518_64],
+    [-0.266_635_4, 0.866_246_8, -0.422_518_64],
+    [-0.422_518_64, 0.866_246_8, 0.266_635_4],
+    [0.422_518_64, 0.866_246_8, -0.266_635_4],
+    [-0.266_635_4, -0.866_246_8, 0.422_518_64],
+    [0.266_635_4, -0.866_246_8, -0.422_518_64],
+    [0.422_518_64, -0.866_246_8, 0.266_635_4],
+    [-0.422_518_64, -0.866_246_8, -0.266_635_4],
+    [0.422_518_64, 0.266_635_4, 0.866_246_8],
+    [-0.422_518_64, -0.266_635_4, 0.866_246_8],
+    [0.266_635_4, -0.422_518_64, 0.866_246_8],
+    [-0.266_635_4, 0.422_518_64, 0.866_246_8],
+    [0.422_518_64, -0.266_635_4, -0.866_246_8],
+    [-0.422_518_64, 0.266_635_4, -0.866_246_8],
+    [0.266_635_4, 0.422_518_64, -0.866_246_8],
+    [-0.266_635_4, -0.422_518_64, -0.866_246_8],
+];
 
 /// Returns the number of ACN channels for an Ambisonics order.
 pub fn native_ambisonics_channel_count(order: u32) -> Result<usize> {
@@ -56,6 +89,37 @@ fn native_ambisonics_coefficients(
     }
 
     Ok(coeffs)
+}
+
+fn native_ambisonics_channel_order(channel: usize) -> u32 {
+    let mut order = 0u32;
+    while ((order + 1) * (order + 1)) as usize <= channel {
+        order += 1;
+    }
+    order
+}
+
+fn native_ambisonics_max_re_weights(order: u32) -> Result<[f32; MAX_NATIVE_AMBISONICS_CHANNELS]> {
+    let channel_count = native_ambisonics_channel_count(order)?;
+    let max_re_cosine = (137.9_f32.to_radians() / (order as f32 + 1.51)).cos();
+    let mut weights = [1.0; MAX_NATIVE_AMBISONICS_CHANNELS];
+
+    for (channel, weight) in weights.iter_mut().enumerate().take(channel_count) {
+        *weight = legendre_polynomial(native_ambisonics_channel_order(channel), max_re_cosine);
+    }
+
+    Ok(weights)
+}
+
+fn legendre_polynomial(order: u32, x: f32) -> f32 {
+    match order {
+        0 => 1.0,
+        1 => x,
+        2 => 0.5 * (3.0 * x * x - 1.0),
+        _ => {
+            unreachable!("native Ambisonics only supports order 0..={MAX_NATIVE_AMBISONICS_ORDER}")
+        }
+    }
 }
 
 /// Native Ambisonics encoder for mono point sources.
@@ -327,19 +391,25 @@ impl NativeAmbisonicsBinauralDecoder {
             ));
         }
 
-        // Approximate the spherical integral that maps an Ambisonics field to binaural HRIRs.
-        // This assumes the HRTF measurements are reasonably distributed over the sphere.
-        let weight = 4.0 * PI / direction_count as f32;
-        for index in 0..direction_count {
-            let entry = table.direction(index).ok_or_else(|| {
+        // Project native HRTFs with the same 24-point spherical design and max-rE order
+        // weighting used by Steam Audio's Ambisonics binaural decoder.  This preserves
+        // much more high-frequency detail than equally weighting every raw HRTF table
+        // entry, which over-smoothed non-uniform measurement sets.
+        let order_weights = native_ambisonics_max_re_weights(order)?;
+        for (speaker_index, speaker) in STEAM_AMBISONICS_VIRTUAL_SPEAKERS.iter().enumerate() {
+            let speaker_direction = Vec3::new(speaker[0], speaker[1], speaker[2]);
+            let hrtf_index = table.nearest_direction_index(speaker_direction);
+            let entry = table.direction(hrtf_index).ok_or_else(|| {
                 PetalSonicError::Configuration(format!(
-                    "native HRTF direction index {index} disappeared during decoder build"
+                    "native HRTF direction index {hrtf_index} for Ambisonics virtual speaker {speaker_index} disappeared during decoder build"
                 ))
             })?;
-            let coeffs = native_ambisonics_coefficients(order, entry.direction)?;
+            let coeffs = native_ambisonics_coefficients(order, speaker_direction)?;
 
             for channel in 0..channel_count {
-                let scaled_coeff = coeffs[channel] * weight;
+                let scaled_coeff = coeffs[channel]
+                    * STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT
+                    * order_weights[channel];
                 let filter_offset = channel * taps;
                 for tap in 0..taps {
                     left_filters[filter_offset + tap] += entry.left[tap] * scaled_coeff;
@@ -692,6 +762,47 @@ mod tests {
         assert_eq!(native_ambisonics_channel_count(1).unwrap(), 4);
         assert_eq!(native_ambisonics_channel_count(2).unwrap(), 9);
         assert!(native_ambisonics_channel_count(3).is_err());
+    }
+
+    #[test]
+    fn steam_virtual_speakers_are_order_two_orthonormal() {
+        let channel_count = native_ambisonics_channel_count(2).unwrap();
+        let mut basis = Vec::new();
+        for speaker in STEAM_AMBISONICS_VIRTUAL_SPEAKERS {
+            basis.push(
+                native_ambisonics_coefficients(2, Vec3::new(speaker[0], speaker[1], speaker[2]))
+                    .unwrap(),
+            );
+        }
+
+        for a in 0..channel_count {
+            for b in 0..channel_count {
+                let integral = basis
+                    .iter()
+                    .map(|coeffs| coeffs[a] * coeffs[b] * STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT)
+                    .sum::<f32>();
+                let expected = if a == b { 1.0 } else { 0.0 };
+                assert!(
+                    (integral - expected).abs() < 1e-5,
+                    "channels {a}/{b}: expected {expected}, got {integral}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_re_weights_match_steam_audio_channel_groups() {
+        let weights = native_ambisonics_max_re_weights(2).unwrap();
+
+        assert!((weights[0] - 1.0).abs() < 1e-6);
+        for channel in 1..=3 {
+            assert!((weights[channel] - weights[1]).abs() < 1e-6);
+        }
+        for channel in 4..=8 {
+            assert!((weights[channel] - weights[4]).abs() < 1e-6);
+        }
+        assert!(weights[1] > weights[4]);
+        assert!(weights[4] > 0.0);
     }
 
     #[test]

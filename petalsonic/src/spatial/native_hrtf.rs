@@ -1,8 +1,13 @@
 use crate::error::{PetalSonicError, Result};
 use crate::math::Vec3;
+use std::path::Path;
 use std::sync::Arc;
 
 const DEFAULT_DIRECTION: Vec3 = Vec3::NEG_Z;
+const PETALHRTF_MAGIC: &[u8; 8] = b"PETHRTF\0";
+const PETALHRTF_VERSION: u32 = 1;
+const PETALHRTF_HEADER_BYTES: usize = 8 + 4 + 4 + 4 + 4;
+const F32_BYTES: usize = std::mem::size_of::<f32>();
 
 /// One directional HRIR pair in a native PetalSonic HRTF table.
 #[derive(Debug, Clone)]
@@ -79,6 +84,94 @@ impl NativeHrtfTable {
             taps,
             directions: normalized_directions,
         })
+    }
+
+    /// Load a native PetalSonic HRTF table from a `.petalhrtf` file.
+    pub fn from_petalhrtf_file(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::read(path)?;
+        Self::from_petalhrtf_bytes(&bytes)
+    }
+
+    /// Decode a native PetalSonic HRTF table from bytes.
+    ///
+    /// Binary format, little-endian:
+    ///
+    /// - magic: `PETHRTF\0` (8 bytes)
+    /// - version: `u32` (`1`)
+    /// - sample rate: `u32`
+    /// - direction count: `u32`
+    /// - taps per ear: `u32`
+    /// - repeated direction records:
+    ///   - listener-local unit direction: `f32 x, y, z`
+    ///   - left HRIR taps: `taps * f32`
+    ///   - right HRIR taps: `taps * f32`
+    pub fn from_petalhrtf_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut reader = PetalHrtfReader::new(bytes);
+        let magic = reader.read_bytes(PETALHRTF_MAGIC.len())?;
+        if magic != PETALHRTF_MAGIC {
+            return Err(PetalSonicError::Configuration(
+                "invalid native HRTF magic; expected PETHRTF".to_string(),
+            ));
+        }
+
+        let version = reader.read_u32()?;
+        if version != PETALHRTF_VERSION {
+            return Err(PetalSonicError::Configuration(format!(
+                "unsupported native HRTF version {version}; expected {PETALHRTF_VERSION}"
+            )));
+        }
+
+        let sample_rate = reader.read_u32()?;
+        let direction_count = reader.read_u32()? as usize;
+        let taps = reader.read_u32()? as usize;
+        validate_petalhrtf_size(bytes.len(), direction_count, taps)?;
+
+        let mut directions = Vec::with_capacity(direction_count);
+        for _ in 0..direction_count {
+            let direction = Vec3::new(reader.read_f32()?, reader.read_f32()?, reader.read_f32()?);
+
+            let mut left = Vec::with_capacity(taps);
+            for _ in 0..taps {
+                left.push(reader.read_f32()?);
+            }
+
+            let mut right = Vec::with_capacity(taps);
+            for _ in 0..taps {
+                right.push(reader.read_f32()?);
+            }
+
+            directions.push(NativeHrtfDirection::new(direction, left, right));
+        }
+        reader.finish()?;
+
+        Self::new(sample_rate, directions)
+    }
+
+    /// Encode this table as `.petalhrtf` bytes.
+    pub fn to_petalhrtf_bytes(&self) -> Vec<u8> {
+        let direction_record_bytes = (3 + self.taps * 2) * F32_BYTES;
+        let total_bytes = PETALHRTF_HEADER_BYTES + self.directions.len() * direction_record_bytes;
+        let mut bytes = Vec::with_capacity(total_bytes);
+
+        bytes.extend_from_slice(PETALHRTF_MAGIC);
+        bytes.extend_from_slice(&PETALHRTF_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(self.directions.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.taps as u32).to_le_bytes());
+
+        for entry in &self.directions {
+            bytes.extend_from_slice(&entry.direction.x.to_le_bytes());
+            bytes.extend_from_slice(&entry.direction.y.to_le_bytes());
+            bytes.extend_from_slice(&entry.direction.z.to_le_bytes());
+            for sample in &entry.left {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            for sample in &entry.right {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+
+        bytes
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -209,6 +302,87 @@ impl NativeHrtfRenderer {
     }
 }
 
+struct PetalHrtfReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PetalHrtfReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_bytes(&mut self, count: usize) -> Result<&'a [u8]> {
+        let end = self.offset.checked_add(count).ok_or_else(|| {
+            PetalSonicError::Configuration("native HRTF read offset overflow".to_string())
+        })?;
+
+        let Some(slice) = self.bytes.get(self.offset..end) else {
+            return Err(PetalSonicError::Configuration(
+                "native HRTF file ended unexpectedly".to_string(),
+            ));
+        };
+
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        let bytes = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("u32 slice size"),
+        ))
+    }
+
+    fn read_f32(&mut self) -> Result<f32> {
+        let bytes = self.read_bytes(4)?;
+        Ok(f32::from_le_bytes(
+            bytes.try_into().expect("f32 slice size"),
+        ))
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.offset != self.bytes.len() {
+            return Err(PetalSonicError::Configuration(format!(
+                "native HRTF file has {} trailing bytes",
+                self.bytes.len() - self.offset
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_petalhrtf_size(bytes_len: usize, direction_count: usize, taps: usize) -> Result<()> {
+    let taps_per_direction = taps.checked_mul(2).ok_or_else(|| {
+        PetalSonicError::Configuration("native HRTF tap count overflow".to_string())
+    })?;
+    let floats_per_direction = 3usize.checked_add(taps_per_direction).ok_or_else(|| {
+        PetalSonicError::Configuration("native HRTF direction size overflow".to_string())
+    })?;
+    let bytes_per_direction = floats_per_direction.checked_mul(F32_BYTES).ok_or_else(|| {
+        PetalSonicError::Configuration("native HRTF direction byte size overflow".to_string())
+    })?;
+    let directions_bytes = direction_count
+        .checked_mul(bytes_per_direction)
+        .ok_or_else(|| {
+            PetalSonicError::Configuration("native HRTF table byte size overflow".to_string())
+        })?;
+    let expected_bytes = PETALHRTF_HEADER_BYTES
+        .checked_add(directions_bytes)
+        .ok_or_else(|| {
+            PetalSonicError::Configuration("native HRTF total byte size overflow".to_string())
+        })?;
+
+    if bytes_len != expected_bytes {
+        return Err(PetalSonicError::Configuration(format!(
+            "native HRTF file size mismatch: expected {expected_bytes} bytes, got {bytes_len}"
+        )));
+    }
+
+    Ok(())
+}
+
 fn normalize_direction(direction: Vec3) -> Vec3 {
     if direction.is_finite() && direction.length_squared() > f32::EPSILON {
         direction.normalize()
@@ -220,6 +394,7 @@ fn normalize_direction(direction: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_renderer() -> (NativeHrtfRenderer, NativeHrtfSourceState) {
         let table = NativeHrtfTable::new(
@@ -234,6 +409,11 @@ mod tests {
         let renderer = NativeHrtfRenderer::new(Arc::new(table));
         let state = renderer.create_source_state();
         (renderer, state)
+    }
+
+    fn unique_test_suffix() -> usize {
+        static NEXT_SUFFIX: AtomicUsize = AtomicUsize::new(0);
+        NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed)
     }
 
     #[test]
@@ -251,6 +431,71 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn petalhrtf_bytes_round_trip_table_data() {
+        let table = NativeHrtfTable::new(
+            44_100,
+            vec![
+                NativeHrtfDirection::new(Vec3::X * 2.0, vec![1.0, 0.5], vec![0.25, 0.0]),
+                NativeHrtfDirection::new(Vec3::NEG_Z, vec![0.0, -0.5], vec![1.0, 0.125]),
+            ],
+        )
+        .unwrap();
+
+        let decoded = NativeHrtfTable::from_petalhrtf_bytes(&table.to_petalhrtf_bytes()).unwrap();
+
+        assert_eq!(decoded.sample_rate(), 44_100);
+        assert_eq!(decoded.direction_count(), 2);
+        assert_eq!(decoded.taps(), 2);
+        let first = decoded.direction(0).unwrap();
+        assert!((first.direction - Vec3::X).length() < 1e-6);
+        assert_eq!(first.left, [1.0, 0.5]);
+        assert_eq!(first.right, [0.25, 0.0]);
+    }
+
+    #[test]
+    fn petalhrtf_file_loader_reads_round_trip_bytes() {
+        let table = NativeHrtfTable::new(
+            48_000,
+            vec![NativeHrtfDirection::new(Vec3::NEG_Z, vec![1.0], vec![0.5])],
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "petalsonic-test-{}-{}.petalhrtf",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+
+        std::fs::write(&path, table.to_petalhrtf_bytes()).unwrap();
+        let decoded = NativeHrtfTable::from_petalhrtf_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(decoded.sample_rate(), 48_000);
+        assert_eq!(decoded.direction_count(), 1);
+        assert_eq!(decoded.taps(), 1);
+    }
+
+    #[test]
+    fn petalhrtf_rejects_bad_magic_version_and_size() {
+        let table = NativeHrtfTable::new(
+            48_000,
+            vec![NativeHrtfDirection::new(Vec3::NEG_Z, vec![1.0], vec![1.0])],
+        )
+        .unwrap();
+        let mut bytes = table.to_petalhrtf_bytes();
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] = b'X';
+        assert!(NativeHrtfTable::from_petalhrtf_bytes(&bad_magic).is_err());
+
+        let mut bad_version = bytes.clone();
+        bad_version[8..12].copy_from_slice(&999u32.to_le_bytes());
+        assert!(NativeHrtfTable::from_petalhrtf_bytes(&bad_version).is_err());
+
+        bytes.push(0);
+        assert!(NativeHrtfTable::from_petalhrtf_bytes(&bytes).is_err());
     }
 
     #[test]

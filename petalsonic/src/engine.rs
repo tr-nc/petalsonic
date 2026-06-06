@@ -1,5 +1,5 @@
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::PetalSonicWorldDesc;
+use crate::config::{DirectPathBackend, HrtfBackend, PetalSonicWorldDesc};
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
@@ -464,6 +464,34 @@ impl PetalSonicEngine {
     /// Get the engine configuration
     pub fn config(&self) -> &PetalSonicWorldDesc {
         &self.desc
+    }
+
+    /// Change spatial backends for subsequent render blocks.
+    ///
+    /// This may allocate if a backend is selected for the first time, so call it from the
+    /// game/update thread rather than the audio callback.
+    pub fn set_spatial_backends(
+        &mut self,
+        hrtf_backend: HrtfBackend,
+        direct_path_backend: DirectPathBackend,
+    ) -> Result<()> {
+        if let Some(spatial_processor) = &self.spatial_processor {
+            let mut processor = spatial_processor.lock().map_err(|_| {
+                PetalSonicError::Engine("Spatial processor lock is poisoned".into())
+            })?;
+            processor.set_spatial_backends(hrtf_backend, direct_path_backend)?;
+            self.desc.hrtf_backend = processor.hrtf_backend();
+            self.desc.direct_path_backend = processor.direct_path_backend();
+        } else {
+            self.desc.hrtf_backend = hrtf_backend;
+            self.desc.direct_path_backend = direct_path_backend;
+        }
+
+        Ok(())
+    }
+
+    pub fn spatial_backends(&self) -> (HrtfBackend, DirectPathBackend) {
+        (self.desc.hrtf_backend, self.desc.direct_path_backend)
     }
 
     pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {

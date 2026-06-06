@@ -539,6 +539,95 @@ impl SpatialProcessor {
         Ok(())
     }
 
+    /// Change the runtime spatial backends used for subsequent render blocks.
+    ///
+    /// This is intended for game-side A/B testing from non-realtime threads. It may allocate the
+    /// first time the Steam Audio HRTF path is selected, so callers must not invoke it from an
+    /// audio callback.
+    pub fn set_spatial_backends(
+        &mut self,
+        hrtf_backend: HrtfBackend,
+        direct_path_backend: DirectPathBackend,
+    ) -> Result<()> {
+        if hrtf_backend == self.hrtf_backend && direct_path_backend == self.direct_path_backend {
+            return Ok(());
+        }
+
+        match hrtf_backend {
+            HrtfBackend::SteamAudio => self.ensure_steam_hrtf_resources()?,
+            HrtfBackend::Native => {
+                if self.native_hrtf_renderer.is_none() {
+                    return Err(PetalSonicError::SpatialAudio(
+                        "native HRTF renderer is not initialized".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let old_hrtf_backend = self.hrtf_backend;
+        let old_direct_path_backend = self.direct_path_backend;
+        self.hrtf_backend = hrtf_backend;
+        self.direct_path_backend = direct_path_backend;
+
+        log::info!(
+            "PetalSonic spatial backend switch: hrtf_backend={:?}->{:?}, direct_path_backend={:?}->{:?}, direct_occlusion_enabled={}, reflections_enabled={}, native_early_reflections_enabled={}",
+            old_hrtf_backend,
+            self.hrtf_backend,
+            old_direct_path_backend,
+            self.direct_path_backend,
+            self.direct_occlusion_enabled,
+            self.reflections_enabled,
+            self.native_early_reflections_enabled
+        );
+
+        Ok(())
+    }
+
+    pub fn hrtf_backend(&self) -> HrtfBackend {
+        self.hrtf_backend
+    }
+
+    pub fn direct_path_backend(&self) -> DirectPathBackend {
+        self.direct_path_backend
+    }
+
+    fn ensure_steam_hrtf_resources(&mut self) -> Result<()> {
+        let audio_settings = AudioSettings {
+            sampling_rate: self.sample_rate,
+            frame_size: self.frame_size as u32,
+        };
+
+        if self.hrtf.is_none() {
+            self.hrtf = Some(hrtf::create_default_hrtf(&self.context, &audio_settings)?);
+        }
+
+        if self.ambisonics_decode_effect.is_none() {
+            let hrtf = self.hrtf.as_ref().ok_or_else(|| {
+                PetalSonicError::SpatialAudio("Steam Audio HRTF is not initialized".to_string())
+            })?;
+            self.ambisonics_decode_effect = Some(
+                AmbisonicsDecodeEffect::try_new(
+                    &self.context,
+                    &audio_settings,
+                    &AmbisonicsDecodeEffectSettings {
+                        max_order: 2,
+                        speaker_layout: SpeakerLayout::Stereo,
+                        hrtf,
+                        rendering: Rendering::Binaural,
+                    },
+                )
+                .map_err(|e| {
+                    PetalSonicError::SpatialAudio(format!(
+                        "Failed to create AmbisonicsDecodeEffect: {}",
+                        e
+                    ))
+                })?,
+            );
+        }
+
+        Ok(())
+    }
+
     /// Create effects for a spatial source
     pub fn create_effects_for_source(&mut self, source_id: SourceId) -> Result<()> {
         let audio_settings = AudioSettings {

@@ -314,9 +314,10 @@ impl SpatialProcessor {
                 frame_size,
             )?);
             if use_ambisonics && hrtf_backend == HrtfBackend::Native {
-                let decoder = NativeAmbisonicsBinauralDecoder::new(
+                let decoder = NativeAmbisonicsBinauralDecoder::with_frame_size(
                     table.clone(),
                     DEFAULT_NATIVE_AMBISONICS_ORDER,
+                    frame_size,
                 )?;
                 native_ambisonics_state = Some(decoder.create_state());
                 native_ambisonics_decoder = Some(decoder);
@@ -756,9 +757,10 @@ impl SpatialProcessor {
             let table = self.native_hrtf_table.as_ref().ok_or_else(|| {
                 PetalSonicError::SpatialAudio("native HRTF table is not initialized".to_string())
             })?;
-            let decoder = NativeAmbisonicsBinauralDecoder::new(
+            let decoder = NativeAmbisonicsBinauralDecoder::with_frame_size(
                 table.clone(),
                 DEFAULT_NATIVE_AMBISONICS_ORDER,
+                self.frame_size,
             )?;
             self.native_ambisonics_state = Some(decoder.create_state());
             self.native_ambisonics_decoder = Some(decoder);

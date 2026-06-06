@@ -98,7 +98,7 @@ pub use acoustics::{
 pub use config::{
     AmbisonicsBackend, DirectPathBackend, HrtfBackend, PetalSonicWorldDesc, SourceConfig,
 };
-pub use engine::{AudioFillCallback, PetalSonicEngine};
+pub use engine::{AudioFillCallback, AudioOutputDeviceInfo, PetalSonicEngine};
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};

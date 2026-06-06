@@ -45,6 +45,10 @@ pub struct PetalSonicWorldDesc {
     pub channels: u16,
     /// Maximum number of concurrent audio sources
     pub max_sources: usize,
+    /// Optional case-insensitive substring used to select a CPAL output device by name.
+    ///
+    /// When `None` or empty, PetalSonic uses the system default output device.
+    pub output_device_name_contains: Option<String>,
     /// Optional backend-specific path to HRTF data.
     ///
     /// Prefer [`Self::steam_hrtf_path`] and [`Self::native_hrtf_path`] when both backends may be
@@ -97,6 +101,7 @@ impl Default for PetalSonicWorldDesc {
             block_size: 1024,
             channels: 2,
             max_sources: 2048,
+            output_device_name_contains: None,
             hrtf_path: None,
             steam_hrtf_path: None,
             native_hrtf_path: None,
@@ -119,6 +124,10 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("block_size", &self.block_size)
             .field("channels", &self.channels)
             .field("max_sources", &self.max_sources)
+            .field(
+                "output_device_name_contains",
+                &self.output_device_name_contains,
+            )
             .field("hrtf_path", &self.hrtf_path)
             .field("steam_hrtf_path", &self.steam_hrtf_path)
             .field("native_hrtf_path", &self.native_hrtf_path)

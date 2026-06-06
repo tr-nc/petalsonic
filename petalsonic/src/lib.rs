@@ -102,5 +102,8 @@ pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};
 pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
 pub use procedural::{ProceduralAudioFactory, ProceduralAudioSource};
-pub use spatial::{DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission};
+pub use spatial::{
+    DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission, NativeHrtfDirection,
+    NativeHrtfRenderer, NativeHrtfSourceState, NativeHrtfTable,
+};
 pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};

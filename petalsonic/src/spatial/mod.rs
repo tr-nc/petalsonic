@@ -5,9 +5,13 @@
 
 mod effects;
 mod hrtf;
+mod native_hrtf;
 mod processor;
 
 // Public API
+pub use native_hrtf::{
+    NativeHrtfDirection, NativeHrtfRenderer, NativeHrtfSourceState, NativeHrtfTable,
+};
 pub use processor::{
     DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission,
     SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor,

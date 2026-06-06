@@ -93,15 +93,21 @@ pub mod spatial;
 pub mod world;
 
 pub use acoustics::{
-    AcousticHit, AcousticMaterial, AcousticRay, BatchedAnyHitRayTracer,
-    BatchedClosestHitRayTracer,
+    AcousticHit, AcousticMaterial, AcousticRay, BatchedAnyHitRayTracer, BatchedClosestHitRayTracer,
 };
-pub use config::{PetalSonicWorldDesc, SourceConfig};
-pub use engine::{AudioFillCallback, PetalSonicEngine};
+pub use config::{
+    AmbisonicsBackend, DirectPathBackend, HrtfBackend, PetalSonicWorldDesc, SourceConfig,
+};
+pub use engine::{AudioFillCallback, AudioOutputDeviceInfo, PetalSonicEngine};
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};
 pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
 pub use procedural::{ProceduralAudioFactory, ProceduralAudioSource};
-pub use spatial::{DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission};
+pub use spatial::{
+    DEFAULT_NATIVE_AMBISONICS_ORDER, DirectOcclusionDebugSnapshot, DirectPathOverride,
+    DirectPathTransmission, NativeAmbisonicsBinauralDecoder, NativeAmbisonicsBinauralState,
+    NativeAmbisonicsEncoder, NativeHrtfDirection, NativeHrtfRenderMetrics, NativeHrtfRenderer,
+    NativeHrtfSourceState, NativeHrtfTable, native_ambisonics_channel_count,
+};
 pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};

@@ -79,9 +79,14 @@ pub fn draw_profiling_widget(
                 "Direct mixing: {}",
                 format_time_auto(latest.direct_mixing_time_us)
             ));
+            ui.label(format!("Spatial sources: {}", latest.spatial_source_count));
             ui.label(format!(
                 "Physics sim: {}",
                 format_time_auto(latest.spatial_simulation_time_us)
+            ));
+            ui.label(format!(
+                "Direct path: {}",
+                format_time_auto(latest.direct_processing_time_us)
             ));
             ui.label(format!(
                 "Ambisonics encode: {}",
@@ -90,6 +95,18 @@ pub fn draw_profiling_widget(
             ui.label(format!(
                 "Ambisonics decode: {}",
                 format_time_auto(latest.ambisonics_decoding_time_us)
+            ));
+            ui.label(format!(
+                "HRTF render: {}",
+                format_time_auto(latest.hrtf_rendering_time_us)
+            ));
+            ui.label(format!(
+                "Native HRTF lookup: {}",
+                format_time_auto(latest.native_hrtf_direction_lookup_time_us)
+            ));
+            ui.label(format!(
+                "Native HRTF FIR: {}",
+                format_time_auto(latest.native_hrtf_convolution_time_us)
             ));
         });
 

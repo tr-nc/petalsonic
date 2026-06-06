@@ -175,7 +175,12 @@ impl PetalSonicWorld {
 
     /// Returns a list of all audio source IDs currently stored in the world.
     pub fn get_audio_source_ids(&self) -> Vec<SourceId> {
-        self.source_storage.lock().unwrap().keys().copied().collect()
+        self.source_storage
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn contains_audio(&self, id: SourceId) -> bool {

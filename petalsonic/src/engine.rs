@@ -1,5 +1,5 @@
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::PetalSonicWorldDesc;
+use crate::config::{AmbisonicsBackend, DirectPathBackend, HrtfBackend, PetalSonicWorldDesc};
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
@@ -17,6 +17,7 @@ use ringbuf::{
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -93,6 +94,18 @@ struct StreamCreationParams {
     timing_sender: Sender<RenderTimingEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioOutputDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+    pub aliases: Vec<String>,
+}
+
+struct AudioOutputDeviceCandidate {
+    device: cpal::Device,
+    info: AudioOutputDeviceInfo,
+}
+
 /// Callback function type for filling audio samples
 ///
 /// The callback receives:
@@ -141,7 +154,13 @@ impl PetalSonicEngine {
             desc.block_size,
             desc.distance_scaler,
             desc.hrtf_path.as_deref(),
+            desc.steam_hrtf_path.as_deref(),
+            desc.native_hrtf_path.as_deref(),
             desc.hrtf_gain,
+            desc.hrtf_backend,
+            desc.direct_path_backend,
+            desc.use_ambisonics,
+            desc.ambisonics_backend,
             desc.batched_any_hit_ray_tracer.clone(),
             desc.batched_closest_hit_ray_tracer.clone(),
         ) {
@@ -228,7 +247,8 @@ impl PetalSonicEngine {
             return Ok(());
         }
 
-        let (device, device_config) = Self::init_audio_device()?;
+        let (device, device_config) =
+            Self::init_audio_device(self.desc.output_device_name_contains.as_deref())?;
         let device_sample_rate = device_config.sample_rate().0;
 
         self.device_sample_rate = device_sample_rate;
@@ -243,8 +263,32 @@ impl PetalSonicEngine {
         let config =
             Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
 
-        let (stream, pump_state) =
-            self.build_and_start_stream(&device, &device_config, &config, device_sample_rate)?;
+        let (stream, pump_state) = match self.build_and_start_stream(
+            &device,
+            &device_config,
+            &config,
+            device_sample_rate,
+        ) {
+            Ok(result) => result,
+            Err(err) if !matches!(config.buffer_size, cpal::BufferSize::Default) => {
+                log::warn!(
+                    "PetalSonic failed to start stream with requested output buffer size ({}); retrying with the device default buffer size",
+                    err
+                );
+                let default_config = Self::create_stream_config(
+                    self.desc.channels,
+                    device_sample_rate,
+                    cpal::BufferSize::Default,
+                );
+                self.build_and_start_stream(
+                    &device,
+                    &device_config,
+                    &default_config,
+                    device_sample_rate,
+                )?
+            }
+            Err(err) => return Err(err),
+        };
 
         self.stream = Some(stream);
         self.pump_state = Some(pump_state);
@@ -254,19 +298,29 @@ impl PetalSonicEngine {
     }
 
     /// Initialize the audio device and retrieve its configuration
-    fn init_audio_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+    fn init_audio_device(
+        output_device_name_contains: Option<&str>,
+    ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or_else(|| {
-            PetalSonicError::AudioDevice("No default output device available".into())
-        })?;
-
-        let device_config = device.default_output_config().map_err(|e| {
-            PetalSonicError::AudioDevice(format!("Failed to get default config: {}", e))
-        })?;
+        let device = match output_device_name_contains
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name_contains) => Self::find_output_device_by_name_contains(&host, name_contains)?,
+            None => host.default_output_device().ok_or_else(|| {
+                PetalSonicError::AudioDevice("No default output device available".into())
+            })?,
+        };
 
         let device_name = device
             .name()
             .unwrap_or_else(|_| "Unknown output device".to_string());
+        let device_config = device.default_output_config().map_err(|e| {
+            PetalSonicError::AudioDevice(format!(
+                "Failed to get default config for output device '{}': {}",
+                device_name, e
+            ))
+        })?;
         let buffer_size = match device_config.buffer_size() {
             cpal::SupportedBufferSize::Range { min, max } => {
                 format!("range {}..{} frames", min, max)
@@ -285,6 +339,235 @@ impl PetalSonicEngine {
         );
 
         Ok((device, device_config))
+    }
+
+    pub fn available_output_devices() -> Result<Vec<AudioOutputDeviceInfo>> {
+        let host = cpal::default_host();
+        Ok(Self::output_device_candidates(&host)?
+            .into_iter()
+            .map(|candidate| candidate.info)
+            .collect())
+    }
+
+    fn find_output_device_by_name_contains(
+        host: &cpal::Host,
+        name_contains: &str,
+    ) -> Result<cpal::Device> {
+        let candidates = Self::output_device_candidates(host)?;
+        let mut matches: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| Self::output_device_matches(&candidate.info, name_contains))
+            .collect();
+
+        if matches.is_empty() {
+            let available_devices = Self::output_device_candidates(host)?
+                .into_iter()
+                .map(|candidate| candidate.info)
+                .collect::<Vec<_>>();
+            return Err(PetalSonicError::AudioDevice(format!(
+                "No output device name or alias matches '{}'. Available output devices: {}",
+                name_contains,
+                Self::format_device_infos(&available_devices)
+            )));
+        }
+
+        let matched_devices: Vec<_> = matches
+            .iter()
+            .map(|candidate| candidate.info.clone())
+            .collect();
+        if matched_devices.len() > 1 {
+            log::warn!(
+                "PetalSonic output device substring '{}' matched multiple devices: {}; using {}",
+                name_contains,
+                Self::format_device_infos(&matched_devices),
+                Self::format_device_info(&matched_devices[0])
+            );
+        } else {
+            log::info!(
+                "PetalSonic output device substring '{}' matched {}",
+                name_contains,
+                Self::format_device_info(&matched_devices[0])
+            );
+        }
+
+        Ok(matches.remove(0).device)
+    }
+
+    fn output_device_candidates(host: &cpal::Host) -> Result<Vec<AudioOutputDeviceCandidate>> {
+        let default_name = host
+            .default_output_device()
+            .and_then(|device| device.name().ok());
+        let alsa_card_aliases = Self::alsa_card_aliases();
+        let output_devices = host.output_devices().map_err(|e| {
+            PetalSonicError::AudioDevice(format!("Failed to enumerate output devices: {}", e))
+        })?;
+
+        Ok(output_devices
+            .map(|device| {
+                let name = device
+                    .name()
+                    .unwrap_or_else(|_| "Unknown output device".to_string());
+                let aliases = Self::output_device_aliases(&name, &alsa_card_aliases);
+                let is_default = default_name.as_deref() == Some(name.as_str());
+                AudioOutputDeviceCandidate {
+                    device,
+                    info: AudioOutputDeviceInfo {
+                        name,
+                        is_default,
+                        aliases,
+                    },
+                }
+            })
+            .collect())
+    }
+
+    fn output_device_matches(info: &AudioOutputDeviceInfo, name_contains: &str) -> bool {
+        let requested = Self::normalize_device_name(name_contains);
+        if requested.is_empty() {
+            return false;
+        }
+
+        if Self::normalize_device_name(&info.name).contains(&requested) {
+            return true;
+        }
+
+        info.aliases.iter().any(|alias| {
+            let alias = Self::normalize_device_name(alias);
+            !alias.is_empty()
+                && (alias.contains(&requested) || alias.len() >= 3 && requested.contains(&alias))
+        })
+    }
+
+    fn output_device_aliases(
+        device_name: &str,
+        alsa_card_aliases: &HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        let mut aliases = Vec::new();
+        for card_id in Self::alsa_card_ids_in_device_name(device_name) {
+            if let Some(card_aliases) = alsa_card_aliases.get(&card_id) {
+                aliases.extend(card_aliases.iter().cloned());
+            }
+        }
+        Self::dedup_strings(&mut aliases);
+        aliases
+    }
+
+    fn alsa_card_ids_in_device_name(device_name: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut rest = device_name;
+        while let Some(index) = rest.find("CARD=") {
+            let after_card = &rest[index + "CARD=".len()..];
+            let id = after_card
+                .split(|ch: char| ch == ',' || ch == ':' || ch.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !id.is_empty() {
+                ids.push(id.to_string());
+            }
+            rest = &after_card[id.len()..];
+        }
+        Self::dedup_strings(&mut ids);
+        ids
+    }
+
+    #[cfg(target_os = "linux")]
+    fn alsa_card_aliases() -> HashMap<String, Vec<String>> {
+        Self::parse_alsa_card_aliases(Path::new("/proc/asound/cards"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn alsa_card_aliases() -> HashMap<String, Vec<String>> {
+        HashMap::new()
+    }
+
+    fn parse_alsa_card_aliases(path: &Path) -> HashMap<String, Vec<String>> {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return HashMap::new();
+        };
+
+        let mut aliases_by_id = HashMap::new();
+        let mut lines = contents.lines();
+        while let Some(line) = lines.next() {
+            let Some(open) = line.find('[') else {
+                continue;
+            };
+            let Some(close) = line[open + 1..].find(']').map(|offset| open + 1 + offset) else {
+                continue;
+            };
+            let card_id = line[open + 1..close].trim();
+            if card_id.is_empty() {
+                continue;
+            }
+
+            let mut aliases = vec![card_id.to_string()];
+            if let Some((_, display_name)) = line.split_once(" - ") {
+                aliases.push(display_name.trim().to_string());
+            }
+            if let Some(detail_line) = lines.next() {
+                let detail = detail_line
+                    .trim()
+                    .split_once(" at ")
+                    .map(|(name, _)| name)
+                    .unwrap_or_else(|| detail_line.trim());
+                if !detail.is_empty() {
+                    aliases.push(detail.to_string());
+                }
+            }
+
+            Self::dedup_strings(&mut aliases);
+            aliases_by_id.insert(card_id.to_string(), aliases);
+        }
+
+        aliases_by_id
+    }
+
+    fn dedup_strings(values: &mut Vec<String>) {
+        let mut seen = Vec::new();
+        values.retain(|value| {
+            let normalized = Self::normalize_device_name(value);
+            if normalized.is_empty() || seen.contains(&normalized) {
+                false
+            } else {
+                seen.push(normalized);
+                true
+            }
+        });
+    }
+
+    fn normalize_device_name(name: &str) -> String {
+        name.trim().to_lowercase()
+    }
+
+    fn format_device_infos(devices: &[AudioOutputDeviceInfo]) -> String {
+        if devices.is_empty() {
+            return "<none>".to_string();
+        }
+
+        devices
+            .iter()
+            .map(Self::format_device_info)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn format_device_info(device: &AudioOutputDeviceInfo) -> String {
+        let default_marker = if device.is_default { " (default)" } else { "" };
+        if device.aliases.is_empty() {
+            return format!("'{}'{}", device.name, default_marker);
+        }
+
+        format!(
+            "'{}'{} (aliases: {})",
+            device.name,
+            default_marker,
+            device
+                .aliases
+                .iter()
+                .map(|alias| format!("'{}'", alias))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 
     /// Create the stream configuration
@@ -462,6 +745,67 @@ impl PetalSonicEngine {
     /// Get the engine configuration
     pub fn config(&self) -> &PetalSonicWorldDesc {
         &self.desc
+    }
+
+    /// Change spatial backends for subsequent render blocks.
+    ///
+    /// This may allocate if a backend is selected for the first time, so call it from the
+    /// game/update thread rather than the audio callback.
+    pub fn set_spatial_backends(
+        &mut self,
+        hrtf_backend: HrtfBackend,
+        direct_path_backend: DirectPathBackend,
+    ) -> Result<()> {
+        self.set_spatial_rendering(
+            hrtf_backend,
+            direct_path_backend,
+            self.desc.use_ambisonics,
+            self.desc.ambisonics_backend,
+        )
+    }
+
+    pub fn set_spatial_rendering(
+        &mut self,
+        hrtf_backend: HrtfBackend,
+        direct_path_backend: DirectPathBackend,
+        use_ambisonics: bool,
+        ambisonics_backend: AmbisonicsBackend,
+    ) -> Result<()> {
+        if let Some(spatial_processor) = &self.spatial_processor {
+            let mut processor = spatial_processor.lock().map_err(|_| {
+                PetalSonicError::Engine("Spatial processor lock is poisoned".into())
+            })?;
+            processor.set_spatial_rendering(
+                hrtf_backend,
+                direct_path_backend,
+                use_ambisonics,
+                ambisonics_backend,
+            )?;
+            self.desc.hrtf_backend = processor.hrtf_backend();
+            self.desc.direct_path_backend = processor.direct_path_backend();
+            self.desc.use_ambisonics = processor.use_ambisonics();
+            self.desc.ambisonics_backend = processor.ambisonics_backend();
+        } else {
+            self.desc.hrtf_backend = hrtf_backend;
+            self.desc.direct_path_backend = direct_path_backend;
+            self.desc.use_ambisonics = use_ambisonics;
+            self.desc.ambisonics_backend = ambisonics_backend;
+        }
+
+        Ok(())
+    }
+
+    pub fn spatial_backends(&self) -> (HrtfBackend, DirectPathBackend) {
+        (self.desc.hrtf_backend, self.desc.direct_path_backend)
+    }
+
+    pub fn spatial_rendering(&self) -> (HrtfBackend, DirectPathBackend, bool, AmbisonicsBackend) {
+        (
+            self.desc.hrtf_backend,
+            self.desc.direct_path_backend,
+            self.desc.use_ambisonics,
+            self.desc.ambisonics_backend,
+        )
     }
 
     pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {
@@ -935,9 +1279,14 @@ impl PetalSonicEngine {
         let mut total_mixing_time_us = 0u64;
         let mut total_spatial_time_us = 0u64;
         let mut total_direct_mixing_time_us = 0u64;
+        let mut total_spatial_source_count = 0usize;
         let mut total_spatial_simulation_time_us = 0u64;
+        let mut total_direct_processing_time_us = 0u64;
         let mut total_ambisonics_encoding_time_us = 0u64;
         let mut total_ambisonics_decoding_time_us = 0u64;
+        let mut total_hrtf_rendering_time_us = 0u64;
+        let mut total_native_hrtf_direction_lookup_time_us = 0u64;
+        let mut total_native_hrtf_convolution_time_us = 0u64;
         let mut total_resampling_time_us = 0u64;
 
         let Ok(mut resampler) = resampler_arc.try_lock() else {
@@ -949,9 +1298,14 @@ impl PetalSonicEngine {
                     mixing_time_us: 0,
                     spatial_time_us: 0,
                     direct_mixing_time_us: 0,
+                    spatial_source_count: 0,
                     spatial_simulation_time_us: 0,
+                    direct_processing_time_us: 0,
                     ambisonics_encoding_time_us: 0,
                     ambisonics_decoding_time_us: 0,
+                    hrtf_rendering_time_us: 0,
+                    native_hrtf_direction_lookup_time_us: 0,
+                    native_hrtf_convolution_time_us: 0,
                     resampling_time_us: 0,
                     total_time_us: 0,
                 },
@@ -1001,11 +1355,18 @@ impl PetalSonicEngine {
                 total_direct_mixing_time_us += mix_profiling.direct_mix_time_us;
                 total_spatial_time_us += mix_profiling.spatial_mix_time_us;
                 if let Some(spatial_metrics) = mix_profiling.spatial_metrics {
+                    total_spatial_source_count += spatial_metrics.spatial_source_count;
                     total_spatial_simulation_time_us += spatial_metrics.physics_simulation_time_us;
+                    total_direct_processing_time_us += spatial_metrics.direct_processing_time_us;
                     total_ambisonics_encoding_time_us +=
                         spatial_metrics.ambisonics_encoding_time_us;
                     total_ambisonics_decoding_time_us +=
                         spatial_metrics.ambisonics_decoding_time_us;
+                    total_hrtf_rendering_time_us += spatial_metrics.hrtf_rendering_time_us;
+                    total_native_hrtf_direction_lookup_time_us +=
+                        spatial_metrics.native_hrtf_direction_lookup_time_us;
+                    total_native_hrtf_convolution_time_us +=
+                        spatial_metrics.native_hrtf_convolution_time_us;
                 }
 
                 RESAMPLED_BUFFER.with(|rbuf| {
@@ -1076,9 +1437,14 @@ impl PetalSonicEngine {
                 mixing_time_us: total_mixing_time_us,
                 spatial_time_us: total_spatial_time_us,
                 direct_mixing_time_us: total_direct_mixing_time_us,
+                spatial_source_count: total_spatial_source_count,
                 spatial_simulation_time_us: total_spatial_simulation_time_us,
+                direct_processing_time_us: total_direct_processing_time_us,
                 ambisonics_encoding_time_us: total_ambisonics_encoding_time_us,
                 ambisonics_decoding_time_us: total_ambisonics_decoding_time_us,
+                hrtf_rendering_time_us: total_hrtf_rendering_time_us,
+                native_hrtf_direction_lookup_time_us: total_native_hrtf_direction_lookup_time_us,
+                native_hrtf_convolution_time_us: total_native_hrtf_convolution_time_us,
                 resampling_time_us: total_resampling_time_us,
                 total_time_us: total_elapsed.as_micros() as u64,
             },
@@ -1130,4 +1496,51 @@ fn apply_master_gain_and_limit(
 
 fn log_audio_timing_event(message: &str) {
     log::trace!("[audio-timing] {}", message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alsa_card_alias_parser_extracts_card_id_and_display_names() {
+        let path = std::env::temp_dir().join(format!(
+            "petalsonic-asound-cards-test-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            " 4 [KA3            ]: USB-Audio - FiiO KA3\n                      FiiO FiiO KA3 at usb-0000:00:14.0-11, high speed\n",
+        )
+        .unwrap();
+
+        let aliases = PetalSonicEngine::parse_alsa_card_aliases(&path);
+        let ka3_aliases = aliases.get("KA3").unwrap();
+        assert_eq!(
+            ka3_aliases,
+            &vec![
+                "KA3".to_string(),
+                "FiiO KA3".to_string(),
+                "FiiO FiiO KA3".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn output_device_matching_accepts_linux_alias_and_pipewire_style_name() {
+        let device = AudioOutputDeviceInfo {
+            name: "sysdefault:CARD=KA3".to_string(),
+            is_default: false,
+            aliases: vec!["KA3".to_string(), "FiiO KA3".to_string()],
+        };
+
+        assert!(PetalSonicEngine::output_device_matches(&device, "ka3"));
+        assert!(PetalSonicEngine::output_device_matches(
+            &device,
+            "FiiO KA3 Analog Stereo"
+        ));
+        assert!(!PetalSonicEngine::output_device_matches(&device, "EX2050S"));
+    }
 }

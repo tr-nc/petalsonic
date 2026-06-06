@@ -1,10 +1,10 @@
 use crate::error::{PetalSonicError, Result};
 use crate::world::SourceId;
 use audionimbus::{
-    num_ambisonics_channels, AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings,
-    AudioSettings, Context, Convolution, CustomRayTracer, Direct, DirectEffect,
-    DirectEffectSettings, ReflectionEffect, ReflectionEffectSettings, Reflections,
-    SimulationFlags, Simulator, Source, SourceSettings,
+    AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings, AudioSettings, BinauralEffect,
+    BinauralEffectSettings, Context, Convolution, CustomRayTracer, Direct, DirectEffect,
+    DirectEffectSettings, Hrtf, ReflectionEffect, ReflectionEffectSettings, Reflections,
+    SimulationFlags, Simulator, Source, SourceSettings, num_ambisonics_channels,
 };
 use std::collections::HashMap;
 
@@ -24,16 +24,38 @@ pub struct SpatialSourceEffects {
     pub reflection_effect: ReflectionEffect<Convolution>,
     /// Ambisonics encode effect (spatial encoding)
     pub ambisonics_encode_effect: AmbisonicsEncodeEffect,
+    /// Steam Audio direct binaural effect used when Ambisonics is disabled.
+    pub binaural_effect: Option<BinauralEffect>,
 }
 
 unsafe impl Send for SpatialSourceEffects {}
 
 impl SpatialSourceEffects {
+    pub fn ensure_binaural_effect(
+        &mut self,
+        context: &Context,
+        audio_settings: &AudioSettings,
+        hrtf: &Hrtf,
+    ) -> Result<()> {
+        if self.binaural_effect.is_some() {
+            return Ok(());
+        }
+
+        self.binaural_effect = Some(
+            BinauralEffect::try_new(context, audio_settings, &BinauralEffectSettings { hrtf })
+                .map_err(|e| {
+                    PetalSonicError::SpatialAudio(format!("Failed to create BinauralEffect: {}", e))
+                })?,
+        );
+        Ok(())
+    }
+
     /// Create effects for a new spatial source
     pub fn new(
         context: &Context,
         simulator: &SpatialSimulator,
         audio_settings: &AudioSettings,
+        hrtf: Option<&Hrtf>,
     ) -> Result<Self> {
         let source: SpatialSource = Source::try_new(
             simulator,
@@ -56,7 +78,8 @@ impl SpatialSourceEffects {
             context,
             audio_settings,
             &ReflectionEffectSettings {
-                impulse_response_size: audio_settings.sampling_rate * REFLECTION_IR_DURATION_SECONDS,
+                impulse_response_size: audio_settings.sampling_rate
+                    * REFLECTION_IR_DURATION_SECONDS,
                 num_channels: num_ambisonics_channels(REFLECTIONS_ORDER),
             },
         )
@@ -75,11 +98,26 @@ impl SpatialSourceEffects {
             PetalSonicError::SpatialAudio(format!("Failed to create AmbisonicsEncodeEffect: {}", e))
         })?;
 
+        let binaural_effect = if let Some(hrtf) = hrtf {
+            Some(
+                BinauralEffect::try_new(context, audio_settings, &BinauralEffectSettings { hrtf })
+                    .map_err(|e| {
+                        PetalSonicError::SpatialAudio(format!(
+                            "Failed to create BinauralEffect: {}",
+                            e
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             source,
             direct_effect,
             reflection_effect,
             ambisonics_encode_effect,
+            binaural_effect,
         })
     }
 }
@@ -103,12 +141,13 @@ impl SpatialEffectsManager {
         context: &Context,
         simulator: &mut SpatialSimulator,
         audio_settings: &AudioSettings,
+        hrtf: Option<&Hrtf>,
     ) -> Result<()> {
         if self.effects.contains_key(&source_id) {
             log::warn!("Effects for source {} already exist, replacing", source_id);
         }
 
-        let effects = SpatialSourceEffects::new(context, simulator, audio_settings)?;
+        let effects = SpatialSourceEffects::new(context, simulator, audio_settings, hrtf)?;
 
         // Add source to simulator
         simulator.add_source(&effects.source);
@@ -139,6 +178,18 @@ impl SpatialEffectsManager {
     /// Check if effects exist for a source
     pub fn has_effects(&self, source_id: SourceId) -> bool {
         self.effects.contains_key(&source_id)
+    }
+
+    pub fn ensure_binaural_effects(
+        &mut self,
+        context: &Context,
+        audio_settings: &AudioSettings,
+        hrtf: &Hrtf,
+    ) -> Result<()> {
+        for effects in self.effects.values_mut() {
+            effects.ensure_binaural_effect(context, audio_settings, hrtf)?;
+        }
+        Ok(())
     }
 
     /// Clear all effects

@@ -309,7 +309,10 @@ impl SpatialProcessor {
                 sample_rate,
                 native_hrtf_path.as_deref().or(legacy_hrtf_path.as_deref()),
             )?;
-            native_hrtf_renderer = Some(NativeHrtfRenderer::new(table.clone()));
+            native_hrtf_renderer = Some(NativeHrtfRenderer::with_frame_size(
+                table.clone(),
+                frame_size,
+            )?);
             if use_ambisonics && hrtf_backend == HrtfBackend::Native {
                 let decoder = NativeAmbisonicsBinauralDecoder::new(
                     table.clone(),
@@ -739,7 +742,10 @@ impl SpatialProcessor {
         }
 
         let table = load_native_hrtf_table(self.sample_rate, self.native_hrtf_path.as_deref())?;
-        self.native_hrtf_renderer = Some(NativeHrtfRenderer::new(table.clone()));
+        self.native_hrtf_renderer = Some(NativeHrtfRenderer::with_frame_size(
+            table.clone(),
+            self.frame_size,
+        )?);
         self.native_hrtf_table = Some(table);
         Ok(())
     }

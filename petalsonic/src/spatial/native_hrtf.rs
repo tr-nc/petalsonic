@@ -1,5 +1,6 @@
 use crate::error::{PetalSonicError, Result};
 use crate::math::Vec3;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex, num_complex::Complex32};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -213,8 +214,139 @@ impl NativeHrtfTable {
 pub struct NativeHrtfRenderMetrics {
     /// Time spent selecting the HRTF direction.
     pub direction_lookup_time_us: u64,
-    /// Time spent running FIR convolution.
+    /// Time spent running HRIR convolution.
     pub convolution_time_us: u64,
+}
+
+#[derive(Clone)]
+struct NativeHrtfFftDirection {
+    left_spectrum: Vec<Complex32>,
+    right_spectrum: Vec<Complex32>,
+}
+
+#[derive(Clone)]
+struct NativeHrtfFftPlan {
+    block_frames: usize,
+    fft_size: usize,
+    complex_len: usize,
+    inverse_scale: f32,
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
+    directions: Vec<NativeHrtfFftDirection>,
+}
+
+impl std::fmt::Debug for NativeHrtfFftPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeHrtfFftPlan")
+            .field("block_frames", &self.block_frames)
+            .field("fft_size", &self.fft_size)
+            .field("complex_len", &self.complex_len)
+            .field("direction_count", &self.directions.len())
+            .finish()
+    }
+}
+
+impl NativeHrtfFftPlan {
+    fn new(table: &NativeHrtfTable, block_frames: usize) -> Result<Self> {
+        if block_frames == 0 {
+            return Err(PetalSonicError::Configuration(
+                "native HRTF FFT block size must be non-zero".to_string(),
+            ));
+        }
+
+        let fft_size = fft_convolution_size(block_frames, table.taps)?;
+        let mut planner = RealFftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(fft_size);
+        let inverse = planner.plan_fft_inverse(fft_size);
+        let complex_len = forward.complex_len();
+        let mut padded = forward.make_input_vec();
+        let mut spectrum = forward.make_output_vec();
+        let mut scratch = forward.make_scratch_vec();
+        let mut directions = Vec::with_capacity(table.directions.len());
+
+        for entry in &table.directions {
+            padded.fill(0.0);
+            padded[..table.taps].copy_from_slice(&entry.left);
+            forward
+                .process_with_scratch(&mut padded, &mut spectrum, &mut scratch)
+                .map_err(|error| native_hrtf_fft_error("precomputing left HRIR", error))?;
+            let left_spectrum = spectrum.clone();
+
+            padded.fill(0.0);
+            padded[..table.taps].copy_from_slice(&entry.right);
+            forward
+                .process_with_scratch(&mut padded, &mut spectrum, &mut scratch)
+                .map_err(|error| native_hrtf_fft_error("precomputing right HRIR", error))?;
+            let right_spectrum = spectrum.clone();
+
+            directions.push(NativeHrtfFftDirection {
+                left_spectrum,
+                right_spectrum,
+            });
+        }
+
+        Ok(Self {
+            block_frames,
+            fft_size,
+            complex_len,
+            inverse_scale: 1.0 / fft_size as f32,
+            forward,
+            inverse,
+            directions,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeHrtfFftSourceState {
+    block_frames: usize,
+    fft_size: usize,
+    forward_input: Vec<f32>,
+    input_spectrum: Vec<Complex32>,
+    left_spectrum: Vec<Complex32>,
+    right_spectrum: Vec<Complex32>,
+    left_time: Vec<f32>,
+    right_time: Vec<f32>,
+    left_overlap: Vec<f32>,
+    right_overlap: Vec<f32>,
+    forward_scratch: Vec<Complex32>,
+    inverse_scratch: Vec<Complex32>,
+}
+
+impl NativeHrtfFftSourceState {
+    fn new(plan: &NativeHrtfFftPlan) -> Self {
+        Self {
+            block_frames: plan.block_frames,
+            fft_size: plan.fft_size,
+            forward_input: plan.forward.make_input_vec(),
+            input_spectrum: plan.forward.make_output_vec(),
+            left_spectrum: plan.inverse.make_input_vec(),
+            right_spectrum: plan.inverse.make_input_vec(),
+            left_time: plan.inverse.make_output_vec(),
+            right_time: plan.inverse.make_output_vec(),
+            left_overlap: vec![0.0; plan.fft_size - plan.block_frames],
+            right_overlap: vec![0.0; plan.fft_size - plan.block_frames],
+            forward_scratch: plan.forward.make_scratch_vec(),
+            inverse_scratch: plan.inverse.make_scratch_vec(),
+        }
+    }
+
+    fn matches_plan(&self, plan: &NativeHrtfFftPlan) -> bool {
+        self.block_frames == plan.block_frames && self.fft_size == plan.fft_size
+    }
+
+    fn reset(&mut self) {
+        self.forward_input.fill(0.0);
+        self.input_spectrum.fill(Complex32::new(0.0, 0.0));
+        self.left_spectrum.fill(Complex32::new(0.0, 0.0));
+        self.right_spectrum.fill(Complex32::new(0.0, 0.0));
+        self.left_time.fill(0.0);
+        self.right_time.fill(0.0);
+        self.left_overlap.fill(0.0);
+        self.right_overlap.fill(0.0);
+        self.forward_scratch.fill(Complex32::new(0.0, 0.0));
+        self.inverse_scratch.fill(Complex32::new(0.0, 0.0));
+    }
 }
 
 /// Per-source convolution state for native HRTF rendering.
@@ -224,15 +356,17 @@ pub struct NativeHrtfSourceState {
     write_index: usize,
     cached_direction: Vec3,
     cached_direction_index: Option<usize>,
+    fft_state: Option<NativeHrtfFftSourceState>,
 }
 
 impl NativeHrtfSourceState {
-    fn new(taps: usize) -> Self {
+    fn new(taps: usize, fft_plan: Option<&NativeHrtfFftPlan>) -> Self {
         Self {
             delay_line: vec![0.0; taps],
             write_index: 0,
             cached_direction: DEFAULT_DIRECTION,
             cached_direction_index: None,
+            fft_state: fft_plan.map(NativeHrtfFftSourceState::new),
         }
     }
 
@@ -241,23 +375,38 @@ impl NativeHrtfSourceState {
         self.write_index = 0;
         self.cached_direction = DEFAULT_DIRECTION;
         self.cached_direction_index = None;
+        if let Some(fft_state) = &mut self.fft_state {
+            fft_state.reset();
+        }
     }
 }
 
-/// Time-domain native HRTF renderer.
+/// Native HRTF renderer.
 ///
-/// This is intentionally simple for the first native HRTF step: nearest-direction
-/// lookup plus FIR convolution. Later phases can add direction interpolation,
-/// block crossfades, SIMD, or partitioned convolution without changing the table
-/// format.
+/// The gameplay path uses a fixed-size frequency-domain overlap-add convolution plan,
+/// with the original time-domain FIR kept as a fallback/reference for unusual block sizes.
+/// Direction selection is still nearest-neighbor so Native-vs-Steam HRTF comparisons stay
+/// apples-to-apples.
 #[derive(Debug, Clone)]
 pub struct NativeHrtfRenderer {
     table: Arc<NativeHrtfTable>,
+    fft_plan: Option<Arc<NativeHrtfFftPlan>>,
 }
 
 impl NativeHrtfRenderer {
     pub fn new(table: Arc<NativeHrtfTable>) -> Self {
-        Self { table }
+        Self {
+            table,
+            fft_plan: None,
+        }
+    }
+
+    pub fn with_frame_size(table: Arc<NativeHrtfTable>, frame_size: usize) -> Result<Self> {
+        let fft_plan = NativeHrtfFftPlan::new(&table, frame_size)?;
+        Ok(Self {
+            table,
+            fft_plan: Some(Arc::new(fft_plan)),
+        })
     }
 
     pub fn table(&self) -> &NativeHrtfTable {
@@ -265,7 +414,7 @@ impl NativeHrtfRenderer {
     }
 
     pub fn create_source_state(&self) -> NativeHrtfSourceState {
-        NativeHrtfSourceState::new(self.table.taps)
+        NativeHrtfSourceState::new(self.table.taps, self.fft_plan.as_deref())
     }
 
     /// Render a mono source block into an interleaved stereo output buffer.
@@ -278,19 +427,6 @@ impl NativeHrtfRenderer {
         input: &[f32],
         output_interleaved: &mut [f32],
     ) -> Result<()> {
-        let frames = input.len();
-        if output_interleaved.len() < frames * 2 {
-            return Err(PetalSonicError::Configuration(format!(
-                "native HRTF output buffer too small: need {}, got {} samples",
-                frames * 2,
-                output_interleaved.len()
-            )));
-        }
-
-        if state.delay_line.len() != self.table.taps {
-            *state = self.create_source_state();
-        }
-
         self.render_source_with_metrics(state, direction, input, output_interleaved)?;
         Ok(())
     }
@@ -312,10 +448,61 @@ impl NativeHrtfRenderer {
             )));
         }
 
-        if state.delay_line.len() != self.table.taps {
-            *state = self.create_source_state();
+        self.ensure_source_state_compatible(state);
+        let (direction_index, direction_lookup_time_us) =
+            self.lookup_direction_index(state, direction);
+        let convolution_start = Instant::now();
+
+        if let Some(plan) = self.fft_plan.as_deref() {
+            if input.len() == plan.block_frames {
+                if let Some(fft_state) = state.fft_state.as_ref() {
+                    if fft_state.matches_plan(plan) {
+                        self.render_source_frequency_domain(
+                            state,
+                            plan,
+                            direction_index,
+                            input,
+                            output_interleaved,
+                        )?;
+                        return Ok(NativeHrtfRenderMetrics {
+                            direction_lookup_time_us,
+                            convolution_time_us: convolution_start.elapsed().as_micros() as u64,
+                        });
+                    }
+                }
+            }
         }
 
+        self.render_source_time_domain(state, direction_index, input, output_interleaved);
+
+        Ok(NativeHrtfRenderMetrics {
+            direction_lookup_time_us,
+            convolution_time_us: convolution_start.elapsed().as_micros() as u64,
+        })
+    }
+
+    fn ensure_source_state_compatible(&self, state: &mut NativeHrtfSourceState) {
+        if state.delay_line.len() != self.table.taps {
+            *state = self.create_source_state();
+            return;
+        }
+
+        if let Some(plan) = self.fft_plan.as_deref() {
+            let needs_fft_state = state
+                .fft_state
+                .as_ref()
+                .is_none_or(|fft_state| !fft_state.matches_plan(plan));
+            if needs_fft_state {
+                *state = self.create_source_state();
+            }
+        }
+    }
+
+    fn lookup_direction_index(
+        &self,
+        state: &mut NativeHrtfSourceState,
+        direction: Vec3,
+    ) -> (usize, u64) {
         let normalized_direction = normalize_direction(direction);
         let lookup_start = Instant::now();
         let direction_index = if let Some(cached_index) = state.cached_direction_index {
@@ -333,11 +520,106 @@ impl NativeHrtfRenderer {
             state.cached_direction_index = Some(index);
             index
         };
-        let direction_lookup_time_us = lookup_start.elapsed().as_micros() as u64;
 
+        (direction_index, lookup_start.elapsed().as_micros() as u64)
+    }
+
+    fn render_source_frequency_domain(
+        &self,
+        state: &mut NativeHrtfSourceState,
+        plan: &NativeHrtfFftPlan,
+        direction_index: usize,
+        input: &[f32],
+        output_interleaved: &mut [f32],
+    ) -> Result<()> {
+        let fft_state = state.fft_state.as_mut().ok_or_else(|| {
+            PetalSonicError::SpatialAudio("native HRTF FFT state is not initialized".to_string())
+        })?;
+        let hrir = &plan.directions[direction_index];
+
+        fft_state.forward_input.fill(0.0);
+        fft_state.forward_input[..input.len()].copy_from_slice(input);
+        plan.forward
+            .process_with_scratch(
+                &mut fft_state.forward_input,
+                &mut fft_state.input_spectrum,
+                &mut fft_state.forward_scratch,
+            )
+            .map_err(|error| native_hrtf_fft_error("processing input block", error))?;
+
+        for (((left, right), input_bin), (left_hrir, right_hrir)) in fft_state
+            .left_spectrum
+            .iter_mut()
+            .zip(fft_state.right_spectrum.iter_mut())
+            .zip(&fft_state.input_spectrum)
+            .zip(hrir.left_spectrum.iter().zip(&hrir.right_spectrum))
+        {
+            *left = *input_bin * *left_hrir;
+            *right = *input_bin * *right_hrir;
+        }
+        force_real_realfft_bins(&mut fft_state.left_spectrum);
+        force_real_realfft_bins(&mut fft_state.right_spectrum);
+
+        plan.inverse
+            .process_with_scratch(
+                &mut fft_state.left_spectrum,
+                &mut fft_state.left_time,
+                &mut fft_state.inverse_scratch,
+            )
+            .map_err(|error| native_hrtf_fft_error("inverse left ear", error))?;
+        plan.inverse
+            .process_with_scratch(
+                &mut fft_state.right_spectrum,
+                &mut fft_state.right_time,
+                &mut fft_state.inverse_scratch,
+            )
+            .map_err(|error| native_hrtf_fft_error("inverse right ear", error))?;
+
+        let scale = plan.inverse_scale;
+        for frame_index in 0..plan.block_frames {
+            let previous_left = fft_state
+                .left_overlap
+                .get(frame_index)
+                .copied()
+                .unwrap_or(0.0);
+            let previous_right = fft_state
+                .right_overlap
+                .get(frame_index)
+                .copied()
+                .unwrap_or(0.0);
+            let out_index = frame_index * 2;
+            output_interleaved[out_index] +=
+                fft_state.left_time[frame_index] * scale + previous_left;
+            output_interleaved[out_index + 1] +=
+                fft_state.right_time[frame_index] * scale + previous_right;
+        }
+
+        refresh_overlap(
+            &mut fft_state.left_overlap,
+            &fft_state.left_time,
+            plan.block_frames,
+            scale,
+        );
+        refresh_overlap(
+            &mut fft_state.right_overlap,
+            &fft_state.right_time,
+            plan.block_frames,
+            scale,
+        );
+        append_delay_line(&mut state.delay_line, &mut state.write_index, input);
+
+        Ok(())
+    }
+
+    fn render_source_time_domain(
+        &self,
+        state: &mut NativeHrtfSourceState,
+        direction_index: usize,
+        input: &[f32],
+        output_interleaved: &mut [f32],
+    ) {
         let hrir = &self.table.directions[direction_index];
         let taps = self.table.taps;
-        let convolution_start = Instant::now();
 
         for (frame_index, input_sample) in input.iter().copied().enumerate() {
             state.delay_line[state.write_index] = input_sample;
@@ -364,11 +646,52 @@ impl NativeHrtfRenderer {
 
             state.write_index = (state.write_index + 1) % taps;
         }
+    }
+}
 
-        Ok(NativeHrtfRenderMetrics {
-            direction_lookup_time_us,
-            convolution_time_us: convolution_start.elapsed().as_micros() as u64,
-        })
+fn fft_convolution_size(block_frames: usize, taps: usize) -> Result<usize> {
+    let linear_convolution_len = block_frames
+        .checked_add(taps)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| {
+            PetalSonicError::Configuration("native HRTF FFT size overflow".to_string())
+        })?;
+    linear_convolution_len
+        .checked_next_power_of_two()
+        .ok_or_else(|| PetalSonicError::Configuration("native HRTF FFT size overflow".to_string()))
+}
+
+fn native_hrtf_fft_error(context: &str, error: realfft::FftError) -> PetalSonicError {
+    PetalSonicError::SpatialAudio(format!("native HRTF FFT {context} failed: {error}"))
+}
+
+fn force_real_realfft_bins(spectrum: &mut [Complex32]) {
+    if let Some(first) = spectrum.first_mut() {
+        first.im = 0.0;
+    }
+    if spectrum.len() > 1 {
+        if let Some(last) = spectrum.last_mut() {
+            last.im = 0.0;
+        }
+    }
+}
+
+fn refresh_overlap(overlap: &mut [f32], time_domain: &[f32], block_frames: usize, scale: f32) {
+    let remaining_old = overlap.len().saturating_sub(block_frames);
+    if remaining_old > 0 {
+        overlap.copy_within(block_frames..block_frames + remaining_old, 0);
+    }
+    overlap[remaining_old..].fill(0.0);
+
+    for (overlap_sample, tail_sample) in overlap.iter_mut().zip(&time_domain[block_frames..]) {
+        *overlap_sample += *tail_sample * scale;
+    }
+}
+
+fn append_delay_line(delay_line: &mut [f32], write_index: &mut usize, input: &[f32]) {
+    for sample in input {
+        delay_line[*write_index] = *sample;
+        *write_index = (*write_index + 1) % delay_line.len();
     }
 }
 
@@ -616,5 +939,40 @@ mod tests {
 
         assert!((second[0] - 0.25).abs() < 1e-6);
         assert!((second[1] + 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn frequency_domain_renderer_matches_time_domain_across_blocks() {
+        let table = NativeHrtfTable::new(
+            48_000,
+            vec![NativeHrtfDirection::new(
+                Vec3::NEG_Z,
+                vec![0.75, -0.2, 0.05],
+                vec![0.5, 0.125, -0.25],
+            )],
+        )
+        .unwrap();
+        let time_renderer = NativeHrtfRenderer::new(Arc::new(table.clone()));
+        let fft_renderer = NativeHrtfRenderer::with_frame_size(Arc::new(table), 8).unwrap();
+        let mut time_state = time_renderer.create_source_state();
+        let mut fft_state = fft_renderer.create_source_state();
+
+        for input in [
+            [0.1, -0.25, 0.5, 1.0, -0.75, 0.0, 0.33, -0.12],
+            [0.0, 0.25, -0.5, 0.75, 0.125, -0.33, 0.2, 0.0],
+        ] {
+            let mut time_output = [0.0f32; 16];
+            let mut fft_output = [0.0f32; 16];
+            time_renderer
+                .render_source(&mut time_state, Vec3::NEG_Z, &input, &mut time_output)
+                .unwrap();
+            fft_renderer
+                .render_source(&mut fft_state, Vec3::NEG_Z, &input, &mut fft_output)
+                .unwrap();
+
+            for (time_sample, fft_sample) in time_output.iter().zip(fft_output) {
+                assert!((*time_sample - fft_sample).abs() < 1e-5);
+            }
+        }
     }
 }

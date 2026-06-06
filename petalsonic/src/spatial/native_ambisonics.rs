@@ -267,6 +267,115 @@ impl NativeAmbisonicsBinauralState {
     }
 }
 
+struct NativeAmbisonicsMinimumPhasePlan {
+    fft_size: usize,
+    inverse_scale: f32,
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
+    real_input: Vec<f32>,
+    real_output: Vec<f32>,
+    spectrum: Vec<Complex32>,
+    forward_scratch: Vec<Complex32>,
+    inverse_scratch: Vec<Complex32>,
+}
+
+impl NativeAmbisonicsMinimumPhasePlan {
+    fn new(taps: usize) -> Result<Self> {
+        let fft_size = taps
+            .checked_mul(2)
+            .and_then(|value| value.checked_next_power_of_two())
+            .ok_or_else(|| {
+                PetalSonicError::Configuration(
+                    "native Ambisonics minimum-phase FFT size overflow".to_string(),
+                )
+            })?;
+        let mut planner = RealFftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(fft_size);
+        let inverse = planner.plan_fft_inverse(fft_size);
+        Ok(Self {
+            fft_size,
+            inverse_scale: 1.0 / fft_size as f32,
+            real_input: forward.make_input_vec(),
+            real_output: inverse.make_output_vec(),
+            spectrum: forward.make_output_vec(),
+            forward_scratch: forward.make_scratch_vec(),
+            inverse_scratch: inverse.make_scratch_vec(),
+            forward,
+            inverse,
+        })
+    }
+
+    fn minimum_phase(&mut self, signal: &[f32]) -> Result<Vec<f32>> {
+        self.real_input.fill(0.0);
+        self.real_input[..signal.len()].copy_from_slice(signal);
+        self.forward
+            .process_with_scratch(
+                &mut self.real_input,
+                &mut self.spectrum,
+                &mut self.forward_scratch,
+            )
+            .map_err(|error| {
+                native_ambisonics_fft_error("minimum-phase forward magnitude", error)
+            })?;
+
+        for bin in &mut self.spectrum {
+            bin.re = bin.norm().max(1.0e-9).ln();
+            bin.im = 0.0;
+        }
+        force_real_realfft_bins(&mut self.spectrum);
+
+        self.inverse
+            .process_with_scratch(
+                &mut self.spectrum,
+                &mut self.real_output,
+                &mut self.inverse_scratch,
+            )
+            .map_err(|error| {
+                native_ambisonics_fft_error("minimum-phase inverse cepstrum", error)
+            })?;
+
+        let nyquist = self.fft_size / 2;
+        self.real_input.fill(0.0);
+        self.real_input[0] = self.real_output[0] * self.inverse_scale;
+        for index in 1..nyquist {
+            self.real_input[index] = 2.0 * self.real_output[index] * self.inverse_scale;
+        }
+        if self.fft_size % 2 == 0 {
+            self.real_input[nyquist] = self.real_output[nyquist] * self.inverse_scale;
+        }
+
+        self.forward
+            .process_with_scratch(
+                &mut self.real_input,
+                &mut self.spectrum,
+                &mut self.forward_scratch,
+            )
+            .map_err(|error| {
+                native_ambisonics_fft_error("minimum-phase forward cepstrum", error)
+            })?;
+
+        for bin in &mut self.spectrum {
+            let magnitude = bin.re.exp();
+            let phase = bin.im;
+            *bin = Complex32::new(magnitude * phase.cos(), magnitude * phase.sin());
+        }
+        force_real_realfft_bins(&mut self.spectrum);
+
+        self.inverse
+            .process_with_scratch(
+                &mut self.spectrum,
+                &mut self.real_output,
+                &mut self.inverse_scratch,
+            )
+            .map_err(|error| native_ambisonics_fft_error("minimum-phase inverse signal", error))?;
+
+        Ok(self.real_output[..signal.len()]
+            .iter()
+            .map(|sample| sample * self.inverse_scale)
+            .collect())
+    }
+}
+
 #[derive(Clone)]
 struct NativeAmbisonicsFftFilter {
     left_spectrum: Vec<Complex32>,
@@ -456,6 +565,11 @@ impl NativeAmbisonicsBinauralDecoder {
         } else {
             4.0 * PI / speaker_directions.len() as f32
         };
+        let mut minimum_phase_plan = if order >= 4 {
+            Some(NativeAmbisonicsMinimumPhasePlan::new(taps)?)
+        } else {
+            None
+        };
         for (speaker_index, speaker_direction) in speaker_directions.iter().copied().enumerate() {
             let hrtf_index = table.nearest_direction_index(speaker_direction);
             let entry = table.direction(hrtf_index).ok_or_else(|| {
@@ -464,13 +578,25 @@ impl NativeAmbisonicsBinauralDecoder {
                 ))
             })?;
             let coeffs = native_ambisonics_coefficients(order, speaker_direction)?;
+            let minimum_phase_left;
+            let minimum_phase_right;
+            let (left_hrir, right_hrir) = if let Some(plan) = &mut minimum_phase_plan {
+                minimum_phase_left = plan.minimum_phase(&entry.left)?;
+                minimum_phase_right = plan.minimum_phase(&entry.right)?;
+                (
+                    minimum_phase_left.as_slice(),
+                    minimum_phase_right.as_slice(),
+                )
+            } else {
+                (entry.left.as_slice(), entry.right.as_slice())
+            };
 
             for channel in 0..channel_count {
                 let scaled_coeff = coeffs[channel] * speaker_weight * order_weights[channel];
                 let filter_offset = channel * taps;
                 for tap in 0..taps {
-                    left_filters[filter_offset + tap] += entry.left[tap] * scaled_coeff;
-                    right_filters[filter_offset + tap] += entry.right[tap] * scaled_coeff;
+                    left_filters[filter_offset + tap] += left_hrir[tap] * scaled_coeff;
+                    right_filters[filter_offset + tap] += right_hrir[tap] * scaled_coeff;
                 }
             }
         }
@@ -873,6 +999,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn minimum_phase_transform_preserves_magnitude_response() {
+        let input = vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut plan = NativeAmbisonicsMinimumPhasePlan::new(input.len()).unwrap();
+        let output = plan.minimum_phase(&input).unwrap();
+
+        assert_eq!(output.len(), input.len());
+        let input_magnitude = fft_magnitudes(&input, plan.fft_size);
+        let output_magnitude = fft_magnitudes(&output, plan.fft_size);
+        for (input_bin, output_bin) in input_magnitude.iter().zip(output_magnitude) {
+            assert!((input_bin - output_bin).abs() < 1e-3);
+        }
+        assert!(output[0].abs() > 0.99);
+    }
+
+    fn fft_magnitudes(signal: &[f32], fft_size: usize) -> Vec<f32> {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(fft_size);
+        let mut input = forward.make_input_vec();
+        let mut spectrum = forward.make_output_vec();
+        let mut scratch = forward.make_scratch_vec();
+        input[..signal.len()].copy_from_slice(signal);
+        forward
+            .process_with_scratch(&mut input, &mut spectrum, &mut scratch)
+            .unwrap();
+        spectrum.iter().map(|bin| bin.norm()).collect()
     }
 
     #[test]

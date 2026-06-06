@@ -156,7 +156,12 @@ impl PlaybackInstance {
         config: SourceConfig,
         loop_mode: LoopMode,
     ) -> Self {
-        Self::from_source(audio_id, PlaybackSource::Static(audio_data), config, loop_mode)
+        Self::from_source(
+            audio_id,
+            PlaybackSource::Static(audio_data),
+            config,
+            loop_mode,
+        )
     }
 
     pub(crate) fn from_source(
@@ -169,7 +174,11 @@ impl PlaybackInstance {
             PlaybackSource::Static(audio_data) => {
                 let total_frames = audio_data.total_frames();
                 let sample_rate = audio_data.sample_rate();
-                (PlaybackContent::Static(audio_data), total_frames, sample_rate)
+                (
+                    PlaybackContent::Static(audio_data),
+                    total_frames,
+                    sample_rate,
+                )
             }
             PlaybackSource::Procedural {
                 factory,

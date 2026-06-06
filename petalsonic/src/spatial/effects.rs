@@ -1,10 +1,10 @@
 use crate::error::{PetalSonicError, Result};
 use crate::world::SourceId;
 use audionimbus::{
-    num_ambisonics_channels, AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings,
-    AudioSettings, Context, Convolution, CustomRayTracer, Direct, DirectEffect,
-    DirectEffectSettings, ReflectionEffect, ReflectionEffectSettings, Reflections,
-    SimulationFlags, Simulator, Source, SourceSettings,
+    AmbisonicsEncodeEffect, AmbisonicsEncodeEffectSettings, AudioSettings, Context, Convolution,
+    CustomRayTracer, Direct, DirectEffect, DirectEffectSettings, ReflectionEffect,
+    ReflectionEffectSettings, Reflections, SimulationFlags, Simulator, Source, SourceSettings,
+    num_ambisonics_channels,
 };
 use std::collections::HashMap;
 
@@ -56,7 +56,8 @@ impl SpatialSourceEffects {
             context,
             audio_settings,
             &ReflectionEffectSettings {
-                impulse_response_size: audio_settings.sampling_rate * REFLECTION_IR_DURATION_SECONDS,
+                impulse_response_size: audio_settings.sampling_rate
+                    * REFLECTION_IR_DURATION_SECONDS,
                 num_channels: num_ambisonics_channels(REFLECTIONS_ORDER),
             },
         )

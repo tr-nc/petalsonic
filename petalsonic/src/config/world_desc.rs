@@ -1,6 +1,16 @@
 use crate::acoustics::{BatchedAnyHitRayTracer, BatchedClosestHitRayTracer};
 use std::sync::Arc;
 
+/// Backend used for direct-path spatial processing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DirectPathBackend {
+    /// Use Steam Audio simulation and direct effect for distance, air absorption, and occlusion.
+    #[default]
+    SteamAudio,
+    /// Use PetalSonic's native direct path for distance, air absorption, and occlusion.
+    Native,
+}
+
 /// Configuration descriptor for a PetalSonic world
 #[derive(Clone)]
 pub struct PetalSonicWorldDesc {
@@ -38,6 +48,8 @@ pub struct PetalSonicWorldDesc {
     /// - `1.0`: 1 world unit = 1 meter
     /// - `10.0`: 1 world unit = 10 meters (larger-scale worlds)
     pub distance_scaler: f32,
+    /// Backend used for direct-path processing.
+    pub direct_path_backend: DirectPathBackend,
     /// Optional host-provided batched ray tracing backend for direct acoustics.
     pub batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
     /// Optional host-provided batched ray tracing backend for closest-hit reflections.
@@ -54,6 +66,7 @@ impl Default for PetalSonicWorldDesc {
             hrtf_path: None,
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
+            direct_path_backend: DirectPathBackend::default(),
             batched_any_hit_ray_tracer: None,
             batched_closest_hit_ray_tracer: None,
         }
@@ -70,13 +83,17 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("hrtf_path", &self.hrtf_path)
             .field("hrtf_gain", &self.hrtf_gain)
             .field("distance_scaler", &self.distance_scaler)
+            .field("direct_path_backend", &self.direct_path_backend)
             .field(
                 "batched_any_hit_ray_tracer",
                 &self.batched_any_hit_ray_tracer.as_ref().map(|_| "<custom>"),
             )
             .field(
                 "batched_closest_hit_ray_tracer",
-                &self.batched_closest_hit_ray_tracer.as_ref().map(|_| "<custom>"),
+                &self
+                    .batched_closest_hit_ray_tracer
+                    .as_ref()
+                    .map(|_| "<custom>"),
             )
             .finish()
     }

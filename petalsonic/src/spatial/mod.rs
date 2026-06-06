@@ -9,6 +9,6 @@ mod processor;
 
 // Public API
 pub use processor::{
-    DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission, SpatialProcessingMetrics,
-    SpatialProcessingSummary, SpatialProcessor,
+    DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission,
+    SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor,
 };

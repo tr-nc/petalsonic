@@ -142,6 +142,7 @@ impl PetalSonicEngine {
             desc.distance_scaler,
             desc.hrtf_path.as_deref(),
             desc.hrtf_gain,
+            desc.direct_path_backend,
             desc.batched_any_hit_ray_tracer.clone(),
             desc.batched_closest_hit_ray_tracer.clone(),
         ) {

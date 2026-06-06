@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-07
+
+### Added
+- Added procedural playback sources.
+- Added native direct path, HRTF, early reflection, and ambisonics spatial rendering backends.
+- Added PetalHRTF file support and a SOFA-to-PetalHRTF conversion tool.
+- Added runtime spatial backend switching.
+- Added output device selection.
+
+### Changed
+- Improved native HRTF convolution performance.
+- Improved native ambisonics decode performance and quality, including fourth-order native ambisonics and high-frequency preservation.
+- Aligned Steam HRTF direction handling with the native spatial paths.
+
 ## [0.4.0] - 2026-04-28
 
 ### Added
@@ -46,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RayTracer` trait - Custom ray tracing implementation support
 - Three-layer threading model (main thread, render thread, audio callback)
 
-[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/tr-nc/petalsonic/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/tr-nc/petalsonic/compare/v0.1.0...v0.4.0
 [0.1.0]: https://github.com/tr-nc/petalsonic/releases/tag/v0.1.0

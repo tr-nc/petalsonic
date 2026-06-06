@@ -95,7 +95,7 @@ pub mod world;
 pub use acoustics::{
     AcousticHit, AcousticMaterial, AcousticRay, BatchedAnyHitRayTracer, BatchedClosestHitRayTracer,
 };
-pub use config::{DirectPathBackend, PetalSonicWorldDesc, SourceConfig};
+pub use config::{DirectPathBackend, HrtfBackend, PetalSonicWorldDesc, SourceConfig};
 pub use engine::{AudioFillCallback, PetalSonicEngine};
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};

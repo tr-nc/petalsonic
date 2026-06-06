@@ -11,6 +11,16 @@ pub enum DirectPathBackend {
     Native,
 }
 
+/// Backend used for binaural/HRTF rendering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HrtfBackend {
+    /// Use Steam Audio ambisonics decode with Steam Audio HRTF data.
+    #[default]
+    SteamAudio,
+    /// Use PetalSonic's native `.petalhrtf` table and FIR renderer.
+    Native,
+}
+
 /// Configuration descriptor for a PetalSonic world
 #[derive(Clone)]
 pub struct PetalSonicWorldDesc {
@@ -25,8 +35,13 @@ pub struct PetalSonicWorldDesc {
     pub channels: u16,
     /// Maximum number of concurrent audio sources
     pub max_sources: usize,
-    /// Optional path to a custom HRTF SOFA file (None uses Steam Audio's default HRTF)
+    /// Optional path to HRTF data.
+    ///
+    /// With [`HrtfBackend::SteamAudio`], this is a SOFA file path and `None` uses Steam Audio's
+    /// default HRTF. With [`HrtfBackend::Native`], this must be a `.petalhrtf` file.
     pub hrtf_path: Option<String>,
+    /// Backend used for binaural/HRTF rendering.
+    pub hrtf_backend: HrtfBackend,
     /// HRTF gain compensation in decibels (default: 0.0 dB = no change)
     ///
     /// Different HRTF datasets can have different overall gain levels.
@@ -64,6 +79,7 @@ impl Default for PetalSonicWorldDesc {
             channels: 2,
             max_sources: 2048,
             hrtf_path: None,
+            hrtf_backend: HrtfBackend::default(),
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
             direct_path_backend: DirectPathBackend::default(),
@@ -81,6 +97,7 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("channels", &self.channels)
             .field("max_sources", &self.max_sources)
             .field("hrtf_path", &self.hrtf_path)
+            .field("hrtf_backend", &self.hrtf_backend)
             .field("hrtf_gain", &self.hrtf_gain)
             .field("distance_scaler", &self.distance_scaler)
             .field("direct_path_backend", &self.direct_path_backend)

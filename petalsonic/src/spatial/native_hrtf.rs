@@ -3,7 +3,7 @@ use crate::math::Vec3;
 use std::path::Path;
 use std::sync::Arc;
 
-const DEFAULT_DIRECTION: Vec3 = Vec3::NEG_Z;
+const DEFAULT_DIRECTION: Vec3 = Vec3::Z;
 const PETALHRTF_MAGIC: &[u8; 8] = b"PETHRTF\0";
 const PETALHRTF_VERSION: u32 = 1;
 const PETALHRTF_HEADER_BYTES: usize = 8 + 4 + 4 + 4 + 4;

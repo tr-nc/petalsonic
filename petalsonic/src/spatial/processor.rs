@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+const STEAM_AMBISONICS_ORDER: u32 = 2;
 const REFLECTIONS_ORDER: u32 = 1;
 const REFLECTIONS_MAX_NUM_RAYS: u32 = 1;
 const REFLECTIONS_NUM_DIFFUSE_SAMPLES: u32 = 1;
@@ -1400,10 +1401,12 @@ impl SpatialProcessor {
             ))
         })?;
 
+        let reflection_channel_count = native_ambisonics_channel_count(STEAM_AMBISONICS_ORDER)?;
+        let reflection_sample_count = self.frame_size * reflection_channel_count;
         let output_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &mut self.cached_reflections_buf,
+            &mut self.cached_reflections_buf[..reflection_sample_count],
             AudioBufferSettings {
-                num_channels: Some(9),
+                num_channels: Some(reflection_channel_count as u32),
                 ..Default::default()
             },
         )
@@ -1421,7 +1424,7 @@ impl SpatialProcessor {
                 PetalSonicError::SpatialAudio(format!("Failed to apply ReflectionEffect: {}", e))
             })?;
 
-        for i in 0..self.cached_reflections_buf.len() {
+        for i in 0..reflection_sample_count {
             self.cached_summed_encoded_buf[i] += self.cached_reflections_buf[i];
         }
 
@@ -1446,7 +1449,7 @@ impl SpatialProcessor {
 
         let ambisonics_encode_effect_params = AmbisonicsEncodeEffectParams {
             direction: Direction::new(direction.x, direction.y, direction.z),
-            order: 2,
+            order: STEAM_AMBISONICS_ORDER,
         };
 
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
@@ -1461,10 +1464,12 @@ impl SpatialProcessor {
         })?;
 
         self.cached_ambisonics_encode_buf.fill(0.0);
+        let steam_channel_count = native_ambisonics_channel_count(STEAM_AMBISONICS_ORDER)?;
+        let steam_sample_count = self.frame_size * steam_channel_count;
         let output_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &mut self.cached_ambisonics_encode_buf,
+            &mut self.cached_ambisonics_encode_buf[..steam_sample_count],
             AudioBufferSettings {
-                num_channels: Some(9), // Order 2 = 9 channels
+                num_channels: Some(steam_channel_count as u32),
                 ..Default::default()
             },
         )
@@ -1483,7 +1488,7 @@ impl SpatialProcessor {
             })?;
 
         // Accumulate encoded output to summed buffer
-        for i in 0..self.cached_ambisonics_encode_buf.len() {
+        for i in 0..steam_sample_count {
             self.cached_summed_encoded_buf[i] += self.cached_ambisonics_encode_buf[i];
         }
 
@@ -1605,7 +1610,7 @@ impl SpatialProcessor {
         })?;
 
         let ambisonics_decode_effect_params = AmbisonicsDecodeEffectParams {
-            order: 2,
+            order: STEAM_AMBISONICS_ORDER,
             hrtf,
             orientation: CoordinateSystem {
                 ahead: Vector3::new(0.0, 0.0, -1.0),
@@ -1613,10 +1618,12 @@ impl SpatialProcessor {
             },
         };
 
+        let steam_channel_count = native_ambisonics_channel_count(STEAM_AMBISONICS_ORDER)?;
+        let steam_sample_count = self.frame_size * steam_channel_count;
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &self.cached_summed_encoded_buf,
+            &self.cached_summed_encoded_buf[..steam_sample_count],
             AudioBufferSettings {
-                num_channels: Some(9),
+                num_channels: Some(steam_channel_count as u32),
                 ..Default::default()
             },
         )
@@ -1819,7 +1826,7 @@ fn create_ambisonics_decode_effect(
         context,
         audio_settings,
         &AmbisonicsDecodeEffectSettings {
-            max_order: DEFAULT_NATIVE_AMBISONICS_ORDER,
+            max_order: STEAM_AMBISONICS_ORDER,
             speaker_layout: SpeakerLayout::Stereo,
             hrtf,
             rendering: Rendering::Binaural,

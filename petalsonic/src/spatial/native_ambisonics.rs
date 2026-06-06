@@ -6,13 +6,14 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Native Ambisonics order used by re-flora for Steam Audio parity experiments.
-pub const DEFAULT_NATIVE_AMBISONICS_ORDER: u32 = 2;
-const MAX_NATIVE_AMBISONICS_ORDER: u32 = 2;
-const MAX_NATIVE_AMBISONICS_CHANNELS: usize = 9;
+/// Native Ambisonics order used by re-flora for high-quality Native Ambisonics.
+pub const DEFAULT_NATIVE_AMBISONICS_ORDER: u32 = 4;
+const MAX_NATIVE_AMBISONICS_ORDER: u32 = 4;
+const MAX_NATIVE_AMBISONICS_CHANNELS: usize = 25;
 const STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT: usize = 24;
 const STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT: f32 =
     4.0 * PI / STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT as f32;
+const HIGH_ORDER_NATIVE_AMBISONICS_VIRTUAL_SPEAKER_COUNT: usize = 256;
 
 // Steam Audio uses this 24-point spherical design to precompute Ambisonics HRTFs.
 // Keeping the same decode projection avoids the overly smooth/high-frequency-dull
@@ -55,7 +56,7 @@ pub fn native_ambisonics_channel_count(order: u32) -> Result<usize> {
     Ok(((order + 1) * (order + 1)) as usize)
 }
 
-/// Compute real ACN/N3D spherical-harmonic coefficients up to order 2.
+/// Compute real ACN/N3D spherical-harmonic coefficients up to order 4.
 ///
 /// The listener-local direction convention is the same as native HRTF:
 /// `x=right`, `y=up`, `z=front`. Coefficients are returned in ACN order:
@@ -88,6 +89,31 @@ fn native_ambisonics_coefficients(
         coeffs[8] = 0.546_274_24 * (x * x - y * y);
     }
 
+    if order >= 3 {
+        coeffs[9] = 0.590_044 * y * (3.0 * x * x - y * y);
+        coeffs[10] = 2.890_611 * x * y * z;
+        coeffs[11] = 0.457_046 * y * (4.0 * z * z - x * x - y * y);
+        coeffs[12] = 0.373_176 * z * (2.0 * z * z - 3.0 * x * x - 3.0 * y * y);
+        coeffs[13] = 0.457_046 * x * (4.0 * z * z - x * x - y * y);
+        coeffs[14] = 1.445_306 * z * (x * x - y * y);
+        coeffs[15] = 0.590_044 * x * (x * x - 3.0 * y * y);
+    }
+
+    if order >= 4 {
+        let x2 = x * x;
+        let y2 = y * y;
+        let z2 = z * z;
+        coeffs[16] = 2.503_343 * x * y * (x2 - y2);
+        coeffs[17] = 1.770_131 * y * z * (3.0 * x2 - y2);
+        coeffs[18] = 0.946_175 * x * y * (7.0 * z2 - 1.0);
+        coeffs[19] = 0.669_047 * y * z * (7.0 * z2 - 3.0);
+        coeffs[20] = 0.105_786 * (35.0 * z2 * z2 - 30.0 * z2 + 3.0);
+        coeffs[21] = 0.669_047 * x * z * (7.0 * z2 - 3.0);
+        coeffs[22] = 0.473_087 * (x2 - y2) * (7.0 * z2 - 1.0);
+        coeffs[23] = 1.770_131 * x * z * (x2 - 3.0 * y2);
+        coeffs[24] = 0.625_836 * (x2 * (x2 - 3.0 * y2) - y2 * (3.0 * x2 - y2));
+    }
+
     Ok(coeffs)
 }
 
@@ -116,10 +142,38 @@ fn legendre_polynomial(order: u32, x: f32) -> f32 {
         0 => 1.0,
         1 => x,
         2 => 0.5 * (3.0 * x * x - 1.0),
+        3 => 0.5 * (5.0 * x * x * x - 3.0 * x),
+        4 => (35.0 * x * x * x * x - 30.0 * x * x + 3.0) / 8.0,
         _ => {
             unreachable!("native Ambisonics only supports order 0..={MAX_NATIVE_AMBISONICS_ORDER}")
         }
     }
+}
+
+fn native_ambisonics_decoder_speaker_directions(order: u32) -> Result<Vec<Vec3>> {
+    native_ambisonics_channel_count(order)?;
+    if order <= 3 {
+        Ok(STEAM_AMBISONICS_VIRTUAL_SPEAKERS
+            .iter()
+            .map(|speaker| Vec3::new(speaker[0], speaker[1], speaker[2]))
+            .collect())
+    } else {
+        Ok(fibonacci_sphere_directions(
+            HIGH_ORDER_NATIVE_AMBISONICS_VIRTUAL_SPEAKER_COUNT,
+        ))
+    }
+}
+
+fn fibonacci_sphere_directions(count: usize) -> Vec<Vec3> {
+    let golden_angle = PI * (3.0 - 5.0_f32.sqrt());
+    (0..count)
+        .map(|index| {
+            let y = 1.0 - 2.0 * ((index as f32 + 0.5) / count as f32);
+            let radius = (1.0 - y * y).max(0.0).sqrt();
+            let theta = index as f32 * golden_angle;
+            Vec3::new(theta.cos() * radius, y, theta.sin() * radius)
+        })
+        .collect()
 }
 
 /// Native Ambisonics encoder for mono point sources.
@@ -391,13 +445,18 @@ impl NativeAmbisonicsBinauralDecoder {
             ));
         }
 
-        // Project native HRTFs with the same 24-point spherical design and max-rE order
-        // weighting used by Steam Audio's Ambisonics binaural decoder.  This preserves
-        // much more high-frequency detail than equally weighting every raw HRTF table
-        // entry, which over-smoothed non-uniform measurement sets.
+        // Project native HRTFs from an equal-area virtual-speaker grid with max-rE
+        // order weighting. Orders 0..=3 keep Steam Audio's 24-point design for
+        // parity; order 4 uses a denser Fibonacci grid because the 24-point design
+        // is not intended for fourth-order binaural Ambisonics.
         let order_weights = native_ambisonics_max_re_weights(order)?;
-        for (speaker_index, speaker) in STEAM_AMBISONICS_VIRTUAL_SPEAKERS.iter().enumerate() {
-            let speaker_direction = Vec3::new(speaker[0], speaker[1], speaker[2]);
+        let speaker_directions = native_ambisonics_decoder_speaker_directions(order)?;
+        let speaker_weight = if order <= 3 {
+            STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT
+        } else {
+            4.0 * PI / speaker_directions.len() as f32
+        };
+        for (speaker_index, speaker_direction) in speaker_directions.iter().copied().enumerate() {
             let hrtf_index = table.nearest_direction_index(speaker_direction);
             let entry = table.direction(hrtf_index).ok_or_else(|| {
                 PetalSonicError::Configuration(format!(
@@ -407,9 +466,7 @@ impl NativeAmbisonicsBinauralDecoder {
             let coeffs = native_ambisonics_coefficients(order, speaker_direction)?;
 
             for channel in 0..channel_count {
-                let scaled_coeff = coeffs[channel]
-                    * STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT
-                    * order_weights[channel];
+                let scaled_coeff = coeffs[channel] * speaker_weight * order_weights[channel];
                 let filter_offset = channel * taps;
                 for tap in 0..taps {
                     left_filters[filter_offset + tap] += entry.left[tap] * scaled_coeff;
@@ -761,7 +818,35 @@ mod tests {
         assert_eq!(native_ambisonics_channel_count(0).unwrap(), 1);
         assert_eq!(native_ambisonics_channel_count(1).unwrap(), 4);
         assert_eq!(native_ambisonics_channel_count(2).unwrap(), 9);
-        assert!(native_ambisonics_channel_count(3).is_err());
+        assert_eq!(native_ambisonics_channel_count(3).unwrap(), 16);
+        assert_eq!(native_ambisonics_channel_count(4).unwrap(), 25);
+        assert!(native_ambisonics_channel_count(5).is_err());
+    }
+
+    #[test]
+    fn default_native_ambisonics_order_is_four() {
+        assert_eq!(DEFAULT_NATIVE_AMBISONICS_ORDER, 4);
+        assert_eq!(
+            native_ambisonics_channel_count(DEFAULT_NATIVE_AMBISONICS_ORDER).unwrap(),
+            25
+        );
+    }
+
+    #[test]
+    fn order_four_coefficients_use_expected_front_axis_terms() {
+        let coeffs = native_ambisonics_coefficients(4, Vec3::Z).unwrap();
+
+        assert!((coeffs[0] - 0.282_094_8).abs() < 1e-6);
+        assert!((coeffs[2] - 0.488_602_52).abs() < 1e-6);
+        assert!((coeffs[6] - 0.630_783_14).abs() < 1e-6);
+        assert!((coeffs[12] - 0.746_352).abs() < 1e-6);
+        assert!((coeffs[20] - 0.846_288).abs() < 1e-6);
+        for channel in 0..=24 {
+            if [0, 2, 6, 12, 20].contains(&channel) {
+                continue;
+            }
+            assert!(coeffs[channel].abs() < 1e-6, "channel {channel}");
+        }
     }
 
     #[test]

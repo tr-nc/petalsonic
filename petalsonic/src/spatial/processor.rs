@@ -1536,7 +1536,7 @@ impl SpatialProcessor {
         })?;
 
         let params = BinauralEffectParams {
-            direction: Direction::new(direction.x, direction.y, direction.z),
+            direction: petal_to_steam_hrtf_direction(direction),
             interpolation: HrtfInterpolation::Nearest,
             spatial_blend: 1.0,
             hrtf,
@@ -1852,6 +1852,12 @@ fn normalize_or_default(direction: Vec3) -> Vec3 {
     }
 }
 
+fn petal_to_steam_hrtf_direction(direction: Vec3) -> Direction {
+    // PetalSonic native HRTF uses listener-local z=front. Steam Audio's HRTF API uses
+    // right-handed coordinates where -z is ahead, so flip z for apples-to-apples SOFA lookup.
+    Direction::new(direction.x, direction.y, -direction.z)
+}
+
 fn native_distance_attenuation(distance_meters: f32) -> f32 {
     if !distance_meters.is_finite() {
         return 0.0;
@@ -1908,6 +1914,12 @@ fn acoustic_hit_to_audionimbus_hit(hit: AcousticHit) -> Hit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steam_hrtf_direction_uses_steam_ahead_axis() {
+        let direction = petal_to_steam_hrtf_direction(Vec3::new(0.25, 0.5, 1.0));
+        assert_eq!(direction, Direction::new(0.25, 0.5, -1.0));
+    }
 
     #[test]
     fn native_distance_attenuation_is_clamped_near_listener() {

@@ -1878,6 +1878,23 @@ mod tests {
     }
 
     #[test]
+    fn world_can_be_recreated_after_close() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+
+        let first = PetalSonicWorld::new(desc.clone()).unwrap();
+        first.close().unwrap();
+        drop(first);
+
+        let second = PetalSonicWorld::new(desc).unwrap();
+        second.close().unwrap();
+    }
+
+    #[test]
     fn detached_control_survives_emitter_destruction() {
         let desc = crate::config::PetalSonicWorldDesc {
             output_device: crate::config::OutputDevicePolicy::PinnedNameContains(

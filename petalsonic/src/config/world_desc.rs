@@ -1,16 +1,6 @@
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::domain::BusDesc;
 
-/// Internal backend plan resolved from [`SpatialQuality`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum DirectPathBackend {
-    /// Use Steam Audio simulation and direct effect for distance, air absorption, and occlusion.
-    #[default]
-    SteamAudio,
-    /// Use PetalSonic's native direct path for distance, air absorption, and occlusion.
-    Native,
-}
-
 /// Backend used for binaural/HRTF rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum HrtfBackend {

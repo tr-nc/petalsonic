@@ -110,25 +110,31 @@ mod tests {
 /// Opaque, generational handle for a long-lived logical sound emitter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Emitter {
+    pub(crate) world_id: u64,
     pub(crate) index: u32,
     pub(crate) generation: u32,
 }
 
 impl std::fmt::Display for Emitter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Emitter({}:{})", self.index, self.generation)
+        write!(
+            f,
+            "Emitter({}:{}:{})",
+            self.world_id, self.index, self.generation
+        )
     }
 }
 
 /// Opaque handle for one explicitly controlled playback voice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackControl {
+    pub(crate) world_id: u64,
     pub(crate) voice_id: SourceId,
 }
 
 impl std::fmt::Display for PlaybackControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Playback({})", self.voice_id)
+        write!(f, "Playback({}:{})", self.world_id, self.voice_id)
     }
 }
 

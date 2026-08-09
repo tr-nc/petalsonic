@@ -1,8 +1,8 @@
 use crate::acoustics::{AcousticSceneSlot, AcousticSceneSnapshot};
 use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::{
-    AmbisonicsBackend, DirectPathBackend, HrtfBackend, LatencyProfile, OutputDevicePolicy,
-    PetalSonicWorldDesc, SpatialQuality,
+    AmbisonicsBackend, HrtfBackend, LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc,
+    SpatialQuality,
 };
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame};
 use crate::error::PetalSonicError;
@@ -12,7 +12,7 @@ use crate::math::Pose;
 use crate::mixer;
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, VoiceStart};
 use crate::spatial::{RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig};
-use crate::world::SourceId;
+use crate::world::{OutputPreparation, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -52,7 +52,6 @@ const LOGICAL_CHANNELS: u16 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SpatialBackendPlan {
     hrtf: HrtfBackend,
-    direct_path: DirectPathBackend,
     use_ambisonics: bool,
     ambisonics: AmbisonicsBackend,
 }
@@ -188,7 +187,7 @@ struct StreamCreationParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AudioOutputDeviceInfo {
+struct AudioOutputDeviceInfo {
     pub name: String,
     pub is_default: bool,
     pub aliases: Vec<String>,
@@ -197,6 +196,12 @@ pub struct AudioOutputDeviceInfo {
 struct AudioOutputDeviceCandidate {
     device: cpal::Device,
     info: AudioOutputDeviceInfo,
+}
+
+struct PreparedOutputDevice {
+    device: cpal::Device,
+    config: cpal::SupportedStreamConfig,
+    _probe_stream: cpal::Stream,
 }
 
 pub(crate) struct EngineObservability {
@@ -234,6 +239,7 @@ pub(crate) struct EngineStartup {
 pub(crate) struct PetalSonicEngine {
     desc: PetalSonicWorldDesc,
     stream: Option<cpal::Stream>,
+    prepared_output_device: Option<PreparedOutputDevice>,
     is_running: Arc<AtomicBool>,
     frames_processed: Arc<AtomicUsize>,
     underrun_count: Arc<AtomicUsize>,
@@ -306,7 +312,6 @@ impl PetalSonicEngine {
             native_hrtf_path: desc.native_hrtf_path.clone(),
             hrtf_gain: desc.hrtf_gain,
             hrtf_backend: backend_plan.hrtf,
-            direct_path_backend: backend_plan.direct_path,
             use_ambisonics: backend_plan.use_ambisonics,
             ambisonics_backend: backend_plan.ambisonics,
             batched_any_hit_ray_tracer: Some(any_hit_adapter),
@@ -330,6 +335,7 @@ impl PetalSonicEngine {
             device_sample_rate: desc.sample_rate, // Will be updated when stream starts
             desc,
             stream: None,
+            prepared_output_device: None,
             is_running: Arc::new(AtomicBool::new(false)),
             frames_processed: ports.frames_processed,
             underrun_count: ports.underrun_count,
@@ -369,7 +375,6 @@ impl PetalSonicEngine {
                 } else {
                     HrtfBackend::SteamAudio
                 },
-                direct_path: DirectPathBackend::Native,
                 use_ambisonics: false,
                 ambisonics: AmbisonicsBackend::Native,
             },
@@ -379,13 +384,11 @@ impl PetalSonicEngine {
                 } else {
                     HrtfBackend::SteamAudio
                 },
-                direct_path: DirectPathBackend::Native,
                 use_ambisonics: true,
                 ambisonics: AmbisonicsBackend::Native,
             },
             SpatialQuality::HighQuality => SpatialBackendPlan {
                 hrtf: HrtfBackend::SteamAudio,
-                direct_path: DirectPathBackend::SteamAudio,
                 use_ambisonics: true,
                 ambisonics: AmbisonicsBackend::SteamAudio,
             },
@@ -440,7 +443,19 @@ impl PetalSonicEngine {
             OutputDevicePolicy::FollowSystemDefault => None,
             OutputDevicePolicy::PinnedNameContains(name) => Some(name.as_str()),
         };
-        let (device, device_config) = Self::init_audio_device(requested_device)?;
+        let (device, device_config) = if let Some(prepared) = self.prepared_output_device.take() {
+            let PreparedOutputDevice {
+                device,
+                config,
+                _probe_stream,
+            } = prepared;
+            // Keep the selected device open across old-stream shutdown, then release
+            // the silent probe immediately before constructing the real stream.
+            drop(_probe_stream);
+            (device, config)
+        } else {
+            Self::init_audio_device(requested_device)?
+        };
         let device_name = device
             .name()
             .unwrap_or_else(|_| "Unknown output device".to_string());
@@ -617,14 +632,6 @@ impl PetalSonicEngine {
         );
 
         Ok((device, device_config))
-    }
-
-    pub(crate) fn available_output_devices() -> Result<Vec<AudioOutputDeviceInfo>> {
-        let host = cpal::default_host();
-        Ok(Self::output_device_candidates(&host)?
-            .into_iter()
-            .map(|candidate| candidate.info)
-            .collect())
     }
 
     fn find_output_device_by_name_contains(
@@ -1047,19 +1054,66 @@ impl PetalSonicEngine {
             .unwrap_or(Some(OutputRecoveryReason::SelectionChanged))
     }
 
-    pub(crate) fn selected_output_available(&self) -> bool {
+    /// Opens the newly selected device before the current output is released.
+    ///
+    /// The probe stream remains paused and silent. `start` consumes the exact device
+    /// and negotiated format after the old stream has stopped, avoiding a second
+    /// default-device lookup during the handoff.
+    pub(crate) fn prepare_selected_output(&mut self) -> OutputPreparation {
         let requested_device = match &self.desc.output_device {
             OutputDevicePolicy::FollowSystemDefault => None,
             OutputDevicePolicy::PinnedNameContains(name) => Some(name.as_str()),
         };
-        Self::init_audio_device(requested_device)
-            .map(|(_, config)| {
-                matches!(
-                    config.sample_format(),
-                    cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16
-                )
+        let Ok((device, config)) = Self::init_audio_device(requested_device) else {
+            return OutputPreparation::Unavailable;
+        };
+        let stream_config = Self::create_stream_config(
+            config.channels(),
+            config.sample_rate().0,
+            cpal::BufferSize::Default,
+        );
+        let probe = match config.sample_format() {
+            cpal::SampleFormat::F32 => Self::build_silent_probe::<f32>(&device, &stream_config),
+            cpal::SampleFormat::I16 => Self::build_silent_probe::<i16>(&device, &stream_config),
+            cpal::SampleFormat::U16 => Self::build_silent_probe::<u16>(&device, &stream_config),
+            _ => return OutputPreparation::Unavailable,
+        };
+        let Ok(probe_stream) = probe else {
+            // Some platform backends cannot hold two output streams at once. The
+            // supervisor will perform the documented stop-then-rebuild fallback.
+            return OutputPreparation::RequiresStop;
+        };
+        self.prepared_output_device = Some(PreparedOutputDevice {
+            device,
+            config,
+            _probe_stream: probe_stream,
+        });
+        OutputPreparation::Ready
+    }
+
+    fn build_silent_probe<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+    ) -> Result<cpal::Stream>
+    where
+        T: SizedSample + FromSample<f32>,
+    {
+        device
+            .build_output_stream(
+                config,
+                move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                    for sample in data {
+                        *sample = T::from_sample(0.0);
+                    }
+                },
+                move |_error| {},
+                None,
+            )
+            .map_err(|error| {
+                PetalSonicError::AudioDevice(format!(
+                    "Failed to open selected output device: {error}"
+                ))
             })
-            .unwrap_or(false)
     }
 
     pub(crate) fn emit_runtime_state(&self, state: RuntimeState) {
@@ -1145,6 +1199,7 @@ impl PetalSonicEngine {
                     PetalSonicEvent::PlaybackCompleted {
                         emitter: completed.emitter,
                         control: PlaybackControl {
+                            world_id: completed.emitter.world_id,
                             voice_id: completed.voice_id,
                         },
                         tag,
@@ -1376,6 +1431,7 @@ impl PetalSonicEngine {
                     PetalSonicEvent::PlaybackCompleted {
                         emitter: completed.emitter,
                         control: PlaybackControl {
+                            world_id: completed.emitter.world_id,
                             voice_id: completed.voice_id,
                         },
                         tag,
@@ -1640,8 +1696,8 @@ impl PetalSonicEngine {
         // - Never dequeue a command unless we *already* hold the active_playback lock.
         //   Otherwise, if locking fails after dequeue, the command would be lost.
         let Ok(mut active_playback) = active_playback.try_lock() else {
-            // Can't safely mutate playback map this callback; leave commands queued.
-            // They'll be processed on a later callback when the lock is available.
+            // Can't safely mutate the playback map this quantum; leave commands queued.
+            // They'll be processed by a later render quantum when the lock is available.
             return;
         };
 
@@ -2121,20 +2177,17 @@ mod tests {
         };
         let low_latency = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
         assert_eq!(low_latency.hrtf, HrtfBackend::SteamAudio);
-        assert_eq!(low_latency.direct_path, DirectPathBackend::Native);
         assert!(!low_latency.use_ambisonics);
 
         desc.native_hrtf_path = Some("headset.petalhrtf".into());
         desc.spatial_quality = SpatialQuality::Balanced;
         let balanced = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
         assert_eq!(balanced.hrtf, HrtfBackend::Native);
-        assert_eq!(balanced.direct_path, DirectPathBackend::Native);
         assert!(balanced.use_ambisonics);
 
         desc.spatial_quality = SpatialQuality::HighQuality;
         let high_quality = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
         assert_eq!(high_quality.hrtf, HrtfBackend::SteamAudio);
-        assert_eq!(high_quality.direct_path, DirectPathBackend::SteamAudio);
         assert!(high_quality.use_ambisonics);
     }
 
@@ -2167,6 +2220,7 @@ mod tests {
 
         let (command_sender, command_receiver) = crossbeam_channel::bounded(8);
         let emitter = crate::domain::Emitter {
+            world_id: 1,
             index: 0,
             generation: 1,
         };
@@ -2204,7 +2258,9 @@ mod tests {
             acoustic_scene_slot: Arc::new(AcousticSceneSlot::new(None)),
             pending_acoustic_retirement: None,
             acoustic_retirement_sender: crossbeam_channel::bounded(2).0,
-            resampler: PetalSonicEngine::create_resampler(sample_rate, sample_rate, 2, block_size)
+            // Exercise the non-bypass path used when the physical device rate differs
+            // from the world's logical 48 kHz rate.
+            resampler: PetalSonicEngine::create_resampler(sample_rate, 44_100, 2, block_size)
                 .unwrap(),
             ring_buffer_producer: producer,
             channels: 2,
@@ -2252,43 +2308,48 @@ mod tests {
     }
 
     #[test]
-    fn warmed_balanced_render_quantum_reuses_buffers_and_meets_budget() {
+    fn warmed_near_capacity_balanced_render_stays_bounded_and_meets_budget() {
+        const VOICES: usize = 32;
         let block_size = 64;
         let sample_rate = 48_000;
-        let (command_sender, command_receiver) = crossbeam_channel::bounded(4);
-        let (_lifecycle_sender, lifecycle_receiver) = crossbeam_channel::bounded(4);
-        command_sender
-            .try_send(PlaybackCommand::Play {
-                voice_id: SourceId::from(1),
-                emitter: crate::domain::Emitter {
-                    index: 0,
-                    generation: 1,
-                },
-                source: Arc::new(PetalSonicAudioData::new(
-                    vec![0.25; block_size * 16],
-                    sample_rate,
-                    1,
-                    Duration::from_secs_f64((block_size * 16) as f64 / sample_rate as f64),
-                )),
-                config: SourceConfig::non_spatial(),
-                loop_mode: LoopMode::Infinite,
-                detached: false,
-                completion_tag: None,
-                bus_index: 0,
-                playback_rate: 1.0,
-                mono_scratch: vec![0.0; block_size],
-            })
-            .unwrap();
+        let (command_sender, command_receiver) = crossbeam_channel::bounded(VOICES);
+        let (_lifecycle_sender, lifecycle_receiver) = crossbeam_channel::bounded(VOICES);
+        let source = Arc::new(PetalSonicAudioData::new(
+            vec![0.25 / VOICES as f32; block_size * 16],
+            sample_rate,
+            1,
+            Duration::from_secs_f64((block_size * 16) as f64 / sample_rate as f64),
+        ));
+        for voice in 0..VOICES {
+            command_sender
+                .try_send(PlaybackCommand::Play {
+                    voice_id: SourceId::from(voice as u64 + 1),
+                    emitter: crate::domain::Emitter {
+                        world_id: 1,
+                        index: voice as u32,
+                        generation: 1,
+                    },
+                    source: source.clone(),
+                    config: SourceConfig::non_spatial(),
+                    loop_mode: LoopMode::Infinite,
+                    detached: false,
+                    completion_tag: None,
+                    bus_index: 0,
+                    playback_rate: 1.0,
+                    mono_scratch: vec![0.0; block_size],
+                })
+                .unwrap();
+        }
         let ring_buffer = HeapRb::<StereoFrame>::new(block_size * 8);
         let (producer, mut consumer) = ring_buffer.split();
-        let (event_sender, _event_receiver) = crossbeam_channel::bounded(4);
-        let (timing_sender, timing_receiver) = crossbeam_channel::bounded(4);
+        let (event_sender, _event_receiver) = crossbeam_channel::bounded(VOICES);
+        let (timing_sender, timing_receiver) = crossbeam_channel::bounded(VOICES);
         let (backend_retirement_sender, _backend_retirement_receiver) =
-            crossbeam_channel::bounded(4);
+            crossbeam_channel::bounded(VOICES);
         let mut pump = PumpState {
-            active_playback: Arc::new(Mutex::new(HashMap::with_capacity(4))),
-            active_voice_count: Arc::new(AtomicUsize::new(1)),
-            retirement_sender: crossbeam_channel::bounded(4).0,
+            active_playback: Arc::new(Mutex::new(HashMap::with_capacity(VOICES))),
+            active_voice_count: Arc::new(AtomicUsize::new(VOICES)),
+            retirement_sender: crossbeam_channel::bounded(VOICES).0,
             latest_spatial_frame: Arc::new(Mutex::new(None)),
             current_spatial_frame: None,
             pending_spatial_retirement: None,
@@ -2310,13 +2371,13 @@ mod tests {
             master_gain_linear: 1.0,
             buses: vec![BusParams::default()],
             schedule: RenderSchedule::for_profile(LatencyProfile::Balanced),
-            mixer_scratch: mixer::MixerScratch::new(4),
-            completed_playbacks: Vec::with_capacity(4),
+            mixer_scratch: mixer::MixerScratch::new(VOICES),
+            completed_playbacks: Vec::with_capacity(VOICES),
             world_buffer: vec![0.0; block_size * 2],
             resampled_buffer: vec![0.0; (block_size + 10) * 2],
             counters: Arc::new(RuntimeCounters::default()),
             backend_retirement_sender,
-            pending_backend_retirements: Vec::with_capacity(4),
+            pending_backend_retirements: Vec::with_capacity(VOICES),
         };
 
         PetalSonicEngine::pump_render_state(&mut pump);
@@ -2329,6 +2390,18 @@ mod tests {
 
         assert_eq!(activity, 0, "steady render quantum allocated or freed");
         assert!(consumer.try_pop().is_some());
+
+        let sustained_activity = callback_memory_activity(|| {
+            for _ in 0..4_096 {
+                while consumer.try_pop().is_some() {}
+                while timing_receiver.try_recv().is_ok() {}
+                PetalSonicEngine::pump_render_state(&mut pump);
+            }
+        });
+        assert_eq!(
+            sustained_activity, 0,
+            "sustained near-capacity rendering allocated or freed"
+        );
 
         let mut elapsed_us = [0u64; 256];
         for elapsed in &mut elapsed_us {
@@ -2348,7 +2421,7 @@ mod tests {
             );
         }
         eprintln!(
-            "balanced full-quantum baseline: p50={}us p95={}us p99={}us max={}us period={}us",
+            "balanced near-capacity baseline ({VOICES} voices): p50={}us p95={}us p99={}us max={}us period={}us",
             elapsed_us[elapsed_us.len() / 2],
             elapsed_us[elapsed_us.len() * 95 / 100],
             p99,
@@ -2360,6 +2433,7 @@ mod tests {
     #[test]
     fn emitter_supports_overlapping_voices_and_detached_destroy_semantics() {
         let emitter = crate::domain::Emitter {
+            world_id: 1,
             index: 4,
             generation: 2,
         };
@@ -2411,6 +2485,7 @@ mod tests {
     #[test]
     fn spatial_frame_updates_attached_voices_as_one_generation() {
         let emitter = crate::domain::Emitter {
+            world_id: 1,
             index: 2,
             generation: 3,
         };

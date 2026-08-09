@@ -131,10 +131,10 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
                              ↓ bounded control intent
 ┌──────────────────────────────────────────────────────────────┐
 │ Render Thread (generates samples at world rate)              │
-│ - Process PlaybackCommand                                    │
+│ - Apply bounded lifecycle and control intent                 │
 │ - For each active source:                                    │
 │   ├─ NonSpatial → direct mixing                              │
-│   └─ Spatial → Steam Audio (Direct, Encode, Decode) → mix    │
+│   └─ Spatial → native acoustics + selected HRTF plan → mix   │
 │ - Push frames to ring buffer                                 │
 └──────────────────────────────────────────────────────────────┘
                              ↓ Ring Buffer (StereoFrame)

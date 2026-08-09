@@ -4,8 +4,8 @@ use crate::domain::{
     SpatialFrame,
 };
 use crate::engine::{
-    AudioOutputDeviceInfo, EngineCommandReceivers, EngineObservability, EngineStartup,
-    OutputRecoveryReason, PetalSonicEngine,
+    EngineCommandReceivers, EngineObservability, EngineStartup, OutputRecoveryReason,
+    PetalSonicEngine,
 };
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
@@ -26,10 +26,17 @@ const MAX_PLAYBACK_RATE: f32 = 4.0;
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputPreparation {
+    Ready,
+    Unavailable,
+    RequiresStop,
+}
+
 trait OutputRuntimeDriver {
     fn drain_retired_resources(&mut self);
     fn output_recovery_reason(&self) -> Option<OutputRecoveryReason>;
-    fn selected_output_available(&self) -> bool;
+    fn prepare_selected_output(&mut self) -> OutputPreparation;
     fn stop_output(&mut self) -> Result<()>;
     fn advance_without_output(
         &mut self,
@@ -54,8 +61,8 @@ impl OutputRuntimeDriver for PetalSonicEngine {
         PetalSonicEngine::output_recovery_reason(self)
     }
 
-    fn selected_output_available(&self) -> bool {
-        PetalSonicEngine::selected_output_available(self)
+    fn prepare_selected_output(&mut self) -> OutputPreparation {
+        PetalSonicEngine::prepare_selected_output(self)
     }
 
     fn stop_output(&mut self) -> Result<()> {
@@ -137,6 +144,7 @@ struct EmitterSlot {
 }
 
 struct EmitterRegistry {
+    world_id: u64,
     slots: Vec<EmitterSlot>,
     free: Vec<u32>,
     len: usize,
@@ -144,8 +152,9 @@ struct EmitterRegistry {
 }
 
 impl EmitterRegistry {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, world_id: u64) -> Self {
         Self {
+            world_id,
             slots: Vec::with_capacity(limit),
             free: Vec::with_capacity(limit),
             len: 0,
@@ -166,6 +175,7 @@ impl EmitterRegistry {
             let slot = &mut self.slots[index as usize];
             slot.state = Some(state);
             return Ok(Emitter {
+                world_id: self.world_id,
                 index,
                 generation: slot.generation,
             });
@@ -177,12 +187,16 @@ impl EmitterRegistry {
             state: Some(state),
         });
         Ok(Emitter {
+            world_id: self.world_id,
             index,
             generation: 1,
         })
     }
 
     fn get(&self, emitter: Emitter) -> Result<&EmitterState> {
+        if emitter.world_id != self.world_id {
+            return Err(PetalSonicError::StaleEmitter);
+        }
         let slot = self
             .slots
             .get(emitter.index as usize)
@@ -194,6 +208,9 @@ impl EmitterRegistry {
     }
 
     fn get_mut(&mut self, emitter: Emitter) -> Result<&mut EmitterState> {
+        if emitter.world_id != self.world_id {
+            return Err(PetalSonicError::StaleEmitter);
+        }
         let slot = self
             .slots
             .get_mut(emitter.index as usize)
@@ -205,6 +222,9 @@ impl EmitterRegistry {
     }
 
     fn remove(&mut self, emitter: Emitter) -> Result<EmitterState> {
+        if emitter.world_id != self.world_id {
+            return Err(PetalSonicError::StaleEmitter);
+        }
         let slot = self
             .slots
             .get_mut(emitter.index as usize)
@@ -358,7 +378,7 @@ impl PetalSonicWorld {
 
         Ok(Self {
             world_id,
-            emitters: Mutex::new(EmitterRegistry::new(config.max_emitters)),
+            emitters: Mutex::new(EmitterRegistry::new(config.max_emitters, world_id)),
             bus_params,
             controlled_voices: Mutex::new(HashMap::with_capacity(config.max_voices)),
             desc: config,
@@ -402,12 +422,17 @@ impl PetalSonicWorld {
         let recovery_reason = (state == RuntimeState::Running && now >= schedule.next_health_probe)
             .then(|| driver.output_recovery_reason())
             .flatten();
+        let selection_preparation = matches!(
+            recovery_reason,
+            Some(OutputRecoveryReason::SelectionChanged)
+        )
+        .then(|| driver.prepare_selected_output());
         let should_recover = state == RuntimeState::Recovering
             || matches!(recovery_reason, Some(OutputRecoveryReason::StreamFailure))
             || matches!(
-                recovery_reason,
-                Some(OutputRecoveryReason::SelectionChanged)
-            ) && driver.selected_output_available();
+                selection_preparation,
+                Some(OutputPreparation::Ready | OutputPreparation::RequiresStop)
+            );
 
         if state == RuntimeState::Running && now >= schedule.next_health_probe {
             schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
@@ -608,10 +633,6 @@ impl PetalSonicWorld {
         &self.desc
     }
 
-    pub fn available_output_devices() -> Result<Vec<AudioOutputDeviceInfo>> {
-        PetalSonicEngine::available_output_devices()
-    }
-
     pub fn create_emitter(&self, clip: ResidentClip, desc: EmitterDesc) -> Result<Emitter> {
         self.ensure_open()?;
         self.validate_optional_bus(desc.bus())?;
@@ -720,7 +741,10 @@ impl PetalSonicWorld {
         tag: PlaybackTag,
     ) -> Result<PlaybackControl> {
         let voice_id = self.submit_play(emitter, options, Some(tag))?;
-        Ok(PlaybackControl { voice_id })
+        Ok(PlaybackControl {
+            world_id: self.world_id,
+            voice_id,
+        })
     }
 
     fn submit_play(
@@ -951,11 +975,12 @@ impl PetalSonicWorld {
 
     fn ensure_controlled(&self, control: PlaybackControl) -> Result<()> {
         self.drain_retired_controls();
-        if self
-            .controlled_voices
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
-            .contains_key(&control.voice_id)
+        if control.world_id == self.world_id
+            && self
+                .controlled_voices
+                .lock()
+                .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
+                .contains_key(&control.voice_id)
         {
             Ok(())
         } else {
@@ -1190,6 +1215,8 @@ mod tests {
         selected: Option<FakeDevice>,
         stream_failed: bool,
         permanent_format_failure: bool,
+        prepared: Option<FakeDevice>,
+        requires_stop_to_prepare: bool,
         actions: Vec<&'static str>,
         checked_while_active: Cell<bool>,
         advanced: Duration,
@@ -1206,6 +1233,8 @@ mod tests {
                 selected: Some(active),
                 stream_failed: false,
                 permanent_format_failure: false,
+                prepared: None,
+                requires_stop_to_prepare: false,
                 actions: Vec::new(),
                 checked_while_active: Cell::new(false),
                 advanced: Duration::ZERO,
@@ -1230,9 +1259,18 @@ mod tests {
             }
         }
 
-        fn selected_output_available(&self) -> bool {
+        fn prepare_selected_output(&mut self) -> OutputPreparation {
             self.checked_while_active.set(self.active.is_some());
-            self.selected.is_some()
+            self.actions.push("prepare");
+            if self.selected.is_some() && self.requires_stop_to_prepare {
+                return OutputPreparation::RequiresStop;
+            }
+            self.prepared = self.selected;
+            if self.prepared.is_some() {
+                OutputPreparation::Ready
+            } else {
+                OutputPreparation::Unavailable
+            }
         }
 
         fn stop_output(&mut self) -> Result<()> {
@@ -1270,7 +1308,7 @@ mod tests {
                     "unsupported fake format".into(),
                 ));
             }
-            let Some(selected) = self.selected else {
+            let Some(selected) = self.prepared.take().or(self.selected) else {
                 return Err(PetalSonicError::AudioDevice("no fake device".into()));
             };
             self.active = Some(selected);
@@ -1381,7 +1419,7 @@ mod tests {
         );
 
         assert!(driver.checked_while_active.get());
-        assert_eq!(driver.actions, ["stop", "advance", "start"]);
+        assert_eq!(driver.actions, ["prepare", "stop", "advance", "start"]);
         assert_eq!(driver.active, Some(b));
         assert_eq!(
             PetalSonicWorld::load_runtime_state(&runtime_state),
@@ -1481,7 +1519,49 @@ mod tests {
         );
 
         assert_eq!(driver.active, Some(a));
-        assert!(driver.actions.is_empty());
+        assert_eq!(driver.actions, ["prepare"]);
+        assert_eq!(
+            PetalSonicWorld::load_runtime_state(&runtime_state),
+            RuntimeState::Running
+        );
+    }
+
+    #[test]
+    fn fake_exclusive_backend_falls_back_to_stop_then_rebuild() {
+        let a = FakeDevice {
+            name: "A",
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let b = FakeDevice {
+            name: "B",
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        let mut driver = FakeOutputDriver::with_active(a);
+        driver.selected = Some(b);
+        driver.requires_stop_to_prepare = true;
+        let commands = fake_command_receivers();
+        let buses = Mutex::new(vec![BusParams::default()]);
+        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let mut recovery_buses = vec![BusParams::default()];
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+
+        PetalSonicWorld::supervisor_tick(
+            &mut driver,
+            &commands,
+            &buses,
+            &runtime_state,
+            &recovery_attempts,
+            &mut recovery_buses,
+            &mut schedule,
+            now,
+        );
+
+        assert_eq!(driver.actions, ["prepare", "stop", "advance", "start"]);
+        assert_eq!(driver.active, Some(b));
         assert_eq!(
             PetalSonicWorld::load_runtime_state(&runtime_state),
             RuntimeState::Running
@@ -1759,9 +1839,28 @@ mod tests {
         };
         let first = PetalSonicWorld::new(desc.clone()).unwrap();
         let second = PetalSonicWorld::new(desc).unwrap();
+        let first_emitter = first
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap();
         let second_emitter = second
             .create_emitter(clip(), EmitterDesc::non_spatial())
             .unwrap();
+        let first_control = first
+            .play_controlled(first_emitter, PlayOptions::looping(), PlaybackTag(1))
+            .unwrap();
+        let second_control = second
+            .play_controlled(second_emitter, PlayOptions::looping(), PlaybackTag(2))
+            .unwrap();
+
+        assert!(matches!(
+            first.pause_emitter(second_emitter),
+            Err(PetalSonicError::StaleEmitter)
+        ));
+        assert!(matches!(
+            first.pause_playback(second_control),
+            Err(PetalSonicError::StalePlayback)
+        ));
+        first.pause_playback(first_control).unwrap();
 
         first.close().unwrap();
         first.close().unwrap();
@@ -1853,7 +1952,7 @@ mod tests {
 
     #[test]
     fn emitter_registry_rejects_stale_generation_after_slot_reuse() {
-        let mut registry = EmitterRegistry::new(1);
+        let mut registry = EmitterRegistry::new(1, 1);
         let first = registry
             .insert(EmitterState {
                 clip: clip(),
@@ -1878,7 +1977,7 @@ mod tests {
 
     #[test]
     fn emitter_registry_enforces_capacity_and_recovers_after_remove() {
-        let mut registry = EmitterRegistry::new(1);
+        let mut registry = EmitterRegistry::new(1, 1);
         let emitter = registry
             .insert(EmitterState {
                 clip: clip(),
@@ -1906,7 +2005,7 @@ mod tests {
 
     #[test]
     fn spatial_frame_must_be_complete_before_any_pose_is_updated() {
-        let mut registry = EmitterRegistry::new(2);
+        let mut registry = EmitterRegistry::new(2, 1);
         let first = registry
             .insert(EmitterState {
                 clip: clip(),

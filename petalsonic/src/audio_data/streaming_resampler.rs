@@ -20,13 +20,21 @@ enum ResamplerImpl {
 }
 
 impl ResamplerImpl {
-    fn process(
+    fn process_into_buffer(
         &mut self,
         input: &[Vec<f32>],
-    ) -> std::result::Result<Vec<Vec<f32>>, rubato::ResampleError> {
+        output: &mut [Vec<f32>],
+    ) -> std::result::Result<(usize, usize), rubato::ResampleError> {
         match self {
-            Self::Fast(r) => r.process(input, None),
-            Self::Sinc(r) => r.process(input, None),
+            Self::Fast(r) => r.process_into_buffer(input, output, None),
+            Self::Sinc(r) => r.process_into_buffer(input, output, None),
+        }
+    }
+
+    fn output_buffer_allocate(&self) -> Vec<Vec<f32>> {
+        match self {
+            Self::Fast(r) => r.output_buffer_allocate(true),
+            Self::Sinc(r) => r.output_buffer_allocate(true),
         }
     }
 }
@@ -41,6 +49,8 @@ pub struct StreamingResampler {
     target_sample_rate: u32,
     channels: u16,
     input_chunk_size: usize,
+    input_waves: Vec<Vec<f32>>,
+    output_waves: Vec<Vec<f32>>,
 }
 
 impl StreamingResampler {
@@ -121,12 +131,17 @@ impl StreamingResampler {
             }
         };
 
+        let input_waves = vec![vec![0.0; input_frames]; channels as usize];
+        let output_waves = resampler.output_buffer_allocate();
+
         Ok(Self {
             resampler,
             source_sample_rate,
             target_sample_rate,
             channels,
             input_chunk_size: input_frames,
+            input_waves,
+            output_waves,
         })
     }
 
@@ -164,20 +179,21 @@ impl StreamingResampler {
             return Ok((input_frames, input_frames));
         }
 
-        // De-interleave input
-        let mut input_waves: Vec<Vec<f32>> = vec![Vec::with_capacity(input_frames); channels];
+        // De-interleave into storage allocated with this output session.
         for frame_idx in 0..input_frames {
             for ch in 0..channels {
-                input_waves[ch].push(input_samples[frame_idx * channels + ch]);
+                self.input_waves[ch][frame_idx] = input_samples[frame_idx * channels + ch];
             }
         }
 
-        // Resample
-        let output_waves = self.resampler.process(&input_waves).map_err(|e| {
-            PetalSonicError::AudioLoading(format!("Streaming resampling error: {}", e))
-        })?;
-
-        let output_frames = output_waves[0].len();
+        // Rubato's allocating `process` convenience API is intentionally avoided on
+        // the render thread. Both planar buffers are reused for every quantum.
+        let (input_frames_consumed, output_frames) = self
+            .resampler
+            .process_into_buffer(&self.input_waves, &mut self.output_waves)
+            .map_err(|e| {
+                PetalSonicError::AudioLoading(format!("Streaming resampling error: {}", e))
+            })?;
         let output_samples_needed = output_frames * channels;
 
         // Check if output buffer is large enough
@@ -192,10 +208,10 @@ impl StreamingResampler {
         // Re-interleave output
         for frame_idx in 0..output_frames {
             for ch in 0..channels {
-                output_samples[frame_idx * channels + ch] = output_waves[ch][frame_idx];
+                output_samples[frame_idx * channels + ch] = self.output_waves[ch][frame_idx];
             }
         }
 
-        Ok((output_frames, input_frames))
+        Ok((output_frames, input_frames_consumed))
     }
 }

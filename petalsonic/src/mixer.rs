@@ -188,6 +188,7 @@ mod tests {
             ));
             let mut voice = PlaybackInstance::from_source(VoiceStart {
                 emitter: Emitter {
+                    world_id: 1,
                     index: id,
                     generation: 1,
                 },
@@ -246,6 +247,7 @@ mod tests {
             ));
             let mut voice = PlaybackInstance::from_source(VoiceStart {
                 emitter: Emitter {
+                    world_id: 1,
                     index: id,
                     generation: 1,
                 },

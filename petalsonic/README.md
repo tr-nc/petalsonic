@@ -119,7 +119,7 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 ┌──────────────────────────────────────────────────────────────┐
 │ Render Thread (generates samples at world rate)              │
 │ - Process playback commands                                  │
-│ - Spatialize audio sources via Steam Audio                   │
+│ - Apply native acoustics and the fixed world HRTF plan       │
 │ - Mix sources together                                       │
 │ - Push frames to ring buffer                                 │
 └──────────────────────────────────────────────────────────────┘
@@ -189,7 +189,7 @@ let config = PetalSonicWorldDesc {
     steam_hrtf_path: None,        // Optional Steam Audio SOFA path
     native_hrtf_path: None,       // Optional native .petalhrtf path
     hrtf_gain: 0.0,               // HRTF gain compensation (dB)
-    distance_scaler: 10.0,        // 1 world unit = 10 meters in spatial simulation
+    distance_scaler: 10.0,        // 1 world unit = 10 meters for acoustic queries
     ..Default::default()
 };
 ```

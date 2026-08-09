@@ -27,7 +27,7 @@ cargo test -p petalsonic --doc
 
 echo "[6/8] release realtime/performance contracts"
 cargo test --release -p petalsonic \
-    warmed_balanced_render_quantum_reuses_buffers_and_meets_budget -- --nocapture
+    warmed_near_capacity_balanced_render_stays_bounded_and_meets_budget -- --nocapture
 
 echo "[7/8] release demo build"
 cargo build --release -p petalsonic-demo

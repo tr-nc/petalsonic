@@ -34,7 +34,11 @@ pub struct AcousticHit {
     pub material: AcousticMaterial,
 }
 
-/// Host-provided batched any-hit ray tracing backend used by Steam Audio custom scenes.
+/// Immutable batched any-hit query backend captured by an acoustic-scene snapshot.
+///
+/// PetalSonic invokes this on its render thread with caller-provided result storage;
+/// implementations must have bounded work and must not allocate, block, or access mutable
+/// game-world state.
 pub trait BatchedAnyHitRayTracer: Send + Sync {
     fn trace_any_hit_batch(
         &self,
@@ -45,7 +49,11 @@ pub trait BatchedAnyHitRayTracer: Send + Sync {
     );
 }
 
-/// Host-provided batched closest-hit ray tracing backend used by reflections.
+/// Immutable batched closest-hit query backend captured by an acoustic-scene snapshot.
+///
+/// PetalSonic invokes this on its render thread with caller-provided result storage;
+/// implementations must have bounded work and must not allocate, block, or access mutable
+/// game-world state.
 pub trait BatchedClosestHitRayTracer: Send + Sync {
     fn trace_closest_hit_batch(
         &self,

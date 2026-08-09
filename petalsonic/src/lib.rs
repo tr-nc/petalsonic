@@ -92,7 +92,6 @@ pub use domain::{
     Bus, BusDesc, BusParams, Emitter, EmitterDesc, EmitterSpatialState, PlayOptions,
     PlaybackControl, PlaybackTag, ResidentClip, SpatialFrame,
 };
-pub use engine::AudioOutputDeviceInfo;
 pub use error::PetalSonicError;
 pub use events::{
     PetalSonicEvent, RenderTimingEvent, RuntimeDiagnostics, RuntimeState, RuntimeStatus,

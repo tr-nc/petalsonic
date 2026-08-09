@@ -1,11 +1,13 @@
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::{PetalSonicWorldDesc, SourceConfig};
+use crate::engine::{AudioOutputDeviceInfo, PetalSonicEngine};
 use crate::error::Result;
+use crate::events::{PetalSonicEvent, RenderTimingEvent};
 use crate::math::{Pose, Vec3};
 use crate::playback::{LoopMode, PlaybackCommand, PlaybackSource};
 use crate::procedural::ProceduralAudioFactory;
 use crate::spatial::DirectPathOverride;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -44,28 +46,98 @@ pub struct PetalSonicWorld {
     source_storage: std::sync::Mutex<HashMap<SourceId, PlaybackSource>>,
     source_configs: std::sync::Mutex<HashMap<SourceId, SourceConfig>>,
     listener: std::sync::Mutex<PetalSonicAudioListener>,
+    listener_pose: Arc<Mutex<Pose>>,
     next_source_id: std::sync::Mutex<u64>,
     command_sender: Sender<PlaybackCommand>,
-    command_receiver: Receiver<PlaybackCommand>,
-    /// Optional reference to engine's listener pose for automatic synchronization
-    /// This is set by the engine when it's created, allowing the world to
-    /// automatically update the engine's listener when set_listener_pose is called
-    engine_listener_pose: std::sync::Mutex<Option<Arc<Mutex<Pose>>>>,
+    engine: Mutex<Option<PetalSonicEngine>>,
 }
 
 impl PetalSonicWorld {
     pub fn new(config: PetalSonicWorldDesc) -> Result<Self> {
-        let (command_sender, command_receiver) = crossbeam_channel::unbounded();
+        let command_capacity = config.max_sources.saturating_mul(2).max(64);
+        let (command_sender, command_receiver) = crossbeam_channel::bounded(command_capacity);
+        let listener_pose = Arc::new(Mutex::new(Pose::default()));
+        let mut engine = PetalSonicEngine::new(config.clone(), listener_pose.clone())?;
+        engine.start(command_receiver)?;
+
         Ok(Self {
             desc: config,
             source_storage: std::sync::Mutex::new(HashMap::new()),
             source_configs: std::sync::Mutex::new(HashMap::new()),
             listener: std::sync::Mutex::new(PetalSonicAudioListener::default()),
+            listener_pose,
             next_source_id: std::sync::Mutex::new(0),
             command_sender,
-            command_receiver,
-            engine_listener_pose: std::sync::Mutex::new(None),
+            engine: Mutex::new(Some(engine)),
         })
+    }
+
+    /// Returns the immutable configuration chosen when this world was created.
+    pub fn config(&self) -> &PetalSonicWorldDesc {
+        &self.desc
+    }
+
+    /// Enumerates the output devices visible to the platform adapter.
+    pub fn available_output_devices() -> Result<Vec<AudioOutputDeviceInfo>> {
+        PetalSonicEngine::available_output_devices()
+    }
+
+    /// Returns whether this world's internal runtime is actively producing audio.
+    pub fn is_running(&self) -> bool {
+        self.engine
+            .lock()
+            .ok()
+            .and_then(|engine| engine.as_ref().map(PetalSonicEngine::is_running))
+            .unwrap_or(false)
+    }
+
+    /// Returns the number of device frames consumed since this world started.
+    pub fn frames_processed(&self) -> usize {
+        self.engine
+            .lock()
+            .ok()
+            .and_then(|engine| engine.as_ref().map(PetalSonicEngine::frames_processed))
+            .unwrap_or(0)
+    }
+
+    /// Returns the cumulative number of device-callback underruns after startup grace.
+    pub fn underrun_count(&self) -> usize {
+        self.engine
+            .lock()
+            .ok()
+            .and_then(|engine| engine.as_ref().map(PetalSonicEngine::underrun_count))
+            .unwrap_or(0)
+    }
+
+    /// Drains all currently queued runtime events without invoking user callbacks.
+    pub fn drain_events(&self) -> Vec<PetalSonicEvent> {
+        self.engine
+            .lock()
+            .ok()
+            .and_then(|engine| engine.as_ref().map(PetalSonicEngine::poll_events))
+            .unwrap_or_default()
+    }
+
+    /// Drains render timing snapshots used by diagnostics and the demo profiler.
+    pub fn drain_timing_events(&self) -> Vec<RenderTimingEvent> {
+        self.engine
+            .lock()
+            .ok()
+            .and_then(|engine| engine.as_ref().map(PetalSonicEngine::poll_timing_events))
+            .unwrap_or_default()
+    }
+
+    /// Stops the device stream and joins the world-owned render thread.
+    ///
+    /// Calling this method more than once is safe.
+    pub fn close(&self) -> Result<()> {
+        let mut engine = self.engine.lock().map_err(|_| {
+            crate::error::PetalSonicError::Engine("Audio runtime lock is poisoned".into())
+        })?;
+        if let Some(mut engine) = engine.take() {
+            engine.stop()?;
+        }
+        Ok(())
     }
 
     /// Returns the sample rate of the audio world.
@@ -201,27 +273,9 @@ impl PetalSonicWorld {
     /// * `pose` - The new pose for the listener
     pub fn set_listener_pose(&self, pose: Pose) {
         self.listener.lock().unwrap().pose = pose;
-
-        // Automatically synchronize with engine if connected
-        if let Ok(engine_pose_opt) = self.engine_listener_pose.lock()
-            && let Some(engine_pose) = engine_pose_opt.as_ref()
-            && let Ok(mut engine_listener) = engine_pose.lock()
-        {
-            *engine_listener = pose;
+        if let Ok(mut runtime_pose) = self.listener_pose.lock() {
+            *runtime_pose = pose;
         }
-    }
-
-    /// Internal method to connect the engine's listener pose for automatic synchronization.
-    ///
-    /// This is called by the engine when it's created, establishing a link that allows
-    /// the world to automatically update the engine's listener pose whenever
-    /// `set_listener_pose` is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `engine_pose` - Reference to the engine's listener pose
-    pub(crate) fn connect_engine_listener(&self, engine_pose: Arc<Mutex<Pose>>) {
-        *self.engine_listener_pose.lock().unwrap() = Some(engine_pose);
     }
 
     /// Returns a copy of the current listener.
@@ -467,18 +521,11 @@ impl PetalSonicWorld {
 
         Ok(())
     }
+}
 
-    /// Returns a reference to the command receiver for the audio engine.
-    ///
-    /// This receiver is used by the audio engine thread to poll for playback commands
-    /// sent from the main thread. This method is primarily used internally when
-    /// initializing the audio engine.
-    ///
-    /// # Returns
-    ///
-    /// A reference to the `Receiver<PlaybackCommand>` channel
-    pub fn command_receiver(&self) -> &Receiver<PlaybackCommand> {
-        &self.command_receiver
+impl Drop for PetalSonicWorld {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 

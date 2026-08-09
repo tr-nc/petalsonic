@@ -3,7 +3,6 @@ use petalsonic::{
     RenderTimingEvent, SourceConfig,
     audio_data::PetalSonicAudioData,
     config::PetalSonicWorldDesc,
-    engine::PetalSonicEngine,
     math::{Pose, Quat, Vec3},
     playback::LoopMode,
     world::{PetalSonicWorld, SourceId},
@@ -118,7 +117,6 @@ struct NonSpatialAudioSource {
 
 pub struct SpatialAudioDemo {
     world: Arc<PetalSonicWorld>,
-    engine: PetalSonicEngine,
     spatial_sources: Vec<SpatialAudioSource>,
     non_spatial_sources: Vec<NonSpatialAudioSource>,
     grid_size: f32,
@@ -180,13 +178,7 @@ impl SpatialAudioDemo {
         let listener_pose = Pose::new(Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY);
         world.set_listener_pose(listener_pose);
 
-        // Create engine
         let world_arc = Arc::new(world);
-        let mut engine = PetalSonicEngine::new(world_desc.clone(), world_arc.clone())
-            .expect("Failed to create engine");
-
-        // Start the engine
-        engine.start().expect("Failed to start audio engine");
 
         // Calculate maximum frame time constraint (block_size / sample_rate)
         //
@@ -214,7 +206,6 @@ impl SpatialAudioDemo {
 
         Self {
             world: world_arc,
-            engine,
             spatial_sources: Vec::new(),
             non_spatial_sources: Vec::new(),
             grid_size: 2.0,                             // Show 4m x 4m area (-2 to +2)
@@ -454,7 +445,7 @@ impl SpatialAudioDemo {
             let distance_world = source.position.length();
             // Convert world units to meters using the world's distance scaler so
             // the UI reflects the same physical scale as the spatial simulation.
-            let distance = distance_world * self.engine.config().distance_scaler;
+            let distance = distance_world * self.world.config().distance_scaler;
             let label = format!(
                 "{} ({:.1}m)",
                 source.file_name.trim_end_matches(".wav"),
@@ -818,7 +809,7 @@ impl eframe::App for SpatialAudioDemo {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll for audio events and handle them
         // This checks for completed sources and removes them from the UI
-        let events = self.engine.poll_events();
+        let events = self.world.drain_events();
         if !events.is_empty() {
             log::debug!("GUI: Received {} event(s)", events.len());
         }
@@ -854,7 +845,7 @@ impl eframe::App for SpatialAudioDemo {
         }
 
         // Poll for timing events and update history
-        let timing_events = self.engine.poll_timing_events();
+        let timing_events = self.world.drain_timing_events();
         for timing in timing_events {
             // Add to history
             self.timing_history.push_back(timing);
@@ -1294,6 +1285,6 @@ impl eframe::App for SpatialAudioDemo {
 impl Drop for SpatialAudioDemo {
     fn drop(&mut self) {
         log::info!("Shutting down audio engine");
-        let _ = self.engine.stop();
+        let _ = self.world.close();
     }
 }

@@ -1,13 +1,13 @@
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::{AmbisonicsBackend, DirectPathBackend, HrtfBackend, PetalSonicWorldDesc};
+use crate::config::PetalSonicWorldDesc;
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
 use crate::math::Pose;
 use crate::mixer;
 use crate::playback::{PlaybackCommand, PlaybackInstance};
-use crate::spatial::{DirectOcclusionDebugSnapshot, SpatialProcessor};
-use crate::world::{PetalSonicWorld, SourceId};
+use crate::spatial::SpatialProcessor;
+use crate::world::SourceId;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use crossbeam_channel::{Receiver, Sender};
@@ -21,7 +21,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 // Stereo frame for ring buffer
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +57,7 @@ const STARTUP_UNDERRUN_GRACE_CALLBACKS: usize = 8;
 struct AudioCallbackContext {
     is_running: Arc<AtomicBool>,
     frames_processed: Arc<AtomicUsize>,
+    underrun_count: Arc<AtomicUsize>,
     /// Consumer end of ring buffer - reads pre-rendered audio samples (lock-free)
     ring_buffer_consumer: HeapCons<StereoFrame>,
     channels: u16,
@@ -89,7 +91,7 @@ struct StreamCreationParams {
     device_sample_rate: u32,
     channels: u16,
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
-    world: Arc<PetalSonicWorld>,
+    command_receiver: Receiver<PlaybackCommand>,
     event_sender: Sender<PetalSonicEvent>,
     timing_sender: Sender<RenderTimingEvent>,
 }
@@ -106,28 +108,19 @@ struct AudioOutputDeviceCandidate {
     info: AudioOutputDeviceInfo,
 }
 
-/// Callback function type for filling audio samples
-///
-/// The callback receives:
-/// - `buffer`: mutable slice to fill with audio samples
-/// - `sample_rate`: target sample rate for the samples
-/// - `channels`: number of audio channels
-///
-/// Returns the number of frames actually filled (frames = samples / channels)
-pub type AudioFillCallback = dyn Fn(&mut [f32], u32, u16) -> usize + Send + Sync;
-
 /// Audio engine that manages real-time audio processing and output
-pub struct PetalSonicEngine {
+pub(crate) struct PetalSonicEngine {
     desc: PetalSonicWorldDesc,
     stream: Option<cpal::Stream>,
     is_running: Arc<AtomicBool>,
     frames_processed: Arc<AtomicUsize>,
-    fill_callback: Option<Arc<AudioFillCallback>>,
-    world: Arc<PetalSonicWorld>,
+    underrun_count: Arc<AtomicUsize>,
+    stream_error: Arc<AtomicBool>,
     active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
     /// The actual sample rate used by the audio device (may differ from desc.sample_rate)
     device_sample_rate: u32,
     pump_state: Option<Arc<Mutex<PumpState>>>,
+    render_thread: Option<JoinHandle<()>>,
     /// Spatial audio processor
     spatial_processor: Option<Arc<Mutex<SpatialProcessor>>>,
     /// Engine-owned listener pose (decoupled from world lock for render thread access)
@@ -145,8 +138,8 @@ pub struct PetalSonicEngine {
 }
 
 impl PetalSonicEngine {
-    /// Create a new audio engine with the given configuration and world
-    pub fn new(desc: PetalSonicWorldDesc, world: Arc<PetalSonicWorld>) -> Result<Self> {
+    /// Create the internal engine owned by a [`PetalSonicWorld`](crate::PetalSonicWorld).
+    pub(crate) fn new(desc: PetalSonicWorldDesc, listener_pose: Arc<Mutex<Pose>>) -> Result<Self> {
         // Initialize spatial processor
         // Use distance_scaler from world configuration (converts world units to meters)
         let spatial_processor = match SpatialProcessor::new(
@@ -172,22 +165,11 @@ impl PetalSonicEngine {
             }
         };
 
-        // Create event channel for playback events
-        // Unbounded channel to ensure event emission never blocks the audio thread
-        let (event_sender, event_receiver) = crossbeam_channel::unbounded();
+        // Event and timing delivery must remain bounded. Saturation is observable via
+        // diagnostics in the public world rather than paid for with unbounded memory.
+        let (event_sender, event_receiver) = crossbeam_channel::bounded(512);
 
-        // Create timing channel for performance profiling
-        // Unbounded channel to ensure timing emission never blocks the render thread
-        let (timing_sender, timing_receiver) = crossbeam_channel::unbounded();
-
-        // Initialize engine-owned listener pose from world
-        // This decouples the render thread from world locks
-        let initial_pose = world.listener().pose();
-        let listener_pose = Arc::new(Mutex::new(initial_pose));
-
-        // Connect the engine's listener pose to the world for automatic synchronization
-        // This allows world.set_listener_pose() to automatically update the engine
-        world.connect_engine_listener(listener_pose.clone());
+        let (timing_sender, timing_receiver) = crossbeam_channel::bounded(512);
 
         let master_headroom_db = MASTER_HEADROOM_DB;
         let master_gain_linear = crate::gain::db_to_linear(master_headroom_db);
@@ -198,10 +180,11 @@ impl PetalSonicEngine {
             stream: None,
             is_running: Arc::new(AtomicBool::new(false)),
             frames_processed: Arc::new(AtomicUsize::new(0)),
-            fill_callback: None,
-            world,
+            underrun_count: Arc::new(AtomicUsize::new(0)),
+            stream_error: Arc::new(AtomicBool::new(false)),
             active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pump_state: None,
+            render_thread: None,
             spatial_processor,
             listener_pose,
             event_sender,
@@ -213,36 +196,12 @@ impl PetalSonicEngine {
         })
     }
 
-    /// Set the listener pose for spatial audio processing
-    ///
-    /// **Note**: In most cases, you should use `world.set_listener_pose()` instead,
-    /// which automatically synchronizes with the engine. This method is provided for
-    /// advanced use cases where the engine is used without a world.
-    ///
-    /// # Arguments
-    ///
-    /// * `pose` - The new pose for the listener
-    pub fn set_listener_pose(&self, pose: Pose) {
-        if let Ok(mut listener) = self.listener_pose.lock() {
-            *listener = pose;
-        }
-    }
-
-    /// Set the callback function that will be called to fill audio buffers
-    /// This is the non-blocking callback required by the TODO
-    pub fn set_fill_callback<F>(&mut self, callback: F)
-    where
-        F: Fn(&mut [f32], u32, u16) -> usize + Send + Sync + 'static,
-    {
-        self.fill_callback = Some(Arc::new(callback));
-    }
-
-    pub fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Relaxed)
     }
 
     /// Start the audio engine with automatic playback management
-    pub fn start(&mut self) -> Result<()> {
+    pub(crate) fn start(&mut self, command_receiver: Receiver<PlaybackCommand>) -> Result<()> {
         if self.is_running() {
             return Ok(());
         }
@@ -263,12 +222,17 @@ impl PetalSonicEngine {
         let config =
             Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
 
-        let (stream, pump_state) = match self.build_and_start_stream(
+        self.is_running.store(true, Ordering::Release);
+        self.stream_error.store(false, Ordering::Release);
+
+        let stream_result = self.build_stream(
             &device,
             &device_config,
             &config,
             device_sample_rate,
-        ) {
+            command_receiver.clone(),
+        );
+        let (stream, pump_state) = match stream_result {
             Ok(result) => result,
             Err(err) if !matches!(config.buffer_size, cpal::BufferSize::Default) => {
                 log::warn!(
@@ -280,21 +244,84 @@ impl PetalSonicEngine {
                     device_sample_rate,
                     cpal::BufferSize::Default,
                 );
-                self.build_and_start_stream(
+                match self.build_stream(
                     &device,
                     &device_config,
                     &default_config,
                     device_sample_rate,
-                )?
+                    command_receiver,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.is_running.store(false, Ordering::Release);
+                        return Err(error);
+                    }
+                }
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                self.is_running.store(false, Ordering::Release);
+                return Err(err);
+            }
+        };
+
+        // Prefill before starting the device callback so normal startup does not begin
+        // with a guaranteed underrun.
+        if let Ok(mut state) = pump_state.lock() {
+            Self::pump_render_state(&mut state);
+            Self::pump_render_state(&mut state);
+        }
+
+        if let Err(error) = stream.play() {
+            self.is_running.store(false, Ordering::Release);
+            return Err(PetalSonicError::AudioDevice(format!(
+                "Failed to start stream: {error}"
+            )));
+        }
+
+        let render_thread = match Self::spawn_render_thread(
+            pump_state.clone(),
+            self.is_running.clone(),
+            self.desc.block_size,
+            self.desc.sample_rate,
+        ) {
+            Ok(thread) => thread,
+            Err(error) => {
+                self.is_running.store(false, Ordering::Release);
+                drop(stream);
+                return Err(error);
+            }
         };
 
         self.stream = Some(stream);
         self.pump_state = Some(pump_state);
-        self.is_running.store(true, Ordering::Relaxed);
+        self.render_thread = Some(render_thread);
 
         Ok(())
+    }
+
+    fn spawn_render_thread(
+        pump_state: Arc<Mutex<PumpState>>,
+        is_running: Arc<AtomicBool>,
+        block_size: usize,
+        sample_rate: u32,
+    ) -> Result<JoinHandle<()>> {
+        let block_duration = Duration::from_secs_f64(block_size as f64 / sample_rate as f64);
+        let wake_interval =
+            (block_duration / 4).clamp(Duration::from_micros(250), Duration::from_millis(2));
+
+        std::thread::Builder::new()
+            .name("petalsonic-render".into())
+            .spawn(move || {
+                while is_running.load(Ordering::Acquire) {
+                    if let Ok(mut state) = pump_state.lock() {
+                        Self::pump_render_state(&mut state);
+                    }
+                    std::thread::park_timeout(wake_interval);
+                }
+            })
+            .map_err(|error| {
+                PetalSonicError::Engine(format!("Failed to start render thread: {error}"))
+            })
     }
 
     /// Initialize the audio device and retrieve its configuration
@@ -341,7 +368,7 @@ impl PetalSonicEngine {
         Ok((device, device_config))
     }
 
-    pub fn available_output_devices() -> Result<Vec<AudioOutputDeviceInfo>> {
+    pub(crate) fn available_output_devices() -> Result<Vec<AudioOutputDeviceInfo>> {
         let host = cpal::default_host();
         Ok(Self::output_device_candidates(&host)?
             .into_iter()
@@ -644,21 +671,21 @@ impl PetalSonicEngine {
         None
     }
 
-    /// Build and start the audio stream
-    fn build_and_start_stream(
+    /// Build an audio stream. Starting it is deliberately separate so the render
+    /// buffer can be prefilled before the first device callback.
+    fn build_stream(
         &mut self,
         device: &cpal::Device,
         device_config: &cpal::SupportedStreamConfig,
         config: &cpal::StreamConfig,
         device_sample_rate: u32,
+        command_receiver: Receiver<PlaybackCommand>,
     ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>)> {
         let is_running = self.is_running.clone();
         let frames_processed = self.frames_processed.clone();
         let world_sample_rate = self.desc.sample_rate;
         let channels = self.desc.channels;
         let active_playback = self.active_playback.clone();
-        let world = self.world.clone();
-
         let event_sender = self.event_sender.clone();
         let timing_sender = self.timing_sender.clone();
 
@@ -673,7 +700,7 @@ impl PetalSonicEngine {
                     device_sample_rate,
                     channels,
                     active_playback,
-                    world,
+                    command_receiver: command_receiver.clone(),
                     event_sender,
                     timing_sender,
                 },
@@ -688,7 +715,7 @@ impl PetalSonicEngine {
                     device_sample_rate,
                     channels,
                     active_playback,
-                    world,
+                    command_receiver: command_receiver.clone(),
                     event_sender,
                     timing_sender,
                 },
@@ -703,7 +730,7 @@ impl PetalSonicEngine {
                     device_sample_rate,
                     channels,
                     active_playback,
-                    world,
+                    command_receiver,
                     event_sender,
                     timing_sender,
                 },
@@ -715,103 +742,35 @@ impl PetalSonicEngine {
             }
         };
 
-        let (stream, pump_state) = result;
-
-        stream
-            .play()
-            .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to start stream: {}", e)))?;
-
-        Ok((stream, pump_state))
+        Ok(result)
     }
 
     /// Stop the audio engine
-    pub fn stop(&mut self) -> Result<()> {
-        // Stop the audio stream
-        if let Some(stream) = self.stream.take() {
-            self.is_running.store(false, Ordering::Relaxed);
-            drop(stream); // This stops the stream
+    pub(crate) fn stop(&mut self) -> Result<()> {
+        self.is_running.store(false, Ordering::Release);
+
+        if let Some(render_thread) = self.render_thread.take() {
+            render_thread.thread().unpark();
+            render_thread.join().map_err(|_| {
+                PetalSonicError::Engine("Render thread panicked while shutting down".into())
+            })?;
         }
+
+        // Dropping the CPAL stream stops future callbacks. The producer is already
+        // quiescent, so no callback can race runtime teardown after this point.
+        drop(self.stream.take());
 
         self.pump_state = None;
 
         Ok(())
     }
 
-    /// Get the number of audio frames processed since start
-    pub fn frames_processed(&self) -> usize {
+    pub(crate) fn frames_processed(&self) -> usize {
         self.frames_processed.load(Ordering::Relaxed)
     }
 
-    /// Get the engine configuration
-    pub fn config(&self) -> &PetalSonicWorldDesc {
-        &self.desc
-    }
-
-    /// Change spatial backends for subsequent render blocks.
-    ///
-    /// This may allocate if a backend is selected for the first time, so call it from the
-    /// game/update thread rather than the audio callback.
-    pub fn set_spatial_backends(
-        &mut self,
-        hrtf_backend: HrtfBackend,
-        direct_path_backend: DirectPathBackend,
-    ) -> Result<()> {
-        self.set_spatial_rendering(
-            hrtf_backend,
-            direct_path_backend,
-            self.desc.use_ambisonics,
-            self.desc.ambisonics_backend,
-        )
-    }
-
-    pub fn set_spatial_rendering(
-        &mut self,
-        hrtf_backend: HrtfBackend,
-        direct_path_backend: DirectPathBackend,
-        use_ambisonics: bool,
-        ambisonics_backend: AmbisonicsBackend,
-    ) -> Result<()> {
-        if let Some(spatial_processor) = &self.spatial_processor {
-            let mut processor = spatial_processor.lock().map_err(|_| {
-                PetalSonicError::Engine("Spatial processor lock is poisoned".into())
-            })?;
-            processor.set_spatial_rendering(
-                hrtf_backend,
-                direct_path_backend,
-                use_ambisonics,
-                ambisonics_backend,
-            )?;
-            self.desc.hrtf_backend = processor.hrtf_backend();
-            self.desc.direct_path_backend = processor.direct_path_backend();
-            self.desc.use_ambisonics = processor.use_ambisonics();
-            self.desc.ambisonics_backend = processor.ambisonics_backend();
-        } else {
-            self.desc.hrtf_backend = hrtf_backend;
-            self.desc.direct_path_backend = direct_path_backend;
-            self.desc.use_ambisonics = use_ambisonics;
-            self.desc.ambisonics_backend = ambisonics_backend;
-        }
-
-        Ok(())
-    }
-
-    pub fn spatial_backends(&self) -> (HrtfBackend, DirectPathBackend) {
-        (self.desc.hrtf_backend, self.desc.direct_path_backend)
-    }
-
-    pub fn spatial_rendering(&self) -> (HrtfBackend, DirectPathBackend, bool, AmbisonicsBackend) {
-        (
-            self.desc.hrtf_backend,
-            self.desc.direct_path_backend,
-            self.desc.use_ambisonics,
-            self.desc.ambisonics_backend,
-        )
-    }
-
-    pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {
-        let spatial_processor = self.spatial_processor.as_ref()?;
-        let processor = spatial_processor.lock().ok()?;
-        processor.direct_occlusion_debug_snapshot()
+    pub(crate) fn underrun_count(&self) -> usize {
+        self.underrun_count.load(Ordering::Relaxed)
     }
 
     /// Poll for playback events (non-blocking)
@@ -828,7 +787,7 @@ impl PetalSonicEngine {
     /// 4. Source remains in world storage for potential replay
     /// 5. GUI calls `poll_events()` and receives the event
     /// 6. GUI removes from UI and optionally calls `world.remove_audio_data(id)`
-    pub fn poll_events(&self) -> Vec<PetalSonicEvent> {
+    pub(crate) fn poll_events(&self) -> Vec<PetalSonicEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.event_receiver.try_recv() {
             events.push(event);
@@ -846,25 +805,12 @@ impl PetalSonicEngine {
     /// - Spatial processing time (microseconds)
     /// - Resampling time (microseconds)
     /// - Total render time (microseconds)
-    pub fn poll_timing_events(&self) -> Vec<RenderTimingEvent> {
+    pub(crate) fn poll_timing_events(&self) -> Vec<RenderTimingEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.timing_receiver.try_recv() {
             events.push(event);
         }
         events
-    }
-
-    pub fn pump_audio(&mut self) -> Result<()> {
-        let pump_state = self
-            .pump_state
-            .as_ref()
-            .ok_or_else(|| PetalSonicError::Engine("Audio pump is not initialized".into()))?;
-        let mut pump_state = pump_state
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("Audio pump state is poisoned".into()))?;
-
-        Self::pump_render_state(&mut pump_state);
-        Ok(())
     }
 
     /// Create a typed audio stream
@@ -915,7 +861,7 @@ impl PetalSonicEngine {
         let ring_buffer_size = block_size * 8;
         let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
 
-        // Split ring buffer into producer (for pump_audio) and consumer (for audio callback)
+        // Split ring buffer into producer (render thread) and consumer (device callback)
         // This is lock-free! Each thread gets exclusive ownership of its half.
         let (producer, consumer) = ring_buffer.split();
 
@@ -926,7 +872,7 @@ impl PetalSonicEngine {
             channels: params.channels,
             block_size,
             spatial_processor: self.spatial_processor.clone(),
-            command_receiver: params.world.command_receiver().clone(),
+            command_receiver: params.command_receiver,
             listener_pose: self.listener_pose.clone(),
             event_sender: params.event_sender,
             timing_sender: params.timing_sender,
@@ -937,10 +883,13 @@ impl PetalSonicEngine {
         let mut context = AudioCallbackContext {
             is_running: params.is_running,
             frames_processed: params.frames_processed,
+            underrun_count: self.underrun_count.clone(),
             ring_buffer_consumer: consumer,
             channels: params.channels,
             startup_underrun_callbacks_remaining: STARTUP_UNDERRUN_GRACE_CALLBACKS,
         };
+
+        let stream_error = self.stream_error.clone();
 
         let stream = device
             .build_output_stream(
@@ -948,8 +897,9 @@ impl PetalSonicEngine {
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                     Self::audio_callback(data, &mut context);
                 },
-                move |err| {
-                    log::error!("Audio stream error: {}", err);
+                move |_err| {
+                    // Error formatting and recovery happen on the runtime thread.
+                    stream_error.store(true, Ordering::Release);
                 },
                 None,
             )
@@ -1015,26 +965,19 @@ impl PetalSonicEngine {
             ctx.spatial_processor.as_ref(),
         );
 
-        if let Err(e) = ctx.timing_sender.send(timing) {
-            log::error!("Failed to send timing event: {}", e);
-        }
+        let _ = ctx.timing_sender.try_send(timing);
 
         for source_id in completed_sources {
-            if let Err(e) = ctx
+            let _ = ctx
                 .event_sender
-                .send(PetalSonicEvent::SourceCompleted { source_id })
-            {
-                log::error!("Failed to send SourceCompleted event: {}", e);
-            }
+                .try_send(PetalSonicEvent::SourceCompleted { source_id });
         }
 
         for source_id in looped_sources {
-            if let Err(e) = ctx.event_sender.send(PetalSonicEvent::SourceLooped {
+            let _ = ctx.event_sender.try_send(PetalSonicEvent::SourceLooped {
                 source_id,
                 loop_count: 0,
-            }) {
-                log::error!("Failed to send SourceLooped event: {}", e);
-            }
+            });
         }
     }
 
@@ -1073,15 +1016,9 @@ impl PetalSonicEngine {
         let channels_usize = ctx.channels as usize;
         let device_frames = data.len() / channels_usize;
 
-        log_audio_timing_event(&format!(
-            "PetalSonic requires audio samples ({} frames)",
-            device_frames
-        ));
-
         // If not running, fill silence
         if !ctx.is_running.load(Ordering::Relaxed) {
             Self::fill_silence(data);
-            log_audio_timing_event("PetalSonic audio feeding done (silence)");
             return;
         }
 
@@ -1105,11 +1042,7 @@ impl PetalSonicEngine {
                 if ctx.startup_underrun_callbacks_remaining > 0 {
                     ctx.startup_underrun_callbacks_remaining -= 1;
                 } else {
-                    log::warn!(
-                        "Ring buffer underrun: only {} of {} frames available",
-                        samples_consumed,
-                        device_frames
-                    );
+                    ctx.underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
                 for j in i..device_frames {
                     let left_idx = j * channels_usize;
@@ -1127,10 +1060,6 @@ impl PetalSonicEngine {
 
         ctx.frames_processed
             .fetch_add(samples_consumed, Ordering::Relaxed);
-        log_audio_timing_event(&format!(
-            "PetalSonic audio feeding done ({} / {} frames)",
-            samples_consumed, device_frames
-        ));
     }
 
     /// Fill buffer with silence
@@ -1494,13 +1423,12 @@ fn apply_master_gain_and_limit(
     }
 }
 
-fn log_audio_timing_event(message: &str) {
-    log::trace!("[audio-timing] {}", message);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_data::PetalSonicAudioData;
+    use crate::config::SourceConfig;
+    use crate::playback::{LoopMode, PlaybackSource};
 
     #[test]
     fn alsa_card_alias_parser_extracts_card_id_and_display_names() {
@@ -1542,5 +1470,70 @@ mod tests {
             "FiiO KA3 Analog Stereo"
         ));
         assert!(!PetalSonicEngine::output_device_matches(&device, "EX2050S"));
+    }
+
+    #[test]
+    fn render_thread_produces_audio_without_a_caller_pump() {
+        let block_size = 256;
+        let sample_rate = 48_000;
+        let source_id = SourceId::from(1);
+        let clip = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; block_size * 8],
+            sample_rate,
+            1,
+            Duration::from_secs_f64((block_size * 8) as f64 / sample_rate as f64),
+        ));
+
+        let (command_sender, command_receiver) = crossbeam_channel::bounded(8);
+        command_sender
+            .try_send(PlaybackCommand::Play(
+                source_id,
+                PlaybackSource::Static(clip),
+                SourceConfig::non_spatial(),
+                LoopMode::Infinite,
+            ))
+            .unwrap();
+
+        let ring_buffer = HeapRb::<StereoFrame>::new(block_size * 8);
+        let (producer, mut consumer) = ring_buffer.split();
+        let (event_sender, _event_receiver) = crossbeam_channel::bounded(8);
+        let (timing_sender, _timing_receiver) = crossbeam_channel::bounded(8);
+        let pump_state = Arc::new(Mutex::new(PumpState {
+            active_playback: Arc::new(Mutex::new(HashMap::new())),
+            resampler: PetalSonicEngine::create_resampler(sample_rate, sample_rate, 2, block_size)
+                .unwrap(),
+            ring_buffer_producer: producer,
+            channels: 2,
+            block_size,
+            spatial_processor: None,
+            command_receiver,
+            listener_pose: Arc::new(Mutex::new(Pose::default())),
+            event_sender,
+            timing_sender,
+            master_gain_linear: 1.0,
+        }));
+        let is_running = Arc::new(AtomicBool::new(true));
+        let render_thread = PetalSonicEngine::spawn_render_thread(
+            pump_state,
+            is_running.clone(),
+            block_size,
+            sample_rate,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while consumer.occupied_len() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        is_running.store(false, Ordering::Release);
+        render_thread.thread().unpark();
+        render_thread.join().unwrap();
+
+        let rendered = consumer
+            .try_pop()
+            .expect("render thread produced no frames");
+        assert!(rendered.left > 0.0);
+        assert!(rendered.right > 0.0);
     }
 }

@@ -21,17 +21,15 @@ Basic usage example:
 use petalsonic::*;
 
 fn main() -> Result<(), PetalSonicError> {
-    // Create the audio world and engine
+    // Creating the world starts its private audio runtime.
     let config = PetalSonicWorldDesc::default();
-    let world = PetalSonicWorld::new(config.clone())?;
-    let mut engine = PetalSonicEngine::new(config, &world)?;
-    engine.start()?;
+    let world = PetalSonicWorld::new(config)?;
 
     // Load and play a 3D positioned sound
     let audio = audio_data::PetalSonicAudioData::from_path("sound.wav")?;
     let source_id = world.register_audio(
         audio,
-        SourceConfig::spatial(Vec3::new(5.0, 0.0, 0.0), 1.0)
+        SourceConfig::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
     )?;
     world.play(source_id, playback::LoopMode::Once)?;
 
@@ -143,7 +141,7 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 ### Key Design Decisions
 
 - **Coexistence**: Spatial and non-spatial sources work together in the same world
-- **Render thread does spatial processing**: No separate simulation thread (simpler architecture)
+- **World-owned render thread**: Creating a world starts audio progress; callers never pump it
 - **Per-source spatial mode**: Each source has `SourceConfig` to determine processing path
 - **World-level listener**: Single global listener pose for all spatial sources
 - **Lock-free ring buffer**: Bridges fixed-size render blocks to variable-size device callbacks

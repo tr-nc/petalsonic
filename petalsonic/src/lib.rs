@@ -11,17 +11,12 @@
 //! ```no_run
 //! use petalsonic::*;
 //! use petalsonic::math::{Pose, Vec3};
-//! use std::sync::Arc;
 //!
 //! // Create a world configuration
 //! let config = PetalSonicWorldDesc::default();
 //!
-//! // Create the audio world
-//! let world = Arc::new(PetalSonicWorld::new(config.clone())?);
-//!
-//! // Create and start the audio engine
-//! let mut engine = PetalSonicEngine::new(config, world.clone())?;
-//! engine.start()?;
+//! // Creating the world also starts its private render runtime.
+//! let world = PetalSonicWorld::new(config)?;
 //!
 //! // Load audio data
 //! let audio_data = audio_data::PetalSonicAudioData::from_path("audio.wav")?;
@@ -39,7 +34,7 @@
 //! world.set_listener_pose(Pose::from_position(Vec3::new(0.0, 0.0, 0.0)));
 //!
 //! // Poll for events
-//! for event in engine.poll_events() {
+//! for event in world.drain_events() {
 //!     match event {
 //!         PetalSonicEvent::SourceCompleted { source_id } => {
 //!             println!("Audio completed: {:?}", source_id);
@@ -53,17 +48,16 @@
 //! ## Key Components
 //!
 //! - **[`PetalSonicWorld`]**: Main API for managing audio sources and playback on the main thread
-//! - **[`PetalSonicEngine`]**: Audio processing engine that runs on a dedicated thread
 //! - **[`SourceConfig`]**: Configuration for spatial vs. non-spatial audio sources
 //! - **[`PetalSonicAudioData`](audio_data::PetalSonicAudioData)**: Audio data loaded from files
 //! - **[`PetalSonicEvent`]**: Events emitted by the engine (completion, errors, etc.)
 //!
 //! ## Architecture
 //!
-//! PetalSonic uses a three-layer threading model:
+//! PetalSonic uses a three-layer threading model owned entirely by the world:
 //!
-//! 1. **Main Thread**: Owns `PetalSonicWorld`, loads audio, sends commands
-//! 2. **Render Thread**: Processes commands, spatializes audio, generates samples
+//! 1. **Main Thread**: Owns `PetalSonicWorld`, loads audio, and submits intent
+//! 2. **World-owned Render Thread**: Processes commands, spatializes audio, generates samples
 //! 3. **Audio Callback**: Lock-free consumption from ring buffer to audio device
 //!
 //! This architecture ensures real-time safety: no allocations or locks in the audio callback path.
@@ -81,7 +75,7 @@
 pub mod acoustics;
 pub mod audio_data;
 pub mod config;
-pub mod engine;
+mod engine;
 pub mod error;
 pub mod events;
 pub mod gain;
@@ -98,7 +92,7 @@ pub use acoustics::{
 pub use config::{
     AmbisonicsBackend, DirectPathBackend, HrtfBackend, PetalSonicWorldDesc, SourceConfig,
 };
-pub use engine::{AudioFillCallback, AudioOutputDeviceInfo, PetalSonicEngine};
+pub use engine::AudioOutputDeviceInfo;
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};

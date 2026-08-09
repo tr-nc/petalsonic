@@ -28,18 +28,12 @@ petalsonic = "0.1"
 
 ```rust
 use petalsonic::*;
-use std::sync::Arc;
-
 fn main() -> Result<(), PetalSonicError> {
     // Create a world configuration
     let config = PetalSonicWorldDesc::default();
 
-    // Create the audio world (runs on main thread)
-    let world = PetalSonicWorld::new(config.clone())?;
-
-    // Create and start the audio engine (spawns audio thread)
-    let mut engine = PetalSonicEngine::new(config, &world)?;
-    engine.start()?;
+    // Creating the world starts its private render runtime.
+    let world = PetalSonicWorld::new(config)?;
 
     // Load audio data from file
     let audio_data = audio_data::PetalSonicAudioData::from_path("path/to/audio.wav")?;
@@ -47,7 +41,7 @@ fn main() -> Result<(), PetalSonicError> {
     // Register audio with spatial configuration
     let source_id = world.register_audio(
         audio_data,
-        SourceConfig::spatial(Vec3::new(5.0, 0.0, 0.0), 1.0) // Position at (5, 0, 0) with volume 1.0
+        SourceConfig::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
     )?;
 
     // Play the audio once
@@ -57,7 +51,7 @@ fn main() -> Result<(), PetalSonicError> {
     world.set_listener_pose(Pose::from_position(Vec3::new(0.0, 0.0, 0.0)));
 
     // Poll for events
-    for event in engine.poll_events() {
+    for event in world.drain_events() {
         match event {
             PetalSonicEvent::SourceCompleted { source_id } => {
                 println!("Audio completed: {:?}", source_id);
@@ -116,7 +110,7 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 │ - register_audio(audio_data, SourceConfig)                   │
 │ - set_listener_pose(pose)                                    │
 │ - play(), pause(), stop()                                    │
-│ - poll_events()                                              │
+│ - drain_events()                                             │
 └──────────────────────────────────────────────────────────────┘
                              ↓ Commands via channel
 ┌──────────────────────────────────────────────────────────────┐
@@ -147,7 +141,6 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 ### Core Types
 
 - **`PetalSonicWorld`**: Main API for managing audio sources and playback (main thread)
-- **`PetalSonicEngine`**: Audio processing engine (dedicated thread)
 - **`SourceId`**: Type-safe handle for audio sources
 - **`SourceConfig`**: Configuration for spatial vs. non-spatial sources
 - **`PetalSonicAudioData`**: Container for loaded and decoded audio data
@@ -212,7 +205,7 @@ The audio callback thread is **completely real-time safe**:
 
 ```rust
 // Get timing information for performance profiling
-for event in engine.poll_timing_events() {
+for event in world.drain_timing_events() {
     println!(
         "Mixing: {}μs (direct {}μs, spatial {}μs), physics {}μs, encode {}μs, decode {}μs, total {}μs",
         event.mixing_time_us,

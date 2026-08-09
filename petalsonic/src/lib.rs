@@ -85,7 +85,8 @@ mod spatial;
 mod world;
 
 pub use acoustics::{
-    AcousticHit, AcousticMaterial, AcousticRay, BatchedAnyHitRayTracer, BatchedClosestHitRayTracer,
+    AcousticHit, AcousticMaterial, AcousticRay, AcousticSceneSnapshot, BatchedAnyHitRayTracer,
+    BatchedClosestHitRayTracer,
 };
 pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 pub use domain::{
@@ -94,7 +95,7 @@ pub use domain::{
 };
 pub use engine::AudioOutputDeviceInfo;
 pub use error::PetalSonicError;
-pub use events::{PetalSonicEvent, RenderTimingEvent};
+pub use events::{PetalSonicEvent, RenderTimingEvent, RuntimeState, RuntimeStatus};
 pub use gain::{db_to_linear, linear_to_db};
 pub use playback::LoopMode;
 pub use spatial::{DirectPathOverride, DirectPathTransmission};

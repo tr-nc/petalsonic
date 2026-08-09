@@ -183,7 +183,7 @@ pub fn mix_playback_instances_with_metrics(
     )
 }
 
-fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusParams {
+pub(crate) fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusParams {
     let master = buses.first().copied().unwrap_or_default();
     let selected = buses.get(index).copied().unwrap_or(master);
     if index == 0 {

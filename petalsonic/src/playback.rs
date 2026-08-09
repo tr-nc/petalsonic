@@ -269,9 +269,36 @@ impl PlaybackInstance {
     }
 
     pub(crate) fn advance_silently(&mut self, output_frames: usize) {
-        for _ in 0..output_frames {
-            if self.next_source_frame().is_none() {
-                break;
+        if output_frames == 0 || !matches!(self.info.play_state, PlayState::Playing) {
+            return;
+        }
+        let total_frames = self.audio_data.total_frames();
+        if total_frames == 0 {
+            self.reached_end_this_iteration = true;
+            self.info.play_state = PlayState::Stopped;
+            return;
+        }
+
+        self.cursor += output_frames as f64 * self.mix_rate as f64;
+        match self.loop_mode {
+            LoopMode::Infinite => {
+                if self.cursor >= total_frames as f64 {
+                    self.cursor %= total_frames as f64;
+                    self.reached_end_this_iteration = true;
+                }
+                self.info
+                    .update_position(self.cursor.floor() as usize, self.sample_rate);
+            }
+            LoopMode::Once => {
+                if self.cursor >= total_frames as f64 {
+                    self.cursor = total_frames as f64;
+                    self.info.update_position(total_frames, self.sample_rate);
+                    self.info.play_state = PlayState::Stopped;
+                    self.reached_end_this_iteration = true;
+                } else {
+                    self.info
+                        .update_position(self.cursor.floor() as usize, self.sample_rate);
+                }
             }
         }
     }

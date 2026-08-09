@@ -579,6 +579,19 @@ impl SpatialProcessor {
         Ok(())
     }
 
+    pub(crate) fn set_acoustic_scene_capabilities(
+        &mut self,
+        supports_occlusion: bool,
+        supports_reflections: bool,
+    ) {
+        self.direct_occlusion_enabled = supports_occlusion;
+        self.reflections_enabled =
+            supports_reflections && self.hrtf_backend == HrtfBackend::SteamAudio;
+        self.native_early_reflections_enabled = supports_reflections
+            && self.hrtf_backend == HrtfBackend::Native
+            && !self.use_ambisonics;
+    }
+
     /// Create effects for a spatial source
     pub fn create_effects_for_source(&mut self, source_id: SourceId) -> Result<()> {
         let audio_settings = AudioSettings {

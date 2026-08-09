@@ -2,6 +2,24 @@
 
 use crate::domain::{Emitter, PlaybackControl, PlaybackTag};
 
+/// Observable state of the world-owned output runtime.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeState {
+    Running = 0,
+    Recovering = 1,
+    Failed = 2,
+    Closed = 3,
+}
+
+/// Pull-based health snapshot. Device names are diagnostic, not stable identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeStatus {
+    pub state: RuntimeState,
+    pub recovery_attempts: u64,
+    pub active_output_device: Option<String>,
+}
+
 /// Timing information for a single render iteration
 /// Used for performance profiling and stress testing
 #[derive(Debug, Clone, Copy)]
@@ -42,4 +60,6 @@ pub enum PetalSonicEvent {
         control: PlaybackControl,
         tag: PlaybackTag,
     },
+    /// The output runtime entered a different lifecycle state.
+    RuntimeStateChanged(RuntimeState),
 }

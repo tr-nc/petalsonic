@@ -860,6 +860,9 @@ impl eframe::App for SpatialAudioDemo {
                     // Source already stopped by mixer, don't send stop command
                     self.delete_source(emitter, false);
                 }
+                petalsonic::PetalSonicEvent::RuntimeStateChanged(state) => {
+                    log::info!("GUI: Audio runtime is now {state:?}");
+                }
             }
         }
 

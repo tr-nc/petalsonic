@@ -1562,6 +1562,146 @@ mod tests {
     }
 
     #[test]
+    fn near_capacity_runtime_remains_bounded_under_snapshot_and_bus_pressure() {
+        const EMITTERS: usize = 24;
+        const VOICES: usize = 48;
+        let desc = crate::config::PetalSonicWorldDesc {
+            max_emitters: EMITTERS,
+            max_voices: VOICES,
+            max_buses: 1,
+            buses: vec![crate::domain::BusDesc::new("Gameplay")],
+            control_queue_capacity: 128,
+            lifecycle_queue_capacity: 64,
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new(desc).unwrap();
+        let mut emitters = Vec::with_capacity(EMITTERS);
+        for index in 0..EMITTERS {
+            let pose = Pose::from_position(crate::math::Vec3::new(index as f32, 0.0, 0.0));
+            emitters.push(
+                world
+                    .create_emitter(clip(), EmitterDesc::spatial(pose))
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            world.create_emitter(clip(), EmitterDesc::non_spatial()),
+            Err(PetalSonicError::CapacityExceeded {
+                resource: "emitter",
+                limit: EMITTERS
+            })
+        ));
+
+        for emitter in &emitters {
+            world.play(*emitter, PlayOptions::looping()).unwrap();
+            world.play(*emitter, PlayOptions::looping()).unwrap();
+        }
+        assert_eq!(world.active_voice_count(), VOICES);
+        assert!(matches!(
+            world.play(emitters[0], PlayOptions::looping()),
+            Err(PetalSonicError::CapacityExceeded {
+                resource: "voice",
+                limit: VOICES
+            })
+        ));
+
+        let gameplay = world.bus("Gameplay").unwrap();
+        let mut queue_pressure_observed = false;
+        for generation in 0usize..1_024 {
+            let states = emitters
+                .iter()
+                .enumerate()
+                .map(|(index, emitter)| {
+                    crate::domain::EmitterSpatialState::new(
+                        *emitter,
+                        Pose::from_position(crate::math::Vec3::new(
+                            index as f32,
+                            generation as f32 * 0.001,
+                            0.0,
+                        )),
+                    )
+                })
+                .collect();
+            world
+                .publish_spatial_frame(SpatialFrame::new(Pose::default(), states))
+                .unwrap();
+
+            let params = BusParams {
+                gain_db: if generation.is_multiple_of(2) {
+                    -3.0
+                } else {
+                    0.0
+                },
+                ..Default::default()
+            };
+            match world.set_bus_params(gameplay, params) {
+                Ok(()) => {}
+                Err(PetalSonicError::QueuePressure) => queue_pressure_observed = true,
+                Err(error) => panic!("unexpected bus update failure: {error}"),
+            }
+        }
+
+        let diagnostics = world.diagnostics();
+        assert_eq!(diagnostics.active_emitters, EMITTERS);
+        assert_eq!(diagnostics.active_voices, VOICES);
+        assert!(diagnostics.control_queue_depth <= 128);
+        assert!(diagnostics.control_queue_high_water <= 128);
+        assert_eq!(
+            world
+                .latest_spatial_frame
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .emitters()
+                .len(),
+            EMITTERS
+        );
+        assert_eq!(queue_pressure_observed, diagnostics.rejected_commands > 0);
+
+        world.stop_all().unwrap();
+        world.close().unwrap();
+        assert_eq!(world.runtime_status().state, RuntimeState::Closed);
+    }
+
+    #[test]
+    fn bounded_event_pressure_is_observable() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            max_emitters: 1,
+            max_voices: 16,
+            control_queue_capacity: 32,
+            event_queue_capacity: 1,
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new(desc).unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap();
+        for tag in 0..16 {
+            world
+                .play_controlled(emitter, PlayOptions::once(), PlaybackTag(tag))
+                .unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && world.diagnostics().dropped_events == 0 {
+            std::thread::yield_now();
+        }
+
+        let diagnostics = world.diagnostics();
+        assert_eq!(diagnostics.event_queue_high_water, 1);
+        assert!(diagnostics.event_queue_depth <= 1);
+        assert!(diagnostics.dropped_events > 0);
+        world.close().unwrap();
+    }
+
+    #[test]
     fn spatial_publication_overwrites_unconsumed_frames_atomically() {
         let desc = crate::config::PetalSonicWorldDesc {
             output_device: crate::config::OutputDevicePolicy::PinnedNameContains(

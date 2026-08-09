@@ -2252,7 +2252,7 @@ mod tests {
     }
 
     #[test]
-    fn warmed_render_quantum_reuses_all_owned_buffers() {
+    fn warmed_balanced_render_quantum_reuses_buffers_and_meets_budget() {
         let block_size = 64;
         let sample_rate = 48_000;
         let (command_sender, command_receiver) = crossbeam_channel::bounded(4);
@@ -2329,6 +2329,32 @@ mod tests {
 
         assert_eq!(activity, 0, "steady render quantum allocated or freed");
         assert!(consumer.try_pop().is_some());
+
+        let mut elapsed_us = [0u64; 256];
+        for elapsed in &mut elapsed_us {
+            while consumer.try_pop().is_some() {}
+            while timing_receiver.try_recv().is_ok() {}
+            let start = Instant::now();
+            PetalSonicEngine::pump_render_state(&mut pump);
+            *elapsed = start.elapsed().as_micros() as u64;
+        }
+        elapsed_us.sort_unstable();
+        let p99 = elapsed_us[elapsed_us.len() * 99 / 100];
+        let device_period_us = block_size as u64 * 1_000_000 / sample_rate as u64;
+        if !cfg!(debug_assertions) {
+            assert!(
+                p99 * 100 < device_period_us * 80,
+                "Balanced full-quantum p99 {p99}us lacks 20% margin under {device_period_us}us period"
+            );
+        }
+        eprintln!(
+            "balanced full-quantum baseline: p50={}us p95={}us p99={}us max={}us period={}us",
+            elapsed_us[elapsed_us.len() / 2],
+            elapsed_us[elapsed_us.len() * 95 / 100],
+            p99,
+            elapsed_us[elapsed_us.len() - 1],
+            device_period_us,
+        );
     }
 
     #[test]

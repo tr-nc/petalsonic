@@ -4,6 +4,7 @@ use crate::math::Pose;
 use crate::playback::LoopMode;
 use crate::world::SourceId;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Immutable, predecoded PCM shared by any number of playback voices.
 #[derive(Clone, Debug)]
@@ -25,6 +26,53 @@ impl ResidentClip {
         Self { data }
     }
 
+    /// Take ownership of predecoded interleaved PCM without copying its sample buffer.
+    pub fn from_interleaved_pcm(
+        samples: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> crate::error::Result<Self> {
+        if sample_rate == 0 {
+            return Err(crate::error::PetalSonicError::InvalidConfiguration {
+                field: "sample_rate",
+                reason: "must be greater than zero".into(),
+            });
+        }
+        if channels == 0 {
+            return Err(crate::error::PetalSonicError::InvalidConfiguration {
+                field: "channels",
+                reason: "must be greater than zero".into(),
+            });
+        }
+        if !samples.len().is_multiple_of(channels as usize) {
+            return Err(crate::error::PetalSonicError::AudioFormat(format!(
+                "interleaved sample count {} is not divisible by {channels} channels",
+                samples.len()
+            )));
+        }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(crate::error::PetalSonicError::AudioFormat(
+                "PCM samples must all be finite".into(),
+            ));
+        }
+
+        let frame_count = samples.len() / channels as usize;
+        let duration = Duration::from_secs_f64(frame_count as f64 / sample_rate as f64);
+        Ok(Self {
+            data: Arc::new(PetalSonicAudioData::new(
+                samples,
+                sample_rate,
+                channels,
+                duration,
+            )),
+        })
+    }
+
+    /// Take ownership of predecoded mono PCM without copying its sample buffer.
+    pub fn from_mono_pcm(samples: Vec<f32>, sample_rate: u32) -> crate::error::Result<Self> {
+        Self::from_interleaved_pcm(samples, sample_rate, 1)
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.data.sample_rate()
     }
@@ -35,6 +83,27 @@ impl ResidentClip {
 
     pub fn total_frames(&self) -> usize {
         self.data.total_frames()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResidentClip;
+
+    #[test]
+    fn resident_pcm_constructor_takes_valid_interleaved_data() {
+        let clip =
+            ResidentClip::from_interleaved_pcm(vec![0.0, 0.5, -0.5, 1.0], 48_000, 2).unwrap();
+        assert_eq!(clip.sample_rate(), 48_000);
+        assert_eq!(clip.channels(), 2);
+        assert_eq!(clip.total_frames(), 2);
+    }
+
+    #[test]
+    fn resident_pcm_constructor_rejects_invalid_shape_and_values() {
+        assert!(ResidentClip::from_interleaved_pcm(vec![0.0], 48_000, 2).is_err());
+        assert!(ResidentClip::from_mono_pcm(vec![f32::NAN], 48_000).is_err());
+        assert!(ResidentClip::from_mono_pcm(vec![0.0], 0).is_err());
     }
 }
 

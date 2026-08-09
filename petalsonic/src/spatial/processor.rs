@@ -101,7 +101,6 @@ pub struct SpatialProcessor {
     ambisonics_decode_effect: Option<AmbisonicsDecodeEffect>,
 
     // Native HRTF/Ambisonics renderer and delay state
-    native_hrtf_table: Option<Arc<NativeHrtfTable>>,
     native_hrtf_renderer: Option<NativeHrtfRenderer>,
     native_hrtf_source_states: HashMap<SourceId, NativeHrtfSourceState>,
     native_ambisonics_encoder: NativeAmbisonicsEncoder,
@@ -120,8 +119,6 @@ pub struct SpatialProcessor {
     direct_path_backend: DirectPathBackend,
     use_ambisonics: bool,
     ambisonics_backend: AmbisonicsBackend,
-    steam_hrtf_path: Option<String>,
-    native_hrtf_path: Option<String>,
     direct_occlusion_enabled: bool,
     reflections_enabled: bool,
     native_early_reflections_enabled: bool,
@@ -251,13 +248,11 @@ impl SpatialProcessor {
     /// * `sample_rate` - Sample rate for audio processing
     /// * `frame_size` - Number of frames to process per call
     /// * `distance_scaler` - Scale factor to convert game units to meters (default: 10.0)
-    /// * `hrtf_path` - Optional path to backend-specific HRTF data
     /// * `hrtf_gain` - HRTF gain compensation in decibels (default: 0.0 dB = no change)
     pub fn new(
         sample_rate: u32,
         frame_size: usize,
         distance_scaler: f32,
-        hrtf_path: Option<&str>,
         steam_hrtf_path: Option<&str>,
         native_hrtf_path: Option<&str>,
         hrtf_gain: f32,
@@ -278,25 +273,15 @@ impl SpatialProcessor {
             frame_size: frame_size as u32,
         };
 
-        let steam_hrtf_path = steam_hrtf_path.map(str::to_string);
-        let native_hrtf_path = native_hrtf_path.map(str::to_string);
-        let legacy_hrtf_path = hrtf_path.map(str::to_string);
-
-        // Create backend-specific HRTF resources. Backends not selected at startup are loaded
-        // lazily by the runtime switcher on the game/render thread.
+        // Create only the fixed backend resources selected for this world.
         let mut hrtf = None;
         let mut ambisonics_decode_effect = None;
-        let mut native_hrtf_table = None;
         let mut native_hrtf_renderer = None;
         let mut native_ambisonics_decoder = None;
         let mut native_ambisonics_state = None;
 
         if hrtf_backend == HrtfBackend::SteamAudio {
-            let loaded_hrtf = create_steam_hrtf(
-                &context,
-                &audio_settings,
-                steam_hrtf_path.as_deref().or(legacy_hrtf_path.as_deref()),
-            )?;
+            let loaded_hrtf = create_steam_hrtf(&context, &audio_settings, steam_hrtf_path)?;
             ambisonics_decode_effect = Some(create_ambisonics_decode_effect(
                 &context,
                 &audio_settings,
@@ -306,10 +291,7 @@ impl SpatialProcessor {
         }
 
         if hrtf_backend == HrtfBackend::Native {
-            let table = load_native_hrtf_table(
-                sample_rate,
-                native_hrtf_path.as_deref().or(legacy_hrtf_path.as_deref()),
-            )?;
+            let table = load_native_hrtf_table(sample_rate, native_hrtf_path)?;
             native_hrtf_renderer = Some(NativeHrtfRenderer::with_frame_size(
                 table.clone(),
                 frame_size,
@@ -323,7 +305,6 @@ impl SpatialProcessor {
                 native_ambisonics_state = Some(decoder.create_state());
                 native_ambisonics_decoder = Some(decoder);
             }
-            native_hrtf_table = Some(table);
         }
 
         let native_ambisonics_encoder =
@@ -547,7 +528,6 @@ impl SpatialProcessor {
             scene,
             hrtf,
             ambisonics_decode_effect,
-            native_hrtf_table,
             native_hrtf_renderer,
             native_hrtf_source_states: HashMap::new(),
             native_ambisonics_encoder,
@@ -562,8 +542,6 @@ impl SpatialProcessor {
             direct_path_backend,
             use_ambisonics,
             ambisonics_backend,
-            steam_hrtf_path,
-            native_hrtf_path,
             direct_occlusion_enabled,
             reflections_enabled,
             native_early_reflections_enabled,
@@ -598,181 +576,6 @@ impl SpatialProcessor {
         self.listener_up = pose.up();
         self.listener_right = pose.right();
 
-        Ok(())
-    }
-
-    /// Change the runtime spatial backends used for subsequent render blocks.
-    ///
-    /// This is intended for game-side A/B testing from non-realtime threads. It may allocate the
-    /// first time the Steam Audio HRTF path is selected, so callers must not invoke it from an
-    /// audio callback.
-    pub fn set_spatial_backends(
-        &mut self,
-        hrtf_backend: HrtfBackend,
-        direct_path_backend: DirectPathBackend,
-    ) -> Result<()> {
-        self.set_spatial_rendering(
-            hrtf_backend,
-            direct_path_backend,
-            self.use_ambisonics,
-            self.ambisonics_backend,
-        )
-    }
-
-    pub fn set_spatial_rendering(
-        &mut self,
-        hrtf_backend: HrtfBackend,
-        direct_path_backend: DirectPathBackend,
-        use_ambisonics: bool,
-        ambisonics_backend: AmbisonicsBackend,
-    ) -> Result<()> {
-        if hrtf_backend == self.hrtf_backend
-            && direct_path_backend == self.direct_path_backend
-            && use_ambisonics == self.use_ambisonics
-            && ambisonics_backend == self.ambisonics_backend
-        {
-            return Ok(());
-        }
-
-        match hrtf_backend {
-            HrtfBackend::SteamAudio => {
-                self.ensure_steam_hrtf_resources()?;
-                if !use_ambisonics {
-                    self.ensure_steam_binaural_effects()?;
-                }
-            }
-            HrtfBackend::Native => {
-                self.ensure_native_hrtf_resources()?;
-                if use_ambisonics {
-                    self.ensure_native_ambisonics_decoder()?;
-                }
-            }
-        }
-
-        let old_hrtf_backend = self.hrtf_backend;
-        let old_direct_path_backend = self.direct_path_backend;
-        let old_use_ambisonics = self.use_ambisonics;
-        let old_ambisonics_backend = self.ambisonics_backend;
-        self.hrtf_backend = hrtf_backend;
-        self.direct_path_backend = direct_path_backend;
-        self.use_ambisonics = use_ambisonics;
-        self.ambisonics_backend = ambisonics_backend;
-        self.reflections_enabled = self.native_closest_hit_ray_tracer.is_some()
-            && self.hrtf_backend == HrtfBackend::SteamAudio;
-        self.native_early_reflections_enabled = self.native_closest_hit_ray_tracer.is_some()
-            && self.hrtf_backend == HrtfBackend::Native
-            && !self.use_ambisonics;
-
-        log::info!(
-            "PetalSonic spatial backend switch: hrtf_backend={:?}->{:?}, direct_path_backend={:?}->{:?}, use_ambisonics={} -> {}, ambisonics_backend={:?}->{:?}, direct_occlusion_enabled={}, reflections_enabled={}, native_early_reflections_enabled={}",
-            old_hrtf_backend,
-            self.hrtf_backend,
-            old_direct_path_backend,
-            self.direct_path_backend,
-            old_use_ambisonics,
-            self.use_ambisonics,
-            old_ambisonics_backend,
-            self.ambisonics_backend,
-            self.direct_occlusion_enabled,
-            self.reflections_enabled,
-            self.native_early_reflections_enabled
-        );
-
-        Ok(())
-    }
-
-    pub fn hrtf_backend(&self) -> HrtfBackend {
-        self.hrtf_backend
-    }
-
-    pub fn direct_path_backend(&self) -> DirectPathBackend {
-        self.direct_path_backend
-    }
-
-    pub fn use_ambisonics(&self) -> bool {
-        self.use_ambisonics
-    }
-
-    pub fn ambisonics_backend(&self) -> AmbisonicsBackend {
-        self.ambisonics_backend
-    }
-
-    fn ensure_steam_hrtf_resources(&mut self) -> Result<()> {
-        let audio_settings = AudioSettings {
-            sampling_rate: self.sample_rate,
-            frame_size: self.frame_size as u32,
-        };
-
-        if self.hrtf.is_none() {
-            self.hrtf = Some(create_steam_hrtf(
-                &self.context,
-                &audio_settings,
-                self.steam_hrtf_path.as_deref(),
-            )?);
-        }
-
-        if self.ambisonics_decode_effect.is_none() {
-            let hrtf = self.hrtf.as_ref().ok_or_else(|| {
-                PetalSonicError::SpatialAudio("Steam Audio HRTF is not initialized".to_string())
-            })?;
-            self.ambisonics_decode_effect = Some(create_ambisonics_decode_effect(
-                &self.context,
-                &audio_settings,
-                hrtf,
-            )?);
-        }
-
-        Ok(())
-    }
-
-    fn ensure_steam_binaural_effects(&mut self) -> Result<()> {
-        self.ensure_steam_hrtf_resources()?;
-        let audio_settings = AudioSettings {
-            sampling_rate: self.sample_rate,
-            frame_size: self.frame_size as u32,
-        };
-        let hrtf = self.hrtf.as_ref().ok_or_else(|| {
-            PetalSonicError::SpatialAudio("Steam Audio HRTF is not initialized".to_string())
-        })?;
-        self.effects_manager
-            .ensure_binaural_effects(&self.context, &audio_settings, hrtf)
-    }
-
-    fn ensure_native_hrtf_resources(&mut self) -> Result<()> {
-        if self.native_hrtf_renderer.is_some() && self.native_hrtf_table.is_some() {
-            return Ok(());
-        }
-
-        let table = load_native_hrtf_table(self.sample_rate, self.native_hrtf_path.as_deref())?;
-        self.native_hrtf_renderer = Some(NativeHrtfRenderer::with_frame_size(
-            table.clone(),
-            self.frame_size,
-        )?);
-        self.native_hrtf_table = Some(table);
-        Ok(())
-    }
-
-    fn ensure_native_ambisonics_decoder(&mut self) -> Result<()> {
-        self.ensure_native_hrtf_resources()?;
-        if self.native_ambisonics_decoder.is_none() {
-            let table = self.native_hrtf_table.as_ref().ok_or_else(|| {
-                PetalSonicError::SpatialAudio("native HRTF table is not initialized".to_string())
-            })?;
-            let decoder = NativeAmbisonicsBinauralDecoder::with_frame_size(
-                table.clone(),
-                DEFAULT_NATIVE_AMBISONICS_ORDER,
-                self.frame_size,
-            )?;
-            self.native_ambisonics_state = Some(decoder.create_state());
-            self.native_ambisonics_decoder = Some(decoder);
-        } else if self.native_ambisonics_state.is_none() {
-            let decoder = self.native_ambisonics_decoder.as_ref().ok_or_else(|| {
-                PetalSonicError::SpatialAudio(
-                    "native Ambisonics decoder is not initialized".to_string(),
-                )
-            })?;
-            self.native_ambisonics_state = Some(decoder.create_state());
-        }
         Ok(())
     }
 

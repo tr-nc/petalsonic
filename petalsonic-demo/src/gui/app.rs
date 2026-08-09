@@ -1,9 +1,8 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use petalsonic::{
-    Emitter, EmitterDesc, LoopMode, PetalSonicWorld, PlayOptions, PlaybackControl, PlaybackTag,
-    RenderTimingEvent, ResidentClip,
+    Emitter, EmitterDesc, EmitterSpatialState, LoopMode, PetalSonicWorld, PetalSonicWorldDesc,
+    PlayOptions, PlaybackControl, PlaybackTag, RenderTimingEvent, ResidentClip, SpatialFrame,
     audio_data::PetalSonicAudioData,
-    config::PetalSonicWorldDesc,
     math::{Pose, Quat, Vec3},
 };
 use std::collections::VecDeque;
@@ -166,7 +165,7 @@ impl SpatialAudioDemo {
         let world_desc = PetalSonicWorldDesc {
             sample_rate: 48000,
             block_size: 1024,
-            hrtf_path: Some("petalsonic-demo/asset/hrtf/hrtf_b_nh172.sofa".to_string()),
+            steam_hrtf_path: Some("petalsonic-demo/asset/hrtf/hrtf_b_nh172.sofa".to_string()),
             hrtf_gain: 20.0,
             ..Default::default()
         };
@@ -177,7 +176,9 @@ impl SpatialAudioDemo {
 
         // Set up listener pose at origin (0, 0, 0) with identity rotation
         let listener_pose = Pose::new(Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY);
-        world.set_listener_pose(listener_pose);
+        world
+            .publish_spatial_frame(SpatialFrame::new(listener_pose, Vec::new()))
+            .expect("Failed to publish initial spatial frame");
 
         // Calculate maximum frame time constraint (block_size / sample_rate)
         //
@@ -576,8 +577,6 @@ impl SpatialAudioDemo {
             );
 
             self.listener_position = clamped_pos;
-            let listener_pose = Pose::new(clamped_pos, Quat::IDENTITY);
-            self.world.set_listener_pose(listener_pose);
         }
 
         // Handle dragging sources
@@ -594,12 +593,6 @@ impl SpatialAudioDemo {
 
             if let Some(source) = self.spatial_sources.get_mut(idx) {
                 source.position = clamped_pos;
-                // Preserve current volume in dB when moving the source.
-                let new_desc = EmitterDesc::spatial(Pose::from_position(clamped_pos))
-                    .with_gain_db(source.volume_db);
-                if let Err(e) = self.world.update_emitter(source.id, new_desc) {
-                    log::error!("Failed to update source config: {}", e);
-                }
             }
         }
 
@@ -620,6 +613,21 @@ impl SpatialAudioDemo {
         let tag = PlaybackTag(self.next_playback_tag);
         self.next_playback_tag = self.next_playback_tag.wrapping_add(1);
         tag
+    }
+
+    fn publish_spatial_frame(&self) {
+        let listener = Pose::new(self.listener_position, Quat::IDENTITY);
+        let emitters = self
+            .spatial_sources
+            .iter()
+            .map(|source| EmitterSpatialState::new(source.id, Pose::from_position(source.position)))
+            .collect();
+        if let Err(error) = self
+            .world
+            .publish_spatial_frame(SpatialFrame::new(listener, emitters))
+        {
+            log::debug!("Spatial frame publication deferred: {error}");
+        }
     }
 
     fn add_spatial_source_at_position(&mut self, position: Vec3) -> Result<(), String> {
@@ -1281,6 +1289,8 @@ impl eframe::App for SpatialAudioDemo {
             // Handle mouse input
             self.handle_mouse_interaction(ui, rect);
         });
+
+        self.publish_spatial_frame();
 
         // Request continuous repaint for smooth interaction
         ctx.request_repaint();

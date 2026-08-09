@@ -1,5 +1,5 @@
 use crate::domain::{
-    Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
+    Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip, SpatialFrame,
 };
 use crate::engine::{AudioOutputDeviceInfo, PetalSonicEngine};
 use crate::error::{PetalSonicError, Result};
@@ -8,7 +8,7 @@ use crate::math::Pose;
 use crate::playback::PlaybackCommand;
 use crate::spatial::DirectPathOverride;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -124,6 +124,46 @@ impl EmitterRegistry {
         self.len -= 1;
         Ok(state)
     }
+
+    fn apply_spatial_frame(&mut self, frame: &SpatialFrame) -> Result<()> {
+        let expected = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.state.as_ref())
+            .filter(|state| state.desc.is_spatial())
+            .count();
+        if frame.emitters().len() != expected {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame",
+                reason: format!(
+                    "expected {expected} spatial emitters, received {}",
+                    frame.emitters().len()
+                ),
+            });
+        }
+
+        let mut seen = HashSet::with_capacity(frame.emitters().len());
+        for spatial in frame.emitters() {
+            if !seen.insert(spatial.emitter) {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field: "spatial_frame",
+                    reason: format!("contains duplicate {}", spatial.emitter),
+                });
+            }
+            let state = self.get(spatial.emitter)?;
+            if !state.desc.is_spatial() {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field: "spatial_frame",
+                    reason: format!("{} is not spatial", spatial.emitter),
+                });
+            }
+        }
+
+        for spatial in frame.emitters() {
+            self.get_mut(spatial.emitter)?.desc.set_pose(spatial.pose);
+        }
+        Ok(())
+    }
 }
 
 /// Main facade for audio resources, emitters, playback, events, and runtime state.
@@ -133,11 +173,12 @@ impl EmitterRegistry {
 pub struct PetalSonicWorld {
     desc: crate::config::PetalSonicWorldDesc,
     emitters: Mutex<EmitterRegistry>,
-    listener_pose: Arc<Mutex<Pose>>,
     next_voice_id: AtomicU64,
     active_voice_count: Arc<AtomicUsize>,
     controlled_voices: Mutex<HashMap<SourceId, Emitter>>,
     retirement_receiver: Receiver<SourceId>,
+    latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
+    spatial_retirement_receiver: Receiver<Arc<SpatialFrame>>,
     command_sender: Sender<PlaybackCommand>,
     engine: Mutex<Option<PetalSonicEngine>>,
 }
@@ -152,11 +193,16 @@ impl PetalSonicWorld {
         let active_voice_count = Arc::new(AtomicUsize::new(0));
         let (retirement_sender, retirement_receiver) =
             crossbeam_channel::bounded(config.max_voices);
+        let latest_spatial_frame = Arc::new(Mutex::new(None));
+        let (spatial_retirement_sender, spatial_retirement_receiver) =
+            crossbeam_channel::bounded(1);
         let mut engine = PetalSonicEngine::new(
             config.clone(),
             listener_pose.clone(),
             active_voice_count.clone(),
             retirement_sender,
+            latest_spatial_frame.clone(),
+            spatial_retirement_sender,
         )?;
         engine.start(command_receiver)?;
 
@@ -164,10 +210,11 @@ impl PetalSonicWorld {
             emitters: Mutex::new(EmitterRegistry::new(config.max_emitters)),
             controlled_voices: Mutex::new(HashMap::with_capacity(config.max_voices)),
             desc: config,
-            listener_pose,
             next_voice_id: AtomicU64::new(0),
             active_voice_count,
             retirement_receiver,
+            latest_spatial_frame,
+            spatial_retirement_receiver,
             command_sender,
             engine: Mutex::new(Some(engine)),
         })
@@ -225,11 +272,36 @@ impl PetalSonicWorld {
             .lock()
             .map_err(|_| PetalSonicError::Engine("Emitter registry is poisoned".into()))?;
         let state = emitters.get_mut(emitter)?;
+        if state.desc.is_spatial() != desc.is_spatial() {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "emitter_desc",
+                reason: "spatial placement cannot change after emitter creation".into(),
+            });
+        }
         self.try_send(PlaybackCommand::UpdateEmitter(
             emitter,
             desc.source_config(0.0),
         ))?;
         state.desc = desc;
+        Ok(())
+    }
+
+    /// Publishes the latest complete listener + spatial-emitter transform set.
+    ///
+    /// An unconsumed older frame is replaced on the caller thread. The render thread
+    /// observes only complete frame generations and never accumulates stale movement.
+    pub fn publish_spatial_frame(&self, frame: SpatialFrame) -> Result<()> {
+        self.drain_retired_spatial_frames();
+        let mut latest = self
+            .latest_spatial_frame
+            .try_lock()
+            .map_err(|_| PetalSonicError::QueuePressure)?;
+        let mut emitters = self
+            .emitters
+            .try_lock()
+            .map_err(|_| PetalSonicError::QueuePressure)?;
+        emitters.apply_spatial_frame(&frame)?;
+        *latest = Some(Arc::new(frame));
         Ok(())
     }
 
@@ -407,19 +479,6 @@ impl PetalSonicWorld {
         }
     }
 
-    pub fn set_listener_pose(&self, pose: Pose) {
-        if let Ok(mut runtime_pose) = self.listener_pose.lock() {
-            *runtime_pose = pose;
-        }
-    }
-
-    pub fn listener_pose(&self) -> Pose {
-        self.listener_pose
-            .lock()
-            .map(|pose| *pose)
-            .unwrap_or_default()
-    }
-
     pub fn sample_rate(&self) -> u32 {
         self.desc.sample_rate
     }
@@ -475,6 +534,10 @@ impl PetalSonicWorld {
                 controlled.remove(&voice_id);
             }
         }
+    }
+
+    fn drain_retired_spatial_frames(&self) {
+        while self.spatial_retirement_receiver.try_recv().is_ok() {}
     }
 
     pub fn drain_timing_events(&self) -> Vec<RenderTimingEvent> {
@@ -583,5 +646,49 @@ mod tests {
                 desc: EmitterDesc::default(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn spatial_frame_must_be_complete_before_any_pose_is_updated() {
+        let mut registry = EmitterRegistry::new(2);
+        let first = registry
+            .insert(EmitterState {
+                clip: clip(),
+                desc: EmitterDesc::spatial(Pose::default()),
+            })
+            .unwrap();
+        let second = registry
+            .insert(EmitterState {
+                clip: clip(),
+                desc: EmitterDesc::spatial(Pose::default()),
+            })
+            .unwrap();
+        let moved = Pose::from_position(crate::math::Vec3::new(1.0, 2.0, 3.0));
+
+        let incomplete = SpatialFrame::new(
+            Pose::default(),
+            vec![crate::domain::EmitterSpatialState::new(first, moved)],
+        );
+        assert!(matches!(
+            registry.apply_spatial_frame(&incomplete),
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame",
+                ..
+            })
+        ));
+        assert_eq!(
+            registry.get(first).unwrap().desc.pose(),
+            Some(Pose::default())
+        );
+
+        let complete = SpatialFrame::new(
+            Pose::default(),
+            vec![
+                crate::domain::EmitterSpatialState::new(first, moved),
+                crate::domain::EmitterSpatialState::new(second, Pose::default()),
+            ],
+        );
+        registry.apply_spatial_frame(&complete).unwrap();
+        assert_eq!(registry.get(first).unwrap().desc.pose(), Some(moved));
     }
 }

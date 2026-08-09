@@ -1,9 +1,9 @@
 use crate::acoustics::{BatchedAnyHitRayTracer, BatchedClosestHitRayTracer};
 use std::sync::Arc;
 
-/// Backend used for direct-path spatial processing.
+/// Internal backend plan resolved from [`SpatialQuality`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum DirectPathBackend {
+pub(crate) enum DirectPathBackend {
     /// Use Steam Audio simulation and direct effect for distance, air absorption, and occlusion.
     #[default]
     SteamAudio,
@@ -13,7 +13,7 @@ pub enum DirectPathBackend {
 
 /// Backend used for binaural/HRTF rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum HrtfBackend {
+pub(crate) enum HrtfBackend {
     /// Use Steam Audio HRTF data and binaural rendering.
     #[default]
     SteamAudio,
@@ -23,12 +23,43 @@ pub enum HrtfBackend {
 
 /// Backend used to encode sources into an Ambisonics field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum AmbisonicsBackend {
+pub(crate) enum AmbisonicsBackend {
     /// Use Steam Audio's Ambisonics encode effect.
     #[default]
     SteamAudio,
     /// Use PetalSonic's native real spherical-harmonic encoder.
     Native,
+}
+
+/// Effect-oriented spatial quality selected once for the world lifetime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpatialQuality {
+    /// Prioritizes low processing cost and direct binaural feedback.
+    LowLatency,
+    /// Balances spatial detail, source count, and render cost.
+    #[default]
+    Balanced,
+    /// Enables the most detailed fixed processing plan available.
+    HighQuality,
+}
+
+/// Constrained render-ahead policy. Callers do not specify raw device periods.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LatencyProfile {
+    Responsive,
+    #[default]
+    Balanced,
+    Robust,
+}
+
+/// Output-device selection policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OutputDevicePolicy {
+    /// Follow the operating system's current default output and recover across changes.
+    #[default]
+    FollowSystemDefault,
+    /// Stay attached to the matching named device and reconnect when it returns.
+    PinnedNameContains(String),
 }
 
 /// Configuration descriptor for a PetalSonic world
@@ -51,26 +82,13 @@ pub struct PetalSonicWorldDesc {
     pub event_queue_capacity: usize,
     /// Capacity of the bounded timing/diagnostics queue.
     pub timing_queue_capacity: usize,
-    /// Optional case-insensitive substring used to select a CPAL output device by name.
-    ///
-    /// When `None` or empty, PetalSonic uses the system default output device.
-    pub output_device_name_contains: Option<String>,
-    /// Optional backend-specific path to HRTF data.
-    ///
-    /// Prefer [`Self::steam_hrtf_path`] and [`Self::native_hrtf_path`] when both backends may be
-    /// used at runtime. This legacy field is still used as a fallback for the initially selected
-    /// backend: SOFA for [`HrtfBackend::SteamAudio`], `.petalhrtf` for [`HrtfBackend::Native`].
-    pub hrtf_path: Option<String>,
+    pub output_device: OutputDevicePolicy,
+    pub spatial_quality: SpatialQuality,
+    pub latency_profile: LatencyProfile,
     /// Optional SOFA path used by Steam Audio HRTF rendering.
     pub steam_hrtf_path: Option<String>,
     /// Optional `.petalhrtf` path used by native HRTF rendering.
     pub native_hrtf_path: Option<String>,
-    /// Backend used for binaural/HRTF rendering.
-    pub hrtf_backend: HrtfBackend,
-    /// Whether spatial sources should first be summed into an Ambisonics field before HRTF decode.
-    pub use_ambisonics: bool,
-    /// Backend used for Ambisonics encoding when [`Self::use_ambisonics`] is true.
-    pub ambisonics_backend: AmbisonicsBackend,
     /// HRTF gain compensation in decibels (default: 0.0 dB = no change)
     ///
     /// Different HRTF datasets can have different overall gain levels.
@@ -92,8 +110,6 @@ pub struct PetalSonicWorldDesc {
     /// - `1.0`: 1 world unit = 1 meter
     /// - `10.0`: 1 world unit = 10 meters (larger-scale worlds)
     pub distance_scaler: f32,
-    /// Backend used for direct-path processing.
-    pub direct_path_backend: DirectPathBackend,
     /// Optional host-provided batched ray tracing backend for direct acoustics.
     pub batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
     /// Optional host-provided batched ray tracing backend for closest-hit reflections.
@@ -110,16 +126,13 @@ impl Default for PetalSonicWorldDesc {
             control_queue_capacity: 4096,
             event_queue_capacity: 1024,
             timing_queue_capacity: 512,
-            output_device_name_contains: None,
-            hrtf_path: None,
+            output_device: OutputDevicePolicy::default(),
+            spatial_quality: SpatialQuality::default(),
+            latency_profile: LatencyProfile::default(),
             steam_hrtf_path: None,
             native_hrtf_path: None,
-            hrtf_backend: HrtfBackend::default(),
-            use_ambisonics: true,
-            ambisonics_backend: AmbisonicsBackend::default(),
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
-            direct_path_backend: DirectPathBackend::default(),
             batched_any_hit_ray_tracer: None,
             batched_closest_hit_ray_tracer: None,
         }
@@ -136,19 +149,13 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("control_queue_capacity", &self.control_queue_capacity)
             .field("event_queue_capacity", &self.event_queue_capacity)
             .field("timing_queue_capacity", &self.timing_queue_capacity)
-            .field(
-                "output_device_name_contains",
-                &self.output_device_name_contains,
-            )
-            .field("hrtf_path", &self.hrtf_path)
+            .field("output_device", &self.output_device)
+            .field("spatial_quality", &self.spatial_quality)
+            .field("latency_profile", &self.latency_profile)
             .field("steam_hrtf_path", &self.steam_hrtf_path)
             .field("native_hrtf_path", &self.native_hrtf_path)
-            .field("hrtf_backend", &self.hrtf_backend)
-            .field("use_ambisonics", &self.use_ambisonics)
-            .field("ambisonics_backend", &self.ambisonics_backend)
             .field("hrtf_gain", &self.hrtf_gain)
             .field("distance_scaler", &self.distance_scaler)
-            .field("direct_path_backend", &self.direct_path_backend)
             .field(
                 "batched_any_hit_ray_tracer",
                 &self.batched_any_hit_ray_tracer.as_ref().map(|_| "<custom>"),

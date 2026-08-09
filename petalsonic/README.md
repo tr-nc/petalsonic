@@ -179,7 +179,10 @@ let config = PetalSonicWorldDesc {
     control_queue_capacity: 256,  // Bounded non-blocking control queue
     event_queue_capacity: 128,    // Bounded pull-event queue
     timing_queue_capacity: 128,   // Bounded diagnostics queue
-    hrtf_path: None,              // Optional custom HRTF data path
+    spatial_quality: SpatialQuality::Balanced,
+    latency_profile: LatencyProfile::Balanced,
+    steam_hrtf_path: None,        // Optional Steam Audio SOFA path
+    native_hrtf_path: None,       // Optional native .petalhrtf path
     hrtf_gain: 0.0,               // HRTF gain compensation (dB)
     distance_scaler: 10.0,        // 1 world unit = 10 meters in spatial simulation
     ..Default::default()

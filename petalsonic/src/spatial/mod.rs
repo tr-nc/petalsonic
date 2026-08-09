@@ -9,16 +9,5 @@ mod native_ambisonics;
 mod native_hrtf;
 mod processor;
 
-// Public API
-pub use native_ambisonics::{
-    DEFAULT_NATIVE_AMBISONICS_ORDER, NativeAmbisonicsBinauralDecoder,
-    NativeAmbisonicsBinauralState, NativeAmbisonicsEncoder, native_ambisonics_channel_count,
-};
-pub use native_hrtf::{
-    NativeHrtfDirection, NativeHrtfRenderMetrics, NativeHrtfRenderer, NativeHrtfSourceState,
-    NativeHrtfTable,
-};
-pub use processor::{
-    DirectOcclusionDebugSnapshot, DirectPathOverride, DirectPathTransmission,
-    SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor,
-};
+pub use processor::{DirectPathOverride, DirectPathTransmission};
+pub(crate) use processor::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};

@@ -29,8 +29,14 @@
 //! // Simple playback creates and reclaims its Voice internally.
 //! world.play(emitter, PlayOptions::once())?;
 //!
-//! // Update listener position as your camera/player moves
-//! world.set_listener_pose(Pose::from_position(Vec3::new(0.0, 0.0, 0.0)));
+//! // Publish listener and every spatial emitter as one complete generation.
+//! world.publish_spatial_frame(SpatialFrame::new(
+//!     Pose::from_position(Vec3::new(0.0, 0.0, 0.0)),
+//!     vec![EmitterSpatialState::new(
+//!         emitter,
+//!         Pose::from_position(Vec3::new(5.0, 0.0, 0.0)),
+//!     )],
+//! ))?;
 //!
 //! // Pull events on the caller thread when controlled playback is used.
 //! let _events = world.drain_events();
@@ -66,7 +72,7 @@
 
 pub mod acoustics;
 pub mod audio_data;
-pub mod config;
+mod config;
 mod domain;
 mod engine;
 pub mod error;
@@ -75,23 +81,21 @@ pub mod gain;
 pub mod math;
 mod mixer;
 mod playback;
-pub mod spatial;
+mod spatial;
 mod world;
 
 pub use acoustics::{
     AcousticHit, AcousticMaterial, AcousticRay, BatchedAnyHitRayTracer, BatchedClosestHitRayTracer,
 };
-pub use config::PetalSonicWorldDesc;
-pub use domain::{Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip};
+pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
+pub use domain::{
+    Emitter, EmitterDesc, EmitterSpatialState, PlayOptions, PlaybackControl, PlaybackTag,
+    ResidentClip, SpatialFrame,
+};
 pub use engine::AudioOutputDeviceInfo;
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};
 pub use playback::LoopMode;
-pub use spatial::{
-    DEFAULT_NATIVE_AMBISONICS_ORDER, DirectOcclusionDebugSnapshot, DirectPathOverride,
-    DirectPathTransmission, NativeAmbisonicsBinauralDecoder, NativeAmbisonicsBinauralState,
-    NativeAmbisonicsEncoder, NativeHrtfDirection, NativeHrtfRenderMetrics, NativeHrtfRenderer,
-    NativeHrtfSourceState, NativeHrtfTable, native_ambisonics_channel_count,
-};
+pub use spatial::{DirectPathOverride, DirectPathTransmission};
 pub use world::PetalSonicWorld;

@@ -111,6 +111,16 @@ impl SourceConfig {
         }
     }
 
+    pub(crate) fn set_pose(&mut self, next_pose: Pose) -> bool {
+        match self {
+            Self::Spatial { pose, .. } => {
+                *pose = next_pose;
+                true
+            }
+            Self::NonSpatial { .. } => false,
+        }
+    }
+
     /// Returns the position if this is a spatial source
     pub fn position(&self) -> Option<Vec3> {
         match self {

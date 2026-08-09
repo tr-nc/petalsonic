@@ -118,6 +118,20 @@ impl EmitterDesc {
             EmitterPlacement::Spatial(pose) => SourceConfig::spatial_with_volume_db(pose, gain_db),
         }
     }
+
+    pub(crate) fn is_spatial(&self) -> bool {
+        matches!(self.placement, EmitterPlacement::Spatial(_))
+    }
+
+    pub(crate) fn set_pose(&mut self, pose: Pose) -> bool {
+        match &mut self.placement {
+            EmitterPlacement::NonSpatial => false,
+            EmitterPlacement::Spatial(current) => {
+                *current = pose;
+                true
+            }
+        }
+    }
 }
 
 impl Default for EmitterDesc {
@@ -165,5 +179,39 @@ impl Default for PlayOptions {
             gain_db: 0.0,
             detached: false,
         }
+    }
+}
+
+/// One spatial emitter transform in a complete game-frame snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EmitterSpatialState {
+    pub emitter: Emitter,
+    pub pose: Pose,
+}
+
+impl EmitterSpatialState {
+    pub fn new(emitter: Emitter, pose: Pose) -> Self {
+        Self { emitter, pose }
+    }
+}
+
+/// Atomic listener + emitter transform snapshot consumed at render-quantum edges.
+#[derive(Clone, Debug)]
+pub struct SpatialFrame {
+    listener: Pose,
+    emitters: Vec<EmitterSpatialState>,
+}
+
+impl SpatialFrame {
+    pub fn new(listener: Pose, emitters: Vec<EmitterSpatialState>) -> Self {
+        Self { listener, emitters }
+    }
+
+    pub fn listener(&self) -> Pose {
+        self.listener
+    }
+
+    pub fn emitters(&self) -> &[EmitterSpatialState] {
+        &self.emitters
     }
 }

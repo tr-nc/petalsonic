@@ -1,6 +1,9 @@
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::PetalSonicWorldDesc;
-use crate::domain::PlaybackControl;
+use crate::config::{
+    AmbisonicsBackend, DirectPathBackend, HrtfBackend, LatencyProfile, OutputDevicePolicy,
+    PetalSonicWorldDesc, SpatialQuality,
+};
+use crate::domain::{PlaybackControl, SpatialFrame};
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
@@ -11,7 +14,7 @@ use crate::spatial::SpatialProcessor;
 use crate::world::SourceId;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer, Observer, Producer, Split},
@@ -51,6 +54,55 @@ const MASTER_HEADROOM_DB: f32 = -6.0;
 const STARTUP_UNDERRUN_GRACE_CALLBACKS: usize = 8;
 const LOGICAL_CHANNELS: u16 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpatialBackendPlan {
+    hrtf: HrtfBackend,
+    direct_path: DirectPathBackend,
+    use_ambisonics: bool,
+    ambisonics: AmbisonicsBackend,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RenderSchedule {
+    ring_blocks: usize,
+    low_water_blocks: usize,
+    high_water_blocks: usize,
+    normal_chunk_blocks: usize,
+    catch_up_chunk_blocks: usize,
+    wake_divisor: u32,
+}
+
+impl RenderSchedule {
+    fn for_profile(profile: LatencyProfile) -> Self {
+        match profile {
+            LatencyProfile::Responsive => Self {
+                ring_blocks: 4,
+                low_water_blocks: 1,
+                high_water_blocks: 2,
+                normal_chunk_blocks: 1,
+                catch_up_chunk_blocks: 1,
+                wake_divisor: 8,
+            },
+            LatencyProfile::Balanced => Self {
+                ring_blocks: 8,
+                low_water_blocks: 2,
+                high_water_blocks: 3,
+                normal_chunk_blocks: 1,
+                catch_up_chunk_blocks: 2,
+                wake_divisor: 4,
+            },
+            LatencyProfile::Robust => Self {
+                ring_blocks: 12,
+                low_water_blocks: 3,
+                high_water_blocks: 5,
+                normal_chunk_blocks: 2,
+                catch_up_chunk_blocks: 3,
+                wake_divisor: 3,
+            },
+        }
+    }
+}
+
 /// Context for audio callback - groups related parameters to reduce argument count
 ///
 /// The audio callback runs on the real-time audio thread and must be extremely fast
@@ -70,6 +122,10 @@ struct PumpState {
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     active_voice_count: Arc<AtomicUsize>,
     retirement_sender: Sender<SourceId>,
+    latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
+    current_spatial_frame: Option<Arc<SpatialFrame>>,
+    pending_spatial_retirement: Option<Arc<SpatialFrame>>,
+    spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
     resampler: Arc<Mutex<StreamingResampler>>,
     /// Producer end of ring buffer - writes pre-rendered audio samples (lock-free)
     ring_buffer_producer: HeapProd<StereoFrame>,
@@ -85,6 +141,7 @@ struct PumpState {
     /// Timing event sender for performance profiling
     timing_sender: Sender<RenderTimingEvent>,
     master_gain_linear: f32,
+    schedule: RenderSchedule,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -123,6 +180,8 @@ pub(crate) struct PetalSonicEngine {
     active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
     active_voice_count: Arc<AtomicUsize>,
     retirement_sender: Sender<SourceId>,
+    latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
+    spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
     /// The actual sample rate used by the audio device (may differ from desc.sample_rate)
     device_sample_rate: u32,
     pump_state: Option<Arc<Mutex<PumpState>>>,
@@ -141,6 +200,7 @@ pub(crate) struct PetalSonicEngine {
     timing_receiver: Receiver<RenderTimingEvent>,
     master_headroom_db: f32,
     master_gain_linear: f32,
+    schedule: RenderSchedule,
 }
 
 impl PetalSonicEngine {
@@ -150,21 +210,24 @@ impl PetalSonicEngine {
         listener_pose: Arc<Mutex<Pose>>,
         active_voice_count: Arc<AtomicUsize>,
         retirement_sender: Sender<SourceId>,
+        latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
+        spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
     ) -> Result<Self> {
+        let backend_plan = Self::resolve_spatial_backend_plan(&desc);
+        let schedule = RenderSchedule::for_profile(desc.latency_profile);
         // Initialize spatial processor
         // Use distance_scaler from world configuration (converts world units to meters)
         let spatial_processor = match SpatialProcessor::new(
             desc.sample_rate,
             desc.block_size,
             desc.distance_scaler,
-            desc.hrtf_path.as_deref(),
             desc.steam_hrtf_path.as_deref(),
             desc.native_hrtf_path.as_deref(),
             desc.hrtf_gain,
-            desc.hrtf_backend,
-            desc.direct_path_backend,
-            desc.use_ambisonics,
-            desc.ambisonics_backend,
+            backend_plan.hrtf,
+            backend_plan.direct_path,
+            backend_plan.use_ambisonics,
+            backend_plan.ambisonics,
             desc.batched_any_hit_ray_tracer.clone(),
             desc.batched_closest_hit_ray_tracer.clone(),
         ) {
@@ -197,6 +260,8 @@ impl PetalSonicEngine {
             active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_voice_count,
             retirement_sender,
+            latest_spatial_frame,
+            spatial_retirement_sender,
             pump_state: None,
             render_thread: None,
             spatial_processor,
@@ -207,7 +272,40 @@ impl PetalSonicEngine {
             timing_receiver,
             master_headroom_db,
             master_gain_linear,
+            schedule,
         })
+    }
+
+    fn resolve_spatial_backend_plan(desc: &PetalSonicWorldDesc) -> SpatialBackendPlan {
+        let native_hrtf_available = desc.native_hrtf_path.is_some();
+        match desc.spatial_quality {
+            SpatialQuality::LowLatency => SpatialBackendPlan {
+                hrtf: if native_hrtf_available {
+                    HrtfBackend::Native
+                } else {
+                    HrtfBackend::SteamAudio
+                },
+                direct_path: DirectPathBackend::Native,
+                use_ambisonics: false,
+                ambisonics: AmbisonicsBackend::Native,
+            },
+            SpatialQuality::Balanced => SpatialBackendPlan {
+                hrtf: if native_hrtf_available {
+                    HrtfBackend::Native
+                } else {
+                    HrtfBackend::SteamAudio
+                },
+                direct_path: DirectPathBackend::Native,
+                use_ambisonics: true,
+                ambisonics: AmbisonicsBackend::Native,
+            },
+            SpatialQuality::HighQuality => SpatialBackendPlan {
+                hrtf: HrtfBackend::SteamAudio,
+                direct_path: DirectPathBackend::SteamAudio,
+                use_ambisonics: true,
+                ambisonics: AmbisonicsBackend::SteamAudio,
+            },
+        }
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -220,8 +318,11 @@ impl PetalSonicEngine {
             return Ok(());
         }
 
-        let (device, device_config) =
-            Self::init_audio_device(self.desc.output_device_name_contains.as_deref())?;
+        let requested_device = match &self.desc.output_device {
+            OutputDevicePolicy::FollowSystemDefault => None,
+            OutputDevicePolicy::PinnedNameContains(name) => Some(name.as_str()),
+        };
+        let (device, device_config) = Self::init_audio_device(requested_device)?;
         let device_sample_rate = device_config.sample_rate().0;
 
         self.device_sample_rate = device_sample_rate;
@@ -296,6 +397,7 @@ impl PetalSonicEngine {
             self.is_running.clone(),
             self.desc.block_size,
             self.desc.sample_rate,
+            self.schedule.wake_divisor,
         ) {
             Ok(thread) => thread,
             Err(error) => {
@@ -317,10 +419,11 @@ impl PetalSonicEngine {
         is_running: Arc<AtomicBool>,
         block_size: usize,
         sample_rate: u32,
+        wake_divisor: u32,
     ) -> Result<JoinHandle<()>> {
         let block_duration = Duration::from_secs_f64(block_size as f64 / sample_rate as f64);
-        let wake_interval =
-            (block_duration / 4).clamp(Duration::from_micros(250), Duration::from_millis(2));
+        let wake_interval = (block_duration / wake_divisor)
+            .clamp(Duration::from_micros(250), Duration::from_millis(2));
 
         std::thread::Builder::new()
             .name("petalsonic-render".into())
@@ -868,10 +971,7 @@ impl PetalSonicEngine {
         // Size calculation: Must be large enough to buffer during render thread delays,
         // but not so large that it introduces noticeable latency.
 
-        // Capacity target: 8 blocks of headroom.
-        // Steady-state fill is controlled separately by the pump's 2-3 block
-        // low/high watermarks.
-        let ring_buffer_size = block_size * 8;
+        let ring_buffer_size = block_size * self.schedule.ring_blocks;
         let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
 
         // Split ring buffer into producer (render thread) and consumer (device callback)
@@ -882,6 +982,10 @@ impl PetalSonicEngine {
             active_playback: params.active_playback.clone(),
             active_voice_count: self.active_voice_count.clone(),
             retirement_sender: self.retirement_sender.clone(),
+            latest_spatial_frame: self.latest_spatial_frame.clone(),
+            current_spatial_frame: None,
+            pending_spatial_retirement: None,
+            spatial_retirement_sender: self.spatial_retirement_sender.clone(),
             resampler: resampler.clone(),
             ring_buffer_producer: producer,
             channels: params.channels,
@@ -892,6 +996,7 @@ impl PetalSonicEngine {
             event_sender: params.event_sender,
             timing_sender: params.timing_sender,
             master_gain_linear: self.master_gain_linear,
+            schedule: self.schedule,
         }));
 
         // Create context for audio callback (simplified - just consumes from ring buffer)
@@ -930,10 +1035,12 @@ impl PetalSonicEngine {
         // - allow up to 2 blocks only when buffer occupancy is critically low
         // This avoids the positive-feedback loop where a slow frame causes a larger refill,
         // which then makes the next frame even slower.
-        let target_occupancy = ctx.block_size * 3;
-        let critical_occupancy = ctx.block_size;
-        let normal_chunk = ctx.block_size;
-        let catch_up_chunk = ctx.block_size * 2;
+        let target_occupancy = ctx.block_size * ctx.schedule.high_water_blocks;
+        let critical_occupancy = ctx.block_size * ctx.schedule.low_water_blocks;
+        let normal_chunk = ctx.block_size * ctx.schedule.normal_chunk_blocks;
+        let catch_up_chunk = ctx.block_size * ctx.schedule.catch_up_chunk_blocks;
+
+        Self::consume_latest_spatial_frame(ctx);
 
         // Update listener pose in spatial processor if available.
         if let Some(ref spatial_processor) = ctx.spatial_processor
@@ -1000,6 +1107,69 @@ impl PetalSonicEngine {
                         },
                         tag,
                     });
+            }
+        }
+    }
+
+    fn consume_latest_spatial_frame(ctx: &mut PumpState) {
+        if let Some(pending) = ctx.pending_spatial_retirement.take() {
+            match ctx.spatial_retirement_sender.try_send(pending) {
+                Ok(()) => {}
+                Err(TrySendError::Full(pending)) => {
+                    ctx.pending_spatial_retirement = Some(pending);
+                    return;
+                }
+                Err(TrySendError::Disconnected(pending)) => {
+                    ctx.pending_spatial_retirement = Some(pending);
+                    return;
+                }
+            }
+        }
+
+        let next = ctx
+            .latest_spatial_frame
+            .try_lock()
+            .ok()
+            .and_then(|mut latest| latest.take());
+        let Some(next) = next else {
+            return;
+        };
+
+        let Ok(mut active_playback) = ctx.active_playback.try_lock() else {
+            if let Ok(mut latest) = ctx.latest_spatial_frame.try_lock()
+                && latest.is_none()
+            {
+                *latest = Some(next);
+            }
+            return;
+        };
+
+        if let Ok(mut listener_pose) = ctx.listener_pose.try_lock() {
+            *listener_pose = next.listener();
+        }
+        Self::apply_spatial_frame_to_voices(&next, &mut active_playback);
+
+        if let Some(previous) = ctx.current_spatial_frame.replace(next) {
+            if let Err(error) = ctx.spatial_retirement_sender.try_send(previous) {
+                ctx.pending_spatial_retirement = Some(error.into_inner());
+            }
+        }
+    }
+
+    fn apply_spatial_frame_to_voices(
+        frame: &SpatialFrame,
+        active_playback: &mut HashMap<SourceId, PlaybackInstance>,
+    ) {
+        for instance in active_playback.values_mut() {
+            if instance.detached {
+                continue;
+            }
+            if let Some(spatial) = frame
+                .emitters()
+                .iter()
+                .find(|spatial| spatial.emitter == instance.emitter)
+            {
+                instance.config.set_pose(spatial.pose);
             }
         }
     }
@@ -1488,6 +1658,45 @@ mod tests {
     }
 
     #[test]
+    fn public_quality_profiles_resolve_to_fixed_internal_plans() {
+        let mut desc = PetalSonicWorldDesc::default();
+
+        desc.spatial_quality = SpatialQuality::LowLatency;
+        let low_latency = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
+        assert_eq!(low_latency.hrtf, HrtfBackend::SteamAudio);
+        assert_eq!(low_latency.direct_path, DirectPathBackend::Native);
+        assert!(!low_latency.use_ambisonics);
+
+        desc.native_hrtf_path = Some("headset.petalhrtf".into());
+        desc.spatial_quality = SpatialQuality::Balanced;
+        let balanced = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
+        assert_eq!(balanced.hrtf, HrtfBackend::Native);
+        assert_eq!(balanced.direct_path, DirectPathBackend::Native);
+        assert!(balanced.use_ambisonics);
+
+        desc.spatial_quality = SpatialQuality::HighQuality;
+        let high_quality = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
+        assert_eq!(high_quality.hrtf, HrtfBackend::SteamAudio);
+        assert_eq!(high_quality.direct_path, DirectPathBackend::SteamAudio);
+        assert!(high_quality.use_ambisonics);
+    }
+
+    #[test]
+    fn latency_profiles_only_select_bounded_render_schedules() {
+        let responsive = RenderSchedule::for_profile(LatencyProfile::Responsive);
+        let balanced = RenderSchedule::for_profile(LatencyProfile::Balanced);
+        let robust = RenderSchedule::for_profile(LatencyProfile::Robust);
+
+        assert!(responsive.ring_blocks < balanced.ring_blocks);
+        assert!(balanced.ring_blocks < robust.ring_blocks);
+        for schedule in [responsive, balanced, robust] {
+            assert!(schedule.low_water_blocks < schedule.high_water_blocks);
+            assert!(schedule.high_water_blocks <= schedule.ring_blocks);
+            assert!(schedule.catch_up_chunk_blocks <= schedule.high_water_blocks);
+        }
+    }
+
+    #[test]
     fn render_thread_produces_audio_without_a_caller_pump() {
         let block_size = 256;
         let sample_rate = 48_000;
@@ -1524,6 +1733,10 @@ mod tests {
             active_playback: Arc::new(Mutex::new(HashMap::new())),
             active_voice_count: Arc::new(AtomicUsize::new(1)),
             retirement_sender: crossbeam_channel::bounded(8).0,
+            latest_spatial_frame: Arc::new(Mutex::new(None)),
+            current_spatial_frame: None,
+            pending_spatial_retirement: None,
+            spatial_retirement_sender: crossbeam_channel::bounded(1).0,
             resampler: PetalSonicEngine::create_resampler(sample_rate, sample_rate, 2, block_size)
                 .unwrap(),
             ring_buffer_producer: producer,
@@ -1535,6 +1748,7 @@ mod tests {
             event_sender,
             timing_sender,
             master_gain_linear: 1.0,
+            schedule: RenderSchedule::for_profile(LatencyProfile::Balanced),
         }));
         let is_running = Arc::new(AtomicBool::new(true));
         let render_thread = PetalSonicEngine::spawn_render_thread(
@@ -1542,6 +1756,7 @@ mod tests {
             is_running.clone(),
             block_size,
             sample_rate,
+            4,
         )
         .unwrap();
 
@@ -1602,5 +1817,45 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert!(active.values().next().unwrap().detached);
         assert_eq!(active_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn spatial_frame_updates_attached_voices_as_one_generation() {
+        let emitter = crate::domain::Emitter {
+            index: 2,
+            generation: 3,
+        };
+        let clip = Arc::new(PetalSonicAudioData::new(
+            vec![0.5; 32],
+            48_000,
+            1,
+            Duration::from_secs_f64(32.0 / 48_000.0),
+        ));
+        let old_pose = Pose::from_position(crate::math::Vec3::ZERO);
+        let new_pose = Pose::from_position(crate::math::Vec3::new(4.0, 0.0, -2.0));
+        let mut voices = HashMap::new();
+        for (voice_id, detached) in [(SourceId::from(20), false), (SourceId::from(21), true)] {
+            voices.insert(
+                voice_id,
+                PlaybackInstance::from_source(
+                    voice_id,
+                    emitter,
+                    clip.clone(),
+                    SourceConfig::spatial(old_pose),
+                    LoopMode::Infinite,
+                    detached,
+                    None,
+                ),
+            );
+        }
+        let frame = SpatialFrame::new(
+            Pose::default(),
+            vec![crate::domain::EmitterSpatialState::new(emitter, new_pose)],
+        );
+
+        PetalSonicEngine::apply_spatial_frame_to_voices(&frame, &mut voices);
+
+        assert_eq!(voices[&SourceId::from(20)].config.pose(), Some(new_pose));
+        assert_eq!(voices[&SourceId::from(21)].config.pose(), Some(old_pose));
     }
 }

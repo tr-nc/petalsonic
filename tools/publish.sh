@@ -25,7 +25,7 @@ cargo test --workspace --all-targets
 echo "[5/8] documentation tests"
 cargo test -p petalsonic --doc
 
-echo "[6/8] release realtime/performance contracts"
+echo "[6/8] release realtime/performance baseline regression"
 cargo test --release -p petalsonic \
     warmed_near_capacity_balanced_render_stays_bounded_and_meets_budget -- --nocapture
 

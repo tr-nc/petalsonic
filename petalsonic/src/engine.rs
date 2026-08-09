@@ -2064,6 +2064,21 @@ mod tests {
         PROBE_ACTIVITY.with(Cell::get)
     }
 
+    fn balanced_release_baseline_value(key: &str) -> u64 {
+        include_str!("../perf/balanced_near_capacity.baseline")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(candidate, value)| {
+                (candidate.trim() == key).then(|| {
+                    value
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("invalid {key} in release performance baseline"))
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {key} in release performance baseline"))
+    }
+
     #[test]
     fn device_callback_and_error_signal_do_not_allocate_or_free() {
         let ring_buffer = HeapRb::<StereoFrame>::new(8);
@@ -2310,8 +2325,10 @@ mod tests {
     #[test]
     fn warmed_near_capacity_balanced_render_stays_bounded_and_meets_budget() {
         const VOICES: usize = 32;
+        const TIMING_SAMPLES: usize = 1_024;
         let block_size = 64;
         let sample_rate = 48_000;
+        let device_sample_rate = 44_100;
         let (command_sender, command_receiver) = crossbeam_channel::bounded(VOICES);
         let (_lifecycle_sender, lifecycle_receiver) = crossbeam_channel::bounded(VOICES);
         let source = Arc::new(PetalSonicAudioData::new(
@@ -2358,8 +2375,13 @@ mod tests {
             acoustic_scene_slot: Arc::new(AcousticSceneSlot::new(None)),
             pending_acoustic_retirement: None,
             acoustic_retirement_sender: crossbeam_channel::bounded(2).0,
-            resampler: PetalSonicEngine::create_resampler(sample_rate, sample_rate, 2, block_size)
-                .unwrap(),
+            resampler: PetalSonicEngine::create_resampler(
+                sample_rate,
+                device_sample_rate,
+                2,
+                block_size,
+            )
+            .unwrap(),
             ring_buffer_producer: producer,
             channels: 2,
             block_size,
@@ -2403,7 +2425,7 @@ mod tests {
             "sustained near-capacity rendering allocated or freed"
         );
 
-        let mut elapsed_us = [0u64; 256];
+        let mut elapsed_us = [0u64; TIMING_SAMPLES];
         for elapsed in &mut elapsed_us {
             while consumer.try_pop().is_some() {}
             while timing_receiver.try_recv().is_ok() {}
@@ -2415,9 +2437,39 @@ mod tests {
         let p99 = elapsed_us[elapsed_us.len() * 99 / 100];
         let device_period_us = block_size as u64 * 1_000_000 / sample_rate as u64;
         if !cfg!(debug_assertions) {
+            assert_eq!(
+                balanced_release_baseline_value("voices"),
+                VOICES as u64,
+                "release performance workload drifted without a new baseline"
+            );
+            assert_eq!(
+                balanced_release_baseline_value("world_sample_rate"),
+                sample_rate as u64,
+                "release performance workload drifted without a new baseline"
+            );
+            assert_eq!(
+                balanced_release_baseline_value("device_sample_rate"),
+                device_sample_rate as u64,
+                "release performance workload drifted without a new baseline"
+            );
+            assert_eq!(
+                balanced_release_baseline_value("block_size"),
+                block_size as u64,
+                "release performance workload drifted without a new baseline"
+            );
             assert!(
                 p99 * 100 < device_period_us * 80,
                 "Balanced full-quantum p99 {p99}us lacks 20% margin under {device_period_us}us period"
+            );
+            let baseline_p99 = balanced_release_baseline_value("p99_us");
+            let max_regression_percent =
+                balanced_release_baseline_value("max_p99_regression_percent");
+            let regression_limit = baseline_p99
+                .saturating_mul(100 + max_regression_percent)
+                .div_ceil(100);
+            assert!(
+                p99 <= regression_limit,
+                "Balanced full-quantum p99 regressed: current={p99}us baseline={baseline_p99}us limit={regression_limit}us ({max_regression_percent}% allowed)"
             );
         }
         eprintln!(

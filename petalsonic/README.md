@@ -212,6 +212,10 @@ The audio callback thread is **completely real-time safe**:
 
 ### Performance Monitoring
 
+The release gate compares the warmed 32-Voice, 48 kHz-to-44.1 kHz full-quantum P99 against
+`perf/balanced_near_capacity.baseline`. Workload changes require an explicit new baseline, and a
+P99 regression beyond the recorded allowance blocks packaging.
+
 ```rust
 // Get timing information for performance profiling
 for event in world.drain_timing_events() {

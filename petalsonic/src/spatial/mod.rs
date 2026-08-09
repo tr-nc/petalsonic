@@ -9,5 +9,6 @@ mod native_ambisonics;
 mod native_hrtf;
 mod processor;
 
-pub use processor::{DirectPathOverride, DirectPathTransmission};
-pub(crate) use processor::{SpatialProcessingMetrics, SpatialProcessor, SpatialProcessorConfig};
+pub(crate) use processor::{
+    RetiredSpatialSource, SpatialProcessingMetrics, SpatialProcessor, SpatialProcessorConfig,
+};

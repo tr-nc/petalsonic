@@ -34,6 +34,15 @@ pub enum PetalSonicError {
     #[error("Audio format error: {0}")]
     AudioFormat(String),
 
+    #[error("Required audio backend {backend} is unavailable: {reason}")]
+    BackendUnavailable {
+        backend: &'static str,
+        reason: String,
+    },
+
+    #[error("Permanent output-device failure: {0}")]
+    PermanentDeviceFailure(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

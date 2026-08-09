@@ -22,7 +22,7 @@ impl ResidentClip {
         })
     }
 
-    pub fn from_audio_data(data: Arc<PetalSonicAudioData>) -> Self {
+    pub(crate) fn from_audio_data(data: Arc<PetalSonicAudioData>) -> Self {
         Self { data }
     }
 

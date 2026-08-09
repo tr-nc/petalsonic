@@ -1,8 +1,7 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use petalsonic::{
-    Emitter, EmitterDesc, EmitterSpatialState, LoopMode, PetalSonicAudioData, PetalSonicWorld,
-    PetalSonicWorldDesc, PlayOptions, PlaybackControl, PlaybackTag, Pose, Quat, RenderTimingEvent,
-    ResidentClip, SpatialFrame, Vec3,
+    Emitter, EmitterDesc, EmitterSpatialState, PetalSonicWorld, PetalSonicWorldDesc, PlayOptions,
+    PlaybackControl, PlaybackTag, Pose, Quat, RenderTimingEvent, ResidentClip, SpatialFrame, Vec3,
 };
 use std::collections::VecDeque;
 
@@ -92,13 +91,19 @@ enum SourceType {
     NonSpatial,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DemoLoopMode {
+    Once,
+    Infinite,
+}
+
 #[derive(Clone)]
 struct SpatialAudioSource {
     id: Emitter,
     playback: PlaybackControl,
     position: Vec3,
     file_name: String,
-    loop_mode: LoopMode,
+    loop_mode: DemoLoopMode,
     /// Volume in decibels for this spatial source.
     volume_db: f32,
 }
@@ -108,7 +113,7 @@ struct NonSpatialAudioSource {
     id: Emitter,
     playback: PlaybackControl,
     file_name: String,
-    loop_mode: LoopMode,
+    loop_mode: DemoLoopMode,
     /// Volume in decibels for this non-spatial source.
     volume_db: f32,
 }
@@ -639,29 +644,26 @@ impl SpatialAudioDemo {
 
         log::info!("GUI: Loading spatial audio file: {}", file_path);
 
-        let audio_data = PetalSonicAudioData::from_path(&file_path)
+        let clip = ResidentClip::from_path(&file_path)
             .map_err(|e| format!("Failed to load audio file: {}", e))?;
 
         log::debug!(
             "GUI: Audio loaded - {} samples at {} Hz",
-            audio_data.samples().len(),
-            audio_data.sample_rate()
+            clip.total_frames(),
+            clip.sample_rate()
         );
 
         let source_id = self
             .world
-            .create_emitter(
-                ResidentClip::from_audio_data(audio_data),
-                EmitterDesc::spatial(Pose::from_position(position)),
-            )
+            .create_emitter(clip, EmitterDesc::spatial(Pose::from_position(position)))
             .map_err(|e| format!("Failed to create emitter: {}", e))?;
 
         log::debug!("GUI: Audio registered with source ID: {}", source_id);
 
         let loop_mode = match self.selected_loop_mode_index {
-            0 => LoopMode::Once,
-            1 => LoopMode::Infinite,
-            _ => LoopMode::Once,
+            0 => DemoLoopMode::Once,
+            1 => DemoLoopMode::Infinite,
+            _ => DemoLoopMode::Once,
         };
 
         log::info!(
@@ -672,8 +674,8 @@ impl SpatialAudioDemo {
         );
 
         let options = match loop_mode {
-            LoopMode::Once => PlayOptions::once(),
-            LoopMode::Infinite => PlayOptions::looping(),
+            DemoLoopMode::Once => PlayOptions::once(),
+            DemoLoopMode::Infinite => PlayOptions::looping(),
         };
         let tag = self.next_tag();
         let playback = self
@@ -724,29 +726,26 @@ impl SpatialAudioDemo {
 
         log::info!("GUI: Loading non-spatial audio file: {}", file_path);
 
-        let audio_data = PetalSonicAudioData::from_path(&file_path)
+        let clip = ResidentClip::from_path(&file_path)
             .map_err(|e| format!("Failed to load audio file: {}", e))?;
 
         log::debug!(
             "GUI: Audio loaded - {} samples at {} Hz",
-            audio_data.samples().len(),
-            audio_data.sample_rate()
+            clip.total_frames(),
+            clip.sample_rate()
         );
 
         let source_id = self
             .world
-            .create_emitter(
-                ResidentClip::from_audio_data(audio_data),
-                EmitterDesc::non_spatial(),
-            )
+            .create_emitter(clip, EmitterDesc::non_spatial())
             .map_err(|e| format!("Failed to create emitter: {}", e))?;
 
         log::debug!("GUI: Audio registered with source ID: {}", source_id);
 
         let loop_mode = match self.selected_loop_mode_index {
-            0 => LoopMode::Once,
-            1 => LoopMode::Infinite,
-            _ => LoopMode::Once,
+            0 => DemoLoopMode::Once,
+            1 => DemoLoopMode::Infinite,
+            _ => DemoLoopMode::Once,
         };
 
         log::info!(
@@ -756,8 +755,8 @@ impl SpatialAudioDemo {
         );
 
         let options = match loop_mode {
-            LoopMode::Once => PlayOptions::once(),
-            LoopMode::Infinite => PlayOptions::looping(),
+            DemoLoopMode::Once => PlayOptions::once(),
+            DemoLoopMode::Infinite => PlayOptions::looping(),
         };
         let tag = self.next_tag();
         let playback = self

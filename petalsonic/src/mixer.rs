@@ -1,13 +1,11 @@
 // Mixer module - handles mixing of audio sources
 // This contains the mixing logic for both spatial and non-spatial sources
 
-use crate::playback::{LoopMode, PlayState, PlaybackInstance};
+use crate::playback::{PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor};
 use crate::world::SourceId;
 use crate::{BusParams, gain};
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -114,28 +112,20 @@ pub fn mix_playback_instances_with_metrics(
         }
     }
 
-    track_mix_peak(world_buffer);
-
-    // NOW check for sources that reached the end during this mix iteration
-    // This must happen AFTER fill_buffer() has been called on all sources
+    // Reclaim only after every source has completed this quantum. Explicit stops
+    // clear their completion tag before entering the de-click ramp.
     for (source_id, instance) in active_playback.iter_mut() {
-        if let Some(loop_mode) = instance.check_and_clear_end_flag() {
-            match loop_mode {
-                LoopMode::Once => {
-                    completed_playbacks.push(CompletedPlayback {
-                        voice_id: *source_id,
-                        emitter: instance.emitter,
-                        completion_tag: instance.completion_tag,
-                    });
-                }
-                LoopMode::Infinite => {}
-            }
+        let _ = instance.check_and_clear_end_flag();
+        if instance.should_reclaim() {
+            completed_playbacks.push(CompletedPlayback {
+                voice_id: *source_id,
+                emitter: instance.emitter,
+                completion_tag: instance.completion_tag,
+            });
         }
     }
 
-    // Only remove instances that are actually finished (stopped playing)
-    // Infinite looping sources wrap around automatically, so they keep playing
-    active_playback.retain(|_, instance| !instance.info.is_finished());
+    active_playback.retain(|_, instance| !instance.should_reclaim());
 
     profiling
 }
@@ -152,54 +142,6 @@ pub(crate) fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusPara
         paused: master.paused || selected.paused,
         playback_rate: master.playback_rate * selected.playback_rate,
     }
-}
-
-fn track_mix_peak(world_buffer: &[f32]) {
-    let mut block_peak = 0.0f32;
-
-    for sample in world_buffer {
-        let abs = sample.abs();
-        if abs > block_peak {
-            block_peak = abs;
-        }
-    }
-
-    update_global_peak(block_peak);
-}
-
-fn update_global_peak(block_peak: f32) {
-    if !block_peak.is_finite() {
-        return;
-    }
-
-    let global_peak = global_peak_amplitude();
-    let mut current_bits = global_peak.load(Ordering::Relaxed);
-
-    loop {
-        let current_peak = f32::from_bits(current_bits);
-        if block_peak <= current_peak {
-            return;
-        }
-
-        match global_peak.compare_exchange_weak(
-            current_bits,
-            block_peak.to_bits(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                return;
-            }
-            Err(observed_bits) => {
-                current_bits = observed_bits;
-            }
-        }
-    }
-}
-
-fn global_peak_amplitude() -> &'static AtomicU32 {
-    static PEAK: OnceLock<AtomicU32> = OnceLock::new();
-    PEAK.get_or_init(|| AtomicU32::new(0.0f32.to_bits()))
 }
 
 #[cfg(test)]

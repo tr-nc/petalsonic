@@ -198,14 +198,4 @@ impl StreamingResampler {
 
         Ok((output_frames, input_frames))
     }
-
-    /// Returns the target (output) sample rate in Hz
-    pub fn target_sample_rate(&self) -> u32 {
-        self.target_sample_rate
-    }
-
-    /// Returns the source (input) sample rate in Hz
-    pub fn source_sample_rate(&self) -> u32 {
-        self.source_sample_rate
-    }
 }

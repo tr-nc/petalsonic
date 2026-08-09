@@ -3,12 +3,17 @@ use crate::domain::{
     Bus, BusParams, Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
     SpatialFrame,
 };
-use crate::engine::{AudioOutputDeviceInfo, EngineObservability, EngineStartup, PetalSonicEngine};
+use crate::engine::{
+    AudioOutputDeviceInfo, EngineCommandReceivers, EngineObservability, EngineStartup,
+    OutputRecoveryReason, PetalSonicEngine,
+};
 use crate::error::{PetalSonicError, Result};
-use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeState, RuntimeStatus};
+use crate::events::{
+    PetalSonicEvent, RenderTimingEvent, RuntimeCounters, RuntimeDiagnostics, RuntimeState,
+    RuntimeStatus,
+};
 use crate::math::Pose;
 use crate::playback::PlaybackCommand;
-use crate::spatial::DirectPathOverride;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -18,7 +23,82 @@ use std::time::{Duration, Instant};
 
 const MIN_PLAYBACK_RATE: f32 = 0.01;
 const MAX_PLAYBACK_RATE: f32 = 4.0;
+const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
+
+trait OutputRuntimeDriver {
+    fn drain_retired_resources(&mut self);
+    fn output_recovery_reason(&self) -> Option<OutputRecoveryReason>;
+    fn selected_output_available(&self) -> bool;
+    fn stop_output(&mut self) -> Result<()>;
+    fn advance_without_output(
+        &mut self,
+        commands: &EngineCommandReceivers,
+        buses: &mut [BusParams],
+        elapsed: Duration,
+    );
+    fn start_output(
+        &mut self,
+        commands: EngineCommandReceivers,
+        buses: Vec<BusParams>,
+    ) -> Result<()>;
+    fn emit_runtime_state(&self, state: RuntimeState);
+}
+
+impl OutputRuntimeDriver for PetalSonicEngine {
+    fn drain_retired_resources(&mut self) {
+        PetalSonicEngine::drain_retired_backend_resources(self);
+    }
+
+    fn output_recovery_reason(&self) -> Option<OutputRecoveryReason> {
+        PetalSonicEngine::output_recovery_reason(self)
+    }
+
+    fn selected_output_available(&self) -> bool {
+        PetalSonicEngine::selected_output_available(self)
+    }
+
+    fn stop_output(&mut self) -> Result<()> {
+        PetalSonicEngine::stop(self)
+    }
+
+    fn advance_without_output(
+        &mut self,
+        commands: &EngineCommandReceivers,
+        buses: &mut [BusParams],
+        elapsed: Duration,
+    ) {
+        PetalSonicEngine::advance_without_output(self, commands, buses, elapsed);
+    }
+
+    fn start_output(
+        &mut self,
+        commands: EngineCommandReceivers,
+        buses: Vec<BusParams>,
+    ) -> Result<()> {
+        PetalSonicEngine::start(self, commands, buses)
+    }
+
+    fn emit_runtime_state(&self, state: RuntimeState) {
+        PetalSonicEngine::emit_runtime_state(self, state);
+    }
+}
+
+struct SupervisorSchedule {
+    next_retry: Instant,
+    next_health_probe: Instant,
+    last_advance: Instant,
+}
+
+impl SupervisorSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_retry: now,
+            next_health_probe: now,
+            last_advance: now,
+        }
+    }
+}
 
 /// Internal identity for one playback voice.
 ///
@@ -193,6 +273,8 @@ pub struct PetalSonicWorld {
     acoustic_retirement_receiver: Receiver<Arc<AcousticSceneSnapshot>>,
     acoustic_scene_version: AtomicU64,
     command_sender: Sender<PlaybackCommand>,
+    lifecycle_sender: Sender<PlaybackCommand>,
+    counters: Arc<RuntimeCounters>,
     frames_processed: Arc<AtomicUsize>,
     underrun_count: Arc<AtomicUsize>,
     active_output_device: Arc<Mutex<Option<String>>>,
@@ -211,6 +293,8 @@ impl PetalSonicWorld {
 
         let (command_sender, command_receiver) =
             crossbeam_channel::bounded(config.control_queue_capacity);
+        let (lifecycle_sender, lifecycle_receiver) =
+            crossbeam_channel::bounded(config.lifecycle_queue_capacity);
         let listener_pose = Arc::new(Mutex::new(Pose::default()));
         let active_voice_count = Arc::new(AtomicUsize::new(0));
         let (retirement_sender, retirement_receiver) =
@@ -251,13 +335,14 @@ impl PetalSonicWorld {
             active_device_name,
             event_receiver,
             timing_receiver,
+            counters,
         } = observability;
         let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
         let recovery_attempts = Arc::new(AtomicU64::new(0));
         let supervisor_stop = Arc::new(AtomicBool::new(false));
         let supervisor_thread = Self::spawn_output_supervisor(
             startup,
-            command_receiver,
+            EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
             bus_params.clone(),
             runtime_state.clone(),
             recovery_attempts.clone(),
@@ -279,6 +364,8 @@ impl PetalSonicWorld {
             acoustic_retirement_receiver,
             acoustic_scene_version: AtomicU64::new(acoustic_scene_version),
             command_sender,
+            lifecycle_sender,
+            counters,
             frames_processed,
             underrun_count,
             active_output_device: active_device_name,
@@ -291,26 +378,111 @@ impl PetalSonicWorld {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn supervisor_tick<D: OutputRuntimeDriver>(
+        driver: &mut D,
+        commands: &EngineCommandReceivers,
+        bus_params: &Mutex<Vec<BusParams>>,
+        runtime_state: &AtomicU8,
+        recovery_attempts: &AtomicU64,
+        recovery_buses: &mut Vec<BusParams>,
+        schedule: &mut SupervisorSchedule,
+        now: Instant,
+    ) {
+        driver.drain_retired_resources();
+        let state = Self::load_runtime_state(runtime_state);
+        let recovery_reason = (state == RuntimeState::Running && now >= schedule.next_health_probe)
+            .then(|| driver.output_recovery_reason())
+            .flatten();
+        let should_recover = state == RuntimeState::Recovering
+            || matches!(recovery_reason, Some(OutputRecoveryReason::StreamFailure))
+            || matches!(
+                recovery_reason,
+                Some(OutputRecoveryReason::SelectionChanged)
+            ) && driver.selected_output_available();
+
+        if state == RuntimeState::Running && now >= schedule.next_health_probe {
+            schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
+        }
+
+        if !should_recover {
+            return;
+        }
+
+        if Self::load_runtime_state(runtime_state) == RuntimeState::Running {
+            let _ = driver.stop_output();
+            driver.emit_runtime_state(RuntimeState::Recovering);
+            runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
+            *recovery_buses = bus_params
+                .lock()
+                .map(|buses| buses.clone())
+                .unwrap_or_else(|_| vec![BusParams::default()]);
+            schedule.last_advance = now;
+            schedule.next_retry = now;
+        }
+
+        if Self::load_runtime_state(runtime_state) != RuntimeState::Recovering {
+            return;
+        }
+
+        let elapsed = now.saturating_duration_since(schedule.last_advance);
+        schedule.last_advance = now;
+        driver.advance_without_output(commands, recovery_buses, elapsed);
+
+        if now < schedule.next_retry {
+            return;
+        }
+
+        recovery_attempts.fetch_add(1, Ordering::Relaxed);
+        let next_buses = bus_params
+            .lock()
+            .map(|buses| buses.clone())
+            .unwrap_or_else(|_| recovery_buses.clone());
+        match driver.start_output(commands.clone(), next_buses) {
+            Ok(()) => {
+                runtime_state.store(RuntimeState::Running as u8, Ordering::Release);
+                schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
+                driver.emit_runtime_state(RuntimeState::Running);
+            }
+            Err(
+                PetalSonicError::AudioFormat(_)
+                | PetalSonicError::PermanentDeviceFailure(_)
+                | PetalSonicError::BackendUnavailable { .. },
+            ) => {
+                runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
+                driver.emit_runtime_state(RuntimeState::Failed);
+            }
+            Err(_) => {
+                schedule.next_retry = now + OUTPUT_RETRY_INTERVAL;
+            }
+        }
+    }
+
     fn spawn_output_supervisor(
         startup: EngineStartup,
-        command_receiver: Receiver<PlaybackCommand>,
+        command_receivers: EngineCommandReceivers,
         bus_params: Arc<Mutex<Vec<BusParams>>>,
         runtime_state: Arc<AtomicU8>,
         recovery_attempts: Arc<AtomicU64>,
         stop: Arc<AtomicBool>,
     ) -> Result<JoinHandle<()>> {
-        std::thread::Builder::new()
+        let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
+        let handle = std::thread::Builder::new()
             .name("petalsonic-output".into())
             .spawn(move || {
-                let Ok(mut engine) = PetalSonicEngine::new(startup) else {
-                    runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                    return;
+                let mut engine = match PetalSonicEngine::new(startup) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
+                        let _ = startup_sender.send(Err(error));
+                        return;
+                    }
                 };
-                let retry_interval = Duration::from_millis(500);
+                if startup_sender.send(Ok(())).is_err() {
+                    return;
+                }
                 let poll_interval = Duration::from_millis(20);
-                let mut next_retry = Instant::now();
-                let mut next_health_probe = Instant::now();
-                let mut last_advance = Instant::now();
+                let mut schedule = SupervisorSchedule::new(Instant::now());
                 let mut recovery_buses = bus_params
                     .lock()
                     .map(|buses| buses.clone())
@@ -318,72 +490,38 @@ impl PetalSonicWorld {
                 engine.emit_runtime_state(RuntimeState::Recovering);
 
                 while !stop.load(Ordering::Acquire) {
-                    let now = Instant::now();
-                    let state = Self::load_runtime_state(&runtime_state);
-                    let should_recover = state == RuntimeState::Recovering
-                        || state == RuntimeState::Running
-                            && now >= next_health_probe
-                            && engine.should_recover_output();
-                    if state == RuntimeState::Running && now >= next_health_probe {
-                        next_health_probe = now + retry_interval;
-                    }
-
-                    if should_recover {
-                        if Self::load_runtime_state(&runtime_state) == RuntimeState::Running {
-                            let _ = engine.stop();
-                            engine.emit_runtime_state(RuntimeState::Recovering);
-                            runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
-                            recovery_buses = bus_params
-                                .lock()
-                                .map(|buses| buses.clone())
-                                .unwrap_or_else(|_| vec![BusParams::default()]);
-                            last_advance = Instant::now();
-                            next_retry = last_advance;
-                        }
-
-                        if Self::load_runtime_state(&runtime_state) == RuntimeState::Recovering {
-                            let elapsed = now.saturating_duration_since(last_advance);
-                            last_advance = now;
-                            engine.advance_without_output(
-                                &command_receiver,
-                                &mut recovery_buses,
-                                elapsed,
-                            );
-
-                            if now >= next_retry {
-                                recovery_attempts.fetch_add(1, Ordering::Relaxed);
-                                let next_buses = bus_params
-                                    .lock()
-                                    .map(|buses| buses.clone())
-                                    .unwrap_or_else(|_| recovery_buses.clone());
-                                let result = engine.start(command_receiver.clone(), next_buses);
-                                match result {
-                                    Ok(()) => {
-                                        runtime_state
-                                            .store(RuntimeState::Running as u8, Ordering::Release);
-                                        next_health_probe = now + retry_interval;
-                                        engine.emit_runtime_state(RuntimeState::Running);
-                                    }
-                                    Err(PetalSonicError::AudioFormat(_)) => {
-                                        runtime_state
-                                            .store(RuntimeState::Failed as u8, Ordering::Release);
-                                        engine.emit_runtime_state(RuntimeState::Failed);
-                                    }
-                                    Err(_) => {
-                                        next_retry = now + retry_interval;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Self::supervisor_tick(
+                        &mut engine,
+                        &command_receivers,
+                        &bus_params,
+                        &runtime_state,
+                        &recovery_attempts,
+                        &mut recovery_buses,
+                        &mut schedule,
+                        Instant::now(),
+                    );
 
                     std::thread::park_timeout(poll_interval);
                 }
-                let _ = engine.stop();
+                let _ = engine.stop_output();
             })
             .map_err(|error| {
                 PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))
-            })
+            })?;
+
+        match startup_receiver.recv() {
+            Ok(Ok(())) => Ok(handle),
+            Ok(Err(error)) => {
+                let _ = handle.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err(PetalSonicError::Engine(
+                    "Output supervisor exited during initialization".into(),
+                ))
+            }
+        }
     }
 
     fn load_runtime_state(state: &AtomicU8) -> RuntimeState {
@@ -402,6 +540,7 @@ impl PetalSonicWorld {
             ("max_emitters", config.max_emitters),
             ("max_voices", config.max_voices),
             ("control_queue_capacity", config.control_queue_capacity),
+            ("lifecycle_queue_capacity", config.lifecycle_queue_capacity),
             ("event_queue_capacity", config.event_queue_capacity),
             ("timing_queue_capacity", config.timing_queue_capacity),
         ] {
@@ -411,6 +550,18 @@ impl PetalSonicWorld {
                     reason: "must be greater than zero".into(),
                 });
             }
+        }
+        if !config.hrtf_gain.is_finite() {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "hrtf_gain",
+                reason: "must be finite".into(),
+            });
+        }
+        if !config.distance_scaler.is_finite() || config.distance_scaler <= 0.0 {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "distance_scaler",
+                reason: "must be finite and greater than zero".into(),
+            });
         }
         if config.buses.len() > config.max_buses {
             return Err(PetalSonicError::CapacityExceeded {
@@ -535,18 +686,6 @@ impl PetalSonicWorld {
         Ok(())
     }
 
-    pub fn update_direct_path_override(
-        &self,
-        emitter: Emitter,
-        direct_path_override: Option<DirectPathOverride>,
-    ) -> Result<()> {
-        self.emitter_state(emitter)?;
-        self.try_send(PlaybackCommand::UpdateDirectPathOverride(
-            emitter,
-            direct_path_override,
-        ))
-    }
-
     pub fn destroy_emitter(&self, emitter: Emitter) -> Result<()> {
         let mut emitters = self
             .emitters
@@ -610,6 +749,7 @@ impl PetalSonicWorld {
             completion_tag,
             bus_index,
             playback_rate: options.playback_rate(),
+            mono_scratch: vec![0.0; self.desc.block_size],
         };
         if let Err(error) = self.try_send(command) {
             self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
@@ -809,10 +949,41 @@ impl PetalSonicWorld {
     }
 
     fn try_send(&self, command: PlaybackCommand) -> Result<()> {
-        match self.command_sender.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(PetalSonicError::QueuePressure),
-            Err(TrySendError::Disconnected(_)) => Err(PetalSonicError::RuntimeClosed),
+        self.ensure_open()?;
+        let lifecycle = matches!(
+            &command,
+            PlaybackCommand::StopVoice(_)
+                | PlaybackCommand::StopEmitter(_)
+                | PlaybackCommand::DestroyEmitter(_)
+                | PlaybackCommand::StopAll
+        );
+        let sender = if lifecycle {
+            &self.lifecycle_sender
+        } else {
+            &self.command_sender
+        };
+        match sender.try_send(command) {
+            Ok(()) => {
+                let high_water = if lifecycle {
+                    &self.counters.lifecycle_queue_high_water
+                } else {
+                    &self.counters.control_queue_high_water
+                };
+                RuntimeCounters::observe_high_water(high_water, sender.len());
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                self.counters
+                    .rejected_commands
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(PetalSonicError::QueuePressure)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters
+                    .rejected_commands
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(PetalSonicError::RuntimeClosed)
+            }
         }
     }
 
@@ -834,6 +1005,50 @@ impl PetalSonicWorld {
             state: Self::load_runtime_state(&self.runtime_state),
             recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
             active_output_device,
+        }
+    }
+
+    pub fn diagnostics(&self) -> RuntimeDiagnostics {
+        let (
+            render_iterations,
+            render_time_p50_us,
+            render_time_p95_us,
+            render_time_p99_us,
+            render_time_max_us,
+        ) = self.counters.render_summary();
+        RuntimeDiagnostics {
+            frames_processed: self.frames_processed.load(Ordering::Relaxed),
+            underrun_count: self.underrun_count.load(Ordering::Relaxed),
+            active_emitters: self
+                .emitters
+                .lock()
+                .map(|emitters| emitters.len)
+                .unwrap_or_default(),
+            active_voices: self.active_voice_count.load(Ordering::Acquire),
+            control_queue_depth: self.command_sender.len(),
+            control_queue_high_water: self
+                .counters
+                .control_queue_high_water
+                .load(Ordering::Relaxed),
+            lifecycle_queue_depth: self.lifecycle_sender.len(),
+            lifecycle_queue_high_water: self
+                .counters
+                .lifecycle_queue_high_water
+                .load(Ordering::Relaxed),
+            rejected_commands: self.counters.rejected_commands.load(Ordering::Relaxed),
+            dropped_events: self.counters.dropped_events.load(Ordering::Relaxed),
+            dropped_timing_events: self.counters.dropped_timing_events.load(Ordering::Relaxed),
+            render_iterations,
+            render_time_p50_us,
+            render_time_p95_us,
+            render_time_p99_us,
+            render_time_max_us,
+            device_generation: self.counters.device_generation.load(Ordering::Relaxed),
+            recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
+            output_sample_rate: self.counters.output_sample_rate.load(Ordering::Relaxed) as u32,
+            output_channels: self.counters.output_channels.load(Ordering::Relaxed) as u16,
+            spatial_quality: self.desc.spatial_quality,
+            latency_profile: self.desc.latency_profile,
         }
     }
 
@@ -920,6 +1135,7 @@ impl Drop for PetalSonicWorld {
 mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
+    use std::cell::Cell;
     use std::time::Duration;
 
     fn clip() -> ResidentClip {
@@ -929,6 +1145,115 @@ mod tests {
             1,
             Duration::from_secs_f64(16.0 / 48_000.0),
         )))
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FakeDevice {
+        name: &'static str,
+        sample_rate: u32,
+        channels: u16,
+    }
+
+    struct FakeOutputDriver {
+        active: Option<FakeDevice>,
+        selected: Option<FakeDevice>,
+        stream_failed: bool,
+        permanent_format_failure: bool,
+        actions: Vec<&'static str>,
+        checked_while_active: Cell<bool>,
+        advanced: Duration,
+        loop_cursor_frames: usize,
+        loop_length_frames: usize,
+        one_shot_remaining_frames: usize,
+        one_shot_completed: bool,
+    }
+
+    impl FakeOutputDriver {
+        fn with_active(active: FakeDevice) -> Self {
+            Self {
+                active: Some(active),
+                selected: Some(active),
+                stream_failed: false,
+                permanent_format_failure: false,
+                actions: Vec::new(),
+                checked_while_active: Cell::new(false),
+                advanced: Duration::ZERO,
+                loop_cursor_frames: 0,
+                loop_length_frames: 12_000,
+                one_shot_remaining_frames: 4_800,
+                one_shot_completed: false,
+            }
+        }
+    }
+
+    impl OutputRuntimeDriver for FakeOutputDriver {
+        fn drain_retired_resources(&mut self) {}
+
+        fn output_recovery_reason(&self) -> Option<OutputRecoveryReason> {
+            if self.stream_failed {
+                Some(OutputRecoveryReason::StreamFailure)
+            } else if self.active != self.selected {
+                Some(OutputRecoveryReason::SelectionChanged)
+            } else {
+                None
+            }
+        }
+
+        fn selected_output_available(&self) -> bool {
+            self.checked_while_active.set(self.active.is_some());
+            self.selected.is_some()
+        }
+
+        fn stop_output(&mut self) -> Result<()> {
+            self.actions.push("stop");
+            self.active = None;
+            Ok(())
+        }
+
+        fn advance_without_output(
+            &mut self,
+            _commands: &EngineCommandReceivers,
+            _buses: &mut [BusParams],
+            elapsed: Duration,
+        ) {
+            self.actions.push("advance");
+            self.advanced += elapsed;
+            let frames = (elapsed.as_secs_f64() * 48_000.0).floor() as usize;
+            self.loop_cursor_frames = (self.loop_cursor_frames + frames) % self.loop_length_frames;
+            if frames >= self.one_shot_remaining_frames {
+                self.one_shot_remaining_frames = 0;
+                self.one_shot_completed = true;
+            } else {
+                self.one_shot_remaining_frames -= frames;
+            }
+        }
+
+        fn start_output(
+            &mut self,
+            _commands: EngineCommandReceivers,
+            _buses: Vec<BusParams>,
+        ) -> Result<()> {
+            self.actions.push("start");
+            if self.permanent_format_failure {
+                return Err(PetalSonicError::PermanentDeviceFailure(
+                    "unsupported fake format".into(),
+                ));
+            }
+            let Some(selected) = self.selected else {
+                return Err(PetalSonicError::AudioDevice("no fake device".into()));
+            };
+            self.active = Some(selected);
+            self.stream_failed = false;
+            Ok(())
+        }
+
+        fn emit_runtime_state(&self, _state: RuntimeState) {}
+    }
+
+    fn fake_command_receivers() -> EngineCommandReceivers {
+        let (_, regular) = crossbeam_channel::bounded(4);
+        let (_, lifecycle) = crossbeam_channel::bounded(4);
+        EngineCommandReceivers::new(regular, lifecycle)
     }
 
     #[test]
@@ -958,6 +1283,280 @@ mod tests {
 
         desc.buses = vec![crate::domain::BusDesc::new("Master")];
         assert!(PetalSonicWorld::validate_config(&desc).is_err());
+    }
+
+    #[test]
+    fn static_configuration_and_spatial_backend_fail_before_world_is_returned() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            distance_scaler: 0.0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            PetalSonicWorld::new(desc),
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "distance_scaler",
+                ..
+            })
+        ));
+
+        let desc = crate::config::PetalSonicWorldDesc {
+            spatial_quality: crate::config::SpatialQuality::LowLatency,
+            native_hrtf_path: Some("/petalsonic/definitely-missing.petalhrtf".into()),
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        assert!(matches!(
+            PetalSonicWorld::new(desc),
+            Err(PetalSonicError::BackendUnavailable {
+                backend: "spatial renderer",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fake_default_device_switch_probes_b_before_releasing_a() {
+        let a = FakeDevice {
+            name: "A",
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let b = FakeDevice {
+            name: "B",
+            sample_rate: 44_100,
+            channels: 6,
+        };
+        let mut driver = FakeOutputDriver::with_active(a);
+        driver.selected = Some(b);
+        let commands = fake_command_receivers();
+        let buses = Mutex::new(vec![BusParams::default()]);
+        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let mut recovery_buses = vec![BusParams::default()];
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+
+        PetalSonicWorld::supervisor_tick(
+            &mut driver,
+            &commands,
+            &buses,
+            &runtime_state,
+            &recovery_attempts,
+            &mut recovery_buses,
+            &mut schedule,
+            now,
+        );
+
+        assert!(driver.checked_while_active.get());
+        assert_eq!(driver.actions, ["stop", "advance", "start"]);
+        assert_eq!(driver.active, Some(b));
+        assert_eq!(
+            PetalSonicWorld::load_runtime_state(&runtime_state),
+            RuntimeState::Running
+        );
+        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn fake_recovery_keeps_timeline_and_retries_with_virtual_time() {
+        let a = FakeDevice {
+            name: "A",
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let b = FakeDevice {
+            name: "B",
+            sample_rate: 96_000,
+            channels: 2,
+        };
+        let mut driver = FakeOutputDriver::with_active(a);
+        driver.stream_failed = true;
+        driver.selected = None;
+        let commands = fake_command_receivers();
+        let buses = Mutex::new(vec![BusParams::default()]);
+        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let mut recovery_buses = vec![BusParams::default()];
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+
+        PetalSonicWorld::supervisor_tick(
+            &mut driver,
+            &commands,
+            &buses,
+            &runtime_state,
+            &recovery_attempts,
+            &mut recovery_buses,
+            &mut schedule,
+            now,
+        );
+        assert_eq!(
+            PetalSonicWorld::load_runtime_state(&runtime_state),
+            RuntimeState::Recovering
+        );
+        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
+
+        driver.selected = Some(b);
+        PetalSonicWorld::supervisor_tick(
+            &mut driver,
+            &commands,
+            &buses,
+            &runtime_state,
+            &recovery_attempts,
+            &mut recovery_buses,
+            &mut schedule,
+            now + OUTPUT_RETRY_INTERVAL,
+        );
+
+        assert_eq!(driver.active, Some(b));
+        assert_eq!(driver.advanced, OUTPUT_RETRY_INTERVAL);
+        assert_eq!(driver.loop_cursor_frames, 0);
+        assert!(driver.one_shot_completed);
+        assert_eq!(
+            PetalSonicWorld::load_runtime_state(&runtime_state),
+            RuntimeState::Running
+        );
+        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn fake_healthy_a_is_kept_when_new_default_is_not_openable() {
+        let a = FakeDevice {
+            name: "A",
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let mut driver = FakeOutputDriver::with_active(a);
+        driver.selected = None;
+        let commands = fake_command_receivers();
+        let buses = Mutex::new(vec![BusParams::default()]);
+        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let mut recovery_buses = vec![BusParams::default()];
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+
+        PetalSonicWorld::supervisor_tick(
+            &mut driver,
+            &commands,
+            &buses,
+            &runtime_state,
+            &recovery_attempts,
+            &mut recovery_buses,
+            &mut schedule,
+            now,
+        );
+
+        assert_eq!(driver.active, Some(a));
+        assert!(driver.actions.is_empty());
+        assert_eq!(
+            PetalSonicWorld::load_runtime_state(&runtime_state),
+            RuntimeState::Running
+        );
+    }
+
+    #[test]
+    fn fake_permanent_format_failure_is_not_retried_as_missing_device() {
+        let a = FakeDevice {
+            name: "A",
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let mut driver = FakeOutputDriver::with_active(a);
+        driver.active = None;
+        driver.permanent_format_failure = true;
+        let commands = fake_command_receivers();
+        let buses = Mutex::new(vec![BusParams::default()]);
+        let runtime_state = AtomicU8::new(RuntimeState::Recovering as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let mut recovery_buses = vec![BusParams::default()];
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+
+        PetalSonicWorld::supervisor_tick(
+            &mut driver,
+            &commands,
+            &buses,
+            &runtime_state,
+            &recovery_attempts,
+            &mut recovery_buses,
+            &mut schedule,
+            now,
+        );
+
+        assert_eq!(
+            PetalSonicWorld::load_runtime_state(&runtime_state),
+            RuntimeState::Failed
+        );
+        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn lifecycle_commands_have_reserved_capacity_under_control_pressure() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            control_queue_capacity: 1,
+            lifecycle_queue_capacity: 1,
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new(desc).unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap();
+
+        let mut rejected = false;
+        for _ in 0..10_000 {
+            if matches!(
+                world.pause_emitter(emitter),
+                Err(PetalSonicError::QueuePressure)
+            ) {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "regular queue should report bounded pressure");
+        world
+            .stop_emitter(emitter)
+            .expect("lifecycle reserve must remain independently available");
+
+        let diagnostics = world.diagnostics();
+        assert_eq!(diagnostics.control_queue_high_water, 1);
+        assert_eq!(diagnostics.lifecycle_queue_high_water, 1);
+        assert!(diagnostics.rejected_commands >= 1);
+        world.close().unwrap();
+    }
+
+    #[test]
+    fn worlds_close_idempotently_and_remain_isolated() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let first = PetalSonicWorld::new(desc.clone()).unwrap();
+        let second = PetalSonicWorld::new(desc).unwrap();
+        let second_emitter = second
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap();
+
+        first.close().unwrap();
+        first.close().unwrap();
+        assert_eq!(first.runtime_status().state, RuntimeState::Closed);
+        assert!(matches!(
+            first.create_emitter(clip(), EmitterDesc::non_spatial()),
+            Err(PetalSonicError::RuntimeClosed)
+        ));
+
+        second
+            .play(second_emitter, PlayOptions::looping())
+            .expect("closing another world must not affect this runtime");
+        assert_ne!(second.runtime_status().state, RuntimeState::Closed);
+        second.close().unwrap();
     }
 
     #[test]

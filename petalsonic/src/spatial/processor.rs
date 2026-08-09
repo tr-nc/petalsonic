@@ -26,7 +26,7 @@ use audionimbus::{
     OcclusionAlgorithm, Point, Reflections, ReflectionsSharedInputs,
     ReflectionsSimulationParameters, ReflectionsSimulationSettings, Rendering, Scene,
     SimulationFlags, SimulationInputs, SimulationSettings, SimulationSharedInputs, Simulator,
-    SpeakerLayout, Transmission, Vector3, audio_buffer::AudioBuffer as AudioNimbusAudioBuffer,
+    SpeakerLayout, Vector3, audio_buffer::AudioBuffer as AudioNimbusAudioBuffer,
     callback::CustomRayTracingCallbacks,
 };
 use std::collections::HashMap;
@@ -46,20 +46,6 @@ const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
 const NATIVE_EARLY_REFLECTION_MAX_DELAY_SECONDS: f32 = 0.25;
 const NATIVE_EARLY_REFLECTION_MAX_TRACE_METERS: f32 = 120.0;
 const NATIVE_EARLY_REFLECTION_GAIN: f32 = 0.18;
-
-/// Host-provided direct-path override applied on top of Steam Audio simulation output.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct DirectPathOverride {
-    pub occlusion: Option<f32>,
-    pub transmission: Option<DirectPathTransmission>,
-}
-
-/// Transmission override for the direct sound path.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DirectPathTransmission {
-    FrequencyIndependent([f32; 3]),
-    FrequencyDependent([f32; 3]),
-}
 
 type SpatialSimulator = Simulator<'static, CustomRayTracer, Direct, Reflections>;
 type SpatialScene = Scene<'static, CustomRayTracer>;
@@ -86,6 +72,14 @@ struct NativeReflectionTap {
     position: Vec3,
     delay_samples: usize,
     gain: f32,
+}
+
+/// Backend allocations removed from active rendering and transferred to the
+/// non-render supervisor for destruction.
+pub(crate) struct RetiredSpatialSource {
+    _steam: Option<crate::spatial::effects::SpatialSourceEffects>,
+    _native_hrtf: Option<NativeHrtfSourceState>,
+    _native_reflection: Option<NativeEarlyReflectionSourceState>,
 }
 
 pub(crate) struct SpatialProcessorConfig {
@@ -303,7 +297,8 @@ impl SpatialProcessor {
                     1.0
                 };
 
-                let results = backend.trace_any_hit_batch(
+                let mut results = [false];
+                backend.trace_any_hit_batch(
                     &[AcousticRay {
                         origin: Vec3::new(
                             ray.origin.x * inv_distance_scaler,
@@ -314,9 +309,9 @@ impl SpatialProcessor {
                     }],
                     &[min_distance * inv_distance_scaler],
                     &[max_distance * inv_distance_scaler],
+                    &mut results,
                 );
-
-                results.into_iter().next().unwrap_or(false)
+                results[0]
             });
 
         let any_hit_backend = batched_any_hit_ray_tracer.clone();
@@ -353,7 +348,14 @@ impl SpatialProcessor {
                     .map(|distance| distance * inv_distance_scaler)
                     .collect::<Vec<_>>();
 
-                backend.trace_any_hit_batch(&acoustic_rays, &min_distances, &max_distances)
+                let mut hits = vec![false; acoustic_rays.len()];
+                backend.trace_any_hit_batch(
+                    &acoustic_rays,
+                    &min_distances,
+                    &max_distances,
+                    &mut hits,
+                );
+                hits
             });
 
         let closest_hit_backend = batched_closest_hit_ray_tracer.clone();
@@ -369,29 +371,21 @@ impl SpatialProcessor {
                     1.0
                 };
 
-                Some(
-                    backend
-                        .trace_closest_hit_batch(
-                            &[AcousticRay {
-                                origin: Vec3::new(
-                                    ray.origin.x * inv_distance_scaler,
-                                    ray.origin.y * inv_distance_scaler,
-                                    ray.origin.z * inv_distance_scaler,
-                                ),
-                                direction: Vec3::new(
-                                    ray.direction.x,
-                                    ray.direction.y,
-                                    ray.direction.z,
-                                ),
-                            }],
-                            &[min_distance * inv_distance_scaler],
-                            &[max_distance * inv_distance_scaler],
-                        )
-                        .into_iter()
-                        .next()
-                        .flatten()
-                        .map_or_else(no_hit, acoustic_hit_to_audionimbus_hit),
-                )
+                let mut hits = [None];
+                backend.trace_closest_hit_batch(
+                    &[AcousticRay {
+                        origin: Vec3::new(
+                            ray.origin.x * inv_distance_scaler,
+                            ray.origin.y * inv_distance_scaler,
+                            ray.origin.z * inv_distance_scaler,
+                        ),
+                        direction: Vec3::new(ray.direction.x, ray.direction.y, ray.direction.z),
+                    }],
+                    &[min_distance * inv_distance_scaler],
+                    &[max_distance * inv_distance_scaler],
+                    &mut hits,
+                );
+                Some(hits[0].map_or_else(no_hit, acoustic_hit_to_audionimbus_hit))
             });
 
         let closest_hit_backend = batched_closest_hit_ray_tracer.clone();
@@ -428,9 +422,14 @@ impl SpatialProcessor {
                     .map(|distance| distance * inv_distance_scaler)
                     .collect::<Vec<_>>();
 
-                backend
-                    .trace_closest_hit_batch(&acoustic_rays, &min_distances, &max_distances)
-                    .into_iter()
+                let mut hits = vec![None; acoustic_rays.len()];
+                backend.trace_closest_hit_batch(
+                    &acoustic_rays,
+                    &min_distances,
+                    &max_distances,
+                    &mut hits,
+                );
+                hits.into_iter()
                     .map(|hit| Some(hit.map_or_else(no_hit, acoustic_hit_to_audionimbus_hit)))
                     .collect()
             });
@@ -562,6 +561,21 @@ impl SpatialProcessor {
             &mut self.simulator,
             &audio_settings,
             self.hrtf.as_ref(),
+        )
+    }
+
+    pub(crate) fn retire_source(&mut self, source_id: SourceId) -> Option<RetiredSpatialSource> {
+        let steam = self
+            .effects_manager
+            .retire_source(source_id, &mut self.simulator);
+        let native_hrtf = self.native_hrtf_source_states.remove(&source_id);
+        let native_reflection = self.native_reflection_source_states.remove(&source_id);
+        (steam.is_some() || native_hrtf.is_some() || native_reflection.is_some()).then_some(
+            RetiredSpatialSource {
+                _steam: steam,
+                _native_hrtf: native_hrtf,
+                _native_reflection: native_reflection,
+            },
         )
     }
 
@@ -731,10 +745,8 @@ impl SpatialProcessor {
         // Apply direct effect (distance attenuation + air absorption)
         let direct_start = Instant::now();
         match self.direct_path_backend {
-            DirectPathBackend::SteamAudio => {
-                self.apply_steam_audio_direct_effect(source_id, instance)?
-            }
-            DirectPathBackend::Native => self.apply_native_direct_effect(position, instance),
+            DirectPathBackend::SteamAudio => self.apply_steam_audio_direct_effect(source_id)?,
+            DirectPathBackend::Native => self.apply_native_direct_effect(position),
         }
         metrics.direct_processing_time_us = direct_start.elapsed().as_micros() as u64;
 
@@ -774,11 +786,7 @@ impl SpatialProcessor {
     }
 
     /// Apply Steam Audio's direct effect to the input buffer.
-    fn apply_steam_audio_direct_effect(
-        &mut self,
-        source_id: SourceId,
-        instance: &PlaybackInstance,
-    ) -> Result<()> {
+    fn apply_steam_audio_direct_effect(&mut self, source_id: SourceId) -> Result<()> {
         let effects = self
             .effects_manager
             .get_effects_mut(source_id)
@@ -802,7 +810,7 @@ impl SpatialProcessor {
             .map(|eq| Equalizer([eq[0], eq[1], eq[2]]))
             .unwrap_or(Equalizer([1.0, 1.0, 1.0]));
 
-        let mut direct_effect_params = DirectEffectParams {
+        let direct_effect_params = DirectEffectParams {
             distance_attenuation: Some(distance_attenuation),
             air_absorption: Some(air_absorption),
             directivity: None,
@@ -813,23 +821,6 @@ impl SpatialProcessor {
             // until closest-hit/material data is wired in Phase 2.
             transmission: None,
         };
-
-        if let Some(direct_path_override) = instance.direct_path_override {
-            if let Some(occlusion) = direct_path_override.occlusion {
-                direct_effect_params.occlusion = Some(occlusion);
-            }
-
-            if let Some(transmission) = direct_path_override.transmission {
-                direct_effect_params.transmission = Some(match transmission {
-                    DirectPathTransmission::FrequencyIndependent(bands) => {
-                        Transmission::FrequencyIndependent(Equalizer(bands))
-                    }
-                    DirectPathTransmission::FrequencyDependent(bands) => {
-                        Transmission::FrequencyDependent(Equalizer(bands))
-                    }
-                });
-            }
-        }
 
         let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
             &self.cached_input_buf,
@@ -864,32 +855,19 @@ impl SpatialProcessor {
     }
 
     /// Apply PetalSonic's native direct path to the input buffer.
-    fn apply_native_direct_effect(&mut self, source_position: Vec3, instance: &PlaybackInstance) {
+    fn apply_native_direct_effect(&mut self, source_position: Vec3) {
         let source_delta = source_position - self.listener_position;
         let distance_world = source_delta.length();
         let distance_meters = distance_world * self.distance_scaler;
         let distance_attenuation = native_distance_attenuation(distance_meters);
         let air_absorption = native_air_absorption(distance_meters);
 
-        let mut occlusion = if self.direct_occlusion_enabled {
+        let occlusion = if self.direct_occlusion_enabled {
             self.native_direct_occlusion(source_position, distance_world)
         } else {
             1.0
         };
-        let mut transmission_gain = 0.0;
-
-        if let Some(direct_path_override) = instance.direct_path_override {
-            if let Some(override_occlusion) = direct_path_override.occlusion {
-                occlusion = override_occlusion.clamp(0.0, 1.0);
-            }
-
-            if let Some(transmission) = direct_path_override.transmission {
-                transmission_gain = native_transmission_gain(transmission);
-            }
-        }
-
-        let audibility = occlusion.max((1.0 - occlusion) * transmission_gain);
-        let direct_gain = distance_attenuation * air_absorption * audibility;
+        let direct_gain = distance_attenuation * air_absorption * occlusion;
 
         self.cached_direct_buf.fill(0.0);
         for (output, input) in self
@@ -918,11 +896,9 @@ impl SpatialProcessor {
         let min_distances = [0.0];
         let max_distances = [distance_world];
 
-        let is_occluded = ray_tracer
-            .trace_any_hit_batch(&rays, &min_distances, &max_distances)
-            .into_iter()
-            .next()
-            .unwrap_or(false);
+        let mut hits = [false];
+        ray_tracer.trace_any_hit_batch(&rays, &min_distances, &max_distances, &mut hits);
+        let is_occluded = hits[0];
 
         if is_occluded { 0.0 } else { 1.0 }
     }
@@ -1019,11 +995,14 @@ impl SpatialProcessor {
         }];
         let min_distances = [0.05];
         let max_distances = [max_trace_distance_world];
-        let hit = closest_hit_ray_tracer
-            .trace_closest_hit_batch(&rays, &min_distances, &max_distances)
-            .into_iter()
-            .next()
-            .flatten()?;
+        let mut hits = [None];
+        closest_hit_ray_tracer.trace_closest_hit_batch(
+            &rays,
+            &min_distances,
+            &max_distances,
+            &mut hits,
+        );
+        let hit = hits[0]?;
 
         let hit_distance_world = hit.distance.max(0.0);
         let hit_position = self.listener_position + probe_direction * hit_distance_world;
@@ -1043,11 +1022,14 @@ impl SpatialProcessor {
             }];
             let visibility_min = [0.05];
             let visibility_max = [(hit_to_source_distance_world - 0.05).max(0.05)];
-            let blocked = any_hit_ray_tracer
-                .trace_any_hit_batch(&visibility_rays, &visibility_min, &visibility_max)
-                .into_iter()
-                .next()
-                .unwrap_or(false);
+            let mut hits = [false];
+            any_hit_ray_tracer.trace_any_hit_batch(
+                &visibility_rays,
+                &visibility_min,
+                &visibility_max,
+                &mut hits,
+            );
+            let blocked = hits[0];
             if blocked {
                 return None;
             }
@@ -1612,15 +1594,6 @@ fn native_air_absorption(distance_meters: f32) -> f32 {
     (-0.0002 * distance_meters.max(0.0)).exp().clamp(0.2, 1.0)
 }
 
-fn native_transmission_gain(transmission: DirectPathTransmission) -> f32 {
-    let bands = match transmission {
-        DirectPathTransmission::FrequencyIndependent(bands)
-        | DirectPathTransmission::FrequencyDependent(bands) => bands,
-    };
-
-    ((bands[0] + bands[1] + bands[2]) / 3.0).clamp(0.0, 1.0)
-}
-
 fn no_hit() -> Hit {
     Hit {
         distance: f32::INFINITY,
@@ -1670,17 +1643,5 @@ mod tests {
         assert_eq!(native_air_absorption(f32::NAN), 0.0);
         assert_eq!(native_air_absorption(-10.0), 1.0);
         assert!((0.2..=1.0).contains(&native_air_absorption(10_000.0)));
-    }
-
-    #[test]
-    fn native_transmission_gain_averages_and_clamps_bands() {
-        let gain = native_transmission_gain(DirectPathTransmission::FrequencyIndependent([
-            0.25, 0.5, 1.25,
-        ]));
-        assert!((gain - (2.0 / 3.0)).abs() < 1e-6);
-
-        let clamped =
-            native_transmission_gain(DirectPathTransmission::FrequencyDependent([2.0, 2.0, 2.0]));
-        assert_eq!(clamped, 1.0);
     }
 }

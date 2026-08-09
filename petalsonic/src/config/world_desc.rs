@@ -80,8 +80,13 @@ pub struct PetalSonicWorldDesc {
     pub max_buses: usize,
     /// Stable buses created with the world. Every bus feeds Master directly.
     pub buses: Vec<BusDesc>,
-    /// Capacity of the bounded lifecycle/control queue.
+    /// Capacity of the bounded regular control queue.
     pub control_queue_capacity: usize,
+    /// Reserved capacity for stop and destruction commands.
+    ///
+    /// This queue is independent from regular control traffic so overload cannot
+    /// consume the capacity needed to retire voices and emitters.
+    pub lifecycle_queue_capacity: usize,
     /// Capacity of the bounded event queue.
     pub event_queue_capacity: usize,
     /// Capacity of the bounded timing/diagnostics queue.
@@ -131,6 +136,7 @@ impl Default for PetalSonicWorldDesc {
                 .map(BusDesc::new)
                 .collect(),
             control_queue_capacity: 4096,
+            lifecycle_queue_capacity: 256,
             event_queue_capacity: 1024,
             timing_queue_capacity: 512,
             output_device: OutputDevicePolicy::default(),
@@ -155,6 +161,7 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("max_buses", &self.max_buses)
             .field("buses", &self.buses)
             .field("control_queue_capacity", &self.control_queue_capacity)
+            .field("lifecycle_queue_capacity", &self.lifecycle_queue_capacity)
             .field("event_queue_capacity", &self.event_queue_capacity)
             .field("timing_queue_capacity", &self.timing_queue_capacity)
             .field("output_device", &self.output_device)

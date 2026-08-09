@@ -13,7 +13,6 @@
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
 use crate::domain::{BusParams, Emitter, PlaybackTag};
-use crate::spatial::DirectPathOverride;
 use crate::world::SourceId;
 use std::fmt;
 use std::sync::Arc;
@@ -84,7 +83,7 @@ pub(crate) struct VoiceStart {
     pub playback_rate: f32,
     pub detached: bool,
     pub completion_tag: Option<PlaybackTag>,
-    pub render_block_size: usize,
+    pub mono_scratch: Vec<f32>,
 }
 
 /// Active playback instance
@@ -106,8 +105,6 @@ pub struct PlaybackInstance {
     pub loop_mode: LoopMode,
     /// Fixed bus route selected when the Voice is created. Zero is Master.
     pub bus_index: usize,
-    /// Optional host-provided direct-path override used during spatial processing.
-    pub direct_path_override: Option<DirectPathOverride>,
     /// Flag to track if we've reached the end this iteration (for event emission)
     pub(crate) reached_end_this_iteration: bool,
     sample_rate: u32,
@@ -116,6 +113,9 @@ pub struct PlaybackInstance {
     mix_gain_linear: f32,
     mix_rate: f32,
     mono_scratch: Vec<f32>,
+    fade_out_remaining_frames: usize,
+    fade_out_total_frames: usize,
+    retired: bool,
 }
 
 impl PlaybackInstance {
@@ -129,7 +129,7 @@ impl PlaybackInstance {
             playback_rate,
             detached,
             completion_tag,
-            render_block_size,
+            mono_scratch,
         } = start;
         let total_frames = audio_data.total_frames();
         let sample_rate = audio_data.sample_rate();
@@ -144,14 +144,16 @@ impl PlaybackInstance {
             config,
             loop_mode,
             bus_index,
-            direct_path_override: None,
             reached_end_this_iteration: false,
             sample_rate,
             cursor: 0.0,
             voice_rate: playback_rate,
             mix_gain_linear: 1.0,
             mix_rate: playback_rate,
-            mono_scratch: vec![0.0; render_block_size],
+            mono_scratch,
+            fade_out_remaining_frames: 0,
+            fade_out_total_frames: 0,
+            retired: false,
         }
     }
 
@@ -171,7 +173,24 @@ impl PlaybackInstance {
     /// Play from the beginning (reset + resume)
     pub fn play_from_beginning(&mut self) {
         self.reset();
+        self.retired = false;
+        self.fade_out_remaining_frames = 0;
+        self.fade_out_total_frames = 0;
         self.resume();
+    }
+
+    /// Retire an audible voice using a short, bounded de-click ramp.
+    pub(crate) fn begin_fade_out(&mut self) {
+        // Explicit stop/destroy does not report a natural-completion event.
+        self.completion_tag = None;
+        if !matches!(self.info.play_state, PlayState::Playing) {
+            self.info.play_state = PlayState::Stopped;
+            self.retired = true;
+            return;
+        }
+        let fade_frames = (self.sample_rate as usize / 200).max(1);
+        self.fade_out_total_frames = fade_frames;
+        self.fade_out_remaining_frames = fade_frames;
     }
 
     /// Pause this instance
@@ -216,6 +235,15 @@ impl PlaybackInstance {
             self.reached_end_this_iteration = true;
             self.info.play_state = PlayState::Stopped;
             return;
+        }
+
+        if self.fade_out_remaining_frames > 0 {
+            self.fade_out_remaining_frames =
+                self.fade_out_remaining_frames.saturating_sub(output_frames);
+            if self.fade_out_remaining_frames == 0 {
+                self.info.play_state = PlayState::Stopped;
+                self.retired = true;
+            }
         }
 
         self.cursor += output_frames as f64 * self.mix_rate as f64;
@@ -325,8 +353,23 @@ impl PlaybackInstance {
                     .copied()
                     .unwrap_or(0.0);
             }
-            *out_sample = (mono / channels as f32) * volume * self.mix_gain_linear;
+            let fade_gain = if self.fade_out_remaining_frames > 0 {
+                let gain = self.fade_out_remaining_frames as f32
+                    / self.fade_out_total_frames.max(1) as f32;
+                self.fade_out_remaining_frames -= 1;
+                if self.fade_out_remaining_frames == 0 {
+                    self.info.play_state = PlayState::Stopped;
+                    self.retired = true;
+                }
+                gain
+            } else {
+                1.0
+            };
+            *out_sample = (mono / channels as f32) * volume * self.mix_gain_linear * fade_gain;
             frames_filled += 1;
+            if self.retired {
+                break;
+            }
         }
 
         frames_filled
@@ -375,6 +418,10 @@ impl PlaybackInstance {
             None
         }
     }
+
+    pub(crate) fn should_reclaim(&self) -> bool {
+        self.retired || matches!(self.loop_mode, LoopMode::Once) && self.info.is_finished()
+    }
 }
 
 /// Commands that can be sent to the audio engine for playback control.
@@ -390,7 +437,6 @@ impl PlaybackInstance {
 /// - `Stop`: Stop an audio source and reset its position
 /// - `StopAll`: Stop all currently playing audio sources
 /// - `UpdateConfig`: Update the spatial configuration of a playing source
-/// - `UpdateDirectPathOverride`: Update host-provided direct-path data for a playing source
 /// - `Seek`: Seek to a specific position in the audio (0.0 = start, 1.0 = end)
 pub enum PlaybackCommand {
     Play {
@@ -403,6 +449,7 @@ pub enum PlaybackCommand {
         completion_tag: Option<PlaybackTag>,
         bus_index: usize,
         playback_rate: f32,
+        mono_scratch: Vec<f32>,
     },
     PauseVoice(SourceId),
     StopVoice(SourceId),
@@ -416,7 +463,6 @@ pub enum PlaybackCommand {
     DestroyEmitter(Emitter),
     StopAll,
     UpdateEmitter(Emitter, SourceConfig, usize),
-    UpdateDirectPathOverride(Emitter, Option<DirectPathOverride>),
     UpdateBus(usize, BusParams),
 }
 
@@ -433,6 +479,7 @@ impl fmt::Debug for PlaybackCommand {
                 completion_tag,
                 bus_index,
                 playback_rate,
+                mono_scratch,
             } => f
                 .debug_struct("Play")
                 .field("voice_id", voice_id)
@@ -444,6 +491,7 @@ impl fmt::Debug for PlaybackCommand {
                 .field("completion_tag", completion_tag)
                 .field("bus_index", bus_index)
                 .field("playback_rate", playback_rate)
+                .field("mono_scratch_len", &mono_scratch.len())
                 .finish(),
             Self::PauseVoice(voice_id) => f.debug_tuple("PauseVoice").field(voice_id).finish(),
             Self::StopVoice(voice_id) => f.debug_tuple("StopVoice").field(voice_id).finish(),
@@ -475,11 +523,6 @@ impl fmt::Debug for PlaybackCommand {
                 .field(emitter)
                 .field(config)
                 .field(bus_index)
-                .finish(),
-            Self::UpdateDirectPathOverride(emitter, direct_path_override) => f
-                .debug_tuple("UpdateDirectPathOverride")
-                .field(emitter)
-                .field(direct_path_override)
                 .finish(),
             Self::UpdateBus(index, params) => f
                 .debug_tuple("UpdateBus")
@@ -516,7 +559,7 @@ mod tests {
             playback_rate: 1.0,
             detached: false,
             completion_tag: None,
-            render_block_size: 4,
+            mono_scratch: vec![0.0; 4],
         });
 
         instance.play_from_beginning();
@@ -556,7 +599,7 @@ mod tests {
             playback_rate: 2.0,
             detached: false,
             completion_tag: None,
-            render_block_size: 4,
+            mono_scratch: vec![0.0; 4],
         });
         instance.play_from_beginning();
         instance.set_mix_parameters(BusParams::default());
@@ -575,5 +618,38 @@ mod tests {
         });
         instance.advance_silently(3);
         assert_eq!(instance.info.current_frame, 3);
+    }
+
+    #[test]
+    fn explicit_stop_uses_bounded_declick_ramp_before_reclaim() {
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![1.0; 1_000],
+            48_000,
+            1,
+            Duration::from_secs_f64(1_000.0 / 48_000.0),
+        ));
+        let mut instance = PlaybackInstance::from_source(VoiceStart {
+            emitter: Emitter {
+                index: 0,
+                generation: 1,
+            },
+            audio_data: audio,
+            config: SourceConfig::non_spatial(),
+            loop_mode: LoopMode::Infinite,
+            bus_index: 0,
+            playback_rate: 1.0,
+            detached: false,
+            completion_tag: Some(PlaybackTag(9)),
+            mono_scratch: vec![0.0; 256],
+        });
+        instance.play_from_beginning();
+        instance.begin_fade_out();
+
+        let mut output = [0.0; 240];
+        assert_eq!(instance.fill_mono_buffer(&mut output, 1.0), 240);
+        assert!(output[0] > output[120]);
+        assert!(output[120] > output[239]);
+        assert!(instance.should_reclaim());
+        assert_eq!(instance.completion_tag, None);
     }
 }

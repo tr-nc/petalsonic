@@ -1,37 +1,12 @@
-//! Audio data loading and management.
-//!
-//! This module provides functionality for loading and processing audio files, including:
-//! - Loading audio from various formats (MP3, WAV, FLAC, OGG, etc.) via [`DefaultAudioLoader`]
-//! - Custom audio loaders through the [`AudioDataLoader`] trait
-//! - Audio data storage in [`PetalSonicAudioData`] with automatic reference counting
-//! - Batch and streaming resampling
-//! - Mono conversion options
-//!
-//! # Examples
-//!
-//! ```no_run
-//! # use petalsonic::{ConvertToMono, LoadOptions, PetalSonicAudioData};
-//! // Load audio with default settings
-//! let audio = PetalSonicAudioData::from_path("music.mp3")?;
-//!
-//! // Load audio and force mono conversion
-//! let options = LoadOptions::new()
-//!     .convert_to_mono(ConvertToMono::ForceMono);
-//! let audio = PetalSonicAudioData::from_path_with_options("music.mp3", &options)?;
-//! # Ok::<(), petalsonic::PetalSonicError>(())
-//! ```
+//! Internal immutable PCM storage, decoding, and resampling.
 
 mod batch_resampler;
 mod default_loader;
-mod load_options;
-mod loader;
 mod streaming_resampler;
 
-use crate::error::{PetalSonicError, Result};
+use crate::error::Result;
 pub use batch_resampler::BatchResampler;
-pub use default_loader::DefaultAudioLoader;
-pub use load_options::{ConvertToMono, LoadOptions};
-pub use loader::AudioDataLoader;
+use default_loader::DefaultAudioLoader;
 use std::sync::Arc;
 use std::time::Duration;
 pub use streaming_resampler::{ResamplerType, StreamingResampler};
@@ -42,7 +17,7 @@ pub use streaming_resampler::{ResamplerType, StreamingResampler};
 /// All audio samples are stored in **INTERLEAVED** format internally.
 /// See the internal documentation for details on the data layout.
 #[derive(Debug, Clone)]
-pub struct PetalSonicAudioData {
+pub(crate) struct PetalSonicAudioData {
     inner: Arc<AudioDataInner>,
 }
 
@@ -93,9 +68,6 @@ pub(crate) struct AudioDataInner {
     /// Number of audio channels (1 = mono, 2 = stereo, etc.)
     pub channels: u16,
 
-    /// Total duration of the audio
-    pub duration: Duration,
-
     /// Total number of frames (one frame = one sample from each channel)
     ///
     /// Calculated as: `samples.len() / channels`
@@ -107,7 +79,7 @@ impl PetalSonicAudioData {
         samples: Vec<f32>,
         sample_rate: u32,
         channels: u16,
-        duration: Duration,
+        _duration: Duration,
     ) -> Self {
         let total_frames = samples.len() / channels as usize;
         Self {
@@ -115,7 +87,6 @@ impl PetalSonicAudioData {
                 samples,
                 sample_rate,
                 channels,
-                duration,
                 total_frames,
             }),
         }
@@ -139,55 +110,7 @@ impl PetalSonicAudioData {
     /// Returns a `PetalSonicError` if the file cannot be loaded or decoded.
     pub fn from_path(path: &str) -> Result<Arc<Self>> {
         let loader = DefaultAudioLoader;
-        loader.load(path, &LoadOptions::default())
-    }
-
-    /// Load audio data from a file path with custom loading options.
-    ///
-    /// This is a convenience method that uses the built-in Symphonia-based loader
-    /// with user-specified loading options.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the audio file
-    /// * `options` - Loading options that control behavior like mono conversion
-    ///
-    /// # Returns
-    ///
-    /// Returns an `Arc<PetalSonicAudioData>` containing the decoded audio on success.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `PetalSonicError` if the file cannot be loaded or decoded.
-    pub fn from_path_with_options(path: &str, options: &LoadOptions) -> Result<Arc<Self>> {
-        let loader = DefaultAudioLoader;
-        loader.load(path, options)
-    }
-
-    /// Load audio data from a file path using a custom loader.
-    ///
-    /// This method allows you to use your own audio loading implementation
-    /// by providing a custom loader that implements the [`AudioDataLoader`] trait.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the audio file
-    /// * `loader` - A custom loader implementing the `AudioDataLoader` trait
-    /// * `options` - Loading options that control behavior like mono conversion
-    ///
-    /// # Returns
-    ///
-    /// Returns an `Arc<PetalSonicAudioData>` containing the decoded audio on success.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `PetalSonicError` if the file cannot be loaded or decoded.
-    pub fn from_path_with_loader<L: AudioDataLoader>(
-        path: &str,
-        loader: &L,
-        options: &LoadOptions,
-    ) -> Result<Arc<Self>> {
-        loader.load(path, options)
+        loader.load(path)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -198,86 +121,12 @@ impl PetalSonicAudioData {
         self.inner.channels
     }
 
-    pub fn duration(&self) -> Duration {
-        self.inner.duration
-    }
-
     pub fn samples(&self) -> &[f32] {
         &self.inner.samples
     }
 
     pub fn total_frames(&self) -> usize {
         self.inner.total_frames
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.samples.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.samples.len()
-    }
-
-    /// Get samples for a specific channel (0-indexed)
-    pub fn channel_samples(&self, channel: usize) -> Result<Vec<f32>> {
-        if channel >= self.inner.channels as usize {
-            return Err(PetalSonicError::AudioFormat(format!(
-                "Channel {} out of range (max: {})",
-                channel,
-                self.inner.channels - 1
-            )));
-        }
-
-        let channel_samples: Vec<f32> = self
-            .inner
-            .samples
-            .chunks(self.inner.channels as usize)
-            .map(|frame| frame[channel])
-            .collect();
-
-        Ok(channel_samples)
-    }
-
-    /// Get interleaved samples for a specific frame range
-    pub fn frame_range(&self, start_frame: usize, end_frame: usize) -> Result<Vec<f32>> {
-        if start_frame >= self.inner.total_frames || end_frame > self.inner.total_frames {
-            return Err(PetalSonicError::AudioFormat(format!(
-                "Frame range {}-{} out of bounds (max: {})",
-                start_frame, end_frame, self.inner.total_frames
-            )));
-        }
-
-        let start_sample = start_frame * self.inner.channels as usize;
-        let end_sample = end_frame * self.inner.channels as usize;
-
-        Ok(self.inner.samples[start_sample..end_sample].to_vec())
-    }
-
-    /// Convert to mono by downmixing all channels
-    pub fn to_mono(&self) -> Result<Self> {
-        if self.inner.channels == 1 {
-            return Ok(self.clone());
-        }
-
-        let mono_samples: Vec<f32> = self
-            .inner
-            .samples
-            .chunks(self.inner.channels as usize)
-            .map(|frame| {
-                let sum: f32 = frame.iter().sum();
-                sum / self.inner.channels as f32
-            })
-            .collect();
-
-        let mono_duration =
-            Duration::from_secs_f64(mono_samples.len() as f64 / self.inner.sample_rate as f64);
-
-        Ok(Self::new(
-            mono_samples,
-            self.inner.sample_rate,
-            1,
-            mono_duration,
-        ))
     }
 
     /// Resample to a different sample rate using rubato, returns a new `PetalSonicAudioData` instance

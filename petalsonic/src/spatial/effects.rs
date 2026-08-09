@@ -28,13 +28,16 @@ pub struct SpatialSourceEffects {
     pub binaural_effect: Option<BinauralEffect>,
 }
 
+// SAFETY: the wrapped Steam Audio objects are never accessed concurrently. They
+// are created and used by one render runtime, removed from the simulator before
+// transfer, and may then be moved only for destruction on the supervisor thread.
 unsafe impl Send for SpatialSourceEffects {}
 
 impl SpatialSourceEffects {
     /// Create effects for a new spatial source
     pub fn new(
         context: &Context,
-        simulator: &SpatialSimulator,
+        simulator: &mut SpatialSimulator,
         audio_settings: &AudioSettings,
         hrtf: Option<&Hrtf>,
     ) -> Result<Self> {
@@ -141,5 +144,21 @@ impl SpatialEffectsManager {
     /// Check if effects exist for a source
     pub fn has_effects(&self, source_id: SourceId) -> bool {
         self.effects.contains_key(&source_id)
+    }
+
+    pub fn retire_source(
+        &mut self,
+        source_id: SourceId,
+        simulator: &mut SpatialSimulator,
+    ) -> Option<SpatialSourceEffects> {
+        let effects = self.effects.remove(&source_id)?;
+        // SAFETY: audionimbus 0.12's `remove_source` accepts only the default
+        // phantom marker type. Source's generic markers are all PhantomData and
+        // do not alter layout; this erases only those compile-time markers.
+        let erased_source: &Source<'static> =
+            unsafe { &*((&effects.source as *const SpatialSource).cast::<Source<'static>>()) };
+        simulator.remove_source(erased_source);
+        simulator.commit();
+        Some(effects)
     }
 }

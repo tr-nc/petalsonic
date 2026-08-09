@@ -1,5 +1,5 @@
 use crate::{
-    audio_data::{AudioDataLoader, ConvertToMono, LoadOptions, PetalSonicAudioData},
+    audio_data::PetalSonicAudioData,
     error::{PetalSonicError, Result},
 };
 use std::fs::File;
@@ -28,10 +28,10 @@ use symphonia::{
 /// let loader = DefaultAudioLoader;
 /// let audio_data = loader.load("path/to/audio.mp3", &LoadOptions::default())?;
 /// ```
-pub struct DefaultAudioLoader;
+pub(crate) struct DefaultAudioLoader;
 
-impl AudioDataLoader for DefaultAudioLoader {
-    fn load(&self, path: &str, options: &LoadOptions) -> Result<Arc<PetalSonicAudioData>> {
+impl DefaultAudioLoader {
+    pub(crate) fn load(&self, path: &str) -> Result<Arc<PetalSonicAudioData>> {
         let file = File::open(path).map_err(|e| {
             PetalSonicError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e))
         })?;
@@ -118,41 +118,10 @@ impl AudioDataLoader for DefaultAudioLoader {
             samples.extend_from_slice(tmp.samples());
         }
 
-        // Apply mono conversion based on the option
-        let final_samples;
-        let final_channels;
+        let duration =
+            Duration::from_secs_f64(samples.len() as f64 / (sample_rate * channels as u32) as f64);
 
-        match options.convert_to_mono {
-            ConvertToMono::Original => {
-                // Keep original channels
-                final_samples = samples;
-                final_channels = channels;
-            }
-            ConvertToMono::ForceMono => {
-                if channels == 1 {
-                    // Already mono, keep as is
-                    final_samples = samples;
-                    final_channels = 1;
-                } else {
-                    // Downmix all channels to mono using the most common technique (averaging)
-                    final_samples = samples
-                        .chunks(channels as usize)
-                        .map(|frame| {
-                            let sum: f32 = frame.iter().sum();
-                            sum / channels as f32
-                        })
-                        .collect();
-                    final_channels = 1;
-                }
-            }
-        }
-
-        let duration = Duration::from_secs_f64(
-            final_samples.len() as f64 / (sample_rate * final_channels as u32) as f64,
-        );
-
-        let audio_data =
-            PetalSonicAudioData::new(final_samples, sample_rate, final_channels, duration);
+        let audio_data = PetalSonicAudioData::new(samples, sample_rate, channels, duration);
 
         Ok(Arc::new(audio_data))
     }

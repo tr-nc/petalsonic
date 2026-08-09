@@ -87,7 +87,6 @@ pub use acoustics::{
     AcousticHit, AcousticMaterial, AcousticRay, AcousticSceneSnapshot, BatchedAnyHitRayTracer,
     BatchedClosestHitRayTracer,
 };
-pub use audio_data::{AudioDataLoader, ConvertToMono, LoadOptions, PetalSonicAudioData};
 pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 pub use domain::{
     Bus, BusDesc, BusParams, Emitter, EmitterDesc, EmitterSpatialState, PlayOptions,
@@ -95,9 +94,8 @@ pub use domain::{
 };
 pub use engine::AudioOutputDeviceInfo;
 pub use error::PetalSonicError;
-pub use events::{PetalSonicEvent, RenderTimingEvent, RuntimeState, RuntimeStatus};
-pub use gain::{db_to_linear, linear_to_db};
+pub use events::{
+    PetalSonicEvent, RenderTimingEvent, RuntimeDiagnostics, RuntimeState, RuntimeStatus,
+};
 pub use math::{Pose, Quat, Vec3};
-pub use playback::LoopMode;
-pub use spatial::{DirectPathOverride, DirectPathTransmission};
 pub use world::PetalSonicWorld;

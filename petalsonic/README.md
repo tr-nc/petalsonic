@@ -94,19 +94,13 @@ let music_emitter = world.create_emitter(
 world.play(music_emitter, PlayOptions::looping())?;
 ```
 
-### Custom Audio Loading
+### Predecoded PCM
 
 ```rust
-use petalsonic::{ConvertToMono, LoadOptions, PetalSonicAudioData};
+use petalsonic::ResidentClip;
 
-// Force mono conversion for spatial audio sources
-let options = LoadOptions::new()
-    .convert_to_mono(ConvertToMono::ForceMono);
-
-let audio = PetalSonicAudioData::from_path_with_options(
-    "sound_effect.wav",
-    &options
-)?;
+// A resource system can decode elsewhere and transfer immutable PCM ownership.
+let clip = ResidentClip::from_mono_pcm(decoded_samples, 48_000)?;
 ```
 
 ## Architecture
@@ -157,11 +151,10 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 ### Configuration
 
 - **`PetalSonicWorldDesc`**: World configuration and executable capacity limits
-- **`LoadOptions`**: Options for audio loading (mono conversion, etc.)
 
 ### Playback Control
 
-- **`LoopMode`**: `Once` or `Infinite`
+- **`PlayOptions`**: One-shot or looping intent plus bus, gain, and detachment
 - **`PlaybackControl`**: Optional handle for one explicitly controlled Voice
 
 ### Events
@@ -229,25 +222,6 @@ for event in world.drain_timing_events() {
         event.ambisonics_decoding_time_us,
         event.total_time_us
     );
-}
-```
-
-## Advanced Features
-
-### Custom Audio Loaders
-
-Implement `AudioDataLoader` for custom file formats:
-
-```rust
-use petalsonic::{AudioDataLoader, LoadOptions, PetalSonicAudioData};
-
-struct MyLoader;
-
-impl AudioDataLoader for MyLoader {
-    fn load(&self, path: &str, options: &LoadOptions) -> Result<Arc<PetalSonicAudioData>> {
-        // Your custom loading logic
-        todo!()
-    }
 }
 ```
 

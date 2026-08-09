@@ -41,7 +41,8 @@ pub trait BatchedAnyHitRayTracer: Send + Sync {
         rays: &[AcousticRay],
         min_distances: &[f32],
         max_distances: &[f32],
-    ) -> Vec<bool>;
+        hits: &mut [bool],
+    );
 }
 
 /// Host-provided batched closest-hit ray tracing backend used by reflections.
@@ -51,7 +52,8 @@ pub trait BatchedClosestHitRayTracer: Send + Sync {
         rays: &[AcousticRay],
         min_distances: &[f32],
         max_distances: &[f32],
-    ) -> Vec<Option<AcousticHit>>;
+        hits: &mut [Option<AcousticHit>],
+    );
 }
 
 /// Immutable, shareable acoustic-scene version.
@@ -131,18 +133,16 @@ impl BatchedAnyHitRayTracer for AcousticSceneSlot {
         rays: &[AcousticRay],
         min_distances: &[f32],
         max_distances: &[f32],
-    ) -> Vec<bool> {
-        self.active
-            .try_read()
-            .ok()
-            .and_then(|snapshot| {
-                snapshot.as_ref().and_then(|snapshot| {
-                    snapshot.any_hit.as_ref().map(|backend| {
-                        backend.trace_any_hit_batch(rays, min_distances, max_distances)
-                    })
+        hits: &mut [bool],
+    ) {
+        hits.fill(false);
+        let _ = self.active.try_read().ok().and_then(|snapshot| {
+            snapshot.as_ref().and_then(|snapshot| {
+                snapshot.any_hit.as_ref().map(|backend| {
+                    backend.trace_any_hit_batch(rays, min_distances, max_distances, hits)
                 })
             })
-            .unwrap_or_else(|| vec![false; rays.len()])
+        });
     }
 }
 
@@ -152,18 +152,16 @@ impl BatchedClosestHitRayTracer for AcousticSceneSlot {
         rays: &[AcousticRay],
         min_distances: &[f32],
         max_distances: &[f32],
-    ) -> Vec<Option<AcousticHit>> {
-        self.active
-            .try_read()
-            .ok()
-            .and_then(|snapshot| {
-                snapshot.as_ref().and_then(|snapshot| {
-                    snapshot.closest_hit.as_ref().map(|backend| {
-                        backend.trace_closest_hit_batch(rays, min_distances, max_distances)
-                    })
+        hits: &mut [Option<AcousticHit>],
+    ) {
+        hits.fill(None);
+        let _ = self.active.try_read().ok().and_then(|snapshot| {
+            snapshot.as_ref().and_then(|snapshot| {
+                snapshot.closest_hit.as_ref().map(|backend| {
+                    backend.trace_closest_hit_batch(rays, min_distances, max_distances, hits)
                 })
             })
-            .unwrap_or_else(|| vec![None; rays.len()])
+        });
     }
 }
 
@@ -179,8 +177,9 @@ mod tests {
             rays: &[AcousticRay],
             _min_distances: &[f32],
             _max_distances: &[f32],
-        ) -> Vec<bool> {
-            vec![true; rays.len()]
+            hits: &mut [bool],
+        ) {
+            hits[..rays.len()].fill(true);
         }
     }
 
@@ -194,7 +193,9 @@ mod tests {
             direction: Vec3::X,
         }];
 
-        assert_eq!(slot.trace_any_hit_batch(&rays, &[0.0], &[10.0]), vec![true]);
+        let mut hits = [false];
+        slot.trace_any_hit_batch(&rays, &[0.0], &[10.0], &mut hits);
+        assert_eq!(hits, [true]);
         assert!(Arc::strong_count(&backend) >= 3);
 
         let previous = slot
@@ -206,6 +207,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(previous.version(), 1);
-        assert_eq!(slot.trace_any_hit_batch(&rays, &[0.0], &[10.0]), vec![true]);
+        slot.trace_any_hit_batch(&rays, &[0.0], &[10.0], &mut hits);
+        assert_eq!(hits, [true]);
     }
 }

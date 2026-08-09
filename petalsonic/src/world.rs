@@ -1,26 +1,27 @@
-use crate::audio_data::PetalSonicAudioData;
-use crate::config::{PetalSonicWorldDesc, SourceConfig};
+use crate::domain::{
+    Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
+};
 use crate::engine::{AudioOutputDeviceInfo, PetalSonicEngine};
-use crate::error::Result;
+use crate::error::{PetalSonicError, Result};
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
-use crate::math::{Pose, Vec3};
-use crate::playback::{LoopMode, PlaybackCommand, PlaybackSource};
-use crate::procedural::ProceduralAudioFactory;
+use crate::math::Pose;
+use crate::playback::PlaybackCommand;
 use crate::spatial::DirectPathOverride;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Lightweight, type-safe handle for audio sources.
+/// Internal identity for one playback voice.
 ///
-/// Returned when adding audio data to the world. Used to reference audio sources
-/// for playback operations (play, pause, stop).
+/// IDs are never reused within a world, so a stale control cannot alias a later
+/// voice even after the earlier slot has been reclaimed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SourceId(u64);
 
 impl std::fmt::Display for SourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SourceId({})", self.0)
+        write!(f, "VoiceId({})", self.0)
     }
 }
 
@@ -30,59 +31,399 @@ impl From<u64> for SourceId {
     }
 }
 
-/// Main world object that manages 3D audio sources and playback.
+#[derive(Clone)]
+struct EmitterState {
+    clip: ResidentClip,
+    desc: EmitterDesc,
+}
+
+struct EmitterSlot {
+    generation: u32,
+    state: Option<EmitterState>,
+}
+
+struct EmitterRegistry {
+    slots: Vec<EmitterSlot>,
+    free: Vec<u32>,
+    len: usize,
+    limit: usize,
+}
+
+impl EmitterRegistry {
+    fn new(limit: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(limit),
+            free: Vec::with_capacity(limit),
+            len: 0,
+            limit,
+        }
+    }
+
+    fn insert(&mut self, state: EmitterState) -> Result<Emitter> {
+        if self.len >= self.limit {
+            return Err(PetalSonicError::CapacityExceeded {
+                resource: "emitter",
+                limit: self.limit,
+            });
+        }
+
+        self.len += 1;
+        if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index as usize];
+            slot.state = Some(state);
+            return Ok(Emitter {
+                index,
+                generation: slot.generation,
+            });
+        }
+
+        let index = self.slots.len() as u32;
+        self.slots.push(EmitterSlot {
+            generation: 1,
+            state: Some(state),
+        });
+        Ok(Emitter {
+            index,
+            generation: 1,
+        })
+    }
+
+    fn get(&self, emitter: Emitter) -> Result<&EmitterState> {
+        let slot = self
+            .slots
+            .get(emitter.index as usize)
+            .ok_or(PetalSonicError::StaleEmitter)?;
+        if slot.generation != emitter.generation {
+            return Err(PetalSonicError::StaleEmitter);
+        }
+        slot.state.as_ref().ok_or(PetalSonicError::StaleEmitter)
+    }
+
+    fn get_mut(&mut self, emitter: Emitter) -> Result<&mut EmitterState> {
+        let slot = self
+            .slots
+            .get_mut(emitter.index as usize)
+            .ok_or(PetalSonicError::StaleEmitter)?;
+        if slot.generation != emitter.generation {
+            return Err(PetalSonicError::StaleEmitter);
+        }
+        slot.state.as_mut().ok_or(PetalSonicError::StaleEmitter)
+    }
+
+    fn remove(&mut self, emitter: Emitter) -> Result<EmitterState> {
+        let slot = self
+            .slots
+            .get_mut(emitter.index as usize)
+            .ok_or(PetalSonicError::StaleEmitter)?;
+        if slot.generation != emitter.generation {
+            return Err(PetalSonicError::StaleEmitter);
+        }
+        let state = slot.state.take().ok_or(PetalSonicError::StaleEmitter)?;
+        slot.generation = slot.generation.wrapping_add(1).max(1);
+        self.free.push(emitter.index);
+        self.len -= 1;
+        Ok(state)
+    }
+}
+
+/// Main facade for audio resources, emitters, playback, events, and runtime state.
 ///
-/// `PetalSonicWorld` is the central API for PetalSonic. It runs on the main thread
-/// and provides a world-driven interface where you manage audio sources, listeners,
-/// and playback commands. The actual audio processing happens on a separate thread
-/// via the audio engine.
-///
-/// # Architecture
-///
-/// - **Main thread**: Owns the `PetalSonicWorld`, loads audio files, manages sources
-/// - **Audio thread**: Receives commands via channels, performs spatialization and playback
+/// Creating a world starts its private render runtime. Callers submit bounded,
+/// non-blocking intent and never drive audio progress themselves.
 pub struct PetalSonicWorld {
-    desc: PetalSonicWorldDesc,
-    source_storage: std::sync::Mutex<HashMap<SourceId, PlaybackSource>>,
-    source_configs: std::sync::Mutex<HashMap<SourceId, SourceConfig>>,
-    listener: std::sync::Mutex<PetalSonicAudioListener>,
+    desc: crate::config::PetalSonicWorldDesc,
+    emitters: Mutex<EmitterRegistry>,
     listener_pose: Arc<Mutex<Pose>>,
-    next_source_id: std::sync::Mutex<u64>,
+    next_voice_id: AtomicU64,
+    active_voice_count: Arc<AtomicUsize>,
+    controlled_voices: Mutex<HashMap<SourceId, Emitter>>,
+    retirement_receiver: Receiver<SourceId>,
     command_sender: Sender<PlaybackCommand>,
     engine: Mutex<Option<PetalSonicEngine>>,
 }
 
 impl PetalSonicWorld {
-    pub fn new(config: PetalSonicWorldDesc) -> Result<Self> {
-        let command_capacity = config.max_sources.saturating_mul(2).max(64);
-        let (command_sender, command_receiver) = crossbeam_channel::bounded(command_capacity);
+    pub fn new(config: crate::config::PetalSonicWorldDesc) -> Result<Self> {
+        Self::validate_config(&config)?;
+
+        let (command_sender, command_receiver) =
+            crossbeam_channel::bounded(config.control_queue_capacity);
         let listener_pose = Arc::new(Mutex::new(Pose::default()));
-        let mut engine = PetalSonicEngine::new(config.clone(), listener_pose.clone())?;
+        let active_voice_count = Arc::new(AtomicUsize::new(0));
+        let (retirement_sender, retirement_receiver) =
+            crossbeam_channel::bounded(config.max_voices);
+        let mut engine = PetalSonicEngine::new(
+            config.clone(),
+            listener_pose.clone(),
+            active_voice_count.clone(),
+            retirement_sender,
+        )?;
         engine.start(command_receiver)?;
 
         Ok(Self {
+            emitters: Mutex::new(EmitterRegistry::new(config.max_emitters)),
+            controlled_voices: Mutex::new(HashMap::with_capacity(config.max_voices)),
             desc: config,
-            source_storage: std::sync::Mutex::new(HashMap::new()),
-            source_configs: std::sync::Mutex::new(HashMap::new()),
-            listener: std::sync::Mutex::new(PetalSonicAudioListener::default()),
             listener_pose,
-            next_source_id: std::sync::Mutex::new(0),
+            next_voice_id: AtomicU64::new(0),
+            active_voice_count,
+            retirement_receiver,
             command_sender,
             engine: Mutex::new(Some(engine)),
         })
     }
 
-    /// Returns the immutable configuration chosen when this world was created.
-    pub fn config(&self) -> &PetalSonicWorldDesc {
+    fn validate_config(config: &crate::config::PetalSonicWorldDesc) -> Result<()> {
+        for (field, value) in [
+            ("sample_rate", config.sample_rate as usize),
+            ("block_size", config.block_size),
+            ("max_emitters", config.max_emitters),
+            ("max_voices", config.max_voices),
+            ("control_queue_capacity", config.control_queue_capacity),
+            ("event_queue_capacity", config.event_queue_capacity),
+            ("timing_queue_capacity", config.timing_queue_capacity),
+        ] {
+            if value == 0 {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field,
+                    reason: "must be greater than zero".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn config(&self) -> &crate::config::PetalSonicWorldDesc {
         &self.desc
     }
 
-    /// Enumerates the output devices visible to the platform adapter.
     pub fn available_output_devices() -> Result<Vec<AudioOutputDeviceInfo>> {
         PetalSonicEngine::available_output_devices()
     }
 
-    /// Returns whether this world's internal runtime is actively producing audio.
+    pub fn create_emitter(&self, clip: ResidentClip, desc: EmitterDesc) -> Result<Emitter> {
+        self.ensure_open()?;
+        let clip = self.prepare_clip(clip)?;
+        self.emitters
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Emitter registry is poisoned".into()))?
+            .insert(EmitterState { clip, desc })
+    }
+
+    fn prepare_clip(&self, clip: ResidentClip) -> Result<ResidentClip> {
+        if clip.sample_rate() == self.desc.sample_rate {
+            return Ok(clip);
+        }
+        Ok(ResidentClip::from_audio_data(Arc::new(
+            clip.data.resample(self.desc.sample_rate)?,
+        )))
+    }
+
+    pub fn update_emitter(&self, emitter: Emitter, desc: EmitterDesc) -> Result<()> {
+        let mut emitters = self
+            .emitters
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Emitter registry is poisoned".into()))?;
+        let state = emitters.get_mut(emitter)?;
+        self.try_send(PlaybackCommand::UpdateEmitter(
+            emitter,
+            desc.source_config(0.0),
+        ))?;
+        state.desc = desc;
+        Ok(())
+    }
+
+    pub fn update_direct_path_override(
+        &self,
+        emitter: Emitter,
+        direct_path_override: Option<DirectPathOverride>,
+    ) -> Result<()> {
+        self.emitter_state(emitter)?;
+        self.try_send(PlaybackCommand::UpdateDirectPathOverride(
+            emitter,
+            direct_path_override,
+        ))
+    }
+
+    pub fn destroy_emitter(&self, emitter: Emitter) -> Result<()> {
+        let mut emitters = self
+            .emitters
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Emitter registry is poisoned".into()))?;
+        emitters.get(emitter)?;
+        self.try_send(PlaybackCommand::DestroyEmitter(emitter))?;
+        emitters.remove(emitter)?;
+        if let Ok(mut controlled) = self.controlled_voices.lock() {
+            controlled.retain(|_, owner| *owner != emitter);
+        }
+        Ok(())
+    }
+
+    pub fn play(&self, emitter: Emitter, options: PlayOptions) -> Result<()> {
+        self.submit_play(emitter, options, None).map(|_| ())
+    }
+
+    pub fn play_controlled(
+        &self,
+        emitter: Emitter,
+        options: PlayOptions,
+        tag: PlaybackTag,
+    ) -> Result<PlaybackControl> {
+        let voice_id = self.submit_play(emitter, options, Some(tag))?;
+        Ok(PlaybackControl { voice_id })
+    }
+
+    fn submit_play(
+        &self,
+        emitter: Emitter,
+        options: PlayOptions,
+        completion_tag: Option<PlaybackTag>,
+    ) -> Result<SourceId> {
+        self.drain_retired_controls();
+        self.ensure_open()?;
+        let state = self.emitter_state(emitter)?;
+        self.reserve_voice()?;
+        let voice_id = SourceId(self.next_voice_id.fetch_add(1, Ordering::Relaxed));
+        if completion_tag.is_some() {
+            let mut controlled = match self.controlled_voices.lock() {
+                Ok(controlled) => controlled,
+                Err(_) => {
+                    self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
+                    return Err(PetalSonicError::Engine(
+                        "Playback registry is poisoned".into(),
+                    ));
+                }
+            };
+            controlled.insert(voice_id, emitter);
+        }
+        let command = PlaybackCommand::Play {
+            voice_id,
+            emitter,
+            source: state.clip.data.clone(),
+            config: state.desc.source_config(options.gain_db),
+            loop_mode: options.loop_mode,
+            detached: options.detached,
+            completion_tag,
+        };
+        if let Err(error) = self.try_send(command) {
+            self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
+            if completion_tag.is_some()
+                && let Ok(mut controlled) = self.controlled_voices.lock()
+            {
+                controlled.remove(&voice_id);
+            }
+            return Err(error);
+        }
+        Ok(voice_id)
+    }
+
+    fn reserve_voice(&self) -> Result<()> {
+        self.active_voice_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.desc.max_voices).then_some(active + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| PetalSonicError::CapacityExceeded {
+                resource: "voice",
+                limit: self.desc.max_voices,
+            })
+    }
+
+    pub fn pause_emitter(&self, emitter: Emitter) -> Result<()> {
+        self.emitter_state(emitter)?;
+        self.try_send(PlaybackCommand::PauseEmitter(emitter))
+    }
+
+    pub fn stop_emitter(&self, emitter: Emitter) -> Result<()> {
+        self.emitter_state(emitter)?;
+        self.try_send(PlaybackCommand::StopEmitter(emitter))?;
+        if let Ok(mut controlled) = self.controlled_voices.lock() {
+            controlled.retain(|_, owner| *owner != emitter);
+        }
+        Ok(())
+    }
+
+    pub fn seek_emitter(&self, emitter: Emitter, progress: f32) -> Result<()> {
+        self.emitter_state(emitter)?;
+        self.try_send(PlaybackCommand::SeekEmitter(emitter, progress))
+    }
+
+    pub fn pause_playback(&self, control: PlaybackControl) -> Result<()> {
+        self.ensure_controlled(control)?;
+        self.try_send(PlaybackCommand::PauseVoice(control.voice_id))
+    }
+
+    pub fn stop_playback(&self, control: PlaybackControl) -> Result<()> {
+        self.ensure_controlled(control)?;
+        self.try_send(PlaybackCommand::StopVoice(control.voice_id))?;
+        self.controlled_voices
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
+            .remove(&control.voice_id);
+        Ok(())
+    }
+
+    pub fn seek_playback(&self, control: PlaybackControl, progress: f32) -> Result<()> {
+        self.ensure_controlled(control)?;
+        self.try_send(PlaybackCommand::SeekVoice(control.voice_id, progress))
+    }
+
+    pub fn stop_all(&self) -> Result<()> {
+        self.try_send(PlaybackCommand::StopAll)?;
+        self.controlled_voices
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
+            .clear();
+        Ok(())
+    }
+
+    fn emitter_state(&self, emitter: Emitter) -> Result<EmitterState> {
+        self.emitters
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Emitter registry is poisoned".into()))?
+            .get(emitter)
+            .cloned()
+    }
+
+    fn ensure_controlled(&self, control: PlaybackControl) -> Result<()> {
+        self.drain_retired_controls();
+        if self
+            .controlled_voices
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
+            .contains_key(&control.voice_id)
+        {
+            Ok(())
+        } else {
+            Err(PetalSonicError::StalePlayback)
+        }
+    }
+
+    fn try_send(&self, command: PlaybackCommand) -> Result<()> {
+        match self.command_sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(PetalSonicError::QueuePressure),
+            Err(TrySendError::Disconnected(_)) => Err(PetalSonicError::RuntimeClosed),
+        }
+    }
+
+    pub fn set_listener_pose(&self, pose: Pose) {
+        if let Ok(mut runtime_pose) = self.listener_pose.lock() {
+            *runtime_pose = pose;
+        }
+    }
+
+    pub fn listener_pose(&self) -> Pose {
+        self.listener_pose
+            .lock()
+            .map(|pose| *pose)
+            .unwrap_or_default()
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.desc.sample_rate
+    }
+
     pub fn is_running(&self) -> bool {
         self.engine
             .lock()
@@ -91,7 +432,10 @@ impl PetalSonicWorld {
             .unwrap_or(false)
     }
 
-    /// Returns the number of device frames consumed since this world started.
+    pub fn active_voice_count(&self) -> usize {
+        self.active_voice_count.load(Ordering::Acquire)
+    }
+
     pub fn frames_processed(&self) -> usize {
         self.engine
             .lock()
@@ -100,7 +444,6 @@ impl PetalSonicWorld {
             .unwrap_or(0)
     }
 
-    /// Returns the cumulative number of device-callback underruns after startup grace.
     pub fn underrun_count(&self) -> usize {
         self.engine
             .lock()
@@ -109,16 +452,31 @@ impl PetalSonicWorld {
             .unwrap_or(0)
     }
 
-    /// Drains all currently queued runtime events without invoking user callbacks.
     pub fn drain_events(&self) -> Vec<PetalSonicEvent> {
-        self.engine
+        let events = self
+            .engine
             .lock()
             .ok()
             .and_then(|engine| engine.as_ref().map(PetalSonicEngine::poll_events))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.drain_retired_controls();
+        if let Ok(mut controlled) = self.controlled_voices.lock() {
+            for event in &events {
+                let PetalSonicEvent::PlaybackCompleted { control, .. } = event;
+                controlled.remove(&control.voice_id);
+            }
+        }
+        events
     }
 
-    /// Drains render timing snapshots used by diagnostics and the demo profiler.
+    fn drain_retired_controls(&self) {
+        if let Ok(mut controlled) = self.controlled_voices.lock() {
+            while let Ok(voice_id) = self.retirement_receiver.try_recv() {
+                controlled.remove(&voice_id);
+            }
+        }
+    }
+
     pub fn drain_timing_events(&self) -> Vec<RenderTimingEvent> {
         self.engine
             .lock()
@@ -127,399 +485,29 @@ impl PetalSonicWorld {
             .unwrap_or_default()
     }
 
-    /// Stops the device stream and joins the world-owned render thread.
-    ///
-    /// Calling this method more than once is safe.
     pub fn close(&self) -> Result<()> {
-        let mut engine = self.engine.lock().map_err(|_| {
-            crate::error::PetalSonicError::Engine("Audio runtime lock is poisoned".into())
-        })?;
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Audio runtime lock is poisoned".into()))?;
         if let Some(mut engine) = engine.take() {
             engine.stop()?;
+            self.active_voice_count.store(0, Ordering::Release);
         }
         Ok(())
     }
 
-    /// Returns the sample rate of the audio world.
-    pub fn sample_rate(&self) -> u32 {
-        self.desc.sample_rate
-    }
-
-    /// Registers audio data in the world's internal storage and returns a SourceId handle.
-    ///
-    /// This pre-loads and prepares the audio for playback but does not start playing it.
-    /// Call `play()` with the returned SourceId to actually start playback.
-    ///
-    /// The audio data is automatically resampled to match the world's sample rate if needed.
-    ///
-    /// # Arguments
-    ///
-    /// * `audio_data` - The audio data to register
-    /// * `config` - Configuration for how the source should be processed (spatial or non-spatial)
-    pub fn register_audio(
-        &self,
-        audio_data: Arc<PetalSonicAudioData>,
-        config: SourceConfig,
-    ) -> Result<SourceId> {
-        // Automatically resample if the audio data sample rate doesn't match the world's sample rate
-        let resampled_audio_data = if audio_data.sample_rate() != self.desc.sample_rate {
-            Arc::new(audio_data.resample(self.desc.sample_rate)?)
+    fn ensure_open(&self) -> Result<()> {
+        if self
+            .engine
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Audio runtime lock is poisoned".into()))?
+            .is_some()
+        {
+            Ok(())
         } else {
-            audio_data
-        };
-
-        let mut next_id = self.next_source_id.lock().unwrap();
-        let id = SourceId(*next_id);
-        *next_id += 1;
-        drop(next_id);
-
-        self.source_storage
-            .lock()
-            .unwrap()
-            .insert(id, PlaybackSource::Static(resampled_audio_data));
-        self.source_configs.lock().unwrap().insert(id, config);
-        Ok(id)
-    }
-
-    /// Registers a procedural audio source factory and returns a SourceId handle.
-    ///
-    /// The factory is retained on the world thread. When playback starts, PetalSonic
-    /// creates a fresh render-thread-owned source instance at the world sample rate.
-    pub fn register_procedural(
-        &self,
-        factory: Arc<dyn ProceduralAudioFactory>,
-        config: SourceConfig,
-    ) -> Result<SourceId> {
-        let mut next_id = self.next_source_id.lock().unwrap();
-        let id = SourceId(*next_id);
-        *next_id += 1;
-        drop(next_id);
-
-        self.source_storage.lock().unwrap().insert(
-            id,
-            PlaybackSource::Procedural {
-                factory,
-                sample_rate: self.desc.sample_rate,
-            },
-        );
-        self.source_configs.lock().unwrap().insert(id, config);
-        Ok(id)
-    }
-
-    /// Retrieves audio data by its SourceId.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The SourceId of the audio source
-    ///
-    /// # Returns
-    ///
-    /// `Some(Arc<PetalSonicAudioData>)` if found, `None` otherwise
-    pub fn get_audio_data(&self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
-        match self.source_storage.lock().unwrap().get(&id) {
-            Some(PlaybackSource::Static(audio_data)) => Some(audio_data.clone()),
-            _ => None,
+            Err(PetalSonicError::RuntimeClosed)
         }
-    }
-
-    /// Removes audio data from the world by its SourceId.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The SourceId of the audio source to remove
-    ///
-    /// # Returns
-    ///
-    /// The removed audio data if it existed, `None` otherwise
-    pub fn remove_audio_data(&self, id: SourceId) -> Option<Arc<PetalSonicAudioData>> {
-        self.source_configs.lock().unwrap().remove(&id);
-        match self.source_storage.lock().unwrap().remove(&id) {
-            Some(PlaybackSource::Static(audio_data)) => Some(audio_data),
-            _ => None,
-        }
-    }
-
-    /// Removes any registered source type from the world by its SourceId.
-    pub fn remove_source(&self, id: SourceId) -> bool {
-        self.source_configs.lock().unwrap().remove(&id);
-        self.source_storage.lock().unwrap().remove(&id).is_some()
-    }
-
-    /// Returns a list of all audio source IDs currently stored in the world.
-    pub fn get_audio_source_ids(&self) -> Vec<SourceId> {
-        self.source_storage
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .collect()
-    }
-
-    pub fn contains_audio(&self, id: SourceId) -> bool {
-        self.source_storage.lock().unwrap().contains_key(&id)
-    }
-
-    /// Sets the listener pose (position and orientation) for spatial audio.
-    ///
-    /// The listener represents the position and orientation of the "ears" in the 3D world.
-    /// All spatial audio sources will be spatialized relative to this listener.
-    ///
-    /// If an engine has been connected via `connect_engine_listener`, this automatically
-    /// synchronizes the pose to the engine, ensuring the render thread uses the updated
-    /// position without additional API calls.
-    ///
-    /// # Arguments
-    ///
-    /// * `pose` - The new pose for the listener
-    pub fn set_listener_pose(&self, pose: Pose) {
-        self.listener.lock().unwrap().pose = pose;
-        if let Ok(mut runtime_pose) = self.listener_pose.lock() {
-            *runtime_pose = pose;
-        }
-    }
-
-    /// Returns a copy of the current listener.
-    pub fn listener(&self) -> PetalSonicAudioListener {
-        self.listener.lock().unwrap().clone()
-    }
-
-    /// Updates the configuration for a source (e.g., position, volume).
-    ///
-    /// This is useful for dynamically changing spatial audio properties without
-    /// stopping and restarting playback.
-    ///
-    /// # Arguments
-    ///
-    /// * `audio_id` - SourceId of the audio source to update
-    /// * `config` - New configuration for the source
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the audio source ID is not found or if the command
-    /// fails to send to the audio engine.
-    pub fn update_source_config(&self, audio_id: SourceId, config: SourceConfig) -> Result<()> {
-        if !self.contains_audio(audio_id) {
-            return Err(crate::error::PetalSonicError::Engine(format!(
-                "Audio data with ID {:?} not found",
-                audio_id
-            )));
-        }
-
-        // Update the config in storage
-        self.source_configs
-            .lock()
-            .unwrap()
-            .insert(audio_id, config.clone());
-
-        // Send command to update active playback instance if it exists
-        self.command_sender
-            .send(PlaybackCommand::UpdateConfig(audio_id, config))
-            .map_err(|e| {
-                crate::error::PetalSonicError::Engine(format!(
-                    "Failed to send update config command: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Updates host-provided direct-path data for a spatial source.
-    ///
-    /// This lets applications feed externally computed occlusion / transmission
-    /// into Steam Audio's direct effect stage.
-    pub fn update_source_direct_path_override(
-        &self,
-        audio_id: SourceId,
-        direct_path_override: Option<DirectPathOverride>,
-    ) -> Result<()> {
-        if !self.contains_audio(audio_id) {
-            return Err(crate::error::PetalSonicError::Engine(format!(
-                "Audio data with ID {:?} not found",
-                audio_id
-            )));
-        }
-
-        self.command_sender
-            .send(PlaybackCommand::UpdateDirectPathOverride(
-                audio_id,
-                direct_path_override,
-            ))
-            .map_err(|e| {
-                crate::error::PetalSonicError::Engine(format!(
-                    "Failed to send direct-path override command: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Starts playing an audio source by its SourceId.
-    ///
-    /// Sends a play command to the audio engine thread. The audio will begin playing
-    /// from its current position (or from the beginning if not yet played).
-    ///
-    /// This method looks up the audio data and configuration on the world thread (where
-    /// blocking on locks is acceptable) and sends both to the engine, eliminating the
-    /// need for the engine to call back into world storage during playback processing.
-    ///
-    /// # Arguments
-    ///
-    /// * `audio_id` - SourceId of the audio source to play
-    /// * `loop_mode` - How the audio should loop (Once, Infinite, or Count(n))
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the audio source ID is not found in the world storage
-    /// or if the command fails to send to the audio engine.
-    pub fn play(&self, audio_id: SourceId, loop_mode: LoopMode) -> Result<()> {
-        // Look up source payload on the world thread (blocking is fine here)
-        let source = self
-            .source_storage
-            .lock()
-            .unwrap()
-            .get(&audio_id)
-            .cloned()
-            .ok_or_else(|| {
-                crate::error::PetalSonicError::Engine(format!(
-                    "Audio source with ID {:?} not found",
-                    audio_id
-                ))
-            })?;
-
-        // Get the source config for this audio source
-        let config = self
-            .source_configs
-            .lock()
-            .unwrap()
-            .get(&audio_id)
-            .cloned()
-            .unwrap_or_default();
-
-        // Send command with source payload included - engine no longer needs to call back into world
-        self.command_sender
-            .send(PlaybackCommand::Play(audio_id, source, config, loop_mode))
-            .map_err(|e| {
-                crate::error::PetalSonicError::Engine(format!("Failed to send play command: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Pauses a playing audio source by its SourceId.
-    ///
-    /// Sends a pause command to the audio engine thread. The audio will stop playing
-    /// but retain its current playback position.
-    ///
-    /// # Arguments
-    ///
-    /// * `audio_id` - SourceId of the audio source to pause
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails to send to the audio engine.
-    pub fn pause(&self, audio_id: SourceId) -> Result<()> {
-        self.command_sender
-            .send(PlaybackCommand::Pause(audio_id))
-            .map_err(|e| {
-                crate::error::PetalSonicError::Engine(format!(
-                    "Failed to send pause command: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Stops a playing audio source by its SourceId.
-    ///
-    /// Sends a stop command to the audio engine thread. The audio will stop playing
-    /// and reset its playback position to the beginning.
-    ///
-    /// # Arguments
-    ///
-    /// * `audio_id` - SourceId of the audio source to stop
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails to send to the audio engine.
-    pub fn stop(&self, audio_id: SourceId) -> Result<()> {
-        self.command_sender
-            .send(PlaybackCommand::Stop(audio_id))
-            .map_err(|e| {
-                crate::error::PetalSonicError::Engine(format!("Failed to send stop command: {}", e))
-            })?;
-
-        Ok(())
-    }
-
-    /// Stops all currently playing audio sources.
-    ///
-    /// Sends a stop-all command to the audio engine thread. All active audio playback
-    /// will be stopped and reset.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails to send to the audio engine.
-    pub fn stop_all(&self) -> Result<()> {
-        self.command_sender
-            .send(PlaybackCommand::StopAll)
-            .map_err(|e| {
-                crate::error::PetalSonicError::Engine(format!(
-                    "Failed to send stop all command: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
-    }
-
-    /// Seeks to a specific position in an audio source's playback.
-    ///
-    /// Sends a seek command to the audio engine thread. The playback position will
-    /// be updated to the specified progress value. This works for both playing and
-    /// paused sources.
-    ///
-    /// # Arguments
-    ///
-    /// * `audio_id` - SourceId of the audio source to seek
-    /// * `progress` - Playback progress in range [0.0, 1.0] where 0.0 is the start and 1.0 is the end
-    ///
-    /// # Behavior
-    ///
-    /// - Progress is automatically clamped to [0.0, 1.0]
-    /// - Only affects sources currently in active playback
-    /// - Position is updated immediately on the next audio callback
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command fails to send to the audio engine.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use petalsonic::*;
-    /// # let world = PetalSonicWorld::new(PetalSonicWorldDesc::default()).unwrap();
-    /// # let source_id = SourceId::from(0);
-    /// // Seek to 50% through the audio
-    /// world.seek(source_id, 0.5)?;
-    ///
-    /// // Jump to the beginning
-    /// world.seek(source_id, 0.0)?;
-    ///
-    /// // Jump to near the end
-    /// world.seek(source_id, 0.95)?;
-    /// # Ok::<(), PetalSonicError>(())
-    /// ```
-    pub fn seek(&self, audio_id: SourceId, progress: f32) -> Result<()> {
-        self.command_sender
-            .send(PlaybackCommand::Seek(audio_id, progress))
-            .map_err(|e| {
-                crate::error::PetalSonicError::Engine(format!("Failed to send seek command: {}", e))
-            })?;
-
-        Ok(())
     }
 }
 
@@ -529,98 +517,71 @@ impl Drop for PetalSonicWorld {
     }
 }
 
-/// Represents a 3D audio source in the world.
-///
-/// `PetalSonicAudioSource` contains the spatial properties and state of an audio source.
-/// This struct is primarily used for querying source state rather than direct manipulation.
-/// To update source properties during playback, use [`PetalSonicWorld::update_source_config`].
-///
-/// # Properties
-///
-/// - Position in 3D space (`Vec3`)
-/// - Volume level in decibels (0.0 dB = unity, negative attenuates, positive amplifies)
-pub struct PetalSonicAudioSource {
-    pub(crate) _id: u64,
-    pub(crate) position: Vec3,
-    pub(crate) volume_db: f32,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_data::PetalSonicAudioData;
+    use std::time::Duration;
 
-impl PetalSonicAudioSource {
-    /// Returns the 3D position of the audio source.
-    ///
-    /// # Returns
-    ///
-    /// The position as a `Vec3` (x, y, z coordinates).
-    pub fn position(&self) -> Vec3 {
-        self.position
+    fn clip() -> ResidentClip {
+        ResidentClip::from_audio_data(Arc::new(PetalSonicAudioData::new(
+            vec![0.0; 16],
+            48_000,
+            1,
+            Duration::from_secs_f64(16.0 / 48_000.0),
+        )))
     }
 
-    /// Returns the volume level of the audio source in decibels.
-    ///
-    /// # Returns
-    ///
-    /// Volume in decibels where 0.0 dB is unity, negative values attenuate, and
-    /// positive values amplify.
-    pub fn volume_db(&self) -> f32 {
-        self.volume_db
-    }
-}
+    #[test]
+    fn emitter_registry_rejects_stale_generation_after_slot_reuse() {
+        let mut registry = EmitterRegistry::new(1);
+        let first = registry
+            .insert(EmitterState {
+                clip: clip(),
+                desc: EmitterDesc::default(),
+            })
+            .unwrap();
+        registry.remove(first).unwrap();
+        let second = registry
+            .insert(EmitterState {
+                clip: clip(),
+                desc: EmitterDesc::default(),
+            })
+            .unwrap();
 
-/// Represents the listener (the "ears") in the 3D audio world.
-///
-/// `PetalSonicAudioListener` defines the position and orientation from which all spatial
-/// audio is perceived. In a typical game or application, this would represent the player's
-/// camera or character position.
-///
-/// # Usage
-///
-/// The listener's pose determines how spatial audio sources are spatialized:
-/// - **Position**: Where the listener is located in 3D space
-/// - **Orientation**: Which direction the listener is facing (affects left/right, front/back audio)
-///
-/// Update the listener position using [`PetalSonicWorld::set_listener_pose`] as the player
-/// or camera moves through the world.
-///
-/// # Example
-///
-/// ```no_run
-/// # use petalsonic::*;
-/// # use petalsonic::math::{Pose, Vec3};
-/// # let world = PetalSonicWorld::new(PetalSonicWorldDesc::default()).unwrap();
-/// // Move listener to position (10, 0, 5) facing forward
-/// let pose = Pose::from_position(Vec3::new(10.0, 0.0, 5.0));
-/// world.set_listener_pose(pose);
-/// ```
-#[derive(Clone, Default)]
-pub struct PetalSonicAudioListener {
-    pub(crate) pose: Pose,
-}
-
-impl PetalSonicAudioListener {
-    /// Creates a new audio listener with the given pose.
-    ///
-    /// # Arguments
-    ///
-    /// * `pose` - The initial position and orientation of the listener
-    pub fn new(pose: Pose) -> Self {
-        Self { pose }
+        assert_eq!(first.index, second.index);
+        assert_ne!(first.generation, second.generation);
+        assert!(matches!(
+            registry.get(first),
+            Err(PetalSonicError::StaleEmitter)
+        ));
     }
 
-    /// Returns the current pose (position and orientation) of the listener.
-    ///
-    /// # Returns
-    ///
-    /// The listener's `Pose` containing position and rotation.
-    pub fn pose(&self) -> Pose {
-        self.pose
-    }
-
-    /// Sets the pose (position and orientation) of the listener.
-    ///
-    /// # Arguments
-    ///
-    /// * `pose` - The new pose for the listener
-    pub fn set_pose(&mut self, pose: Pose) {
-        self.pose = pose;
+    #[test]
+    fn emitter_registry_enforces_capacity_and_recovers_after_remove() {
+        let mut registry = EmitterRegistry::new(1);
+        let emitter = registry
+            .insert(EmitterState {
+                clip: clip(),
+                desc: EmitterDesc::default(),
+            })
+            .unwrap();
+        assert!(matches!(
+            registry.insert(EmitterState {
+                clip: clip(),
+                desc: EmitterDesc::default(),
+            }),
+            Err(PetalSonicError::CapacityExceeded {
+                resource: "emitter",
+                limit: 1
+            })
+        ));
+        registry.remove(emitter).unwrap();
+        registry
+            .insert(EmitterState {
+                clip: clip(),
+                desc: EmitterDesc::default(),
+            })
+            .unwrap();
     }
 }

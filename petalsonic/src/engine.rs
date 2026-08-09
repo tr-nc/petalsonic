@@ -1,5 +1,6 @@
 use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::PetalSonicWorldDesc;
+use crate::domain::PlaybackControl;
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
@@ -48,6 +49,7 @@ thread_local! {
 
 const MASTER_HEADROOM_DB: f32 = -6.0;
 const STARTUP_UNDERRUN_GRACE_CALLBACKS: usize = 8;
+const LOGICAL_CHANNELS: u16 = 2;
 
 /// Context for audio callback - groups related parameters to reduce argument count
 ///
@@ -66,6 +68,8 @@ struct AudioCallbackContext {
 
 struct PumpState {
     active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    active_voice_count: Arc<AtomicUsize>,
+    retirement_sender: Sender<SourceId>,
     resampler: Arc<Mutex<StreamingResampler>>,
     /// Producer end of ring buffer - writes pre-rendered audio samples (lock-free)
     ring_buffer_producer: HeapProd<StereoFrame>,
@@ -117,6 +121,8 @@ pub(crate) struct PetalSonicEngine {
     underrun_count: Arc<AtomicUsize>,
     stream_error: Arc<AtomicBool>,
     active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    active_voice_count: Arc<AtomicUsize>,
+    retirement_sender: Sender<SourceId>,
     /// The actual sample rate used by the audio device (may differ from desc.sample_rate)
     device_sample_rate: u32,
     pump_state: Option<Arc<Mutex<PumpState>>>,
@@ -139,7 +145,12 @@ pub(crate) struct PetalSonicEngine {
 
 impl PetalSonicEngine {
     /// Create the internal engine owned by a [`PetalSonicWorld`](crate::PetalSonicWorld).
-    pub(crate) fn new(desc: PetalSonicWorldDesc, listener_pose: Arc<Mutex<Pose>>) -> Result<Self> {
+    pub(crate) fn new(
+        desc: PetalSonicWorldDesc,
+        listener_pose: Arc<Mutex<Pose>>,
+        active_voice_count: Arc<AtomicUsize>,
+        retirement_sender: Sender<SourceId>,
+    ) -> Result<Self> {
         // Initialize spatial processor
         // Use distance_scaler from world configuration (converts world units to meters)
         let spatial_processor = match SpatialProcessor::new(
@@ -167,9 +178,10 @@ impl PetalSonicEngine {
 
         // Event and timing delivery must remain bounded. Saturation is observable via
         // diagnostics in the public world rather than paid for with unbounded memory.
-        let (event_sender, event_receiver) = crossbeam_channel::bounded(512);
+        let (event_sender, event_receiver) = crossbeam_channel::bounded(desc.event_queue_capacity);
 
-        let (timing_sender, timing_receiver) = crossbeam_channel::bounded(512);
+        let (timing_sender, timing_receiver) =
+            crossbeam_channel::bounded(desc.timing_queue_capacity);
 
         let master_headroom_db = MASTER_HEADROOM_DB;
         let master_gain_linear = crate::gain::db_to_linear(master_headroom_db);
@@ -183,6 +195,8 @@ impl PetalSonicEngine {
             underrun_count: Arc::new(AtomicUsize::new(0)),
             stream_error: Arc::new(AtomicBool::new(false)),
             active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active_voice_count,
+            retirement_sender,
             pump_state: None,
             render_thread: None,
             spatial_processor,
@@ -219,8 +233,7 @@ impl PetalSonicEngine {
         );
 
         let buffer_size = Self::select_buffer_size(&device_config);
-        let config =
-            Self::create_stream_config(self.desc.channels, device_sample_rate, buffer_size);
+        let config = Self::create_stream_config(LOGICAL_CHANNELS, device_sample_rate, buffer_size);
 
         self.is_running.store(true, Ordering::Release);
         self.stream_error.store(false, Ordering::Release);
@@ -240,7 +253,7 @@ impl PetalSonicEngine {
                     err
                 );
                 let default_config = Self::create_stream_config(
-                    self.desc.channels,
+                    LOGICAL_CHANNELS,
                     device_sample_rate,
                     cpal::BufferSize::Default,
                 );
@@ -684,7 +697,7 @@ impl PetalSonicEngine {
         let is_running = self.is_running.clone();
         let frames_processed = self.frames_processed.clone();
         let world_sample_rate = self.desc.sample_rate;
-        let channels = self.desc.channels;
+        let channels = LOGICAL_CHANNELS;
         let active_playback = self.active_playback.clone();
         let event_sender = self.event_sender.clone();
         let timing_sender = self.timing_sender.clone();
@@ -867,6 +880,8 @@ impl PetalSonicEngine {
 
         let pump_state = Arc::new(Mutex::new(PumpState {
             active_playback: params.active_playback.clone(),
+            active_voice_count: self.active_voice_count.clone(),
+            retirement_sender: self.retirement_sender.clone(),
             resampler: resampler.clone(),
             ring_buffer_producer: producer,
             channels: params.channels,
@@ -929,7 +944,11 @@ impl PetalSonicEngine {
             log::error!("Failed to update listener pose: {}", e);
         }
 
-        Self::process_playback_commands(&ctx.command_receiver, &ctx.active_playback);
+        Self::process_playback_commands(
+            &ctx.command_receiver,
+            &ctx.active_playback,
+            &ctx.active_voice_count,
+        );
 
         let occupied = ctx.ring_buffer_producer.occupied_len();
         if occupied >= target_occupancy {
@@ -953,7 +972,7 @@ impl PetalSonicEngine {
             return;
         }
 
-        let (completed_sources, looped_sources, timing) = Self::generate_samples(
+        let (completed_playbacks, _looped_sources, timing) = Self::generate_samples(
             &mut ctx.ring_buffer_producer,
             samples_to_generate,
             ctx.channels as usize,
@@ -967,17 +986,21 @@ impl PetalSonicEngine {
 
         let _ = ctx.timing_sender.try_send(timing);
 
-        for source_id in completed_sources {
-            let _ = ctx
-                .event_sender
-                .try_send(PetalSonicEvent::SourceCompleted { source_id });
-        }
-
-        for source_id in looped_sources {
-            let _ = ctx.event_sender.try_send(PetalSonicEvent::SourceLooped {
-                source_id,
-                loop_count: 0,
-            });
+        ctx.active_voice_count
+            .fetch_sub(completed_playbacks.len(), Ordering::AcqRel);
+        for completed in completed_playbacks {
+            if let Some(tag) = completed.completion_tag {
+                let _ = ctx.retirement_sender.try_send(completed.voice_id);
+                let _ = ctx
+                    .event_sender
+                    .try_send(PetalSonicEvent::PlaybackCompleted {
+                        emitter: completed.emitter,
+                        control: PlaybackControl {
+                            voice_id: completed.voice_id,
+                        },
+                        tag,
+                    });
+            }
         }
     }
 
@@ -1079,6 +1102,7 @@ impl PetalSonicEngine {
     fn process_playback_commands(
         command_receiver: &Receiver<PlaybackCommand>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
+        active_voice_count: &Arc<AtomicUsize>,
     ) {
         // Important real-time rule:
         // - Never dequeue a command unless we *already* hold the active_playback lock.
@@ -1092,98 +1116,85 @@ impl PetalSonicEngine {
 
         while let Ok(command) = command_receiver.try_recv() {
             match command {
-                PlaybackCommand::Play(audio_id, source, config, loop_mode) => {
-                    log::debug!(
-                        "Engine: Received Play command for source {} (loop mode: {:?})",
-                        audio_id,
-                        loop_mode
+                PlaybackCommand::Play {
+                    voice_id,
+                    emitter,
+                    source,
+                    config,
+                    loop_mode,
+                    detached,
+                    completion_tag,
+                } => {
+                    let mut instance = PlaybackInstance::from_source(
+                        voice_id,
+                        emitter,
+                        source,
+                        config,
+                        loop_mode,
+                        detached,
+                        completion_tag,
                     );
-
-                    // Audio data is now passed directly in the command - no need to call back into world
-                    let instance = active_playback.entry(audio_id).or_insert_with(|| {
-                        log::debug!(
-                            "Engine: Creating new PlaybackInstance for source {}",
-                            audio_id
-                        );
-                        PlaybackInstance::from_source(
-                            audio_id,
-                            source.clone(),
-                            config.clone(),
-                            loop_mode,
-                        )
-                    });
-
-                    // Always update config and loop_mode when playing
-                    instance.config = config;
-                    instance.set_loop_mode(loop_mode);
                     instance.play_from_beginning();
+                    if active_playback.insert(voice_id, instance).is_some() {
+                        active_voice_count.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
-                PlaybackCommand::Pause(audio_id) => {
-                    log::debug!("Engine: Received Pause command for source {}", audio_id);
-                    if let Some(instance) = active_playback.get_mut(&audio_id) {
+                PlaybackCommand::PauseVoice(voice_id) => {
+                    if let Some(instance) = active_playback.get_mut(&voice_id) {
                         instance.pause();
-                    } else {
-                        log::warn!(
-                            "Engine: Cannot pause, source {} not in active playback",
-                            audio_id
-                        );
                     }
                 }
-                PlaybackCommand::Stop(audio_id) => {
-                    log::debug!("Engine: Received Stop command for source {}", audio_id);
-                    if active_playback.remove(&audio_id).is_some() {
-                        log::debug!("Engine: Removed source {} from active playback", audio_id);
-                    } else {
-                        log::warn!(
-                            "Engine: Cannot stop, source {} not in active playback",
-                            audio_id
-                        );
+                PlaybackCommand::StopVoice(voice_id) => {
+                    if active_playback.remove(&voice_id).is_some() {
+                        active_voice_count.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
-                PlaybackCommand::UpdateConfig(audio_id, config) => {
-                    log::debug!(
-                        "Engine: Received UpdateConfig command for source {}",
-                        audio_id
-                    );
-                    if let Some(instance) = active_playback.get_mut(&audio_id) {
-                        instance.config = config;
-                    } else {
-                        log::warn!(
-                            "Engine: Cannot update config, source {} not in active playback",
-                            audio_id
-                        );
-                    }
-                }
-                PlaybackCommand::UpdateDirectPathOverride(audio_id, direct_path_override) => {
-                    log::debug!(
-                        "Engine: Received UpdateDirectPathOverride command for source {}",
-                        audio_id
-                    );
-                    if let Some(instance) = active_playback.get_mut(&audio_id) {
-                        instance.direct_path_override = direct_path_override;
-                    } else {
-                        log::warn!(
-                            "Engine: Cannot update direct-path override, source {} not in active playback",
-                            audio_id
-                        );
-                    }
-                }
-                PlaybackCommand::Seek(audio_id, progress) => {
-                    log::debug!(
-                        "Engine: Received Seek command for source {} to {:.2}%",
-                        audio_id,
-                        progress * 100.0
-                    );
-                    if let Some(instance) = active_playback.get_mut(&audio_id) {
+                PlaybackCommand::SeekVoice(voice_id, progress) => {
+                    if let Some(instance) = active_playback.get_mut(&voice_id) {
                         instance.seek(progress);
-                    } else {
-                        log::warn!(
-                            "Engine: Cannot seek, source {} not in active playback",
-                            audio_id
-                        );
+                    }
+                }
+                PlaybackCommand::PauseEmitter(emitter) => {
+                    for instance in active_playback.values_mut() {
+                        if instance.emitter == emitter {
+                            instance.pause();
+                        }
+                    }
+                }
+                PlaybackCommand::StopEmitter(emitter) => {
+                    let before = active_playback.len();
+                    active_playback.retain(|_, instance| instance.emitter != emitter);
+                    active_voice_count.fetch_sub(before - active_playback.len(), Ordering::AcqRel);
+                }
+                PlaybackCommand::SeekEmitter(emitter, progress) => {
+                    for instance in active_playback.values_mut() {
+                        if instance.emitter == emitter {
+                            instance.seek(progress);
+                        }
+                    }
+                }
+                PlaybackCommand::DestroyEmitter(emitter) => {
+                    let before = active_playback.len();
+                    active_playback
+                        .retain(|_, instance| instance.emitter != emitter || instance.detached);
+                    active_voice_count.fetch_sub(before - active_playback.len(), Ordering::AcqRel);
+                }
+                PlaybackCommand::UpdateEmitter(emitter, config) => {
+                    for instance in active_playback.values_mut() {
+                        if instance.emitter == emitter && !instance.detached {
+                            instance.config = config.clone();
+                        }
+                    }
+                }
+                PlaybackCommand::UpdateDirectPathOverride(emitter, direct_path_override) => {
+                    for instance in active_playback.values_mut() {
+                        if instance.emitter == emitter && !instance.detached {
+                            instance.direct_path_override = direct_path_override;
+                        }
                     }
                 }
                 PlaybackCommand::StopAll => {
+                    active_voice_count.fetch_sub(active_playback.len(), Ordering::AcqRel);
                     active_playback.clear();
                 }
             }
@@ -1191,7 +1202,7 @@ impl PetalSonicEngine {
     }
 
     /// Generate resampled samples and push to ring buffer
-    /// Returns a tuple of (completed_sources, looped_sources, timing_event)
+    /// Returns completed voices, loop notifications, and timing data.
     #[allow(clippy::too_many_arguments)] // All parameters are necessary for this complex function
     fn generate_samples(
         producer: &mut impl Producer<Item = StereoFrame>,
@@ -1203,7 +1214,11 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         block_size: usize,
         spatial_processor: Option<&Arc<Mutex<SpatialProcessor>>>,
-    ) -> (Vec<SourceId>, Vec<SourceId>, RenderTimingEvent) {
+    ) -> (
+        Vec<mixer::CompletedPlayback>,
+        Vec<SourceId>,
+        RenderTimingEvent,
+    ) {
         let total_start = Instant::now();
         let mut total_mixing_time_us = 0u64;
         let mut total_spatial_time_us = 0u64;
@@ -1242,7 +1257,7 @@ impl PetalSonicEngine {
         };
 
         // Track all completed and looped sources across all mixing iterations
-        let mut all_completed_sources = Vec::new();
+        let mut all_completed_playbacks = Vec::new();
         let mut all_looped_sources = Vec::new();
 
         // Generate samples in fixed world block_size chunks, output is variable
@@ -1276,7 +1291,7 @@ impl PetalSonicEngine {
                 let mixing_elapsed = mixing_start.elapsed();
 
                 // Collect completed and looped sources for event emission
-                all_completed_sources.extend(mix_result.completed_sources);
+                all_completed_playbacks.extend(mix_result.completed_playbacks);
                 all_looped_sources.extend(mix_result.looped_sources);
 
                 // Capture coarse mixing time plus the detailed stage breakdown reported by the mixer
@@ -1360,7 +1375,7 @@ impl PetalSonicEngine {
         let total_elapsed = total_start.elapsed();
 
         (
-            all_completed_sources,
+            all_completed_playbacks,
             all_looped_sources,
             RenderTimingEvent {
                 mixing_time_us: total_mixing_time_us,
@@ -1428,7 +1443,7 @@ mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::SourceConfig;
-    use crate::playback::{LoopMode, PlaybackSource};
+    use crate::playback::LoopMode;
 
     #[test]
     fn alsa_card_alias_parser_extracts_card_id_and_display_names() {
@@ -1485,13 +1500,20 @@ mod tests {
         ));
 
         let (command_sender, command_receiver) = crossbeam_channel::bounded(8);
+        let emitter = crate::domain::Emitter {
+            index: 0,
+            generation: 1,
+        };
         command_sender
-            .try_send(PlaybackCommand::Play(
-                source_id,
-                PlaybackSource::Static(clip),
-                SourceConfig::non_spatial(),
-                LoopMode::Infinite,
-            ))
+            .try_send(PlaybackCommand::Play {
+                voice_id: source_id,
+                emitter,
+                source: clip,
+                config: SourceConfig::non_spatial(),
+                loop_mode: LoopMode::Infinite,
+                detached: false,
+                completion_tag: None,
+            })
             .unwrap();
 
         let ring_buffer = HeapRb::<StereoFrame>::new(block_size * 8);
@@ -1500,6 +1522,8 @@ mod tests {
         let (timing_sender, _timing_receiver) = crossbeam_channel::bounded(8);
         let pump_state = Arc::new(Mutex::new(PumpState {
             active_playback: Arc::new(Mutex::new(HashMap::new())),
+            active_voice_count: Arc::new(AtomicUsize::new(1)),
+            retirement_sender: crossbeam_channel::bounded(8).0,
             resampler: PetalSonicEngine::create_resampler(sample_rate, sample_rate, 2, block_size)
                 .unwrap(),
             ring_buffer_producer: producer,
@@ -1535,5 +1559,48 @@ mod tests {
             .expect("render thread produced no frames");
         assert!(rendered.left > 0.0);
         assert!(rendered.right > 0.0);
+    }
+
+    #[test]
+    fn emitter_supports_overlapping_voices_and_detached_destroy_semantics() {
+        let emitter = crate::domain::Emitter {
+            index: 4,
+            generation: 2,
+        };
+        let clip = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; 32],
+            48_000,
+            1,
+            Duration::from_secs_f64(32.0 / 48_000.0),
+        ));
+        let (sender, receiver) = crossbeam_channel::bounded(8);
+        for (voice, detached) in [(SourceId::from(10), false), (SourceId::from(11), true)] {
+            sender
+                .try_send(PlaybackCommand::Play {
+                    voice_id: voice,
+                    emitter,
+                    source: clip.clone(),
+                    config: SourceConfig::non_spatial(),
+                    loop_mode: LoopMode::Infinite,
+                    detached,
+                    completion_tag: None,
+                })
+                .unwrap();
+        }
+
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let active_count = Arc::new(AtomicUsize::new(2));
+        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count);
+        assert_eq!(active.lock().unwrap().len(), 2);
+
+        sender
+            .try_send(PlaybackCommand::DestroyEmitter(emitter))
+            .unwrap();
+        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count);
+
+        let active = active.lock().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active.values().next().unwrap().detached);
+        assert_eq!(active_count.load(Ordering::Acquire), 1);
     }
 }

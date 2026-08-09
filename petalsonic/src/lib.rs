@@ -18,38 +18,30 @@
 //! // Creating the world also starts its private render runtime.
 //! let world = PetalSonicWorld::new(config)?;
 //!
-//! // Load audio data
-//! let audio_data = audio_data::PetalSonicAudioData::from_path("audio.wav")?;
+//! // Load immutable, resident PCM and bind it to an emitter.
+//! let clip = ResidentClip::from_path("audio.wav")?;
 //!
-//! // Register audio with spatial configuration
-//! let source_id = world.register_audio(
-//!     audio_data,
-//!     SourceConfig::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
+//! let emitter = world.create_emitter(
+//!     clip,
+//!     EmitterDesc::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
 //! )?;
 //!
-//! // Play the audio
-//! world.play(source_id, playback::LoopMode::Once)?;
+//! // Simple playback creates and reclaims its Voice internally.
+//! world.play(emitter, PlayOptions::once())?;
 //!
 //! // Update listener position as your camera/player moves
 //! world.set_listener_pose(Pose::from_position(Vec3::new(0.0, 0.0, 0.0)));
 //!
-//! // Poll for events
-//! for event in world.drain_events() {
-//!     match event {
-//!         PetalSonicEvent::SourceCompleted { source_id } => {
-//!             println!("Audio completed: {:?}", source_id);
-//!         }
-//!         _ => {}
-//!     }
-//! }
+//! // Pull events on the caller thread when controlled playback is used.
+//! let _events = world.drain_events();
 //! # Ok::<(), PetalSonicError>(())
 //! ```
 //!
 //! ## Key Components
 //!
 //! - **[`PetalSonicWorld`]**: Main API for managing audio sources and playback on the main thread
-//! - **[`SourceConfig`]**: Configuration for spatial vs. non-spatial audio sources
-//! - **[`PetalSonicAudioData`](audio_data::PetalSonicAudioData)**: Audio data loaded from files
+//! - **[`Emitter`]**: Opaque, generational handle for a logical sound emitter
+//! - **[`ResidentClip`]**: Immutable, predecoded PCM shared by playback voices
 //! - **[`PetalSonicEvent`]**: Events emitted by the engine (completion, errors, etc.)
 //!
 //! ## Architecture
@@ -75,33 +67,31 @@
 pub mod acoustics;
 pub mod audio_data;
 pub mod config;
+mod domain;
 mod engine;
 pub mod error;
 pub mod events;
 pub mod gain;
 pub mod math;
-pub mod mixer;
-pub mod playback;
-pub mod procedural;
+mod mixer;
+mod playback;
 pub mod spatial;
-pub mod world;
+mod world;
 
 pub use acoustics::{
     AcousticHit, AcousticMaterial, AcousticRay, BatchedAnyHitRayTracer, BatchedClosestHitRayTracer,
 };
-pub use config::{
-    AmbisonicsBackend, DirectPathBackend, HrtfBackend, PetalSonicWorldDesc, SourceConfig,
-};
+pub use config::PetalSonicWorldDesc;
+pub use domain::{Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip};
 pub use engine::AudioOutputDeviceInfo;
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent};
 pub use gain::{db_to_linear, linear_to_db};
-pub use playback::{PlayState, PlaybackCommand, PlaybackInfo, PlaybackInstance};
-pub use procedural::{ProceduralAudioFactory, ProceduralAudioSource};
+pub use playback::LoopMode;
 pub use spatial::{
     DEFAULT_NATIVE_AMBISONICS_ORDER, DirectOcclusionDebugSnapshot, DirectPathOverride,
     DirectPathTransmission, NativeAmbisonicsBinauralDecoder, NativeAmbisonicsBinauralState,
     NativeAmbisonicsEncoder, NativeHrtfDirection, NativeHrtfRenderMetrics, NativeHrtfRenderer,
     NativeHrtfSourceState, NativeHrtfTable, native_ambisonics_channel_count,
 };
-pub use world::{PetalSonicAudioListener, PetalSonicAudioSource, PetalSonicWorld, SourceId};
+pub use world::PetalSonicWorld;

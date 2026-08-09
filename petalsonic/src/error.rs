@@ -4,6 +4,27 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum PetalSonicError {
+    #[error("Invalid configuration for {field}: {reason}")]
+    InvalidConfiguration { field: &'static str, reason: String },
+
+    #[error("{resource} capacity exceeded (limit {limit})")]
+    CapacityExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+
+    #[error("Audio control queue is full; retry on a later game update")]
+    QueuePressure,
+
+    #[error("Emitter handle is stale")]
+    StaleEmitter,
+
+    #[error("Playback control is stale")]
+    StalePlayback,
+
+    #[error("Audio runtime is closed")]
+    RuntimeClosed,
+
     #[error("Audio device error: {0}")]
     AudioDevice(String),
 

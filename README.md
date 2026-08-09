@@ -26,12 +26,12 @@ fn main() -> Result<(), PetalSonicError> {
     let world = PetalSonicWorld::new(config)?;
 
     // Load and play a 3D positioned sound
-    let audio = audio_data::PetalSonicAudioData::from_path("sound.wav")?;
-    let source_id = world.register_audio(
-        audio,
-        SourceConfig::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
+    let clip = ResidentClip::from_path("sound.wav")?;
+    let emitter = world.create_emitter(
+        clip,
+        EmitterDesc::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
     )?;
-    world.play(source_id, playback::LoopMode::Once)?;
+    world.play(emitter, PlayOptions::once())?;
 
     // Update listener position in your game loop
     world.set_listener_pose(Pose::from_position(Vec3::ZERO));
@@ -115,13 +115,12 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 ```plaintext
 ┌──────────────────────────────────────────────────────────────┐
 │ Main Thread (World)                                          │
-│ - register_audio(audio_data, SourceConfig)                   │
-│   * SourceConfig::NonSpatial                                 │
-│   * SourceConfig::Spatial { position, volume, ... }          │
+│ - create_emitter(ResidentClip, EmitterDesc)                  │
+│ - play(emitter, PlayOptions)                                 │
 │ - set_listener_pose(pose)                                    │
 │ - send PlaybackCommand via channel                           │
 └──────────────────────────────────────────────────────────────┘
-                             ↓ PlaybackCommand + SourceConfig
+                             ↓ bounded control intent
 ┌──────────────────────────────────────────────────────────────┐
 │ Render Thread (generates samples at world rate)              │
 │ - Process PlaybackCommand                                    │
@@ -142,7 +141,7 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 
 - **Coexistence**: Spatial and non-spatial sources work together in the same world
 - **World-owned render thread**: Creating a world starts audio progress; callers never pump it
-- **Per-source spatial mode**: Each source has `SourceConfig` to determine processing path
+- **Emitter/Voice split**: Callers manage stable Emitters; playback Voices are internal
 - **World-level listener**: Single global listener pose for all spatial sources
 - **Lock-free ring buffer**: Bridges fixed-size render blocks to variable-size device callbacks
 - **Real-time safety**: No allocations or locks in the audio callback path

@@ -1,14 +1,12 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use petalsonic::{
-    RenderTimingEvent, SourceConfig,
+    Emitter, EmitterDesc, LoopMode, PetalSonicWorld, PlayOptions, PlaybackControl, PlaybackTag,
+    RenderTimingEvent, ResidentClip,
     audio_data::PetalSonicAudioData,
     config::PetalSonicWorldDesc,
     math::{Pose, Quat, Vec3},
-    playback::LoopMode,
-    world::{PetalSonicWorld, SourceId},
 };
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use super::profiling;
 
@@ -98,7 +96,8 @@ enum SourceType {
 
 #[derive(Clone)]
 struct SpatialAudioSource {
-    id: SourceId,
+    id: Emitter,
+    playback: PlaybackControl,
     position: Vec3,
     file_name: String,
     loop_mode: LoopMode,
@@ -108,7 +107,8 @@ struct SpatialAudioSource {
 
 #[derive(Clone)]
 struct NonSpatialAudioSource {
-    id: SourceId,
+    id: Emitter,
+    playback: PlaybackControl,
     file_name: String,
     loop_mode: LoopMode,
     /// Volume in decibels for this non-spatial source.
@@ -116,7 +116,7 @@ struct NonSpatialAudioSource {
 }
 
 pub struct SpatialAudioDemo {
-    world: Arc<PetalSonicWorld>,
+    world: PetalSonicWorld,
     spatial_sources: Vec<SpatialAudioSource>,
     non_spatial_sources: Vec<NonSpatialAudioSource>,
     grid_size: f32,
@@ -145,6 +145,7 @@ pub struct SpatialAudioDemo {
     timing_history: VecDeque<RenderTimingEvent>,
     max_history_size: usize,
     max_frame_time_us: u64, // Hard constraint: block_size / sample_rate in microseconds
+    next_playback_tag: u64,
 }
 
 impl SpatialAudioDemo {
@@ -178,8 +179,6 @@ impl SpatialAudioDemo {
         let listener_pose = Pose::new(Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY);
         world.set_listener_pose(listener_pose);
 
-        let world_arc = Arc::new(world);
-
         // Calculate maximum frame time constraint (block_size / sample_rate)
         //
         // This is the hard real-time constraint for audio processing:
@@ -205,7 +204,7 @@ impl SpatialAudioDemo {
         );
 
         Self {
-            world: world_arc,
+            world,
             spatial_sources: Vec::new(),
             non_spatial_sources: Vec::new(),
             grid_size: 2.0,                             // Show 4m x 4m area (-2 to +2)
@@ -226,6 +225,7 @@ impl SpatialAudioDemo {
             timing_history: VecDeque::with_capacity(100),
             max_history_size: 100,
             max_frame_time_us,
+            next_playback_tag: 0,
         }
     }
 
@@ -595,11 +595,9 @@ impl SpatialAudioDemo {
             if let Some(source) = self.spatial_sources.get_mut(idx) {
                 source.position = clamped_pos;
                 // Preserve current volume in dB when moving the source.
-                let new_config = SourceConfig::spatial_from_position_with_volume_db(
-                    clamped_pos,
-                    source.volume_db,
-                );
-                if let Err(e) = self.world.update_source_config(source.id, new_config) {
+                let new_desc = EmitterDesc::spatial(Pose::from_position(clamped_pos))
+                    .with_gain_db(source.volume_db);
+                if let Err(e) = self.world.update_emitter(source.id, new_desc) {
                     log::error!("Failed to update source config: {}", e);
                 }
             }
@@ -618,12 +616,18 @@ impl SpatialAudioDemo {
         }
     }
 
+    fn next_tag(&mut self) -> PlaybackTag {
+        let tag = PlaybackTag(self.next_playback_tag);
+        self.next_playback_tag = self.next_playback_tag.wrapping_add(1);
+        tag
+    }
+
     fn add_spatial_source_at_position(&mut self, position: Vec3) -> Result<(), String> {
         if self.available_audio_files.is_empty() {
             return Err("No audio files available".to_string());
         }
 
-        let file_name = &self.available_audio_files[self.selected_audio_file_index];
+        let file_name = self.available_audio_files[self.selected_audio_file_index].clone();
         let file_path = format!("petalsonic-demo/asset/sound/{}", file_name);
 
         log::info!("GUI: Loading spatial audio file: {}", file_path);
@@ -639,12 +643,11 @@ impl SpatialAudioDemo {
 
         let source_id = self
             .world
-            .register_audio(
-                audio_data,
-                // Start spatial sources at 0 dB (unity gain).
-                SourceConfig::spatial_from_position_with_volume_db(position, 0.0),
+            .create_emitter(
+                ResidentClip::from_audio_data(audio_data),
+                EmitterDesc::spatial(Pose::from_position(position)),
             )
-            .map_err(|e| format!("Failed to register audio in world: {}", e))?;
+            .map_err(|e| format!("Failed to create emitter: {}", e))?;
 
         log::debug!("GUI: Audio registered with source ID: {}", source_id);
 
@@ -661,8 +664,14 @@ impl SpatialAudioDemo {
             loop_mode
         );
 
-        self.world
-            .play(source_id, loop_mode)
+        let options = match loop_mode {
+            LoopMode::Once => PlayOptions::once(),
+            LoopMode::Infinite => PlayOptions::looping(),
+        };
+        let tag = self.next_tag();
+        let playback = self
+            .world
+            .play_controlled(source_id, options, tag)
             .map_err(|e| format!("Failed to start playback: {}", e))?;
 
         // Apply initial progress if set to non-zero
@@ -673,12 +682,13 @@ impl SpatialAudioDemo {
                 self.initial_progress * 100.0
             );
             self.world
-                .seek(source_id, self.initial_progress)
+                .seek_playback(playback, self.initial_progress)
                 .map_err(|e| format!("Failed to seek to initial progress: {}", e))?;
         }
 
         self.spatial_sources.push(SpatialAudioSource {
             id: source_id,
+            playback,
             position,
             file_name: file_name.clone(),
             loop_mode,
@@ -702,7 +712,7 @@ impl SpatialAudioDemo {
             return Err("No audio files available".to_string());
         }
 
-        let file_name = &self.available_audio_files[self.selected_audio_file_index];
+        let file_name = self.available_audio_files[self.selected_audio_file_index].clone();
         let file_path = format!("petalsonic-demo/asset/sound/{}", file_name);
 
         log::info!("GUI: Loading non-spatial audio file: {}", file_path);
@@ -718,8 +728,11 @@ impl SpatialAudioDemo {
 
         let source_id = self
             .world
-            .register_audio(audio_data, SourceConfig::non_spatial())
-            .map_err(|e| format!("Failed to register audio in world: {}", e))?;
+            .create_emitter(
+                ResidentClip::from_audio_data(audio_data),
+                EmitterDesc::non_spatial(),
+            )
+            .map_err(|e| format!("Failed to create emitter: {}", e))?;
 
         log::debug!("GUI: Audio registered with source ID: {}", source_id);
 
@@ -735,8 +748,14 @@ impl SpatialAudioDemo {
             loop_mode
         );
 
-        self.world
-            .play(source_id, loop_mode)
+        let options = match loop_mode {
+            LoopMode::Once => PlayOptions::once(),
+            LoopMode::Infinite => PlayOptions::looping(),
+        };
+        let tag = self.next_tag();
+        let playback = self
+            .world
+            .play_controlled(source_id, options, tag)
             .map_err(|e| format!("Failed to start playback: {}", e))?;
 
         // Apply initial progress if set to non-zero
@@ -747,12 +766,13 @@ impl SpatialAudioDemo {
                 self.initial_progress * 100.0
             );
             self.world
-                .seek(source_id, self.initial_progress)
+                .seek_playback(playback, self.initial_progress)
                 .map_err(|e| format!("Failed to seek to initial progress: {}", e))?;
         }
 
         self.non_spatial_sources.push(NonSpatialAudioSource {
             id: source_id,
+            playback,
             file_name: file_name.clone(),
             loop_mode,
             volume_db: 0.0,
@@ -772,12 +792,14 @@ impl SpatialAudioDemo {
     /// # Arguments
     /// * `source_id` - The source to delete
     /// * `should_stop` - Whether to send a stop command (false if already stopped/completed)
-    fn delete_source(&mut self, source_id: SourceId, should_stop: bool) {
+    fn delete_source(&mut self, source_id: Emitter, should_stop: bool) {
         log::info!("GUI: Deleting source {}", source_id);
+        let mut playback = None;
 
         // Remove from spatial sources list if present
         if let Some(pos) = self.spatial_sources.iter().position(|s| s.id == source_id) {
             let source = self.spatial_sources.remove(pos);
+            playback = Some(source.playback);
             log::info!(
                 "GUI: Removed spatial source '{}' at position {:?}",
                 source.file_name,
@@ -792,16 +814,21 @@ impl SpatialAudioDemo {
             .position(|s| s.id == source_id)
         {
             let source = self.non_spatial_sources.remove(pos);
+            playback = Some(source.playback);
             log::info!("GUI: Removed non-spatial source '{}'", source.file_name);
         }
 
         // Only stop playback if explicitly requested (not for naturally completed sources)
-        if should_stop && let Err(e) = self.world.stop(source_id) {
-            log::warn!("Failed to stop source {}: {}", source_id, e);
+        if should_stop
+            && let Some(playback) = playback
+            && let Err(e) = self.world.stop_playback(playback)
+        {
+            log::warn!("Failed to stop playback for {}: {}", source_id, e);
         }
 
-        // Remove from world storage to free memory
-        self.world.remove_audio_data(source_id);
+        if let Err(e) = self.world.destroy_emitter(source_id) {
+            log::warn!("Failed to destroy {}: {}", source_id, e);
+        }
     }
 }
 
@@ -816,30 +843,14 @@ impl eframe::App for SpatialAudioDemo {
 
         for event in events {
             match event {
-                petalsonic::PetalSonicEvent::SourceCompleted { source_id } => {
+                petalsonic::PetalSonicEvent::PlaybackCompleted { emitter, .. } => {
                     log::info!(
                         "GUI: Source {} completed, removing from UI and world storage",
-                        source_id
+                        emitter
                     );
 
                     // Source already stopped by mixer, don't send stop command
-                    self.delete_source(source_id, false);
-                }
-                petalsonic::PetalSonicEvent::SourceLooped {
-                    source_id,
-                    loop_count,
-                } => {
-                    // Infinite looping sources emit this event each time they loop
-                    // They continue playing, so we don't remove them
-                    log::info!(
-                        "GUI: Source {} looped (count: {}), continuing playback",
-                        source_id,
-                        loop_count
-                    );
-                }
-                _ => {
-                    // Handle other events if needed
-                    log::debug!("GUI: Received event: {:?}", event);
+                    self.delete_source(emitter, false);
                 }
             }
         }
@@ -1057,9 +1068,9 @@ impl eframe::App for SpatialAudioDemo {
                         ))
                         .id_salt("spatial_sources_list")
                         .show(ui, |ui| {
-                            let mut source_to_delete: Option<SourceId> = None;
+                            let mut source_to_delete: Option<Emitter> = None;
                             // Store new volumes in dB for each non-spatial source.
-                            let mut volume_changes: Vec<(SourceId, f32)> = Vec::new();
+                            let mut volume_changes: Vec<(Emitter, f32)> = Vec::new();
 
                             egui::ScrollArea::vertical()
                                 .max_height(200.0)
@@ -1124,14 +1135,10 @@ impl eframe::App for SpatialAudioDemo {
                                     self.spatial_sources.iter_mut().find(|s| s.id == source_id)
                                 {
                                     source.volume_db = new_volume_db;
-                                    let new_config =
-                                        SourceConfig::spatial_from_position_with_volume_db(
-                                            source.position,
-                                            new_volume_db,
-                                        );
-                                    if let Err(e) =
-                                        self.world.update_source_config(source_id, new_config)
-                                    {
+                                    let new_desc =
+                                        EmitterDesc::spatial(Pose::from_position(source.position))
+                                            .with_gain_db(new_volume_db);
+                                    if let Err(e) = self.world.update_emitter(source_id, new_desc) {
                                         log::error!(
                                             "Failed to update volume for source {}: {}",
                                             source_id,
@@ -1157,8 +1164,8 @@ impl eframe::App for SpatialAudioDemo {
                         ))
                         .id_salt("non_spatial_sources_list")
                         .show(ui, |ui| {
-                            let mut source_to_delete: Option<SourceId> = None;
-                            let mut volume_changes: Vec<(SourceId, f32)> = Vec::new();
+                            let mut source_to_delete: Option<Emitter> = None;
+                            let mut volume_changes: Vec<(Emitter, f32)> = Vec::new();
 
                             egui::ScrollArea::vertical()
                                 .max_height(200.0)
@@ -1222,11 +1229,9 @@ impl eframe::App for SpatialAudioDemo {
                                     .find(|s| s.id == source_id)
                                 {
                                     source.volume_db = new_volume_db;
-                                    let new_config =
-                                        SourceConfig::non_spatial_with_volume_db(new_volume_db);
-                                    if let Err(e) =
-                                        self.world.update_source_config(source_id, new_config)
-                                    {
+                                    let new_desc =
+                                        EmitterDesc::non_spatial().with_gain_db(new_volume_db);
+                                    if let Err(e) = self.world.update_emitter(source_id, new_desc) {
                                         log::error!(
                                             "Failed to update volume for source {}: {}",
                                             source_id,

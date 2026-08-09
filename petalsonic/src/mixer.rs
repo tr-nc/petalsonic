@@ -12,9 +12,15 @@ use std::time::Instant;
 
 /// Result of mixing - contains both the number of frames and loop events
 pub struct MixResult {
-    pub frames_filled: usize,
-    pub completed_sources: Vec<SourceId>,
+    pub completed_playbacks: Vec<CompletedPlayback>,
     pub looped_sources: Vec<SourceId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompletedPlayback {
+    pub voice_id: SourceId,
+    pub emitter: crate::domain::Emitter,
+    pub completion_tag: Option<crate::domain::PlaybackTag>,
 }
 
 /// Per-frame timing breakdown emitted by the mixer.
@@ -25,34 +31,7 @@ pub struct MixProfilingSummary {
     pub spatial_metrics: Option<SpatialProcessingMetrics>,
 }
 
-/// Mix all active playback instances into the buffer
-/// Returns MixResult containing:
-/// - The number of frames filled
-/// - Vector of source IDs that completed (LoopMode::Once finished)
-/// - Vector of source IDs that looped (LoopMode::Infinite completed one iteration)
-///
-/// # Arguments
-/// * `world_buffer` - Output buffer to fill with mixed audio
-/// * `channels` - Number of audio channels (typically 2 for stereo)
-/// * `active_playback` - Map of active playback instances
-/// * `spatial_processor` - Optional spatial processor for 3D audio
-///
-/// # Loop Event Detection
-///
-/// All loop modes emit events when reaching the end of playback:
-/// - `LoopMode::Once`: Emits `SourceCompleted`, stops playing, removed from active_playback
-/// - `LoopMode::Infinite`: Emits `SourceLooped`, continues playing (loops automatically)
-pub fn mix_playback_instances(
-    world_buffer: &mut [f32],
-    channels: u16,
-    active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
-    spatial_processor: Option<&mut SpatialProcessor>,
-) -> MixResult {
-    mix_playback_instances_with_metrics(world_buffer, channels, active_playback, spatial_processor)
-        .0
-}
-
-/// Same as [`mix_playback_instances`] but also returns timing metrics used for profiling.
+/// Mixes all active voices and returns completion plus bounded timing summaries.
 pub fn mix_playback_instances_with_metrics(
     world_buffer: &mut [f32],
     channels: u16,
@@ -63,8 +42,7 @@ pub fn mix_playback_instances_with_metrics(
         log::debug!("Failed to acquire active playback lock in mixer");
         return (
             MixResult {
-                frames_filled: 0,
-                completed_sources: Vec::new(),
+                completed_playbacks: Vec::new(),
                 looped_sources: Vec::new(),
             },
             MixProfilingSummary::default(),
@@ -92,12 +70,11 @@ pub fn mix_playback_instances_with_metrics(
         }
 
         log::debug!(
-            "Mixer: Processing source {} - frame {}/{} (spatial: {}, procedural: {})",
+            "Mixer: Processing source {} - frame {}/{} (spatial: {})",
             source_id,
             instance.info.current_frame,
             instance.total_frames(),
-            instance.config.is_spatial(),
-            instance.is_procedural()
+            instance.config.is_spatial()
         );
 
         if instance.config.is_spatial() {
@@ -107,15 +84,12 @@ pub fn mix_playback_instances_with_metrics(
         }
     }
 
-    let mut frames_filled_max = 0;
-
     let mut profiling = MixProfilingSummary::default();
 
     // Process non-spatial sources first
     let direct_start = Instant::now();
     for instance in non_spatial_instances {
-        let frames_filled = instance.fill_buffer(world_buffer, channels);
-        frames_filled_max = frames_filled_max.max(frames_filled);
+        instance.fill_buffer(world_buffer, channels);
     }
     profiling.direct_mix_time_us = direct_start.elapsed().as_micros() as u64;
 
@@ -127,10 +101,9 @@ pub fn mix_playback_instances_with_metrics(
                 .process_spatial_sources_with_metrics(&mut spatial_instances, world_buffer)
             {
                 Ok(SpatialProcessingSummary {
-                    frames_processed,
+                    frames_processed: _,
                     metrics,
                 }) => {
-                    frames_filled_max = frames_filled_max.max(frames_processed);
                     profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
                     profiling.spatial_metrics = Some(metrics);
                 }
@@ -150,7 +123,7 @@ pub fn mix_playback_instances_with_metrics(
 
     // NOW check for sources that reached the end during this mix iteration
     // This must happen AFTER fill_buffer() has been called on all sources
-    let mut completed_sources = Vec::new();
+    let mut completed_playbacks = Vec::new();
     let mut looped_sources = Vec::new();
 
     log::debug!("Mixer: Checking for completed/looped sources...");
@@ -171,7 +144,11 @@ pub fn mix_playback_instances_with_metrics(
             );
             match loop_mode {
                 LoopMode::Once => {
-                    completed_sources.push(*source_id);
+                    completed_playbacks.push(CompletedPlayback {
+                        voice_id: *source_id,
+                        emitter: instance.emitter,
+                        completion_tag: instance.completion_tag,
+                    });
                 }
                 LoopMode::Infinite => {
                     // No longer need to restart - wraparound already handled in fill_buffer
@@ -195,8 +172,7 @@ pub fn mix_playback_instances_with_metrics(
 
     (
         MixResult {
-            frames_filled: frames_filled_max,
-            completed_sources,
+            completed_playbacks,
             looped_sources,
         },
         profiling,

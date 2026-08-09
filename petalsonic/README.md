@@ -35,17 +35,21 @@ fn main() -> Result<(), PetalSonicError> {
     // Creating the world starts its private render runtime.
     let world = PetalSonicWorld::new(config)?;
 
-    // Load audio data from file
-    let audio_data = audio_data::PetalSonicAudioData::from_path("path/to/audio.wav")?;
+    // Load immutable, predecoded audio.
+    let clip = ResidentClip::from_path("path/to/audio.wav")?;
 
     // Register audio with spatial configuration
-    let source_id = world.register_audio(
-        audio_data,
-        SourceConfig::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
+    let emitter = world.create_emitter(
+        clip,
+        EmitterDesc::spatial(Pose::from_position(Vec3::new(5.0, 0.0, 0.0)))
     )?;
 
     // Play the audio once
-    world.play(source_id, playback::LoopMode::Once)?;
+    let _playback = world.play_controlled(
+        emitter,
+        PlayOptions::once(),
+        PlaybackTag(7),
+    )?;
 
     // Update listener position (typically in your game loop)
     world.set_listener_pose(Pose::from_position(Vec3::new(0.0, 0.0, 0.0)));
@@ -53,13 +57,9 @@ fn main() -> Result<(), PetalSonicError> {
     // Poll for events
     for event in world.drain_events() {
         match event {
-            PetalSonicEvent::SourceCompleted { source_id } => {
-                println!("Audio completed: {:?}", source_id);
+            PetalSonicEvent::PlaybackCompleted { emitter, control, tag } => {
+                println!("{emitter} completed {control} with tag {tag:?}");
             }
-            PetalSonicEvent::SourceLooped { source_id, loop_count } => {
-                println!("Audio looped: {:?} (iteration {})", source_id, loop_count);
-            }
-            _ => {}
         }
     }
 
@@ -73,16 +73,16 @@ fn main() -> Result<(), PetalSonicError> {
 use petalsonic::*;
 
 // Load background music
-let music = audio_data::PetalSonicAudioData::from_path("music.mp3")?;
+let music = ResidentClip::from_path("music.mp3")?;
 
 // Register as non-spatial (no 3D effects, just plays normally)
-let music_id = world.register_audio(
+let music_emitter = world.create_emitter(
     music,
-    SourceConfig::non_spatial()
+    EmitterDesc::non_spatial()
 )?;
 
 // Play on infinite loop
-world.play(music_id, playback::LoopMode::Infinite)?;
+world.play(music_emitter, PlayOptions::looping())?;
 ```
 
 ### Custom Audio Loading
@@ -107,7 +107,7 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 ```plaintext
 ┌──────────────────────────────────────────────────────────────┐
 │ Main Thread (World)                                          │
-│ - register_audio(audio_data, SourceConfig)                   │
+│ - create_emitter(ResidentClip, EmitterDesc)                  │
 │ - set_listener_pose(pose)                                    │
 │ - play(), pause(), stop()                                    │
 │ - drain_events()                                             │
@@ -141,27 +141,24 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 ### Core Types
 
 - **`PetalSonicWorld`**: Main API for managing audio sources and playback (main thread)
-- **`SourceId`**: Type-safe handle for audio sources
-- **`SourceConfig`**: Configuration for spatial vs. non-spatial sources
-- **`PetalSonicAudioData`**: Container for loaded and decoded audio data
+- **`Emitter`**: Generational handle for a logical sound emitter
+- **`EmitterDesc`**: Low-frequency spatial/non-spatial defaults
+- **`ResidentClip`**: Immutable, predecoded PCM shared by Voices
 
 ### Configuration
 
-- **`PetalSonicWorldDesc`**: World configuration (sample rate, channels, buffer size, etc.)
+- **`PetalSonicWorldDesc`**: World configuration and executable capacity limits
 - **`LoadOptions`**: Options for audio loading (mono conversion, etc.)
 
 ### Playback Control
 
 - **`LoopMode`**: `Once` or `Infinite`
-- **`PlayState`**: `Playing`, `Paused`, or `Stopped`
-- **`PlaybackInfo`**: Detailed playback position and timing
+- **`PlaybackControl`**: Optional handle for one explicitly controlled Voice
 
 ### Events
 
 - **`PetalSonicEvent`**: Events emitted by the engine
-  - `SourceCompleted`, `SourceLooped`, `SourceStarted`, `SourceStopped`
-  - `BufferUnderrun`, `BufferOverrun`
-  - `EngineError`, `SpatializationError`
+  - `PlaybackCompleted` for controlled one-shots
 
 ### Math & Spatial
 
@@ -177,11 +174,15 @@ use petalsonic::*;
 let config = PetalSonicWorldDesc {
     sample_rate: 48000,           // Audio sample rate (Hz)
     block_size: 512,              // Render block size (frames)
-    channels: 2,                  // Output channels (stereo)
-    max_sources: 64,              // Maximum simultaneous sources
+    max_emitters: 64,             // Maximum long-lived emitters
+    max_voices: 128,              // Maximum simultaneous playback voices
+    control_queue_capacity: 256,  // Bounded non-blocking control queue
+    event_queue_capacity: 128,    // Bounded pull-event queue
+    timing_queue_capacity: 128,   // Bounded diagnostics queue
     hrtf_path: None,              // Optional custom HRTF data path
     hrtf_gain: 0.0,               // HRTF gain compensation (dB)
     distance_scaler: 10.0,        // 1 world unit = 10 meters in spatial simulation
+    ..Default::default()
 };
 ```
 

@@ -41,10 +41,16 @@ pub struct PetalSonicWorldDesc {
     /// This is the fixed number of frames generated at the world's sample rate, which are then
     /// resampled to the device's sample rate (producing variable output based on the ratio).
     pub block_size: usize,
-    /// Number of audio channels (typically 2 for stereo)
-    pub channels: u16,
-    /// Maximum number of concurrent audio sources
-    pub max_sources: usize,
+    /// Maximum number of long-lived emitters.
+    pub max_emitters: usize,
+    /// Maximum number of simultaneous playback voices.
+    pub max_voices: usize,
+    /// Capacity of the bounded lifecycle/control queue.
+    pub control_queue_capacity: usize,
+    /// Capacity of the bounded event queue.
+    pub event_queue_capacity: usize,
+    /// Capacity of the bounded timing/diagnostics queue.
+    pub timing_queue_capacity: usize,
     /// Optional case-insensitive substring used to select a CPAL output device by name.
     ///
     /// When `None` or empty, PetalSonic uses the system default output device.
@@ -99,8 +105,11 @@ impl Default for PetalSonicWorldDesc {
         Self {
             sample_rate: 48000,
             block_size: 1024,
-            channels: 2,
-            max_sources: 2048,
+            max_emitters: 2048,
+            max_voices: 4096,
+            control_queue_capacity: 4096,
+            event_queue_capacity: 1024,
+            timing_queue_capacity: 512,
             output_device_name_contains: None,
             hrtf_path: None,
             steam_hrtf_path: None,
@@ -122,8 +131,11 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
         f.debug_struct("PetalSonicWorldDesc")
             .field("sample_rate", &self.sample_rate)
             .field("block_size", &self.block_size)
-            .field("channels", &self.channels)
-            .field("max_sources", &self.max_sources)
+            .field("max_emitters", &self.max_emitters)
+            .field("max_voices", &self.max_voices)
+            .field("control_queue_capacity", &self.control_queue_capacity)
+            .field("event_queue_capacity", &self.event_queue_capacity)
+            .field("timing_queue_capacity", &self.timing_queue_capacity)
             .field(
                 "output_device_name_contains",
                 &self.output_device_name_contains,

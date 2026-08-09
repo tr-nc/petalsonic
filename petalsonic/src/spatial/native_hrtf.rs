@@ -150,6 +150,7 @@ impl NativeHrtfTable {
     }
 
     /// Encode this table as `.petalhrtf` bytes.
+    #[cfg(test)]
     pub fn to_petalhrtf_bytes(&self) -> Vec<u8> {
         let direction_record_bytes = (3 + self.taps * 2) * F32_BYTES;
         let total_bytes = PETALHRTF_HEADER_BYTES + self.directions.len() * direction_record_bytes;
@@ -334,19 +335,6 @@ impl NativeHrtfFftSourceState {
     fn matches_plan(&self, plan: &NativeHrtfFftPlan) -> bool {
         self.block_frames == plan.block_frames && self.fft_size == plan.fft_size
     }
-
-    fn reset(&mut self) {
-        self.forward_input.fill(0.0);
-        self.input_spectrum.fill(Complex32::new(0.0, 0.0));
-        self.left_spectrum.fill(Complex32::new(0.0, 0.0));
-        self.right_spectrum.fill(Complex32::new(0.0, 0.0));
-        self.left_time.fill(0.0);
-        self.right_time.fill(0.0);
-        self.left_overlap.fill(0.0);
-        self.right_overlap.fill(0.0);
-        self.forward_scratch.fill(Complex32::new(0.0, 0.0));
-        self.inverse_scratch.fill(Complex32::new(0.0, 0.0));
-    }
 }
 
 /// Per-source convolution state for native HRTF rendering.
@@ -369,16 +357,6 @@ impl NativeHrtfSourceState {
             fft_state: fft_plan.map(NativeHrtfFftSourceState::new),
         }
     }
-
-    pub fn reset(&mut self) {
-        self.delay_line.fill(0.0);
-        self.write_index = 0;
-        self.cached_direction = DEFAULT_DIRECTION;
-        self.cached_direction_index = None;
-        if let Some(fft_state) = &mut self.fft_state {
-            fft_state.reset();
-        }
-    }
 }
 
 /// Native HRTF renderer.
@@ -394,6 +372,7 @@ pub struct NativeHrtfRenderer {
 }
 
 impl NativeHrtfRenderer {
+    #[cfg(test)]
     pub fn new(table: Arc<NativeHrtfTable>) -> Self {
         Self {
             table,
@@ -407,10 +386,6 @@ impl NativeHrtfRenderer {
             table,
             fft_plan: Some(Arc::new(fft_plan)),
         })
-    }
-
-    pub fn table(&self) -> &NativeHrtfTable {
-        &self.table
     }
 
     pub fn create_source_state(&self) -> NativeHrtfSourceState {
@@ -453,24 +428,22 @@ impl NativeHrtfRenderer {
             self.lookup_direction_index(state, direction);
         let convolution_start = Instant::now();
 
-        if let Some(plan) = self.fft_plan.as_deref() {
-            if input.len() == plan.block_frames {
-                if let Some(fft_state) = state.fft_state.as_ref() {
-                    if fft_state.matches_plan(plan) {
-                        self.render_source_frequency_domain(
-                            state,
-                            plan,
-                            direction_index,
-                            input,
-                            output_interleaved,
-                        )?;
-                        return Ok(NativeHrtfRenderMetrics {
-                            direction_lookup_time_us,
-                            convolution_time_us: convolution_start.elapsed().as_micros() as u64,
-                        });
-                    }
-                }
-            }
+        if let Some(plan) = self.fft_plan.as_deref()
+            && input.len() == plan.block_frames
+            && let Some(fft_state) = state.fft_state.as_ref()
+            && fft_state.matches_plan(plan)
+        {
+            self.render_source_frequency_domain(
+                state,
+                plan,
+                direction_index,
+                input,
+                output_interleaved,
+            )?;
+            return Ok(NativeHrtfRenderMetrics {
+                direction_lookup_time_us,
+                convolution_time_us: convolution_start.elapsed().as_micros() as u64,
+            });
         }
 
         self.render_source_time_domain(state, direction_index, input, output_interleaved);
@@ -669,10 +642,10 @@ fn force_real_realfft_bins(spectrum: &mut [Complex32]) {
     if let Some(first) = spectrum.first_mut() {
         first.im = 0.0;
     }
-    if spectrum.len() > 1 {
-        if let Some(last) = spectrum.last_mut() {
-            last.im = 0.0;
-        }
+    if spectrum.len() > 1
+        && let Some(last) = spectrum.last_mut()
+    {
+        last.im = 0.0;
     }
 }
 

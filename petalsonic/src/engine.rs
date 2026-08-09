@@ -10,8 +10,8 @@ use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeState};
 use crate::math::Pose;
 use crate::mixer;
-use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance};
-use crate::spatial::SpatialProcessor;
+use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, VoiceStart};
+use crate::spatial::{SpatialProcessor, SpatialProcessorConfig};
 use crate::world::SourceId;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -148,6 +148,8 @@ struct PumpState {
     master_gain_linear: f32,
     buses: Vec<BusParams>,
     schedule: RenderSchedule,
+    mixer_scratch: mixer::MixerScratch,
+    completed_playbacks: Vec<mixer::CompletedPlayback>,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -239,6 +241,7 @@ pub(crate) struct PetalSonicEngine {
     master_gain_linear: f32,
     schedule: RenderSchedule,
     starting_buses: Vec<BusParams>,
+    recovery_completed_playbacks: Vec<mixer::CompletedPlayback>,
 }
 
 impl PetalSonicEngine {
@@ -258,26 +261,28 @@ impl PetalSonicEngine {
         } = startup;
         let backend_plan = Self::resolve_spatial_backend_plan(&desc);
         let schedule = RenderSchedule::for_profile(desc.latency_profile);
+        let max_voices = desc.max_voices;
         // Initialize spatial processor
         // Use distance_scaler from world configuration (converts world units to meters)
         let any_hit_adapter: Arc<dyn crate::acoustics::BatchedAnyHitRayTracer> =
             acoustic_scene_slot.clone();
         let closest_hit_adapter: Arc<dyn crate::acoustics::BatchedClosestHitRayTracer> =
             acoustic_scene_slot.clone();
-        let spatial_processor = match SpatialProcessor::new(
-            desc.sample_rate,
-            desc.block_size,
-            desc.distance_scaler,
-            desc.steam_hrtf_path.as_deref(),
-            desc.native_hrtf_path.as_deref(),
-            desc.hrtf_gain,
-            backend_plan.hrtf,
-            backend_plan.direct_path,
-            backend_plan.use_ambisonics,
-            backend_plan.ambisonics,
-            Some(any_hit_adapter),
-            Some(closest_hit_adapter),
-        ) {
+        let spatial_processor = match SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: desc.sample_rate,
+            frame_size: desc.block_size,
+            max_voices: desc.max_voices,
+            distance_scaler: desc.distance_scaler,
+            steam_hrtf_path: desc.steam_hrtf_path.clone(),
+            native_hrtf_path: desc.native_hrtf_path.clone(),
+            hrtf_gain: desc.hrtf_gain,
+            hrtf_backend: backend_plan.hrtf,
+            direct_path_backend: backend_plan.direct_path,
+            use_ambisonics: backend_plan.use_ambisonics,
+            ambisonics_backend: backend_plan.ambisonics,
+            batched_any_hit_ray_tracer: Some(any_hit_adapter),
+            batched_closest_hit_ray_tracer: Some(closest_hit_adapter),
+        }) {
             Ok(mut processor) => {
                 let initial = desc.acoustic_scene.as_ref();
                 processor.set_acoustic_scene_capabilities(
@@ -305,7 +310,7 @@ impl PetalSonicEngine {
             underrun_count: ports.underrun_count,
             stream_error: Arc::new(AtomicBool::new(false)),
             current_device_name: ports.active_device_name,
-            active_playback: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            active_playback: Arc::new(std::sync::Mutex::new(HashMap::with_capacity(max_voices))),
             active_voice_count,
             retirement_sender,
             latest_spatial_frame,
@@ -323,6 +328,7 @@ impl PetalSonicEngine {
             master_gain_linear,
             schedule,
             starting_buses: Vec::new(),
+            recovery_completed_playbacks: Vec::with_capacity(max_voices),
         })
     }
 
@@ -999,7 +1005,7 @@ impl PetalSonicEngine {
     }
 
     pub(crate) fn advance_without_output(
-        &self,
+        &mut self,
         command_receiver: &Receiver<PlaybackCommand>,
         buses: &mut [BusParams],
         elapsed: Duration,
@@ -1009,6 +1015,7 @@ impl PetalSonicEngine {
             &self.active_playback,
             &self.active_voice_count,
             buses,
+            self.desc.block_size,
         );
 
         let frames = (elapsed.as_secs_f64() * self.desc.sample_rate as f64).floor() as usize;
@@ -1018,7 +1025,7 @@ impl PetalSonicEngine {
         let Ok(mut active) = self.active_playback.lock() else {
             return;
         };
-        let mut completed = Vec::new();
+        self.recovery_completed_playbacks.clear();
         for (voice_id, instance) in active.iter_mut() {
             if !matches!(instance.info.play_state, PlayState::Playing) {
                 continue;
@@ -1033,19 +1040,20 @@ impl PetalSonicEngine {
                 instance.check_and_clear_end_flag(),
                 Some(crate::playback::LoopMode::Once)
             ) {
-                completed.push(mixer::CompletedPlayback {
-                    voice_id: *voice_id,
-                    emitter: instance.emitter,
-                    completion_tag: instance.completion_tag,
-                });
+                self.recovery_completed_playbacks
+                    .push(mixer::CompletedPlayback {
+                        voice_id: *voice_id,
+                        emitter: instance.emitter,
+                        completion_tag: instance.completion_tag,
+                    });
             }
         }
         active.retain(|_, instance| !instance.info.is_finished());
         drop(active);
 
         self.active_voice_count
-            .fetch_sub(completed.len(), Ordering::AcqRel);
-        for completed in completed {
+            .fetch_sub(self.recovery_completed_playbacks.len(), Ordering::AcqRel);
+        for completed in self.recovery_completed_playbacks.drain(..) {
             if let Some(tag) = completed.completion_tag {
                 let _ = self.retirement_sender.try_send(completed.voice_id);
                 let _ = self
@@ -1134,6 +1142,8 @@ impl PetalSonicEngine {
             master_gain_linear: self.master_gain_linear,
             buses: self.starting_buses.clone(),
             schedule: self.schedule,
+            mixer_scratch: mixer::MixerScratch::new(self.desc.max_voices),
+            completed_playbacks: Vec::with_capacity(self.desc.max_voices),
         }));
 
         // Create context for audio callback (simplified - just consumes from ring buffer)
@@ -1184,9 +1194,8 @@ impl PetalSonicEngine {
         if let Some(ref spatial_processor) = ctx.spatial_processor
             && let Ok(mut processor) = spatial_processor.try_lock()
             && let Ok(listener_pose) = ctx.listener_pose.try_lock()
-            && let Err(e) = processor.set_listener_pose(*listener_pose)
         {
-            log::error!("Failed to update listener pose: {}", e);
+            let _ = processor.set_listener_pose(*listener_pose);
         }
 
         Self::process_playback_commands(
@@ -1194,6 +1203,7 @@ impl PetalSonicEngine {
             &ctx.active_playback,
             &ctx.active_voice_count,
             &mut ctx.buses,
+            ctx.block_size,
         );
 
         let occupied = ctx.ring_buffer_producer.occupied_len();
@@ -1218,7 +1228,7 @@ impl PetalSonicEngine {
             return;
         }
 
-        let (completed_playbacks, _looped_sources, timing) = Self::generate_samples(
+        let timing = Self::generate_samples(
             &mut ctx.ring_buffer_producer,
             samples_to_generate,
             ctx.channels as usize,
@@ -1229,13 +1239,15 @@ impl PetalSonicEngine {
             ctx.block_size,
             ctx.spatial_processor.as_ref(),
             &ctx.buses,
+            &mut ctx.mixer_scratch,
+            &mut ctx.completed_playbacks,
         );
 
         let _ = ctx.timing_sender.try_send(timing);
 
         ctx.active_voice_count
-            .fetch_sub(completed_playbacks.len(), Ordering::AcqRel);
-        for completed in completed_playbacks {
+            .fetch_sub(ctx.completed_playbacks.len(), Ordering::AcqRel);
+        for completed in ctx.completed_playbacks.drain(..) {
             if let Some(tag) = completed.completion_tag {
                 let _ = ctx.retirement_sender.try_send(completed.voice_id);
                 let _ = ctx
@@ -1289,10 +1301,10 @@ impl PetalSonicEngine {
         }
         Self::apply_spatial_frame_to_voices(&next, &mut active_playback);
 
-        if let Some(previous) = ctx.current_spatial_frame.replace(next) {
-            if let Err(error) = ctx.spatial_retirement_sender.try_send(previous) {
-                ctx.pending_spatial_retirement = Some(error.into_inner());
-            }
+        if let Some(previous) = ctx.current_spatial_frame.replace(next)
+            && let Err(error) = ctx.spatial_retirement_sender.try_send(previous)
+        {
+            ctx.pending_spatial_retirement = Some(error.into_inner());
         }
     }
 
@@ -1462,6 +1474,7 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         active_voice_count: &Arc<AtomicUsize>,
         buses: &mut [BusParams],
+        render_block_size: usize,
     ) {
         // Important real-time rule:
         // - Never dequeue a command unless we *already* hold the active_playback lock.
@@ -1469,7 +1482,6 @@ impl PetalSonicEngine {
         let Ok(mut active_playback) = active_playback.try_lock() else {
             // Can't safely mutate playback map this callback; leave commands queued.
             // They'll be processed on a later callback when the lock is available.
-            log::debug!("Engine: Skipping command processing - active playback lock busy");
             return;
         };
 
@@ -1486,17 +1498,17 @@ impl PetalSonicEngine {
                     bus_index,
                     playback_rate,
                 } => {
-                    let mut instance = PlaybackInstance::from_source(
-                        voice_id,
+                    let mut instance = PlaybackInstance::from_source(VoiceStart {
                         emitter,
-                        source,
+                        audio_data: source,
                         config,
                         loop_mode,
                         bus_index,
                         playback_rate,
                         detached,
                         completion_tag,
-                    );
+                        render_block_size,
+                    });
                     instance.play_from_beginning();
                     if active_playback.insert(voice_id, instance).is_some() {
                         active_voice_count.fetch_sub(1, Ordering::AcqRel);
@@ -1588,7 +1600,7 @@ impl PetalSonicEngine {
     }
 
     /// Generate resampled samples and push to ring buffer
-    /// Returns completed voices, loop notifications, and timing data.
+    /// Appends completed voices to reusable storage and returns timing data.
     #[allow(clippy::too_many_arguments)] // All parameters are necessary for this complex function
     fn generate_samples(
         producer: &mut impl Producer<Item = StereoFrame>,
@@ -1601,11 +1613,9 @@ impl PetalSonicEngine {
         block_size: usize,
         spatial_processor: Option<&Arc<Mutex<SpatialProcessor>>>,
         buses: &[BusParams],
-    ) -> (
-        Vec<mixer::CompletedPlayback>,
-        Vec<SourceId>,
-        RenderTimingEvent,
-    ) {
+        mixer_scratch: &mut mixer::MixerScratch,
+        completed_playbacks: &mut Vec<mixer::CompletedPlayback>,
+    ) -> RenderTimingEvent {
         let total_start = Instant::now();
         let mut total_mixing_time_us = 0u64;
         let mut total_spatial_time_us = 0u64;
@@ -1619,37 +1629,30 @@ impl PetalSonicEngine {
         let mut total_native_hrtf_direction_lookup_time_us = 0u64;
         let mut total_native_hrtf_convolution_time_us = 0u64;
         let mut total_resampling_time_us = 0u64;
+        completed_playbacks.clear();
 
         let Ok(mut resampler) = resampler_arc.try_lock() else {
-            log::warn!("Failed to acquire resampler lock in generate_resampled_samples");
-            return (
-                Vec::new(),
-                Vec::new(),
-                RenderTimingEvent {
-                    mixing_time_us: 0,
-                    spatial_time_us: 0,
-                    direct_mixing_time_us: 0,
-                    spatial_source_count: 0,
-                    spatial_simulation_time_us: 0,
-                    direct_processing_time_us: 0,
-                    ambisonics_encoding_time_us: 0,
-                    ambisonics_decoding_time_us: 0,
-                    hrtf_rendering_time_us: 0,
-                    native_hrtf_direction_lookup_time_us: 0,
-                    native_hrtf_convolution_time_us: 0,
-                    resampling_time_us: 0,
-                    total_time_us: 0,
-                },
-            );
+            return RenderTimingEvent {
+                mixing_time_us: 0,
+                spatial_time_us: 0,
+                direct_mixing_time_us: 0,
+                spatial_source_count: 0,
+                spatial_simulation_time_us: 0,
+                direct_processing_time_us: 0,
+                ambisonics_encoding_time_us: 0,
+                ambisonics_decoding_time_us: 0,
+                hrtf_rendering_time_us: 0,
+                native_hrtf_direction_lookup_time_us: 0,
+                native_hrtf_convolution_time_us: 0,
+                resampling_time_us: 0,
+                total_time_us: 0,
+            };
         };
-
-        // Track all completed and looped sources across all mixing iterations
-        let mut all_completed_playbacks = Vec::new();
-        let mut all_looped_sources = Vec::new();
 
         // Generate samples in fixed world block_size chunks, output is variable
         let mut total_generated = 0;
         while total_generated < samples_needed {
+            let generated_before = total_generated;
             // Use thread-local buffers to avoid allocations
             WORLD_BUFFER.with(|buf| {
                 let mut world_buffer = buf.borrow_mut();
@@ -1668,19 +1671,17 @@ impl PetalSonicEngine {
                     spatial_processor.and_then(|sp| sp.try_lock().ok());
 
                 // Mix returns MixResult with completed and looped sources
-                let (mix_result, mix_profiling) = mixer::mix_playback_instances_with_metrics(
+                let mix_profiling = mixer::mix_playback_instances_with_metrics(
                     &mut world_buffer,
                     channels,
                     active_playback,
                     spatial_processor_guard.as_deref_mut(),
                     buses,
+                    mixer_scratch,
+                    completed_playbacks,
                 );
 
                 let mixing_elapsed = mixing_start.elapsed();
-
-                // Collect completed and looped sources for event emission
-                all_completed_playbacks.extend(mix_result.completed_playbacks);
-                all_looped_sources.extend(mix_result.looped_sources);
 
                 // Capture coarse mixing time plus the detailed stage breakdown reported by the mixer
                 total_mixing_time_us += mixing_elapsed.as_micros() as u64;
@@ -1713,46 +1714,44 @@ impl PetalSonicEngine {
                     // Measure resampling time
                     let resampling_start = Instant::now();
 
-                    match resampler.process_interleaved(&world_buffer, &mut resampled_buffer) {
-                        Ok((frames_out, _frames_in)) => {
-                            let resampling_elapsed = resampling_start.elapsed();
-                            total_resampling_time_us += resampling_elapsed.as_micros() as u64;
+                    if let Ok((frames_out, _frames_in)) =
+                        resampler.process_interleaved(&world_buffer, &mut resampled_buffer)
+                    {
+                        let resampling_elapsed = resampling_start.elapsed();
+                        total_resampling_time_us += resampling_elapsed.as_micros() as u64;
 
-                            apply_master_gain_and_limit(
-                                &mut resampled_buffer,
-                                frames_out,
-                                channels_usize,
-                                master_gain_linear,
-                            );
+                        apply_master_gain_and_limit(
+                            &mut resampled_buffer,
+                            frames_out,
+                            channels_usize,
+                            master_gain_linear,
+                        );
 
-                            // Push all generated frames to ring buffer
-                            let mut pushed = 0;
-                            for i in 0..frames_out {
-                                let left_idx = i * channels_usize;
-                                let right_idx = left_idx + 1;
-                                let frame = StereoFrame {
-                                    left: *resampled_buffer.get(left_idx).unwrap_or(&0.0),
-                                    right: *resampled_buffer.get(right_idx).unwrap_or(&0.0),
-                                };
-                                if producer.try_push(frame).is_ok() {
-                                    pushed += 1;
-                                } else {
-                                    // Ring buffer is full
-                                    break;
-                                }
+                        // Push all generated frames to ring buffer
+                        let mut pushed = 0;
+                        for i in 0..frames_out {
+                            let left_idx = i * channels_usize;
+                            let right_idx = left_idx + 1;
+                            let frame = StereoFrame {
+                                left: *resampled_buffer.get(left_idx).unwrap_or(&0.0),
+                                right: *resampled_buffer.get(right_idx).unwrap_or(&0.0),
+                            };
+                            if producer.try_push(frame).is_ok() {
+                                pushed += 1;
+                            } else {
+                                // Ring buffer is full
+                                break;
                             }
-
-                            total_generated += pushed;
-
-                            // If we couldn't push any frames, ring buffer is full
-                            if pushed == 0 {}
                         }
-                        Err(e) => {
-                            log::error!("Resampling error: {}", e);
-                        }
+
+                        total_generated += pushed;
                     }
                 });
             });
+
+            if total_generated == generated_before {
+                break;
+            }
 
             // If we've generated enough or can't push more, stop
             if total_generated >= samples_needed {
@@ -1762,25 +1761,21 @@ impl PetalSonicEngine {
 
         let total_elapsed = total_start.elapsed();
 
-        (
-            all_completed_playbacks,
-            all_looped_sources,
-            RenderTimingEvent {
-                mixing_time_us: total_mixing_time_us,
-                spatial_time_us: total_spatial_time_us,
-                direct_mixing_time_us: total_direct_mixing_time_us,
-                spatial_source_count: total_spatial_source_count,
-                spatial_simulation_time_us: total_spatial_simulation_time_us,
-                direct_processing_time_us: total_direct_processing_time_us,
-                ambisonics_encoding_time_us: total_ambisonics_encoding_time_us,
-                ambisonics_decoding_time_us: total_ambisonics_decoding_time_us,
-                hrtf_rendering_time_us: total_hrtf_rendering_time_us,
-                native_hrtf_direction_lookup_time_us: total_native_hrtf_direction_lookup_time_us,
-                native_hrtf_convolution_time_us: total_native_hrtf_convolution_time_us,
-                resampling_time_us: total_resampling_time_us,
-                total_time_us: total_elapsed.as_micros() as u64,
-            },
-        )
+        RenderTimingEvent {
+            mixing_time_us: total_mixing_time_us,
+            spatial_time_us: total_spatial_time_us,
+            direct_mixing_time_us: total_direct_mixing_time_us,
+            spatial_source_count: total_spatial_source_count,
+            spatial_simulation_time_us: total_spatial_simulation_time_us,
+            direct_processing_time_us: total_direct_processing_time_us,
+            ambisonics_encoding_time_us: total_ambisonics_encoding_time_us,
+            ambisonics_decoding_time_us: total_ambisonics_decoding_time_us,
+            hrtf_rendering_time_us: total_hrtf_rendering_time_us,
+            native_hrtf_direction_lookup_time_us: total_native_hrtf_direction_lookup_time_us,
+            native_hrtf_convolution_time_us: total_native_hrtf_convolution_time_us,
+            resampling_time_us: total_resampling_time_us,
+            total_time_us: total_elapsed.as_micros() as u64,
+        }
     }
 }
 
@@ -1801,14 +1796,8 @@ fn apply_master_gain_and_limit(
         return;
     }
 
-    let mut peak_after_gain = 0.0f32;
     for sample in buffer.iter_mut().take(sample_count) {
         let scaled = *sample * master_gain_linear;
-        let abs = scaled.abs();
-        if abs > peak_after_gain {
-            peak_after_gain = abs;
-        }
-
         if scaled > 1.0 {
             *sample = 1.0;
         } else if scaled < -1.0 {
@@ -1816,13 +1805,6 @@ fn apply_master_gain_and_limit(
         } else {
             *sample = scaled;
         }
-    }
-
-    if peak_after_gain > 1.0 {
-        log::warn!(
-            "PetalSonic output clipped after master gain, peak amplitude: {:.6}",
-            peak_after_gain
-        );
     }
 }
 
@@ -1877,9 +1859,10 @@ mod tests {
 
     #[test]
     fn public_quality_profiles_resolve_to_fixed_internal_plans() {
-        let mut desc = PetalSonicWorldDesc::default();
-
-        desc.spatial_quality = SpatialQuality::LowLatency;
+        let mut desc = PetalSonicWorldDesc {
+            spatial_quality: SpatialQuality::LowLatency,
+            ..PetalSonicWorldDesc::default()
+        };
         let low_latency = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
         assert_eq!(low_latency.hrtf, HrtfBackend::SteamAudio);
         assert_eq!(low_latency.direct_path, DirectPathBackend::Native);
@@ -1974,6 +1957,8 @@ mod tests {
             master_gain_linear: 1.0,
             buses: vec![BusParams::default()],
             schedule: RenderSchedule::for_profile(LatencyProfile::Balanced),
+            mixer_scratch: mixer::MixerScratch::new(8),
+            completed_playbacks: Vec::with_capacity(8),
         }));
         let is_running = Arc::new(AtomicBool::new(true));
         let render_thread = PetalSonicEngine::spawn_render_thread(
@@ -2033,13 +2018,25 @@ mod tests {
         let active = Arc::new(Mutex::new(HashMap::new()));
         let active_count = Arc::new(AtomicUsize::new(2));
         let mut buses = [BusParams::default()];
-        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count, &mut buses);
+        PetalSonicEngine::process_playback_commands(
+            &receiver,
+            &active,
+            &active_count,
+            &mut buses,
+            32,
+        );
         assert_eq!(active.lock().unwrap().len(), 2);
 
         sender
             .try_send(PlaybackCommand::DestroyEmitter(emitter))
             .unwrap();
-        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count, &mut buses);
+        PetalSonicEngine::process_playback_commands(
+            &receiver,
+            &active,
+            &active_count,
+            &mut buses,
+            32,
+        );
 
         let active = active.lock().unwrap();
         assert_eq!(active.len(), 1);
@@ -2065,17 +2062,17 @@ mod tests {
         for (voice_id, detached) in [(SourceId::from(20), false), (SourceId::from(21), true)] {
             voices.insert(
                 voice_id,
-                PlaybackInstance::from_source(
-                    voice_id,
+                PlaybackInstance::from_source(VoiceStart {
                     emitter,
-                    clip.clone(),
-                    SourceConfig::spatial(old_pose),
-                    LoopMode::Infinite,
-                    0,
-                    1.0,
+                    audio_data: clip.clone(),
+                    config: SourceConfig::spatial(old_pose),
+                    loop_mode: LoopMode::Infinite,
+                    bus_index: 0,
+                    playback_rate: 1.0,
                     detached,
-                    None,
-                ),
+                    completion_tag: None,
+                    render_block_size: 32,
+                }),
             );
         }
         let frame = SpatialFrame::new(

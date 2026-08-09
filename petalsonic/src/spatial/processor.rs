@@ -88,17 +88,26 @@ struct NativeReflectionTap {
     gain: f32,
 }
 
+pub(crate) struct SpatialProcessorConfig {
+    pub sample_rate: u32,
+    pub frame_size: usize,
+    pub max_voices: usize,
+    pub distance_scaler: f32,
+    pub steam_hrtf_path: Option<String>,
+    pub native_hrtf_path: Option<String>,
+    pub hrtf_gain: f32,
+    pub hrtf_backend: HrtfBackend,
+    pub direct_path_backend: DirectPathBackend,
+    pub use_ambisonics: bool,
+    pub ambisonics_backend: AmbisonicsBackend,
+    pub batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
+    pub batched_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
+}
+
 /// Spatial audio processor that manages Steam Audio integration
 pub struct SpatialProcessor {
-    // Steam Audio core objects
-    context: Context,
-    simulator: SpatialSimulator,
-    #[allow(dead_code)] // Must be kept alive for simulator lifetime
-    scene: SpatialScene,
-    hrtf: Option<Hrtf>,
-
-    // Shared ambisonics decode effect (used for all sources in the Steam Audio HRTF path)
-    ambisonics_decode_effect: Option<AmbisonicsDecodeEffect>,
+    // Drop source/effect wrappers before the simulator, scene, callbacks, and context they use.
+    effects_manager: SpatialEffectsManager,
 
     // Native HRTF/Ambisonics renderer and delay state
     native_hrtf_renderer: Option<NativeHrtfRenderer>,
@@ -108,8 +117,15 @@ pub struct SpatialProcessor {
     native_ambisonics_state: Option<NativeAmbisonicsBinauralState>,
     native_reflection_source_states: HashMap<SourceId, NativeEarlyReflectionSourceState>,
 
-    // Per-source effects management
-    effects_manager: SpatialEffectsManager,
+    // Steam Audio objects are declared in dependency drop order.
+    ambisonics_decode_effect: Option<AmbisonicsDecodeEffect>,
+    hrtf: Option<Hrtf>,
+    simulator: SpatialSimulator,
+    #[allow(dead_code)] // Must be kept alive for simulator lifetime
+    scene: SpatialScene,
+    #[allow(dead_code)] // Keeps the callback allocation alive through scene destruction.
+    ray_callbacks: Arc<CustomRayTracingCallbacks>,
+    context: Context,
 
     // Configuration
     frame_size: usize,
@@ -124,10 +140,7 @@ pub struct SpatialProcessor {
     native_early_reflections_enabled: bool,
     native_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
     native_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
-    /// HRTF gain in decibels (for introspection / debugging).
-    #[allow(dead_code)] // Only used for debugging / future introspection
-    hrtf_gain_db: f32,
-    /// HRTF gain as linear multiplier (derived from `hrtf_gain_db`).
+    /// HRTF gain as linear multiplier.
     hrtf_gain_linear: f32,
 
     // Cached buffers to avoid allocations
@@ -145,56 +158,6 @@ pub struct SpatialProcessor {
     listener_up: Vec3,
     listener_front: Vec3,
     listener_right: Vec3,
-    direct_debug: DirectDebugStats,
-    latest_direct_snapshot: Option<DirectOcclusionDebugSnapshot>,
-}
-
-struct DirectDebugStats {
-    sample_count: usize,
-    occlusion_sum: f32,
-    occlusion_min: f32,
-    occlusion_max: f32,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DirectOcclusionDebugSnapshot {
-    pub sample_count: usize,
-    pub avg_occlusion: f32,
-    pub min_occlusion: f32,
-    pub max_occlusion: f32,
-}
-
-impl Default for DirectDebugStats {
-    fn default() -> Self {
-        Self {
-            sample_count: 0,
-            occlusion_sum: 0.0,
-            occlusion_min: f32::INFINITY,
-            occlusion_max: f32::NEG_INFINITY,
-        }
-    }
-}
-
-impl DirectDebugStats {
-    fn snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {
-        if self.sample_count == 0 {
-            return None;
-        }
-
-        Some(DirectOcclusionDebugSnapshot {
-            sample_count: self.sample_count,
-            avg_occlusion: self.occlusion_sum / self.sample_count as f32,
-            min_occlusion: self.occlusion_min,
-            max_occlusion: self.occlusion_max,
-        })
-    }
-
-    fn clear_samples(&mut self) {
-        self.sample_count = 0;
-        self.occlusion_sum = 0.0;
-        self.occlusion_min = f32::INFINITY;
-        self.occlusion_max = f32::NEG_INFINITY;
-    }
 }
 
 /// Detailed timing metrics captured for a single spatial processing pass.
@@ -218,13 +181,6 @@ pub struct SpatialProcessingMetrics {
     pub native_hrtf_convolution_time_us: u64,
 }
 
-/// Summary of spatial processing output including the number of frames produced.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SpatialProcessingSummary {
-    pub frames_processed: usize,
-    pub metrics: SpatialProcessingMetrics,
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 struct SourceProcessingMetrics {
     direct_processing_time_us: u64,
@@ -242,27 +198,23 @@ impl SourceProcessingMetrics {
 }
 
 impl SpatialProcessor {
-    /// Create a new spatial processor
-    ///
-    /// # Arguments
-    /// * `sample_rate` - Sample rate for audio processing
-    /// * `frame_size` - Number of frames to process per call
-    /// * `distance_scaler` - Scale factor to convert game units to meters (default: 10.0)
-    /// * `hrtf_gain` - HRTF gain compensation in decibels (default: 0.0 dB = no change)
-    pub fn new(
-        sample_rate: u32,
-        frame_size: usize,
-        distance_scaler: f32,
-        steam_hrtf_path: Option<&str>,
-        native_hrtf_path: Option<&str>,
-        hrtf_gain: f32,
-        hrtf_backend: HrtfBackend,
-        direct_path_backend: DirectPathBackend,
-        use_ambisonics: bool,
-        ambisonics_backend: AmbisonicsBackend,
-        batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
-        batched_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
-    ) -> Result<Self> {
+    /// Create a new spatial processor from the fixed world backend plan.
+    pub fn new(config: SpatialProcessorConfig) -> Result<Self> {
+        let SpatialProcessorConfig {
+            sample_rate,
+            frame_size,
+            max_voices,
+            distance_scaler,
+            steam_hrtf_path,
+            native_hrtf_path,
+            hrtf_gain,
+            hrtf_backend,
+            direct_path_backend,
+            use_ambisonics,
+            ambisonics_backend,
+            batched_any_hit_ray_tracer,
+            batched_closest_hit_ray_tracer,
+        } = config;
         // Create Steam Audio context
         let context = Context::try_new(&audionimbus::ContextSettings::default()).map_err(|e| {
             PetalSonicError::SpatialAudio(format!("Failed to create Steam Audio context: {}", e))
@@ -281,7 +233,8 @@ impl SpatialProcessor {
         let mut native_ambisonics_state = None;
 
         if hrtf_backend == HrtfBackend::SteamAudio {
-            let loaded_hrtf = create_steam_hrtf(&context, &audio_settings, steam_hrtf_path)?;
+            let loaded_hrtf =
+                create_steam_hrtf(&context, &audio_settings, steam_hrtf_path.as_deref())?;
             ambisonics_decode_effect = Some(create_ambisonics_decode_effect(
                 &context,
                 &audio_settings,
@@ -291,7 +244,7 @@ impl SpatialProcessor {
         }
 
         if hrtf_backend == HrtfBackend::Native {
-            let table = load_native_hrtf_table(sample_rate, native_hrtf_path)?;
+            let table = load_native_hrtf_table(sample_rate, native_hrtf_path.as_deref())?;
             native_hrtf_renderer = Some(NativeHrtfRenderer::with_frame_size(
                 table.clone(),
                 frame_size,
@@ -482,14 +435,21 @@ impl SpatialProcessor {
                     .collect()
             });
 
-        let ray_callbacks = Box::leak(Box::new(CustomRayTracingCallbacks::new(
+        let ray_callbacks = Arc::new(CustomRayTracingCallbacks::new(
             closest_hit_single_callback,
             any_hit_single_callback,
             closest_hit_callback,
             any_hit_callback,
-        )));
+        ));
 
-        let scene = Scene::try_with_custom(&context, ray_callbacks)
+        // SAFETY: `Scene` stores callback pointers for its full lifetime. The Arc is
+        // moved into `SpatialProcessor` and declared after `scene`, so Rust drops the
+        // scene before releasing the final callback allocation. The allocation address
+        // is stable even if the Arc itself moves.
+        let static_ray_callbacks: &'static CustomRayTracingCallbacks =
+            unsafe { &*Arc::as_ptr(&ray_callbacks) };
+
+        let scene = Scene::try_with_custom(&context, static_ray_callbacks)
             .map_err(|e| PetalSonicError::SpatialAudio(format!("Failed to create scene: {}", e)))?;
 
         simulator.set_scene(&scene);
@@ -508,8 +468,7 @@ impl SpatialProcessor {
         let cached_native_reflection_buf = vec![0.0; frame_size];
 
         // Pre-compute HRTF gain in linear space for efficient application.
-        let hrtf_gain_db = hrtf_gain;
-        let hrtf_gain_linear = gain::db_to_linear(hrtf_gain_db);
+        let hrtf_gain_linear = gain::db_to_linear(hrtf_gain);
 
         log::info!(
             "PetalSonic spatial processor: hrtf_backend={:?}, direct_path_backend={:?}, use_ambisonics={}, ambisonics_backend={:?}, direct_occlusion_enabled={}, reflections_enabled={}, native_early_reflections_enabled={}",
@@ -523,18 +482,19 @@ impl SpatialProcessor {
         );
 
         Ok(Self {
-            context,
-            simulator,
-            scene,
-            hrtf,
-            ambisonics_decode_effect,
+            effects_manager: SpatialEffectsManager::new(max_voices),
             native_hrtf_renderer,
-            native_hrtf_source_states: HashMap::new(),
+            native_hrtf_source_states: HashMap::with_capacity(max_voices),
             native_ambisonics_encoder,
             native_ambisonics_decoder,
             native_ambisonics_state,
-            native_reflection_source_states: HashMap::new(),
-            effects_manager: SpatialEffectsManager::new(),
+            native_reflection_source_states: HashMap::with_capacity(max_voices),
+            ambisonics_decode_effect,
+            hrtf,
+            simulator,
+            scene,
+            ray_callbacks,
+            context,
             frame_size,
             sample_rate,
             distance_scaler,
@@ -547,7 +507,6 @@ impl SpatialProcessor {
             native_early_reflections_enabled,
             native_any_hit_ray_tracer: batched_any_hit_ray_tracer,
             native_closest_hit_ray_tracer: batched_closest_hit_ray_tracer,
-            hrtf_gain_db,
             hrtf_gain_linear,
             cached_input_buf,
             cached_direct_buf,
@@ -561,8 +520,6 @@ impl SpatialProcessor {
             listener_up: Vec3::new(0.0, 1.0, 0.0),
             listener_front: Vec3::new(0.0, 0.0, -1.0),
             listener_right: Vec3::new(1.0, 0.0, 0.0),
-            direct_debug: DirectDebugStats::default(),
-            latest_direct_snapshot: None,
         })
     }
 
@@ -606,13 +563,6 @@ impl SpatialProcessor {
             &audio_settings,
             self.hrtf.as_ref(),
         )
-    }
-
-    /// Remove effects for a spatial source
-    pub fn remove_effects_for_source(&mut self, source_id: SourceId) {
-        self.effects_manager.remove_effects_for_source(source_id);
-        self.native_hrtf_source_states.remove(&source_id);
-        self.native_reflection_source_states.remove(&source_id);
     }
 
     fn uses_steam_source_effects(&self) -> bool {
@@ -662,49 +612,32 @@ impl SpatialProcessor {
         Ok(())
     }
 
-    /// Process all spatial sources and output to stereo buffer
-    ///
-    /// # Arguments
-    /// * `instances` - Slice of spatial playback instances to process
-    /// * `output_buffer` - Stereo output buffer (interleaved L/R)
-    ///
-    /// # Returns
-    /// Number of frames processed
-    pub fn process_spatial_sources(
-        &mut self,
-        instances: &mut [(SourceId, &mut PlaybackInstance)],
-        output_buffer: &mut [f32],
-    ) -> Result<usize> {
-        Ok(self
-            .process_spatial_sources_with_metrics(instances, output_buffer)?
-            .frames_processed)
-    }
-
-    /// Same as [`process_spatial_sources`] but also returns detailed timing metrics.
+    /// Process all spatial sources and return bounded timing metrics.
     pub fn process_spatial_sources_with_metrics(
         &mut self,
-        instances: &mut [(SourceId, &mut PlaybackInstance)],
+        spatial_ids: &[SourceId],
+        instances: &mut HashMap<SourceId, PlaybackInstance>,
         output_buffer: &mut [f32],
-    ) -> Result<SpatialProcessingSummary> {
-        if instances.is_empty() {
+    ) -> Result<SpatialProcessingMetrics> {
+        if spatial_ids.is_empty() {
             // No spatial sources, don't modify the buffer (may contain non-spatial audio)
-            return Ok(SpatialProcessingSummary::default());
+            return Ok(SpatialProcessingMetrics::default());
         }
 
-        let mut metrics = SpatialProcessingMetrics::default();
-        metrics.spatial_source_count = instances
-            .iter()
-            .filter(|(_, instance)| matches!(instance.config, SourceConfig::Spatial { .. }))
-            .count();
-        self.direct_debug.clear_samples();
-        self.latest_direct_snapshot = None;
+        let mut metrics = SpatialProcessingMetrics {
+            spatial_source_count: spatial_ids.len(),
+            ..SpatialProcessingMetrics::default()
+        };
 
         // Ensure all spatial sources have backend state created before processing.
         // This guarantees newly played spatial sources participate in the very first
         // block, avoiding a "first block louder" case where distance attenuation /
         // air absorption would still be at their default values.
         let uses_steam_source_effects = self.uses_steam_source_effects();
-        for (source_id, instance) in instances.iter() {
+        for source_id in spatial_ids {
+            let Some(instance) = instances.get(source_id) else {
+                continue;
+            };
             if !matches!(instance.config, SourceConfig::Spatial { .. }) {
                 continue;
             }
@@ -724,12 +657,15 @@ impl SpatialProcessor {
         // source outputs. The fully-native path traces directly against the host scene data.
         if uses_steam_source_effects {
             let simulation_start = Instant::now();
-            self.simulate(instances)?;
+            self.simulate(spatial_ids, instances)?;
             metrics.physics_simulation_time_us = simulation_start.elapsed().as_micros() as u64;
         }
 
         // Process each spatial source and accumulate detailed timing.
-        for (source_id, instance) in instances.iter_mut() {
+        for source_id in spatial_ids {
+            let Some(instance) = instances.get_mut(source_id) else {
+                continue;
+            };
             let source_metrics = self.process_single_source(*source_id, instance)?;
             metrics.direct_processing_time_us += source_metrics.direct_processing_time_us;
             metrics.ambisonics_encoding_time_us += source_metrics.ambisonics_encoding_time_us;
@@ -739,8 +675,6 @@ impl SpatialProcessor {
             metrics.native_hrtf_convolution_time_us +=
                 source_metrics.native_hrtf_convolution_time_us;
         }
-
-        self.latest_direct_snapshot = self.direct_debug.snapshot();
 
         if self.use_ambisonics {
             let decoding_start = Instant::now();
@@ -771,10 +705,7 @@ impl SpatialProcessor {
             output_buffer[i * 2 + 1] += self.cached_binaural_processed[i * 2 + 1];
         }
 
-        Ok(SpatialProcessingSummary {
-            frames_processed: frames_to_copy,
-            metrics,
-        })
+        Ok(metrics)
     }
 
     /// Process a single spatial source
@@ -848,97 +779,86 @@ impl SpatialProcessor {
         source_id: SourceId,
         instance: &PlaybackInstance,
     ) -> Result<()> {
-        let occlusion_for_debug = {
-            let effects = self
-                .effects_manager
-                .get_effects_mut(source_id)
-                .ok_or_else(|| {
-                    PetalSonicError::SpatialAudio(format!(
-                        "No effects found for source {}",
-                        source_id
-                    ))
-                })?;
-
-            // Get simulation results
-            let outputs = effects
-                .source
-                .get_outputs(SimulationFlags::DIRECT)
-                .map_err(|e| {
-                    PetalSonicError::SpatialAudio(format!("Failed to get direct outputs: {}", e))
-                })?;
-            let direct_outputs = outputs.direct();
-
-            let distance_attenuation = direct_outputs.distance_attenuation.unwrap_or(1.0);
-            let air_absorption = direct_outputs
-                .air_absorption
-                .as_ref()
-                .map(|eq| Equalizer([eq[0], eq[1], eq[2]]))
-                .unwrap_or(Equalizer([1.0, 1.0, 1.0]));
-
-            let mut direct_effect_params = DirectEffectParams {
-                distance_attenuation: Some(distance_attenuation),
-                air_absorption: Some(air_absorption),
-                directivity: None,
-                // In this path Steam Audio's direct output matches DirectEffect polarity:
-                // 1.0 is fully audible, 0.0 is fully occluded.
-                occlusion: direct_outputs.occlusion,
-                // Phase 1 only supports boolean any-hit occlusion. Keep transmission disabled
-                // until closest-hit/material data is wired in Phase 2.
-                transmission: None,
-            };
-
-            if let Some(direct_path_override) = instance.direct_path_override {
-                if let Some(occlusion) = direct_path_override.occlusion {
-                    direct_effect_params.occlusion = Some(occlusion);
-                }
-
-                if let Some(transmission) = direct_path_override.transmission {
-                    direct_effect_params.transmission = Some(match transmission {
-                        DirectPathTransmission::FrequencyIndependent(bands) => {
-                            Transmission::FrequencyIndependent(Equalizer(bands))
-                        }
-                        DirectPathTransmission::FrequencyDependent(bands) => {
-                            Transmission::FrequencyDependent(Equalizer(bands))
-                        }
-                    });
-                }
-            }
-
-            let occlusion_for_debug = direct_effect_params.occlusion;
-
-            let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-                &self.cached_input_buf,
-                AudioBufferSettings {
-                    num_channels: Some(1),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| {
-                PetalSonicError::SpatialAudio(format!("Failed to create input buffer: {}", e))
+        let effects = self
+            .effects_manager
+            .get_effects_mut(source_id)
+            .ok_or_else(|| {
+                PetalSonicError::SpatialAudio(format!("No effects found for source {}", source_id))
             })?;
 
-            let direct_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-                &mut self.cached_direct_buf,
-                AudioBufferSettings {
-                    num_channels: Some(1),
-                    ..Default::default()
-                },
-            )
+        // Get simulation results
+        let outputs = effects
+            .source
+            .get_outputs(SimulationFlags::DIRECT)
             .map_err(|e| {
-                PetalSonicError::SpatialAudio(format!("Failed to create direct buffer: {}", e))
+                PetalSonicError::SpatialAudio(format!("Failed to get direct outputs: {}", e))
             })?;
+        let direct_outputs = outputs.direct();
 
-            effects
-                .direct_effect
-                .apply(&direct_effect_params, &input_buf, &direct_buf)
-                .map_err(|e| {
-                    PetalSonicError::SpatialAudio(format!("Failed to apply DirectEffect: {}", e))
-                })?;
+        let distance_attenuation = direct_outputs.distance_attenuation.unwrap_or(1.0);
+        let air_absorption = direct_outputs
+            .air_absorption
+            .as_ref()
+            .map(|eq| Equalizer([eq[0], eq[1], eq[2]]))
+            .unwrap_or(Equalizer([1.0, 1.0, 1.0]));
 
-            occlusion_for_debug
+        let mut direct_effect_params = DirectEffectParams {
+            distance_attenuation: Some(distance_attenuation),
+            air_absorption: Some(air_absorption),
+            directivity: None,
+            // In this path Steam Audio's direct output matches DirectEffect polarity:
+            // 1.0 is fully audible, 0.0 is fully occluded.
+            occlusion: direct_outputs.occlusion,
+            // Phase 1 only supports boolean any-hit occlusion. Keep transmission disabled
+            // until closest-hit/material data is wired in Phase 2.
+            transmission: None,
         };
 
-        self.record_direct_debug_stats(occlusion_for_debug);
+        if let Some(direct_path_override) = instance.direct_path_override {
+            if let Some(occlusion) = direct_path_override.occlusion {
+                direct_effect_params.occlusion = Some(occlusion);
+            }
+
+            if let Some(transmission) = direct_path_override.transmission {
+                direct_effect_params.transmission = Some(match transmission {
+                    DirectPathTransmission::FrequencyIndependent(bands) => {
+                        Transmission::FrequencyIndependent(Equalizer(bands))
+                    }
+                    DirectPathTransmission::FrequencyDependent(bands) => {
+                        Transmission::FrequencyDependent(Equalizer(bands))
+                    }
+                });
+            }
+        }
+
+        let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
+            &self.cached_input_buf,
+            AudioBufferSettings {
+                num_channels: Some(1),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| {
+            PetalSonicError::SpatialAudio(format!("Failed to create input buffer: {}", e))
+        })?;
+
+        let direct_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
+            &mut self.cached_direct_buf,
+            AudioBufferSettings {
+                num_channels: Some(1),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| {
+            PetalSonicError::SpatialAudio(format!("Failed to create direct buffer: {}", e))
+        })?;
+
+        effects
+            .direct_effect
+            .apply(&direct_effect_params, &input_buf, &direct_buf)
+            .map_err(|e| {
+                PetalSonicError::SpatialAudio(format!("Failed to apply DirectEffect: {}", e))
+            })?;
 
         Ok(())
     }
@@ -979,8 +899,6 @@ impl SpatialProcessor {
         {
             *output = *input * direct_gain;
         }
-
-        self.record_direct_debug_stats(Some(occlusion));
     }
 
     fn native_direct_occlusion(&self, source_position: Vec3, distance_world: f32) -> f32 {
@@ -1164,21 +1082,6 @@ impl SpatialProcessor {
             delay_samples,
             gain,
         })
-    }
-
-    fn record_direct_debug_stats(&mut self, occlusion: Option<f32>) {
-        let Some(occlusion) = occlusion else {
-            return;
-        };
-
-        self.direct_debug.sample_count += 1;
-        self.direct_debug.occlusion_sum += occlusion;
-        self.direct_debug.occlusion_min = self.direct_debug.occlusion_min.min(occlusion);
-        self.direct_debug.occlusion_max = self.direct_debug.occlusion_max.max(occlusion);
-    }
-
-    pub fn direct_occlusion_debug_snapshot(&self) -> Option<DirectOcclusionDebugSnapshot> {
-        self.latest_direct_snapshot
     }
 
     fn apply_reflection_effect(&mut self, source_id: SourceId) -> Result<()> {
@@ -1513,7 +1416,11 @@ impl SpatialProcessor {
     }
 
     /// Run the Steam Audio simulation paths that are still enabled.
-    fn simulate(&mut self, instances: &[(SourceId, &mut PlaybackInstance)]) -> Result<()> {
+    fn simulate(
+        &mut self,
+        spatial_ids: &[SourceId],
+        instances: &HashMap<SourceId, PlaybackInstance>,
+    ) -> Result<()> {
         let run_steam_direct = self.direct_path_backend == DirectPathBackend::SteamAudio;
         if !run_steam_direct && !self.reflections_enabled {
             return Ok(());
@@ -1527,7 +1434,10 @@ impl SpatialProcessor {
         };
 
         // Set simulation inputs for each source
-        for (source_id, instance) in instances.iter() {
+        for source_id in spatial_ids {
+            let Some(instance) = instances.get(source_id) else {
+                continue;
+            };
             let position = match &instance.config {
                 SourceConfig::Spatial { pose, .. } => pose.position,
                 _ => continue,
@@ -1613,11 +1523,6 @@ impl SpatialProcessor {
         }
 
         Ok(())
-    }
-
-    /// Get the frame size
-    pub fn frame_size(&self) -> usize {
-        self.frame_size
     }
 }
 

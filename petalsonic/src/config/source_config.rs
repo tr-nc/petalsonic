@@ -1,5 +1,5 @@
 use crate::gain;
-use crate::math::{Pose, Vec3};
+use crate::math::Pose;
 
 /// Configuration for how an audio source should be processed
 #[derive(Debug, Clone)]
@@ -27,6 +27,7 @@ impl Default for SourceConfig {
 
 impl SourceConfig {
     /// Create a non-spatial source configuration at 0 dB (unity gain).
+    #[cfg(test)]
     pub fn non_spatial() -> Self {
         Self::NonSpatial { volume_db: 0.0 }
     }
@@ -38,16 +39,8 @@ impl SourceConfig {
         Self::NonSpatial { volume_db }
     }
 
-    /// Create a non-spatial source configuration with a volume as linear gain.
-    ///
-    /// `1.0` is unity, `0.0` is silent, values > 1.0 amplify.
-    pub fn non_spatial_with_volume_linear(volume: f32) -> Self {
-        Self::NonSpatial {
-            volume_db: gain::linear_to_db(volume),
-        }
-    }
-
     /// Create a spatial source configuration with the given pose at 0 dB (unity gain).
+    #[cfg(test)]
     pub fn spatial(pose: Pose) -> Self {
         Self::Spatial {
             pose,
@@ -62,48 +55,13 @@ impl SourceConfig {
         Self::Spatial { pose, volume_db }
     }
 
-    /// Create a spatial source configuration with pose and volume as linear gain.
-    ///
-    /// `1.0` is unity, `0.0` is silent, values > 1.0 amplify.
-    pub fn spatial_with_volume_linear(pose: Pose, volume: f32) -> Self {
-        Self::Spatial {
-            pose,
-            volume_db: gain::linear_to_db(volume),
-        }
-    }
-
-    /// Create a spatial source configuration from a position (with identity rotation)
-    pub fn spatial_from_position(position: Vec3) -> Self {
-        Self::Spatial {
-            pose: Pose::from_position(position),
-            volume_db: 0.0,
-        }
-    }
-
-    /// Create a spatial source configuration from a position and volume in decibels
-    /// (with identity rotation).
-    pub fn spatial_from_position_with_volume_db(position: Vec3, volume_db: f32) -> Self {
-        Self::Spatial {
-            pose: Pose::from_position(position),
-            volume_db,
-        }
-    }
-
-    /// Create a spatial source configuration from a position and volume as linear gain
-    /// (with identity rotation).
-    pub fn spatial_from_position_with_volume_linear(position: Vec3, volume: f32) -> Self {
-        Self::Spatial {
-            pose: Pose::from_position(position),
-            volume_db: gain::linear_to_db(volume),
-        }
-    }
-
     /// Returns true if this is a spatial source
     pub fn is_spatial(&self) -> bool {
         matches!(self, Self::Spatial { .. })
     }
 
     /// Returns the pose if this is a spatial source
+    #[cfg(test)]
     pub fn pose(&self) -> Option<Pose> {
         match self {
             Self::Spatial { pose, .. } => Some(*pose),
@@ -118,14 +76,6 @@ impl SourceConfig {
                 true
             }
             Self::NonSpatial { .. } => false,
-        }
-    }
-
-    /// Returns the position if this is a spatial source
-    pub fn position(&self) -> Option<Vec3> {
-        match self {
-            Self::Spatial { pose, .. } => Some(pose.position),
-            Self::NonSpatial { .. } => None,
         }
     }
 

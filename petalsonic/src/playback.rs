@@ -26,7 +26,6 @@ pub enum LoopMode {
     #[default]
     Once,
     /// Loop infinitely
-    /// Emits SourceLooped event at the end of each iteration
     Infinite,
 }
 
@@ -52,20 +51,16 @@ pub struct PlaybackInfo {
     pub total_frames: usize,
     /// Current playback time in seconds
     pub current_time: f64,
-    /// Total duration in seconds
-    pub total_time: f64,
     /// Current playback state
     pub play_state: PlayState,
 }
 
 impl PlaybackInfo {
-    pub fn new(total_frames: usize, sample_rate: u32) -> Self {
-        let total_time = total_frames as f64 / sample_rate as f64;
+    pub fn new(total_frames: usize) -> Self {
         Self {
             current_frame: 0,
             total_frames,
             current_time: 0.0,
-            total_time,
             play_state: PlayState::Stopped,
         }
     }
@@ -80,11 +75,21 @@ impl PlaybackInfo {
     }
 }
 
+pub(crate) struct VoiceStart {
+    pub emitter: Emitter,
+    pub audio_data: Arc<PetalSonicAudioData>,
+    pub config: SourceConfig,
+    pub loop_mode: LoopMode,
+    pub bus_index: usize,
+    pub playback_rate: f32,
+    pub detached: bool,
+    pub completion_tag: Option<PlaybackTag>,
+    pub render_block_size: usize,
+}
+
 /// Active playback instance
 #[derive(Debug)]
 pub struct PlaybackInstance {
-    /// Internal identity of this playback voice.
-    pub voice_id: SourceId,
     /// Logical emitter that initiated this voice.
     pub emitter: Emitter,
     /// Detached voices survive emitter destruction and stop following emitter updates.
@@ -114,35 +119,23 @@ pub struct PlaybackInstance {
 }
 
 impl PlaybackInstance {
-    pub fn new(
-        voice_id: SourceId,
-        emitter: Emitter,
-        audio_data: Arc<PetalSonicAudioData>,
-        config: SourceConfig,
-        loop_mode: LoopMode,
-    ) -> Self {
-        Self::from_source(
-            voice_id, emitter, audio_data, config, loop_mode, 0, 1.0, false, None,
-        )
-    }
-
-    pub(crate) fn from_source(
-        voice_id: SourceId,
-        emitter: Emitter,
-        audio_data: Arc<PetalSonicAudioData>,
-        config: SourceConfig,
-        loop_mode: LoopMode,
-        bus_index: usize,
-        playback_rate: f32,
-        detached: bool,
-        completion_tag: Option<PlaybackTag>,
-    ) -> Self {
+    pub(crate) fn from_source(start: VoiceStart) -> Self {
+        let VoiceStart {
+            emitter,
+            audio_data,
+            config,
+            loop_mode,
+            bus_index,
+            playback_rate,
+            detached,
+            completion_tag,
+            render_block_size,
+        } = start;
         let total_frames = audio_data.total_frames();
         let sample_rate = audio_data.sample_rate();
-        let info = PlaybackInfo::new(total_frames, sample_rate);
+        let info = PlaybackInfo::new(total_frames);
 
         Self {
-            voice_id,
             emitter,
             detached,
             completion_tag,
@@ -158,32 +151,17 @@ impl PlaybackInstance {
             voice_rate: playback_rate,
             mix_gain_linear: 1.0,
             mix_rate: playback_rate,
-            mono_scratch: Vec::new(),
+            mono_scratch: vec![0.0; render_block_size],
         }
-    }
-
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    pub fn total_frames(&self) -> usize {
-        self.info.total_frames
     }
 
     /// Resume playing from current position
     pub fn resume(&mut self) {
-        log::debug!(
-            "Source {} resuming from frame {} (loop mode: {:?})",
-            self.voice_id,
-            self.info.current_frame,
-            self.loop_mode
-        );
         self.info.play_state = PlayState::Playing;
     }
 
     /// Reset playback cursor to the beginning
     pub fn reset(&mut self) {
-        log::debug!("Source {} resetting cursor to beginning", self.voice_id);
         self.info.current_frame = 0;
         self.info.current_time = 0.0;
         self.cursor = 0.0;
@@ -192,44 +170,13 @@ impl PlaybackInstance {
 
     /// Play from the beginning (reset + resume)
     pub fn play_from_beginning(&mut self) {
-        log::debug!(
-            "Source {} playing from beginning (loop mode: {:?})",
-            self.voice_id,
-            self.loop_mode
-        );
         self.reset();
         self.resume();
     }
 
-    /// Set the loop mode
-    pub fn set_loop_mode(&mut self, loop_mode: LoopMode) {
-        log::debug!(
-            "Source {} loop mode changed: {:?} -> {:?}",
-            self.voice_id,
-            self.loop_mode,
-            loop_mode
-        );
-        self.loop_mode = loop_mode;
-    }
-
     /// Pause this instance
     pub fn pause(&mut self) {
-        log::debug!(
-            "Source {} paused at frame {}",
-            self.voice_id,
-            self.info.current_frame
-        );
         self.info.play_state = PlayState::Paused;
-    }
-
-    /// Stop this instance (keeps current position)
-    pub fn stop(&mut self) {
-        log::debug!(
-            "Source {} stopped at frame {}",
-            self.voice_id,
-            self.info.current_frame
-        );
-        self.info.play_state = PlayState::Stopped;
     }
 
     /// Seek to a specific progress position (0.0 = start, 1.0 = end)
@@ -238,14 +185,6 @@ impl PlaybackInstance {
         let progress_clamped = progress.clamp(0.0, 1.0);
         let total_frames = self.audio_data.total_frames();
         let target_frame = (total_frames as f32 * progress_clamped) as usize;
-
-        log::debug!(
-            "Source {} seeking to progress {:.2}% (frame {}/{})",
-            self.voice_id,
-            progress_clamped * 100.0,
-            target_frame,
-            total_frames
-        );
 
         self.info.current_frame = target_frame.min(total_frames);
         self.cursor = self.info.current_frame as f64;
@@ -566,20 +505,20 @@ mod tests {
             1,
             Duration::from_secs_f64(4.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_source(
-            SourceId::from(7),
-            Emitter {
+        let mut instance = PlaybackInstance::from_source(VoiceStart {
+            emitter: Emitter {
                 index: 0,
                 generation: 1,
             },
-            audio,
-            SourceConfig::non_spatial(),
-            LoopMode::Infinite,
-            0,
-            1.0,
-            false,
-            None,
-        );
+            audio_data: audio,
+            config: SourceConfig::non_spatial(),
+            loop_mode: LoopMode::Infinite,
+            bus_index: 0,
+            playback_rate: 1.0,
+            detached: false,
+            completion_tag: None,
+            render_block_size: 4,
+        });
 
         instance.play_from_beginning();
 
@@ -606,20 +545,20 @@ mod tests {
             1,
             Duration::from_secs_f64(4.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_source(
-            SourceId::from(8),
-            Emitter {
+        let mut instance = PlaybackInstance::from_source(VoiceStart {
+            emitter: Emitter {
                 index: 0,
                 generation: 1,
             },
-            audio,
-            SourceConfig::non_spatial(),
-            LoopMode::Once,
-            0,
-            2.0,
-            false,
-            None,
-        );
+            audio_data: audio,
+            config: SourceConfig::non_spatial(),
+            loop_mode: LoopMode::Once,
+            bus_index: 0,
+            playback_rate: 2.0,
+            detached: false,
+            completion_tag: None,
+            render_block_size: 4,
+        });
         instance.play_from_beginning();
         instance.set_mix_parameters(BusParams::default());
 

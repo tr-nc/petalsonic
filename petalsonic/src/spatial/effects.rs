@@ -31,25 +31,6 @@ pub struct SpatialSourceEffects {
 unsafe impl Send for SpatialSourceEffects {}
 
 impl SpatialSourceEffects {
-    pub fn ensure_binaural_effect(
-        &mut self,
-        context: &Context,
-        audio_settings: &AudioSettings,
-        hrtf: &Hrtf,
-    ) -> Result<()> {
-        if self.binaural_effect.is_some() {
-            return Ok(());
-        }
-
-        self.binaural_effect = Some(
-            BinauralEffect::try_new(context, audio_settings, &BinauralEffectSettings { hrtf })
-                .map_err(|e| {
-                    PetalSonicError::SpatialAudio(format!("Failed to create BinauralEffect: {}", e))
-                })?,
-        );
-        Ok(())
-    }
-
     /// Create effects for a new spatial source
     pub fn new(
         context: &Context,
@@ -128,9 +109,9 @@ pub struct SpatialEffectsManager {
 }
 
 impl SpatialEffectsManager {
-    pub fn new() -> Self {
+    pub fn new(max_sources: usize) -> Self {
         Self {
-            effects: HashMap::new(),
+            effects: HashMap::with_capacity(max_sources),
         }
     }
 
@@ -143,31 +124,13 @@ impl SpatialEffectsManager {
         audio_settings: &AudioSettings,
         hrtf: Option<&Hrtf>,
     ) -> Result<()> {
-        if self.effects.contains_key(&source_id) {
-            log::warn!("Effects for source {} already exist, replacing", source_id);
-        }
-
         let effects = SpatialSourceEffects::new(context, simulator, audio_settings, hrtf)?;
 
         // Add source to simulator
         simulator.add_source(&effects.source);
 
         self.effects.insert(source_id, effects);
-        log::debug!("Created spatial effects for source {}", source_id);
         Ok(())
-    }
-
-    /// Remove effects for a spatial source
-    pub fn remove_effects_for_source(&mut self, source_id: SourceId) {
-        if self.effects.remove(&source_id).is_some() {
-            log::debug!("Removed spatial effects for source {}", source_id);
-        }
-    }
-
-    /// Get effects for a source
-    #[allow(dead_code)]
-    pub fn get_effects(&self, source_id: SourceId) -> Option<&SpatialSourceEffects> {
-        self.effects.get(&source_id)
     }
 
     /// Get mutable effects for a source
@@ -178,24 +141,5 @@ impl SpatialEffectsManager {
     /// Check if effects exist for a source
     pub fn has_effects(&self, source_id: SourceId) -> bool {
         self.effects.contains_key(&source_id)
-    }
-
-    pub fn ensure_binaural_effects(
-        &mut self,
-        context: &Context,
-        audio_settings: &AudioSettings,
-        hrtf: &Hrtf,
-    ) -> Result<()> {
-        for effects in self.effects.values_mut() {
-            effects.ensure_binaural_effect(context, audio_settings, hrtf)?;
-        }
-        Ok(())
-    }
-
-    /// Clear all effects
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.effects.clear();
-        log::debug!("Cleared all spatial effects");
     }
 }

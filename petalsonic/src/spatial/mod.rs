@@ -10,4 +10,4 @@ mod native_hrtf;
 mod processor;
 
 pub use processor::{DirectPathOverride, DirectPathTransmission};
-pub(crate) use processor::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
+pub(crate) use processor::{SpatialProcessingMetrics, SpatialProcessor, SpatialProcessorConfig};

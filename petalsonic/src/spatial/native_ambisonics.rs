@@ -192,14 +192,6 @@ impl NativeAmbisonicsEncoder {
         })
     }
 
-    pub fn order(&self) -> u32 {
-        self.order
-    }
-
-    pub fn channel_count(&self) -> usize {
-        self.channel_count
-    }
-
     /// Encode `input` and accumulate it into a planar Ambisonics output buffer.
     pub fn encode_source_accumulate(
         &self,
@@ -217,8 +209,7 @@ impl NativeAmbisonicsEncoder {
         }
 
         let coeffs = native_ambisonics_coefficients(self.order, direction)?;
-        for channel in 0..self.channel_count {
-            let coeff = coeffs[channel];
+        for (channel, coeff) in coeffs.iter().copied().take(self.channel_count).enumerate() {
             let channel_offset = channel * frames;
             for (frame_index, input_sample) in input.iter().copied().enumerate() {
                 output_planar[channel_offset + frame_index] += input_sample * coeff;
@@ -255,14 +246,6 @@ impl NativeAmbisonicsBinauralState {
             delay_lines: vec![0.0; channel_count * taps],
             write_index: 0,
             fft_state: fft_plan.map(NativeAmbisonicsFftState::new),
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.delay_lines.fill(0.0);
-        self.write_index = 0;
-        if let Some(fft_state) = &mut self.fft_state {
-            fft_state.reset();
         }
     }
 }
@@ -340,7 +323,7 @@ impl NativeAmbisonicsMinimumPhasePlan {
         for index in 1..nyquist {
             self.real_input[index] = 2.0 * self.real_output[index] * self.inverse_scale;
         }
-        if self.fft_size % 2 == 0 {
+        if self.fft_size.is_multiple_of(2) {
             self.real_input[nyquist] = self.real_output[nyquist] * self.inverse_scale;
         }
 
@@ -499,25 +482,11 @@ impl NativeAmbisonicsFftState {
     fn matches_plan(&self, plan: &NativeAmbisonicsFftPlan) -> bool {
         self.block_frames == plan.block_frames && self.fft_size == plan.fft_size
     }
-
-    fn reset(&mut self) {
-        self.forward_input.fill(0.0);
-        self.input_spectrum.fill(Complex32::new(0.0, 0.0));
-        self.left_spectrum.fill(Complex32::new(0.0, 0.0));
-        self.right_spectrum.fill(Complex32::new(0.0, 0.0));
-        self.left_time.fill(0.0);
-        self.right_time.fill(0.0);
-        self.left_overlap.fill(0.0);
-        self.right_overlap.fill(0.0);
-        self.forward_scratch.fill(Complex32::new(0.0, 0.0));
-        self.inverse_scratch.fill(Complex32::new(0.0, 0.0));
-    }
 }
 
 /// Native Ambisonics binaural decoder derived from the native HRTF table.
 #[derive(Debug, Clone)]
 pub struct NativeAmbisonicsBinauralDecoder {
-    order: u32,
     channel_count: usize,
     taps: usize,
     left_filters: Vec<f32>,
@@ -526,6 +495,7 @@ pub struct NativeAmbisonicsBinauralDecoder {
 }
 
 impl NativeAmbisonicsBinauralDecoder {
+    #[cfg(test)]
     pub fn new(table: Arc<NativeHrtfTable>, order: u32) -> Result<Self> {
         Self::from_table(table, order, None)
     }
@@ -615,7 +585,6 @@ impl NativeAmbisonicsBinauralDecoder {
             .transpose()?;
 
         Ok(Self {
-            order,
             channel_count,
             taps,
             left_filters,
@@ -624,10 +593,7 @@ impl NativeAmbisonicsBinauralDecoder {
         })
     }
 
-    pub fn order(&self) -> u32 {
-        self.order
-    }
-
+    #[cfg(test)]
     pub fn channel_count(&self) -> usize {
         self.channel_count
     }
@@ -659,7 +625,7 @@ impl NativeAmbisonicsBinauralDecoder {
             ));
         }
 
-        if input_planar.len() % self.channel_count != 0 {
+        if !input_planar.len().is_multiple_of(self.channel_count) {
             return Err(PetalSonicError::Configuration(format!(
                 "native Ambisonics input length {} is not divisible by channel count {}",
                 input_planar.len(),
@@ -679,23 +645,16 @@ impl NativeAmbisonicsBinauralDecoder {
         self.ensure_state_compatible(state);
 
         let convolution_start = Instant::now();
-        if let Some(plan) = self.fft_plan.as_deref() {
-            if frames == plan.block_frames {
-                if let Some(fft_state) = state.fft_state.as_ref() {
-                    if fft_state.matches_plan(plan) {
-                        self.decode_frequency_domain(
-                            state,
-                            plan,
-                            input_planar,
-                            output_interleaved,
-                        )?;
-                        return Ok(NativeHrtfRenderMetrics {
-                            direction_lookup_time_us: 0,
-                            convolution_time_us: convolution_start.elapsed().as_micros() as u64,
-                        });
-                    }
-                }
-            }
+        if let Some(plan) = self.fft_plan.as_deref()
+            && frames == plan.block_frames
+            && let Some(fft_state) = state.fft_state.as_ref()
+            && fft_state.matches_plan(plan)
+        {
+            self.decode_frequency_domain(state, plan, input_planar, output_interleaved)?;
+            return Ok(NativeHrtfRenderMetrics {
+                direction_lookup_time_us: 0,
+                convolution_time_us: convolution_start.elapsed().as_micros() as u64,
+            });
         }
 
         self.decode_time_domain(state, input_planar, output_interleaved, frames);
@@ -889,10 +848,10 @@ fn force_real_realfft_bins(spectrum: &mut [Complex32]) {
     if let Some(first) = spectrum.first_mut() {
         first.im = 0.0;
     }
-    if spectrum.len() > 1 {
-        if let Some(last) = spectrum.last_mut() {
-            last.im = 0.0;
-        }
+    if spectrum.len() > 1
+        && let Some(last) = spectrum.last_mut()
+    {
+        last.im = 0.0;
     }
 }
 
@@ -967,11 +926,11 @@ mod tests {
         assert!((coeffs[6] - 0.630_783_14).abs() < 1e-6);
         assert!((coeffs[12] - 0.746_352).abs() < 1e-6);
         assert!((coeffs[20] - 0.846_288).abs() < 1e-6);
-        for channel in 0..=24 {
+        for (channel, coefficient) in coeffs.iter().enumerate() {
             if [0, 2, 6, 12, 20].contains(&channel) {
                 continue;
             }
-            assert!(coeffs[channel].abs() < 1e-6, "channel {channel}");
+            assert!(coefficient.abs() < 1e-6, "channel {channel}");
         }
     }
 

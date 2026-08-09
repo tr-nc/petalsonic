@@ -2,7 +2,7 @@
 // This contains the mixing logic for both spatial and non-spatial sources
 
 use crate::playback::{LoopMode, PlayState, PlaybackInstance};
-use crate::spatial::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
+use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor};
 use crate::world::SourceId;
 use crate::{BusParams, gain};
 use std::collections::HashMap;
@@ -11,17 +11,26 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Result of mixing - contains both the number of frames and loop events
-pub struct MixResult {
-    pub completed_playbacks: Vec<CompletedPlayback>,
-    pub looped_sources: Vec<SourceId>,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct CompletedPlayback {
     pub voice_id: SourceId,
     pub emitter: crate::domain::Emitter,
     pub completion_tag: Option<crate::domain::PlaybackTag>,
+}
+
+/// Reusable identity lists for one render quantum.
+pub struct MixerScratch {
+    spatial_ids: Vec<SourceId>,
+    non_spatial_ids: Vec<SourceId>,
+}
+
+impl MixerScratch {
+    pub fn new(max_voices: usize) -> Self {
+        Self {
+            spatial_ids: Vec::with_capacity(max_voices),
+            non_spatial_ids: Vec::with_capacity(max_voices),
+        }
+    }
 }
 
 /// Per-frame timing breakdown emitted by the mixer.
@@ -39,36 +48,20 @@ pub fn mix_playback_instances_with_metrics(
     active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     spatial_processor: Option<&mut SpatialProcessor>,
     buses: &[BusParams],
-) -> (MixResult, MixProfilingSummary) {
+    scratch: &mut MixerScratch,
+    completed_playbacks: &mut Vec<CompletedPlayback>,
+) -> MixProfilingSummary {
     let Ok(mut active_playback) = active_playback.try_lock() else {
-        log::debug!("Failed to acquire active playback lock in mixer");
-        return (
-            MixResult {
-                completed_playbacks: Vec::new(),
-                looped_sources: Vec::new(),
-            },
-            MixProfilingSummary::default(),
-        );
+        return MixProfilingSummary::default();
     };
 
-    // Separate spatial and non-spatial sources FIRST
-    let mut spatial_instances = Vec::new();
-    let mut non_spatial_instances = Vec::new();
-
-    log::debug!(
-        "Mixer: Starting mix with {} active sources",
-        active_playback.len()
-    );
+    scratch.spatial_ids.clear();
+    scratch.non_spatial_ids.clear();
 
     let output_frames = world_buffer.len() / channels.max(1) as usize;
     for (source_id, instance) in active_playback.iter_mut() {
         // Only process playing instances
         if !matches!(instance.info.play_state, PlayState::Playing) {
-            log::debug!(
-                "Mixer: Skipping source {} - not playing (state: {:?})",
-                source_id,
-                instance.info.play_state
-            );
             continue;
         }
 
@@ -83,9 +76,9 @@ pub fn mix_playback_instances_with_metrics(
         }
 
         if instance.config.is_spatial() {
-            spatial_instances.push((*source_id, instance as &mut PlaybackInstance));
+            scratch.spatial_ids.push(*source_id);
         } else {
-            non_spatial_instances.push(instance);
+            scratch.non_spatial_ids.push(*source_id);
         }
     }
 
@@ -93,33 +86,31 @@ pub fn mix_playback_instances_with_metrics(
 
     // Process non-spatial sources first
     let direct_start = Instant::now();
-    for instance in non_spatial_instances {
-        instance.fill_buffer(world_buffer, channels);
+    for source_id in &scratch.non_spatial_ids {
+        if let Some(instance) = active_playback.get_mut(source_id) {
+            instance.fill_buffer(world_buffer, channels);
+        }
     }
     profiling.direct_mix_time_us = direct_start.elapsed().as_micros() as u64;
 
     // Process spatial sources if spatial processor is available
     if let Some(processor) = spatial_processor {
-        if !spatial_instances.is_empty() {
+        if !scratch.spatial_ids.is_empty() {
             let spatial_start = Instant::now();
-            match processor
-                .process_spatial_sources_with_metrics(&mut spatial_instances, world_buffer)
-            {
-                Ok(SpatialProcessingSummary {
-                    frames_processed: _,
-                    metrics,
-                }) => {
-                    profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
-                    profiling.spatial_metrics = Some(metrics);
-                }
-                Err(e) => {
-                    log::error!("Error processing spatial sources: {}", e);
-                }
+            if let Ok(metrics) = processor.process_spatial_sources_with_metrics(
+                &scratch.spatial_ids,
+                &mut active_playback,
+                world_buffer,
+            ) {
+                profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
+                profiling.spatial_metrics = Some(metrics);
             }
         }
-    } else if !spatial_instances.is_empty() {
-        for (_, instance) in spatial_instances {
-            instance.advance_silently(output_frames);
+    } else if !scratch.spatial_ids.is_empty() {
+        for source_id in &scratch.spatial_ids {
+            if let Some(instance) = active_playback.get_mut(source_id) {
+                instance.advance_silently(output_frames);
+            }
         }
     }
 
@@ -127,25 +118,8 @@ pub fn mix_playback_instances_with_metrics(
 
     // NOW check for sources that reached the end during this mix iteration
     // This must happen AFTER fill_buffer() has been called on all sources
-    let mut completed_playbacks = Vec::new();
-    let mut looped_sources = Vec::new();
-
-    log::debug!("Mixer: Checking for completed/looped sources...");
-
     for (source_id, instance) in active_playback.iter_mut() {
-        log::debug!(
-            "Mixer: Checking source {} - reached_end_flag: {}, state: {:?}",
-            source_id,
-            instance.reached_end_this_iteration,
-            instance.info.play_state
-        );
-
         if let Some(loop_mode) = instance.check_and_clear_end_flag() {
-            log::debug!(
-                "Mixer: Source {} reached end with loop mode: {:?}",
-                source_id,
-                loop_mode
-            );
             match loop_mode {
                 LoopMode::Once => {
                     completed_playbacks.push(CompletedPlayback {
@@ -154,33 +128,16 @@ pub fn mix_playback_instances_with_metrics(
                         completion_tag: instance.completion_tag,
                     });
                 }
-                LoopMode::Infinite => {
-                    // No longer need to restart - wraparound already handled in fill_buffer
-                    looped_sources.push(*source_id);
-                }
+                LoopMode::Infinite => {}
             }
         }
     }
 
     // Only remove instances that are actually finished (stopped playing)
     // Infinite looping sources wrap around automatically, so they keep playing
-    let removed_count = active_playback.len();
     active_playback.retain(|_, instance| !instance.info.is_finished());
-    let removed = removed_count - active_playback.len();
-    if removed > 0 {
-        log::debug!(
-            "Mixer: Removed {} finished sources from active playback",
-            removed
-        );
-    }
 
-    (
-        MixResult {
-            completed_playbacks,
-            looped_sources,
-        },
-        profiling,
-    )
+    profiling
 }
 
 pub(crate) fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusParams {

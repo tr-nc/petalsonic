@@ -67,11 +67,69 @@ impl std::fmt::Display for PlaybackControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackTag(pub u64);
 
+/// Stable handle for one world-owned mix bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Bus {
+    pub(crate) world_id: u64,
+    pub(crate) index: u16,
+}
+
+/// Initial declaration for a bus. Bus topology is fixed when the world is created.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BusDesc {
+    name: String,
+    params: BusParams,
+}
+
+impl BusDesc {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            params: BusParams::default(),
+        }
+    }
+
+    pub fn with_params(mut self, params: BusParams) -> Self {
+        self.params = params;
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn params(&self) -> BusParams {
+        self.params
+    }
+}
+
+/// Mutable controls for a fixed bus. Every declared bus feeds Master directly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BusParams {
+    pub gain_db: f32,
+    pub muted: bool,
+    pub paused: bool,
+    /// Playback speed with matching pitch change. High-quality time stretching is not provided.
+    pub playback_rate: f32,
+}
+
+impl Default for BusParams {
+    fn default() -> Self {
+        Self {
+            gain_db: 0.0,
+            muted: false,
+            paused: false,
+            playback_rate: 1.0,
+        }
+    }
+}
+
 /// Initial, low-frequency properties of an emitter.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EmitterDesc {
     placement: EmitterPlacement,
     gain_db: f32,
+    bus: Option<Bus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -85,6 +143,7 @@ impl EmitterDesc {
         Self {
             placement: EmitterPlacement::NonSpatial,
             gain_db: 0.0,
+            bus: None,
         }
     }
 
@@ -92,6 +151,7 @@ impl EmitterDesc {
         Self {
             placement: EmitterPlacement::Spatial(pose),
             gain_db: 0.0,
+            bus: None,
         }
     }
 
@@ -102,6 +162,16 @@ impl EmitterDesc {
 
     pub fn gain_db(&self) -> f32 {
         self.gain_db
+    }
+
+    /// Routes this emitter to a declared bus. Without this, it feeds Master directly.
+    pub fn with_bus(mut self, bus: Bus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    pub fn bus(&self) -> Option<Bus> {
+        self.bus
     }
 
     pub fn pose(&self) -> Option<Pose> {
@@ -147,6 +217,8 @@ pub struct PlayOptions {
     pub loop_mode: LoopMode,
     pub gain_db: f32,
     pub detached: bool,
+    bus: Option<Bus>,
+    playback_rate: f32,
 }
 
 impl PlayOptions {
@@ -170,6 +242,26 @@ impl PlayOptions {
         self.detached = true;
         self
     }
+
+    /// Overrides the emitter's default bus for this playback.
+    pub fn with_bus(mut self, bus: Bus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// Sets playback speed with a corresponding pitch change.
+    pub fn with_playback_rate(mut self, playback_rate: f32) -> Self {
+        self.playback_rate = playback_rate;
+        self
+    }
+
+    pub(crate) fn bus(self) -> Option<Bus> {
+        self.bus
+    }
+
+    pub(crate) fn playback_rate(self) -> f32 {
+        self.playback_rate
+    }
 }
 
 impl Default for PlayOptions {
@@ -178,6 +270,8 @@ impl Default for PlayOptions {
             loop_mode: LoopMode::Once,
             gain_db: 0.0,
             detached: false,
+            bus: None,
+            playback_rate: 1.0,
         }
     }
 }

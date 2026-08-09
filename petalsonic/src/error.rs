@@ -19,6 +19,9 @@ pub enum PetalSonicError {
     #[error("Emitter handle is stale")]
     StaleEmitter,
 
+    #[error("Bus handle is stale or belongs to another world")]
+    StaleBus,
+
     #[error("Playback control is stale")]
     StalePlayback,
 

@@ -4,6 +4,7 @@
 use crate::playback::{LoopMode, PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessingSummary, SpatialProcessor};
 use crate::world::SourceId;
+use crate::{BusParams, gain};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -37,6 +38,7 @@ pub fn mix_playback_instances_with_metrics(
     channels: u16,
     active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     spatial_processor: Option<&mut SpatialProcessor>,
+    buses: &[BusParams],
 ) -> (MixResult, MixProfilingSummary) {
     let Ok(mut active_playback) = active_playback.try_lock() else {
         log::debug!("Failed to acquire active playback lock in mixer");
@@ -58,6 +60,7 @@ pub fn mix_playback_instances_with_metrics(
         active_playback.len()
     );
 
+    let output_frames = world_buffer.len() / channels.max(1) as usize;
     for (source_id, instance) in active_playback.iter_mut() {
         // Only process playing instances
         if !matches!(instance.info.play_state, PlayState::Playing) {
@@ -69,13 +72,15 @@ pub fn mix_playback_instances_with_metrics(
             continue;
         }
 
-        log::debug!(
-            "Mixer: Processing source {} - frame {}/{} (spatial: {})",
-            source_id,
-            instance.info.current_frame,
-            instance.total_frames(),
-            instance.config.is_spatial()
-        );
+        let bus = effective_bus_params(instance.bus_index, buses);
+        if bus.paused {
+            continue;
+        }
+        instance.set_mix_parameters(bus);
+        if bus.muted || gain::db_to_linear(bus.gain_db) == 0.0 {
+            instance.advance_silently(output_frames);
+            continue;
+        }
 
         if instance.config.is_spatial() {
             spatial_instances.push((*source_id, instance as &mut PlaybackInstance));
@@ -113,10 +118,9 @@ pub fn mix_playback_instances_with_metrics(
             }
         }
     } else if !spatial_instances.is_empty() {
-        log::warn!(
-            "Spatial processor not available, {} spatial sources will be silent",
-            spatial_instances.len()
-        );
+        for (_, instance) in spatial_instances {
+            instance.advance_silently(output_frames);
+        }
     }
 
     track_mix_peak(world_buffer);
@@ -179,6 +183,20 @@ pub fn mix_playback_instances_with_metrics(
     )
 }
 
+fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusParams {
+    let master = buses.first().copied().unwrap_or_default();
+    let selected = buses.get(index).copied().unwrap_or(master);
+    if index == 0 {
+        return master;
+    }
+    BusParams {
+        gain_db: master.gain_db + selected.gain_db,
+        muted: master.muted || selected.muted,
+        paused: master.paused || selected.paused,
+        playback_rate: master.playback_rate * selected.playback_rate,
+    }
+}
+
 fn track_mix_peak(world_buffer: &[f32]) {
     let mut block_peak = 0.0f32;
 
@@ -225,4 +243,32 @@ fn update_global_peak(block_peak: f32) {
 fn global_peak_amplitude() -> &'static AtomicU32 {
     static PEAK: OnceLock<AtomicU32> = OnceLock::new();
     PEAK.get_or_init(|| AtomicU32::new(0.0f32.to_bits()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_bus_controls_compose_directly_with_master() {
+        let buses = [
+            BusParams {
+                gain_db: -3.0,
+                playback_rate: 0.5,
+                ..BusParams::default()
+            },
+            BusParams {
+                gain_db: -6.0,
+                muted: true,
+                playback_rate: 2.0,
+                ..BusParams::default()
+            },
+        ];
+
+        let effective = effective_bus_params(1, &buses);
+        assert_eq!(effective.gain_db, -9.0);
+        assert!(effective.muted);
+        assert!(!effective.paused);
+        assert_eq!(effective.playback_rate, 1.0);
+    }
 }

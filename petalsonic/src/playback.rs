@@ -12,7 +12,7 @@
 
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
-use crate::domain::{Emitter, PlaybackTag};
+use crate::domain::{BusParams, Emitter, PlaybackTag};
 use crate::spatial::DirectPathOverride;
 use crate::world::SourceId;
 use std::fmt;
@@ -99,11 +99,17 @@ pub struct PlaybackInstance {
     pub config: SourceConfig,
     /// Loop mode for this playback
     pub loop_mode: LoopMode,
+    /// Fixed bus route selected when the Voice is created. Zero is Master.
+    pub bus_index: usize,
     /// Optional host-provided direct-path override used during spatial processing.
     pub direct_path_override: Option<DirectPathOverride>,
     /// Flag to track if we've reached the end this iteration (for event emission)
     pub(crate) reached_end_this_iteration: bool,
     sample_rate: u32,
+    cursor: f64,
+    voice_rate: f32,
+    mix_gain_linear: f32,
+    mix_rate: f32,
     mono_scratch: Vec<f32>,
 }
 
@@ -116,7 +122,7 @@ impl PlaybackInstance {
         loop_mode: LoopMode,
     ) -> Self {
         Self::from_source(
-            voice_id, emitter, audio_data, config, loop_mode, false, None,
+            voice_id, emitter, audio_data, config, loop_mode, 0, 1.0, false, None,
         )
     }
 
@@ -126,6 +132,8 @@ impl PlaybackInstance {
         audio_data: Arc<PetalSonicAudioData>,
         config: SourceConfig,
         loop_mode: LoopMode,
+        bus_index: usize,
+        playback_rate: f32,
         detached: bool,
         completion_tag: Option<PlaybackTag>,
     ) -> Self {
@@ -142,9 +150,14 @@ impl PlaybackInstance {
             info,
             config,
             loop_mode,
+            bus_index,
             direct_path_override: None,
             reached_end_this_iteration: false,
             sample_rate,
+            cursor: 0.0,
+            voice_rate: playback_rate,
+            mix_gain_linear: 1.0,
+            mix_rate: playback_rate,
             mono_scratch: Vec::new(),
         }
     }
@@ -173,6 +186,7 @@ impl PlaybackInstance {
         log::debug!("Source {} resetting cursor to beginning", self.voice_id);
         self.info.current_frame = 0;
         self.info.current_time = 0.0;
+        self.cursor = 0.0;
         self.reached_end_this_iteration = false;
     }
 
@@ -234,48 +248,82 @@ impl PlaybackInstance {
         );
 
         self.info.current_frame = target_frame.min(total_frames);
+        self.cursor = self.info.current_frame as f64;
         self.info
             .update_position(self.info.current_frame, self.audio_data.sample_rate());
 
         self.reached_end_this_iteration = false;
     }
 
-    fn advance_static(&mut self, frames_consumed: usize) {
+    pub(crate) fn set_mix_parameters(&mut self, bus: BusParams) {
+        self.mix_gain_linear = if bus.muted {
+            0.0
+        } else {
+            crate::gain::db_to_linear(bus.gain_db)
+        };
+        self.mix_rate = self.voice_rate * bus.playback_rate;
+    }
+
+    pub(crate) fn set_playback_rate(&mut self, playback_rate: f32) {
+        self.voice_rate = playback_rate;
+    }
+
+    pub(crate) fn advance_silently(&mut self, output_frames: usize) {
+        for _ in 0..output_frames {
+            if self.next_source_frame().is_none() {
+                break;
+            }
+        }
+    }
+
+    fn next_source_frame(&mut self) -> Option<usize> {
         let total_frames = self.audio_data.total_frames();
 
         if total_frames == 0 {
             self.reached_end_this_iteration = true;
             self.info.play_state = PlayState::Stopped;
-            return;
+            return None;
         }
 
-        self.info.current_frame = self.info.current_frame.saturating_add(frames_consumed);
-
-        if self.info.current_frame >= total_frames {
+        if self.cursor >= total_frames as f64 {
             match self.loop_mode {
                 LoopMode::Infinite => {
-                    self.info.current_frame %= total_frames;
-                    log::debug!(
-                        "Source {} wrapped around to frame {} (Infinite loop)",
-                        self.voice_id,
-                        self.info.current_frame
-                    );
+                    self.cursor %= total_frames as f64;
+                    self.reached_end_this_iteration = true;
                 }
                 LoopMode::Once => {
-                    self.reached_end_this_iteration = true;
+                    self.info.update_position(total_frames, self.sample_rate);
                     self.info.play_state = PlayState::Stopped;
-                    log::debug!(
-                        "Source {} reached end at frame {}/{} (Once mode)",
-                        self.voice_id,
-                        self.info.current_frame,
-                        total_frames
-                    );
+                    self.reached_end_this_iteration = true;
+                    return None;
                 }
             }
         }
 
-        self.info
-            .update_position(self.info.current_frame, self.sample_rate);
+        let source_frame = self.cursor.floor() as usize;
+        self.cursor += self.mix_rate as f64;
+        if self.cursor >= total_frames as f64 {
+            match self.loop_mode {
+                LoopMode::Infinite => {
+                    self.cursor %= total_frames as f64;
+                    self.reached_end_this_iteration = true;
+                }
+                LoopMode::Once => {
+                    self.reached_end_this_iteration = true;
+                    self.info.play_state = PlayState::Stopped;
+                }
+            }
+        }
+
+        let next_frame = if matches!(self.loop_mode, LoopMode::Once)
+            && !matches!(self.info.play_state, PlayState::Playing)
+        {
+            total_frames
+        } else {
+            self.cursor.floor() as usize
+        };
+        self.info.update_position(next_frame, self.sample_rate);
+        Some(source_frame)
     }
 
     /// Fill a mono buffer for this instance and apply `volume`.
@@ -286,7 +334,6 @@ impl PlaybackInstance {
             return 0;
         }
 
-        let samples = self.audio_data.samples();
         let channels = self.audio_data.channels().max(1) as usize;
         let total_frames = self.audio_data.total_frames();
         if total_frames == 0 {
@@ -295,34 +342,25 @@ impl PlaybackInstance {
             return 0;
         }
 
-        let current_frame = self.info.current_frame;
         let mut frames_filled = 0;
 
-        for (frame_idx, out_sample) in buffer.iter_mut().enumerate() {
-            let mut source_frame = current_frame + frame_idx;
-
-            if source_frame >= total_frames {
-                if matches!(self.loop_mode, LoopMode::Infinite) {
-                    if !self.reached_end_this_iteration {
-                        self.reached_end_this_iteration = true;
-                    }
-                    source_frame %= total_frames;
-                } else {
-                    break;
-                }
-            }
+        for out_sample in buffer.iter_mut() {
+            let Some(source_frame) = self.next_source_frame() else {
+                break;
+            };
 
             let base_idx = source_frame * channels;
             let mut mono = 0.0;
             for channel in 0..channels {
-                mono += samples.get(base_idx + channel).copied().unwrap_or(0.0);
+                mono += self
+                    .audio_data
+                    .samples()
+                    .get(base_idx + channel)
+                    .copied()
+                    .unwrap_or(0.0);
             }
-            *out_sample = (mono / channels as f32) * volume;
+            *out_sample = (mono / channels as f32) * volume * self.mix_gain_linear;
             frames_filled += 1;
-        }
-
-        if frames_filled > 0 {
-            self.advance_static(frames_filled);
         }
 
         frames_filled
@@ -398,17 +436,23 @@ pub enum PlaybackCommand {
         loop_mode: LoopMode,
         detached: bool,
         completion_tag: Option<PlaybackTag>,
+        bus_index: usize,
+        playback_rate: f32,
     },
     PauseVoice(SourceId),
     StopVoice(SourceId),
     SeekVoice(SourceId, f32),
+    ResumeVoice(SourceId),
+    SetVoiceRate(SourceId, f32),
     PauseEmitter(Emitter),
+    ResumeEmitter(Emitter),
     StopEmitter(Emitter),
     SeekEmitter(Emitter, f32),
     DestroyEmitter(Emitter),
     StopAll,
-    UpdateEmitter(Emitter, SourceConfig),
+    UpdateEmitter(Emitter, SourceConfig, usize),
     UpdateDirectPathOverride(Emitter, Option<DirectPathOverride>),
+    UpdateBus(usize, BusParams),
 }
 
 impl fmt::Debug for PlaybackCommand {
@@ -422,6 +466,8 @@ impl fmt::Debug for PlaybackCommand {
                 loop_mode,
                 detached,
                 completion_tag,
+                bus_index,
+                playback_rate,
             } => f
                 .debug_struct("Play")
                 .field("voice_id", voice_id)
@@ -431,6 +477,8 @@ impl fmt::Debug for PlaybackCommand {
                 .field("loop_mode", loop_mode)
                 .field("detached", detached)
                 .field("completion_tag", completion_tag)
+                .field("bus_index", bus_index)
+                .field("playback_rate", playback_rate)
                 .finish(),
             Self::PauseVoice(voice_id) => f.debug_tuple("PauseVoice").field(voice_id).finish(),
             Self::StopVoice(voice_id) => f.debug_tuple("StopVoice").field(voice_id).finish(),
@@ -439,7 +487,14 @@ impl fmt::Debug for PlaybackCommand {
                 .field(voice_id)
                 .field(progress)
                 .finish(),
+            Self::ResumeVoice(voice_id) => f.debug_tuple("ResumeVoice").field(voice_id).finish(),
+            Self::SetVoiceRate(voice_id, rate) => f
+                .debug_tuple("SetVoiceRate")
+                .field(voice_id)
+                .field(rate)
+                .finish(),
             Self::PauseEmitter(emitter) => f.debug_tuple("PauseEmitter").field(emitter).finish(),
+            Self::ResumeEmitter(emitter) => f.debug_tuple("ResumeEmitter").field(emitter).finish(),
             Self::StopEmitter(emitter) => f.debug_tuple("StopEmitter").field(emitter).finish(),
             Self::SeekEmitter(emitter, progress) => f
                 .debug_tuple("SeekEmitter")
@@ -450,15 +505,21 @@ impl fmt::Debug for PlaybackCommand {
                 f.debug_tuple("DestroyEmitter").field(emitter).finish()
             }
             Self::StopAll => f.write_str("StopAll"),
-            Self::UpdateEmitter(emitter, config) => f
+            Self::UpdateEmitter(emitter, config, bus_index) => f
                 .debug_tuple("UpdateEmitter")
                 .field(emitter)
                 .field(config)
+                .field(bus_index)
                 .finish(),
             Self::UpdateDirectPathOverride(emitter, direct_path_override) => f
                 .debug_tuple("UpdateDirectPathOverride")
                 .field(emitter)
                 .field(direct_path_override)
+                .finish(),
+            Self::UpdateBus(index, params) => f
+                .debug_tuple("UpdateBus")
+                .field(index)
+                .field(params)
                 .finish(),
         }
     }
@@ -487,6 +548,8 @@ mod tests {
             audio,
             SourceConfig::non_spatial(),
             LoopMode::Infinite,
+            0,
+            1.0,
             false,
             None,
         );
@@ -506,5 +569,46 @@ mod tests {
         let frames = instance.fill_mono_buffer(&mut mono, 0.5);
         assert_eq!(frames, 2);
         assert_eq!(mono, [1.0, 1.5]);
+    }
+
+    #[test]
+    fn playback_rate_changes_source_progress_and_muted_time_still_advances() {
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.0, 1.0, 2.0, 3.0],
+            48_000,
+            1,
+            Duration::from_secs_f64(4.0 / 48_000.0),
+        ));
+        let mut instance = PlaybackInstance::from_source(
+            SourceId::from(8),
+            Emitter {
+                index: 0,
+                generation: 1,
+            },
+            audio,
+            SourceConfig::non_spatial(),
+            LoopMode::Once,
+            0,
+            2.0,
+            false,
+            None,
+        );
+        instance.play_from_beginning();
+        instance.set_mix_parameters(BusParams::default());
+
+        let mut output = [0.0; 4];
+        assert_eq!(instance.fill_mono_buffer(&mut output, 1.0), 2);
+        assert_eq!(output, [0.0, 2.0, 0.0, 0.0]);
+        assert!(instance.info.is_finished());
+
+        instance.reset();
+        instance.resume();
+        instance.set_playback_rate(1.0);
+        instance.set_mix_parameters(BusParams {
+            muted: true,
+            ..BusParams::default()
+        });
+        instance.advance_silently(3);
+        assert_eq!(instance.info.current_frame, 3);
     }
 }

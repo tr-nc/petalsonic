@@ -1,5 +1,6 @@
 use crate::domain::{
-    Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip, SpatialFrame,
+    Bus, BusParams, Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
+    SpatialFrame,
 };
 use crate::engine::{AudioOutputDeviceInfo, PetalSonicEngine};
 use crate::error::{PetalSonicError, Result};
@@ -11,6 +12,10 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+const MIN_PLAYBACK_RATE: f32 = 0.01;
+const MAX_PLAYBACK_RATE: f32 = 4.0;
+static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Internal identity for one playback voice.
 ///
@@ -171,7 +176,9 @@ impl EmitterRegistry {
 /// Creating a world starts its private render runtime. Callers submit bounded,
 /// non-blocking intent and never drive audio progress themselves.
 pub struct PetalSonicWorld {
+    world_id: u64,
     desc: crate::config::PetalSonicWorldDesc,
+    bus_params: Mutex<Vec<BusParams>>,
     emitters: Mutex<EmitterRegistry>,
     next_voice_id: AtomicU64,
     active_voice_count: Arc<AtomicUsize>,
@@ -186,6 +193,7 @@ pub struct PetalSonicWorld {
 impl PetalSonicWorld {
     pub fn new(config: crate::config::PetalSonicWorldDesc) -> Result<Self> {
         Self::validate_config(&config)?;
+        let world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
 
         let (command_sender, command_receiver) =
             crossbeam_channel::bounded(config.control_queue_capacity);
@@ -207,7 +215,13 @@ impl PetalSonicWorld {
         engine.start(command_receiver)?;
 
         Ok(Self {
+            world_id,
             emitters: Mutex::new(EmitterRegistry::new(config.max_emitters)),
+            bus_params: Mutex::new(
+                std::iter::once(BusParams::default())
+                    .chain(config.buses.iter().map(|bus| bus.params()))
+                    .collect(),
+            ),
             controlled_voices: Mutex::new(HashMap::with_capacity(config.max_voices)),
             desc: config,
             next_voice_id: AtomicU64::new(0),
@@ -237,6 +251,35 @@ impl PetalSonicWorld {
                 });
             }
         }
+        if config.buses.len() > config.max_buses {
+            return Err(PetalSonicError::CapacityExceeded {
+                resource: "bus",
+                limit: config.max_buses,
+            });
+        }
+        let mut names = HashSet::with_capacity(config.buses.len());
+        for bus in &config.buses {
+            let name = bus.name().trim();
+            if name.is_empty() {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field: "buses",
+                    reason: "bus names must not be empty".into(),
+                });
+            }
+            if name.eq_ignore_ascii_case("Master") {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field: "buses",
+                    reason: "Master is implicit and must not be declared".into(),
+                });
+            }
+            if !names.insert(name.to_ascii_lowercase()) {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field: "buses",
+                    reason: format!("duplicate bus name {name:?}"),
+                });
+            }
+            Self::validate_bus_params(bus.params())?;
+        }
         Ok(())
     }
 
@@ -250,6 +293,7 @@ impl PetalSonicWorld {
 
     pub fn create_emitter(&self, clip: ResidentClip, desc: EmitterDesc) -> Result<Emitter> {
         self.ensure_open()?;
+        self.validate_optional_bus(desc.bus())?;
         let clip = self.prepare_clip(clip)?;
         self.emitters
             .lock()
@@ -267,6 +311,8 @@ impl PetalSonicWorld {
     }
 
     pub fn update_emitter(&self, emitter: Emitter, desc: EmitterDesc) -> Result<()> {
+        self.validate_optional_bus(desc.bus())?;
+        let bus_index = self.resolve_bus(desc.bus())?;
         let mut emitters = self
             .emitters
             .lock()
@@ -281,6 +327,7 @@ impl PetalSonicWorld {
         self.try_send(PlaybackCommand::UpdateEmitter(
             emitter,
             desc.source_config(0.0),
+            bus_index,
         ))?;
         state.desc = desc;
         Ok(())
@@ -354,6 +401,8 @@ impl PetalSonicWorld {
         self.drain_retired_controls();
         self.ensure_open()?;
         let state = self.emitter_state(emitter)?;
+        Self::validate_playback_rate(options.playback_rate())?;
+        let bus_index = self.resolve_bus(options.bus().or(state.desc.bus()))?;
         self.reserve_voice()?;
         let voice_id = SourceId(self.next_voice_id.fetch_add(1, Ordering::Relaxed));
         if completion_tag.is_some() {
@@ -376,6 +425,8 @@ impl PetalSonicWorld {
             loop_mode: options.loop_mode,
             detached: options.detached,
             completion_tag,
+            bus_index,
+            playback_rate: options.playback_rate(),
         };
         if let Err(error) = self.try_send(command) {
             self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
@@ -406,6 +457,11 @@ impl PetalSonicWorld {
         self.try_send(PlaybackCommand::PauseEmitter(emitter))
     }
 
+    pub fn resume_emitter(&self, emitter: Emitter) -> Result<()> {
+        self.emitter_state(emitter)?;
+        self.try_send(PlaybackCommand::ResumeEmitter(emitter))
+    }
+
     pub fn stop_emitter(&self, emitter: Emitter) -> Result<()> {
         self.emitter_state(emitter)?;
         self.try_send(PlaybackCommand::StopEmitter(emitter))?;
@@ -423,6 +479,20 @@ impl PetalSonicWorld {
     pub fn pause_playback(&self, control: PlaybackControl) -> Result<()> {
         self.ensure_controlled(control)?;
         self.try_send(PlaybackCommand::PauseVoice(control.voice_id))
+    }
+
+    pub fn resume_playback(&self, control: PlaybackControl) -> Result<()> {
+        self.ensure_controlled(control)?;
+        self.try_send(PlaybackCommand::ResumeVoice(control.voice_id))
+    }
+
+    pub fn set_playback_rate(&self, control: PlaybackControl, playback_rate: f32) -> Result<()> {
+        self.ensure_controlled(control)?;
+        Self::validate_playback_rate(playback_rate)?;
+        self.try_send(PlaybackCommand::SetVoiceRate(
+            control.voice_id,
+            playback_rate,
+        ))
     }
 
     pub fn stop_playback(&self, control: PlaybackControl) -> Result<()> {
@@ -447,6 +517,90 @@ impl PetalSonicWorld {
             .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
             .clear();
         Ok(())
+    }
+
+    /// Returns the implicit Master bus.
+    pub fn master_bus(&self) -> Bus {
+        Bus {
+            world_id: self.world_id,
+            index: 0,
+        }
+    }
+
+    /// Resolves a declared bus by name. Matching is case-insensitive.
+    pub fn bus(&self, name: &str) -> Option<Bus> {
+        if name.eq_ignore_ascii_case("Master") {
+            return Some(self.master_bus());
+        }
+        self.desc
+            .buses
+            .iter()
+            .position(|bus| bus.name().eq_ignore_ascii_case(name))
+            .and_then(|index| u16::try_from(index + 1).ok())
+            .map(|index| Bus {
+                world_id: self.world_id,
+                index,
+            })
+    }
+
+    pub fn set_bus_params(&self, bus: Bus, params: BusParams) -> Result<()> {
+        let index = self.resolve_bus(Some(bus))?;
+        Self::validate_bus_params(params)?;
+        let mut current = self
+            .bus_params
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Bus state is poisoned".into()))?;
+        self.try_send(PlaybackCommand::UpdateBus(index, params))?;
+        current[index] = params;
+        Ok(())
+    }
+
+    pub fn bus_params(&self, bus: Bus) -> Result<BusParams> {
+        let index = self.resolve_bus(Some(bus))?;
+        self.bus_params
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("Bus state is poisoned".into()))?
+            .get(index)
+            .copied()
+            .ok_or(PetalSonicError::StaleBus)
+    }
+
+    fn validate_optional_bus(&self, bus: Option<Bus>) -> Result<()> {
+        self.resolve_bus(bus).map(|_| ())
+    }
+
+    fn resolve_bus(&self, bus: Option<Bus>) -> Result<usize> {
+        let Some(bus) = bus else {
+            return Ok(0);
+        };
+        let index = bus.index as usize;
+        if bus.world_id != self.world_id || index > self.desc.buses.len() {
+            return Err(PetalSonicError::StaleBus);
+        }
+        Ok(index)
+    }
+
+    fn validate_bus_params(params: BusParams) -> Result<()> {
+        if !params.gain_db.is_finite() {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "bus.gain_db",
+                reason: "must be finite".into(),
+            });
+        }
+        Self::validate_playback_rate(params.playback_rate)
+    }
+
+    fn validate_playback_rate(playback_rate: f32) -> Result<()> {
+        if playback_rate.is_finite()
+            && (MIN_PLAYBACK_RATE..=MAX_PLAYBACK_RATE).contains(&playback_rate)
+        {
+            Ok(())
+        } else {
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "playback_rate",
+                reason: format!("must be between {MIN_PLAYBACK_RATE} and {MAX_PLAYBACK_RATE}"),
+            })
+        }
     }
 
     fn emitter_state(&self, emitter: Emitter) -> Result<EmitterState> {
@@ -593,6 +747,35 @@ mod tests {
             1,
             Duration::from_secs_f64(16.0 / 48_000.0),
         )))
+    }
+
+    #[test]
+    fn bus_declarations_are_bounded_unique_and_exclude_master() {
+        let mut desc = crate::config::PetalSonicWorldDesc {
+            max_buses: 1,
+            buses: vec![crate::domain::BusDesc::new("Gameplay")],
+            ..Default::default()
+        };
+        assert!(PetalSonicWorld::validate_config(&desc).is_ok());
+
+        desc.buses.push(crate::domain::BusDesc::new("Music"));
+        assert!(matches!(
+            PetalSonicWorld::validate_config(&desc),
+            Err(PetalSonicError::CapacityExceeded {
+                resource: "bus",
+                limit: 1
+            })
+        ));
+
+        desc.max_buses = 2;
+        desc.buses = vec![
+            crate::domain::BusDesc::new("Gameplay"),
+            crate::domain::BusDesc::new("gameplay"),
+        ];
+        assert!(PetalSonicWorld::validate_config(&desc).is_err());
+
+        desc.buses = vec![crate::domain::BusDesc::new("Master")];
+        assert!(PetalSonicWorld::validate_config(&desc).is_err());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::acoustics::{BatchedAnyHitRayTracer, BatchedClosestHitRayTracer};
+use crate::domain::BusDesc;
 use std::sync::Arc;
 
 /// Internal backend plan resolved from [`SpatialQuality`].
@@ -76,6 +77,10 @@ pub struct PetalSonicWorldDesc {
     pub max_emitters: usize,
     /// Maximum number of simultaneous playback voices.
     pub max_voices: usize,
+    /// Maximum number of declared buses, excluding the implicit Master bus.
+    pub max_buses: usize,
+    /// Stable buses created with the world. Every bus feeds Master directly.
+    pub buses: Vec<BusDesc>,
     /// Capacity of the bounded lifecycle/control queue.
     pub control_queue_capacity: usize,
     /// Capacity of the bounded event queue.
@@ -123,6 +128,11 @@ impl Default for PetalSonicWorldDesc {
             block_size: 1024,
             max_emitters: 2048,
             max_voices: 4096,
+            max_buses: 8,
+            buses: ["Gameplay", "Music", "UI", "Voice"]
+                .into_iter()
+                .map(BusDesc::new)
+                .collect(),
             control_queue_capacity: 4096,
             event_queue_capacity: 1024,
             timing_queue_capacity: 512,
@@ -146,6 +156,8 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("block_size", &self.block_size)
             .field("max_emitters", &self.max_emitters)
             .field("max_voices", &self.max_voices)
+            .field("max_buses", &self.max_buses)
+            .field("buses", &self.buses)
             .field("control_queue_capacity", &self.control_queue_capacity)
             .field("event_queue_capacity", &self.event_queue_capacity)
             .field("timing_queue_capacity", &self.timing_queue_capacity)

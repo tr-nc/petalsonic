@@ -3,7 +3,7 @@ use crate::config::{
     AmbisonicsBackend, DirectPathBackend, HrtfBackend, LatencyProfile, OutputDevicePolicy,
     PetalSonicWorldDesc, SpatialQuality,
 };
-use crate::domain::{PlaybackControl, SpatialFrame};
+use crate::domain::{BusParams, PlaybackControl, SpatialFrame};
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{PetalSonicEvent, RenderTimingEvent};
@@ -141,6 +141,7 @@ struct PumpState {
     /// Timing event sender for performance profiling
     timing_sender: Sender<RenderTimingEvent>,
     master_gain_linear: f32,
+    buses: Vec<BusParams>,
     schedule: RenderSchedule,
 }
 
@@ -996,6 +997,9 @@ impl PetalSonicEngine {
             event_sender: params.event_sender,
             timing_sender: params.timing_sender,
             master_gain_linear: self.master_gain_linear,
+            buses: std::iter::once(BusParams::default())
+                .chain(self.desc.buses.iter().map(|bus| bus.params()))
+                .collect(),
             schedule: self.schedule,
         }));
 
@@ -1055,6 +1059,7 @@ impl PetalSonicEngine {
             &ctx.command_receiver,
             &ctx.active_playback,
             &ctx.active_voice_count,
+            &mut ctx.buses,
         );
 
         let occupied = ctx.ring_buffer_producer.occupied_len();
@@ -1089,6 +1094,7 @@ impl PetalSonicEngine {
             &ctx.active_playback,
             ctx.block_size,
             ctx.spatial_processor.as_ref(),
+            &ctx.buses,
         );
 
         let _ = ctx.timing_sender.try_send(timing);
@@ -1273,6 +1279,7 @@ impl PetalSonicEngine {
         command_receiver: &Receiver<PlaybackCommand>,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         active_voice_count: &Arc<AtomicUsize>,
+        buses: &mut [BusParams],
     ) {
         // Important real-time rule:
         // - Never dequeue a command unless we *already* hold the active_playback lock.
@@ -1294,6 +1301,8 @@ impl PetalSonicEngine {
                     loop_mode,
                     detached,
                     completion_tag,
+                    bus_index,
+                    playback_rate,
                 } => {
                     let mut instance = PlaybackInstance::from_source(
                         voice_id,
@@ -1301,6 +1310,8 @@ impl PetalSonicEngine {
                         source,
                         config,
                         loop_mode,
+                        bus_index,
+                        playback_rate,
                         detached,
                         completion_tag,
                     );
@@ -1324,10 +1335,27 @@ impl PetalSonicEngine {
                         instance.seek(progress);
                     }
                 }
+                PlaybackCommand::ResumeVoice(voice_id) => {
+                    if let Some(instance) = active_playback.get_mut(&voice_id) {
+                        instance.resume();
+                    }
+                }
+                PlaybackCommand::SetVoiceRate(voice_id, rate) => {
+                    if let Some(instance) = active_playback.get_mut(&voice_id) {
+                        instance.set_playback_rate(rate);
+                    }
+                }
                 PlaybackCommand::PauseEmitter(emitter) => {
                     for instance in active_playback.values_mut() {
                         if instance.emitter == emitter {
                             instance.pause();
+                        }
+                    }
+                }
+                PlaybackCommand::ResumeEmitter(emitter) => {
+                    for instance in active_playback.values_mut() {
+                        if instance.emitter == emitter {
+                            instance.resume();
                         }
                     }
                 }
@@ -1349,10 +1377,11 @@ impl PetalSonicEngine {
                         .retain(|_, instance| instance.emitter != emitter || instance.detached);
                     active_voice_count.fetch_sub(before - active_playback.len(), Ordering::AcqRel);
                 }
-                PlaybackCommand::UpdateEmitter(emitter, config) => {
+                PlaybackCommand::UpdateEmitter(emitter, config, bus_index) => {
                     for instance in active_playback.values_mut() {
                         if instance.emitter == emitter && !instance.detached {
                             instance.config = config.clone();
+                            instance.bus_index = bus_index;
                         }
                     }
                 }
@@ -1361,6 +1390,11 @@ impl PetalSonicEngine {
                         if instance.emitter == emitter && !instance.detached {
                             instance.direct_path_override = direct_path_override;
                         }
+                    }
+                }
+                PlaybackCommand::UpdateBus(index, params) => {
+                    if let Some(bus) = buses.get_mut(index) {
+                        *bus = params;
                     }
                 }
                 PlaybackCommand::StopAll => {
@@ -1384,6 +1418,7 @@ impl PetalSonicEngine {
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         block_size: usize,
         spatial_processor: Option<&Arc<Mutex<SpatialProcessor>>>,
+        buses: &[BusParams],
     ) -> (
         Vec<mixer::CompletedPlayback>,
         Vec<SourceId>,
@@ -1456,6 +1491,7 @@ impl PetalSonicEngine {
                     channels,
                     active_playback,
                     spatial_processor_guard.as_deref_mut(),
+                    buses,
                 );
 
                 let mixing_elapsed = mixing_start.elapsed();
@@ -1722,6 +1758,8 @@ mod tests {
                 loop_mode: LoopMode::Infinite,
                 detached: false,
                 completion_tag: None,
+                bus_index: 0,
+                playback_rate: 1.0,
             })
             .unwrap();
 
@@ -1748,6 +1786,7 @@ mod tests {
             event_sender,
             timing_sender,
             master_gain_linear: 1.0,
+            buses: vec![BusParams::default()],
             schedule: RenderSchedule::for_profile(LatencyProfile::Balanced),
         }));
         let is_running = Arc::new(AtomicBool::new(true));
@@ -1799,19 +1838,22 @@ mod tests {
                     loop_mode: LoopMode::Infinite,
                     detached,
                     completion_tag: None,
+                    bus_index: 0,
+                    playback_rate: 1.0,
                 })
                 .unwrap();
         }
 
         let active = Arc::new(Mutex::new(HashMap::new()));
         let active_count = Arc::new(AtomicUsize::new(2));
-        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count);
+        let mut buses = [BusParams::default()];
+        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count, &mut buses);
         assert_eq!(active.lock().unwrap().len(), 2);
 
         sender
             .try_send(PlaybackCommand::DestroyEmitter(emitter))
             .unwrap();
-        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count);
+        PetalSonicEngine::process_playback_commands(&receiver, &active, &active_count, &mut buses);
 
         let active = active.lock().unwrap();
         assert_eq!(active.len(), 1);
@@ -1843,6 +1885,8 @@ mod tests {
                     clip.clone(),
                     SourceConfig::spatial(old_pose),
                     LoopMode::Infinite,
+                    0,
+                    1.0,
                     detached,
                     None,
                 ),

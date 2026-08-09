@@ -20,4 +20,11 @@ jobs:
       - name: Compile every target on the host platform
         run: cargo check --workspace --all-targets
       - name: Run workspace tests
+        if: runner.os != 'Windows'
         run: cargo test --workspace --all-targets
+      - name: Run workspace tests serially on Windows
+        if: runner.os == 'Windows'
+        # Steam Audio's Windows DLL can fault when independent test cases create
+        # and release process-level contexts concurrently. The suite still covers
+        # multiple simultaneous PetalSonic worlds inside one dedicated test.
+        run: cargo test --workspace --all-targets -- --test-threads=1

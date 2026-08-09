@@ -29,13 +29,6 @@ impl ResamplerImpl {
             Self::Sinc(r) => r.process(input, None),
         }
     }
-
-    fn reset(&mut self) {
-        match self {
-            Self::Fast(r) => r.reset(),
-            Self::Sinc(r) => r.reset(),
-        }
-    }
 }
 
 /// A real-time streaming resampler that converts audio from one sample rate to another
@@ -206,11 +199,6 @@ impl StreamingResampler {
         Ok((output_frames, input_frames))
     }
 
-    /// Returns the fixed input chunk size (in frames)
-    pub fn input_chunk_size(&self) -> usize {
-        self.input_chunk_size
-    }
-
     /// Returns the target (output) sample rate in Hz
     pub fn target_sample_rate(&self) -> u32 {
         self.target_sample_rate
@@ -219,16 +207,5 @@ impl StreamingResampler {
     /// Returns the source (input) sample rate in Hz
     pub fn source_sample_rate(&self) -> u32 {
         self.source_sample_rate
-    }
-
-    /// Returns the resampling ratio (source/target) - for diagnostic purposes
-    /// Note: This is NOT the ratio passed to rubato, which uses target/source
-    pub fn resample_ratio(&self) -> f64 {
-        self.source_sample_rate as f64 / self.target_sample_rate as f64
-    }
-
-    /// Reset the internal state of the resampler
-    pub fn reset(&mut self) {
-        self.resampler.reset();
     }
 }

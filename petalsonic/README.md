@@ -11,8 +11,8 @@ A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spa
 - **Real-Time Safe**: No allocations or locks in the audio callback path
 - **Flexible Source Management**: Support for both spatial and non-spatial audio sources
 - **Automatic Resampling**: Audio is automatically resampled to match the world's sample rate
-- **Multiple Loop Modes**: Play once, loop infinitely, or loop a specific number of times
-- **Event-Driven**: Get notified of playback events (completion, loops, errors)
+- **Automatic Recovery**: Keeps logical audio state while output devices change or disappear
+- **Pull-Based Events**: Controlled completion and runtime state are observed on the caller thread
 - **Multiple Audio Formats**: Support for WAV, MP3, FLAC, OGG, and more via Symphonia
 
 ## Quick Start
@@ -21,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-petalsonic = "0.1"
+petalsonic = "0.6"
 ```
 
 ### Basic Example
@@ -51,14 +51,23 @@ fn main() -> Result<(), PetalSonicError> {
         PlaybackTag(7),
     )?;
 
-    // Update listener position (typically in your game loop)
-    world.set_listener_pose(Pose::from_position(Vec3::new(0.0, 0.0, 0.0)));
+    // Publish one complete listener + Emitter generation per game frame.
+    world.publish_spatial_frame(SpatialFrame::new(
+        Pose::from_position(Vec3::ZERO),
+        vec![EmitterSpatialState::new(
+            emitter,
+            Pose::from_position(Vec3::new(5.0, 0.0, 0.0)),
+        )],
+    ))?;
 
     // Poll for events
     for event in world.drain_events() {
         match event {
             PetalSonicEvent::PlaybackCompleted { emitter, control, tag } => {
                 println!("{emitter} completed {control} with tag {tag:?}");
+            }
+            PetalSonicEvent::RuntimeStateChanged(state) => {
+                println!("audio runtime is now {state:?}");
             }
         }
     }
@@ -88,7 +97,7 @@ world.play(music_emitter, PlayOptions::looping())?;
 ### Custom Audio Loading
 
 ```rust
-use petalsonic::audio_data::*;
+use petalsonic::{ConvertToMono, LoadOptions, PetalSonicAudioData};
 
 // Force mono conversion for spatial audio sources
 let options = LoadOptions::new()
@@ -108,7 +117,7 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 ┌──────────────────────────────────────────────────────────────┐
 │ Main Thread (World)                                          │
 │ - create_emitter(ResidentClip, EmitterDesc)                  │
-│ - set_listener_pose(pose)                                    │
+│ - publish_spatial_frame(complete_snapshot)                   │
 │ - play(), pause(), stop()                                    │
 │ - drain_events()                                             │
 └──────────────────────────────────────────────────────────────┘
@@ -132,7 +141,7 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 
 - **World-Driven API**: Main thread owns the 3D world state
 - **Real-Time Safety**: Audio callback has no allocations, locks, or blocking operations
-- **Lock-Free Communication**: Commands sent via channels, audio data via ring buffer
+- **Bounded Communication**: Non-blocking control/event queues and latest-only spatial snapshots
 - **Automatic Resampling**: All audio is resampled to world rate on load
 - **Mixed Spatialization**: Spatial and non-spatial sources coexist in the same world
 
@@ -230,7 +239,7 @@ for event in world.drain_timing_events() {
 Implement `AudioDataLoader` for custom file formats:
 
 ```rust
-use petalsonic::audio_data::*;
+use petalsonic::{AudioDataLoader, LoadOptions, PetalSonicAudioData};
 
 struct MyLoader;
 

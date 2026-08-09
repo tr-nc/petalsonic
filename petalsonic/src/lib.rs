@@ -10,7 +10,6 @@
 //!
 //! ```no_run
 //! use petalsonic::*;
-//! use petalsonic::math::{Pose, Vec3};
 //!
 //! // Create a world configuration
 //! let config = PetalSonicWorldDesc::default();
@@ -48,7 +47,7 @@
 //! - **[`PetalSonicWorld`]**: Main API for managing audio sources and playback on the main thread
 //! - **[`Emitter`]**: Opaque, generational handle for a logical sound emitter
 //! - **[`ResidentClip`]**: Immutable, predecoded PCM shared by playback voices
-//! - **[`PetalSonicEvent`]**: Events emitted by the engine (completion, errors, etc.)
+//! - **[`PetalSonicEvent`]**: Pull-based controlled-playback and runtime state events
 //!
 //! ## Architecture
 //!
@@ -66,19 +65,19 @@
 //! - Support for both spatial and non-spatial audio sources
 //! - Real-time safe audio processing
 //! - Automatic resampling to world sample rate
-//! - Loop modes: once, infinite, or counted loops
+//! - Loop modes: once or infinite
 //! - Event-driven architecture for playback notifications
 //! - Performance profiling via timing events
 
-pub mod acoustics;
-pub mod audio_data;
+mod acoustics;
+mod audio_data;
 mod config;
 mod domain;
 mod engine;
-pub mod error;
-pub mod events;
-pub mod gain;
-pub mod math;
+mod error;
+mod events;
+mod gain;
+mod math;
 mod mixer;
 mod playback;
 mod spatial;
@@ -88,6 +87,7 @@ pub use acoustics::{
     AcousticHit, AcousticMaterial, AcousticRay, AcousticSceneSnapshot, BatchedAnyHitRayTracer,
     BatchedClosestHitRayTracer,
 };
+pub use audio_data::{AudioDataLoader, ConvertToMono, LoadOptions, PetalSonicAudioData};
 pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 pub use domain::{
     Bus, BusDesc, BusParams, Emitter, EmitterDesc, EmitterSpatialState, PlayOptions,
@@ -97,6 +97,7 @@ pub use engine::AudioOutputDeviceInfo;
 pub use error::PetalSonicError;
 pub use events::{PetalSonicEvent, RenderTimingEvent, RuntimeState, RuntimeStatus};
 pub use gain::{db_to_linear, linear_to_db};
+pub use math::{Pose, Quat, Vec3};
 pub use playback::LoopMode;
 pub use spatial::{DirectPathOverride, DirectPathTransmission};
 pub use world::PetalSonicWorld;

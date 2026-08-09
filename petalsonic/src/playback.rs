@@ -366,8 +366,7 @@ impl PlaybackInstance {
     }
 
     /// Check if this instance reached the end of playback this iteration
-    /// Returns true if reached end, and also returns the loop mode for event determination
-    /// This is used by the mixer to emit appropriate events
+    /// Returns the loop mode when this voice crossed its end boundary.
     pub fn check_and_clear_end_flag(&mut self) -> Option<LoopMode> {
         if self.reached_end_this_iteration {
             self.reached_end_this_iteration = false;

@@ -158,25 +158,4 @@ impl BatchResampler {
 
         Ok(interleaved_samples)
     }
-
-    /// Returns the target (output) sample rate in Hz.
-    pub fn target_sample_rate(&self) -> u32 {
-        self.target_sample_rate
-    }
-
-    /// Returns the source (input) sample rate in Hz.
-    pub fn source_sample_rate(&self) -> u32 {
-        self.source_sample_rate
-    }
-
-    /// Calculates the resampling ratio (target/source).
-    ///
-    /// # Returns
-    /// A ratio where:
-    /// - `> 1.0` means upsampling (increasing sample rate)
-    /// - `< 1.0` means downsampling (decreasing sample rate)
-    /// - `= 1.0` means no resampling needed
-    pub fn resample_ratio(&self) -> f64 {
-        self.target_sample_rate as f64 / self.source_sample_rate as f64
-    }
 }

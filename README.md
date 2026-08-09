@@ -12,7 +12,7 @@ Add PetalSonic to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-petalsonic = "0.1"
+petalsonic = "0.6"
 ```
 
 Basic usage example:
@@ -33,8 +33,14 @@ fn main() -> Result<(), PetalSonicError> {
     )?;
     world.play(emitter, PlayOptions::once())?;
 
-    // Update listener position in your game loop
-    world.set_listener_pose(Pose::from_position(Vec3::ZERO));
+    // Publish the listener and all spatial Emitters as one complete game-frame snapshot.
+    world.publish_spatial_frame(SpatialFrame::new(
+        Pose::from_position(Vec3::ZERO),
+        vec![EmitterSpatialState::new(
+            emitter,
+            Pose::from_position(Vec3::new(5.0, 0.0, 0.0)),
+        )],
+    ))?;
 
     Ok(())
 }
@@ -46,7 +52,8 @@ fn main() -> Result<(), PetalSonicError> {
 - **Real-Time Safe**: Zero allocations and locks in the audio thread
 - **Easy to Use**: Simple world-driven API - just load audio, position sources, and play
 - **Flexible**: Supports both spatial and non-spatial audio in the same world
-- **Event-Driven**: Get notified when sounds complete, loop, or encounter errors
+- **Recoverable Output**: Keeps the World alive while devices disappear or the default changes
+- **Pull-Based Events**: Observe controlled completion and runtime state on the caller thread
 - **Multiple Formats**: Load WAV, MP3, FLAC, OGG, and more via Symphonia
 - **Ray Tracing**: Optional ray tracing support for occlusion and reverb effects
 - **Cross-Platform**: Works on Windows, macOS, Linux, and more via CPAL
@@ -117,7 +124,8 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 │ Main Thread (World)                                          │
 │ - create_emitter(ResidentClip, EmitterDesc)                  │
 │ - play(emitter, PlayOptions)                                 │
-│ - set_listener_pose(pose)                                    │
+│ - publish_spatial_frame(complete_snapshot)                   │
+│ - set_bus_params(), drain_events(), runtime_status()         │
 │ - send PlaybackCommand via channel                           │
 └──────────────────────────────────────────────────────────────┘
                              ↓ bounded control intent
@@ -153,7 +161,7 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 - Decoding with Symphonia; optional resampling on load to a world-wide sample rate.
 - Playback via CPAL, with a lock-free SPSC ring buffer bridging fixed-size producer blocks to variable-size device callbacks.
 - Real-time safe in the audio callback; no allocations/locks on the RT path.
-- One-shot and loop sources, with automatic removal of finished one-shots via events.
+- One-shot Voices are reclaimed automatically; controlled completion is available when requested.
 
 ## Documentation
 
@@ -172,11 +180,11 @@ cargo build
 # Run demo application
 cargo run
 
-# Run tests
-cargo test
+# Run all tests
+cargo test --workspace --all-targets
 
-# Run clippy on workspace
-cargo clippy
+# Run strict clippy on workspace
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Generate documentation
 cargo doc --open
@@ -184,36 +192,21 @@ cargo doc --open
 
 ## Publishing to crates.io
 
-To publish the `petalsonic` core library to crates.io:
+The release gate is non-destructive by default and includes formatting, strict static checks,
+all workspace tests, documentation tests, a release Demo build, and a registry dry run:
 
 ```bash
-# 1. Ensure you're logged in to crates.io
-cargo login
+tools/publish.sh
 
-# 2. Navigate to the core library directory
-cd petalsonic
-
-# 3. Update version in Cargo.toml if needed
-# Edit petalsonic/Cargo.toml and increment the version number
-
-# 4. Verify the package contents
-cargo package --list
-
-# 5. Do a dry run to check for issues
-cargo publish --dry-run
-
-# 6. Publish to crates.io
-cargo publish
-
-# 7. Return to workspace root
-cd ..
+# Registry publication requires an explicit write flag.
+tools/publish.sh --publish
 ```
 
 **Important notes:**
 - Only the `petalsonic` core library is published (not `petalsonic-demo`)
 - Ensure all dependencies have compatible versions
 - Update CHANGELOG.md and documentation before publishing
-- Tag the release in git: `git tag -a v0.1.0 -m "Release v0.1.0"`
+- Tag the release only after the publish gate and registry write succeed
 
 ## License
 

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-10
+
+### Added
+- Added a world-owned output supervisor with automatic default-device recovery.
+- Added generational Emitters, optional controlled playback, fixed buses, atomic spatial frames,
+  immutable acoustic scene snapshots, quality profiles, and runtime health snapshots.
+
+### Changed
+- Audio rendering now advances automatically for the lifetime of `PetalSonicWorld`.
+- The public API is centered on `PetalSonicWorld`, immutable `ResidentClip` resources, and
+  opaque value handles; backend plans and render scheduling are internal.
+- Stable render paths reuse capacity-bounded voice and mixing storage.
+
+### Removed
+- Removed caller-driven pumping, runtime backend switching, procedural render callbacks, and
+  public access to playback, mixer, resampler, and spatial-renderer internals.
+
 ## [0.5.0] - 2026-06-07
 
 ### Added
@@ -60,7 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RayTracer` trait - Custom ray tracing implementation support
 - Three-layer threading model (main thread, render thread, audio callback)
 
-[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/tr-nc/petalsonic/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/tr-nc/petalsonic/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/tr-nc/petalsonic/compare/v0.1.0...v0.4.0
 [0.1.0]: https://github.com/tr-nc/petalsonic/releases/tag/v0.1.0

@@ -1,9 +1,8 @@
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use petalsonic::{
-    Emitter, EmitterDesc, EmitterSpatialState, LoopMode, PetalSonicWorld, PetalSonicWorldDesc,
-    PlayOptions, PlaybackControl, PlaybackTag, RenderTimingEvent, ResidentClip, SpatialFrame,
-    audio_data::PetalSonicAudioData,
-    math::{Pose, Quat, Vec3},
+    Emitter, EmitterDesc, EmitterSpatialState, LoopMode, PetalSonicAudioData, PetalSonicWorld,
+    PetalSonicWorldDesc, PlayOptions, PlaybackControl, PlaybackTag, Pose, Quat, RenderTimingEvent,
+    ResidentClip, SpatialFrame, Vec3,
 };
 use std::collections::VecDeque;
 

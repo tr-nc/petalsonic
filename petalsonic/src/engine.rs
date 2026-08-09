@@ -456,7 +456,8 @@ impl PetalSonicEngine {
         );
 
         let buffer_size = Self::select_buffer_size(&device_config);
-        let config = Self::create_stream_config(LOGICAL_CHANNELS, device_sample_rate, buffer_size);
+        let physical_channels = device_config.channels();
+        let config = Self::create_stream_config(physical_channels, device_sample_rate, buffer_size);
 
         self.is_running.store(true, Ordering::Release);
         self.stream_error.store(false, Ordering::Release);
@@ -476,7 +477,7 @@ impl PetalSonicEngine {
                     err
                 );
                 let default_config = Self::create_stream_config(
-                    LOGICAL_CHANNELS,
+                    physical_channels,
                     device_sample_rate,
                     cpal::BufferSize::Default,
                 );
@@ -540,7 +541,7 @@ impl PetalSonicEngine {
             .store(device_sample_rate as usize, Ordering::Relaxed);
         self.counters
             .output_channels
-            .store(LOGICAL_CHANNELS as usize, Ordering::Relaxed);
+            .store(physical_channels as usize, Ordering::Relaxed);
         self.counters
             .device_generation
             .fetch_add(1, Ordering::Relaxed);
@@ -1062,12 +1063,22 @@ impl PetalSonicEngine {
     }
 
     pub(crate) fn emit_runtime_state(&self, state: RuntimeState) {
-        if self
-            .event_sender
-            .try_send(PetalSonicEvent::RuntimeStateChanged(state))
-            .is_err()
-        {
-            self.counters.dropped_events.fetch_add(1, Ordering::Relaxed);
+        Self::try_send_event(
+            &self.event_sender,
+            &self.counters,
+            PetalSonicEvent::RuntimeStateChanged(state),
+        );
+    }
+
+    fn try_send_event(
+        sender: &Sender<PetalSonicEvent>,
+        counters: &RuntimeCounters,
+        event: PetalSonicEvent,
+    ) {
+        if sender.try_send(event).is_ok() {
+            RuntimeCounters::observe_high_water(&counters.event_queue_high_water, sender.len());
+        } else {
+            counters.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1128,19 +1139,17 @@ impl PetalSonicEngine {
         for completed in self.recovery_completed_playbacks.drain(..) {
             if let Some(tag) = completed.completion_tag {
                 let _ = self.retirement_sender.try_send(completed.voice_id);
-                if self
-                    .event_sender
-                    .try_send(PetalSonicEvent::PlaybackCompleted {
+                Self::try_send_event(
+                    &self.event_sender,
+                    &self.counters,
+                    PetalSonicEvent::PlaybackCompleted {
                         emitter: completed.emitter,
                         control: PlaybackControl {
                             voice_id: completed.voice_id,
                         },
                         tag,
-                    })
-                    .is_err()
-                {
-                    self.counters.dropped_events.fetch_add(1, Ordering::Relaxed);
-                }
+                    },
+                );
             }
         }
     }
@@ -1208,7 +1217,7 @@ impl PetalSonicEngine {
             acoustic_retirement_sender: self.acoustic_retirement_sender.clone(),
             resampler: resampler.clone(),
             ring_buffer_producer: producer,
-            channels: params.channels,
+            channels: config.channels,
             block_size,
             spatial_processor: self.spatial_processor.clone(),
             command_receivers: params.command_receivers,
@@ -1341,7 +1350,12 @@ impl PetalSonicEngine {
         );
 
         ctx.counters.record_render_time(timing.total_time_us);
-        if ctx.timing_sender.try_send(timing).is_err() {
+        if ctx.timing_sender.try_send(timing).is_ok() {
+            RuntimeCounters::observe_high_water(
+                &ctx.counters.timing_queue_high_water,
+                ctx.timing_sender.len(),
+            );
+        } else {
             ctx.counters
                 .dropped_timing_events
                 .fetch_add(1, Ordering::Relaxed);
@@ -1356,19 +1370,17 @@ impl PetalSonicEngine {
         for completed in ctx.completed_playbacks.drain(..) {
             if let Some(tag) = completed.completion_tag {
                 let _ = ctx.retirement_sender.try_send(completed.voice_id);
-                if ctx
-                    .event_sender
-                    .try_send(PetalSonicEvent::PlaybackCompleted {
+                Self::try_send_event(
+                    &ctx.event_sender,
+                    &ctx.counters,
+                    PetalSonicEvent::PlaybackCompleted {
                         emitter: completed.emitter,
                         control: PlaybackControl {
                             voice_id: completed.voice_id,
                         },
                         tag,
-                    })
-                    .is_err()
-                {
-                    ctx.counters.dropped_events.fetch_add(1, Ordering::Relaxed);
-                }
+                    },
+                );
             }
         }
     }
@@ -1575,13 +1587,16 @@ impl PetalSonicEngine {
                 } else {
                     1.0
                 };
-                let left_idx = i * channels_usize;
-                let right_idx = left_idx + 1;
-                if left_idx < data.len() {
-                    data[left_idx] = T::from_sample(frame.left * fade_gain);
-                }
-                if right_idx < data.len() {
-                    data[right_idx] = T::from_sample(frame.right * fade_gain);
+                let frame_start = i * channels_usize;
+                if channels_usize == 1 {
+                    data[frame_start] =
+                        T::from_sample((frame.left + frame.right) * 0.5 * fade_gain);
+                } else {
+                    data[frame_start] = T::from_sample(frame.left * fade_gain);
+                    data[frame_start + 1] = T::from_sample(frame.right * fade_gain);
+                    for sample in &mut data[frame_start + 2..frame_start + channels_usize] {
+                        *sample = T::from_sample(0.0);
+                    }
                 }
                 samples_consumed += 1;
             } else {
@@ -1592,16 +1607,7 @@ impl PetalSonicEngine {
                 } else {
                     ctx.underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
-                for j in i..device_frames {
-                    let left_idx = j * channels_usize;
-                    let right_idx = left_idx + 1;
-                    if left_idx < data.len() {
-                        data[left_idx] = T::from_sample(0.0f32);
-                    }
-                    if right_idx < data.len() {
-                        data[right_idx] = T::from_sample(0.0f32);
-                    }
-                }
+                data[i * channels_usize..].fill(T::from_sample(0.0f32));
                 break;
             }
         }
@@ -2039,6 +2045,33 @@ mod tests {
     }
 
     #[test]
+    fn device_callback_maps_logical_stereo_to_physical_layout() {
+        let ring_buffer = HeapRb::<StereoFrame>::new(2);
+        let (mut producer, consumer) = ring_buffer.split();
+        producer
+            .try_push(StereoFrame {
+                left: 0.75,
+                right: -0.25,
+            })
+            .unwrap();
+        let mut context = AudioCallbackContext {
+            is_running: Arc::new(AtomicBool::new(true)),
+            frames_processed: Arc::new(AtomicUsize::new(0)),
+            underrun_count: Arc::new(AtomicUsize::new(0)),
+            ring_buffer_consumer: consumer,
+            channels: 6,
+            startup_underrun_callbacks_remaining: 0,
+            fade_in_remaining_frames: 0,
+            fade_in_total_frames: 1,
+        };
+        let mut output = [1.0f32; 6];
+
+        PetalSonicEngine::audio_callback(&mut output, &mut context);
+
+        assert_eq!(output, [0.75, -0.25, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn alsa_card_alias_parser_extracts_card_id_and_display_names() {
         let path = std::env::temp_dir().join(format!(
             "petalsonic-asound-cards-test-{}.txt",
@@ -2216,6 +2249,86 @@ mod tests {
             .expect("render thread produced no frames");
         assert!(rendered.left > 0.0);
         assert!(rendered.right > 0.0);
+    }
+
+    #[test]
+    fn warmed_render_quantum_reuses_all_owned_buffers() {
+        let block_size = 64;
+        let sample_rate = 48_000;
+        let (command_sender, command_receiver) = crossbeam_channel::bounded(4);
+        let (_lifecycle_sender, lifecycle_receiver) = crossbeam_channel::bounded(4);
+        command_sender
+            .try_send(PlaybackCommand::Play {
+                voice_id: SourceId::from(1),
+                emitter: crate::domain::Emitter {
+                    index: 0,
+                    generation: 1,
+                },
+                source: Arc::new(PetalSonicAudioData::new(
+                    vec![0.25; block_size * 16],
+                    sample_rate,
+                    1,
+                    Duration::from_secs_f64((block_size * 16) as f64 / sample_rate as f64),
+                )),
+                config: SourceConfig::non_spatial(),
+                loop_mode: LoopMode::Infinite,
+                detached: false,
+                completion_tag: None,
+                bus_index: 0,
+                playback_rate: 1.0,
+                mono_scratch: vec![0.0; block_size],
+            })
+            .unwrap();
+        let ring_buffer = HeapRb::<StereoFrame>::new(block_size * 8);
+        let (producer, mut consumer) = ring_buffer.split();
+        let (event_sender, _event_receiver) = crossbeam_channel::bounded(4);
+        let (timing_sender, timing_receiver) = crossbeam_channel::bounded(4);
+        let (backend_retirement_sender, _backend_retirement_receiver) =
+            crossbeam_channel::bounded(4);
+        let mut pump = PumpState {
+            active_playback: Arc::new(Mutex::new(HashMap::with_capacity(4))),
+            active_voice_count: Arc::new(AtomicUsize::new(1)),
+            retirement_sender: crossbeam_channel::bounded(4).0,
+            latest_spatial_frame: Arc::new(Mutex::new(None)),
+            current_spatial_frame: None,
+            pending_spatial_retirement: None,
+            spatial_retirement_sender: crossbeam_channel::bounded(1).0,
+            latest_acoustic_scene: Arc::new(Mutex::new(None)),
+            acoustic_scene_slot: Arc::new(AcousticSceneSlot::new(None)),
+            pending_acoustic_retirement: None,
+            acoustic_retirement_sender: crossbeam_channel::bounded(2).0,
+            resampler: PetalSonicEngine::create_resampler(sample_rate, sample_rate, 2, block_size)
+                .unwrap(),
+            ring_buffer_producer: producer,
+            channels: 2,
+            block_size,
+            spatial_processor: None,
+            command_receivers: EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
+            listener_pose: Arc::new(Mutex::new(Pose::default())),
+            event_sender,
+            timing_sender,
+            master_gain_linear: 1.0,
+            buses: vec![BusParams::default()],
+            schedule: RenderSchedule::for_profile(LatencyProfile::Balanced),
+            mixer_scratch: mixer::MixerScratch::new(4),
+            completed_playbacks: Vec::with_capacity(4),
+            world_buffer: vec![0.0; block_size * 2],
+            resampled_buffer: vec![0.0; (block_size + 10) * 2],
+            counters: Arc::new(RuntimeCounters::default()),
+            backend_retirement_sender,
+            pending_backend_retirements: Vec::with_capacity(4),
+        };
+
+        PetalSonicEngine::pump_render_state(&mut pump);
+        while consumer.try_pop().is_some() {}
+        while timing_receiver.try_recv().is_ok() {}
+
+        let activity = callback_memory_activity(|| {
+            PetalSonicEngine::pump_render_state(&mut pump);
+        });
+
+        assert_eq!(activity, 0, "steady render quantum allocated or freed");
+        assert!(consumer.try_pop().is_some());
     }
 
     #[test]

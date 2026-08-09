@@ -125,8 +125,8 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 │ - create_emitter(ResidentClip, EmitterDesc)                  │
 │ - play(emitter, PlayOptions)                                 │
 │ - publish_spatial_frame(complete_snapshot)                   │
-│ - set_bus_params(), drain_events(), runtime_status()         │
-│ - send PlaybackCommand via channel                           │
+│ - set_bus_params(), drain_events(), diagnostics()            │
+│ - submit bounded intent                                      │
 └──────────────────────────────────────────────────────────────┘
                              ↓ bounded control intent
 ┌──────────────────────────────────────────────────────────────┐
@@ -153,6 +153,9 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 - **World-level listener**: Single global listener pose for all spatial sources
 - **Lock-free ring buffer**: Bridges fixed-size render blocks to variable-size device callbacks
 - **Real-time safety**: No allocations or locks in the audio callback path
+- **Recoverable devices**: Default-device changes preserve the World and rebuild only output state
+- **Observable pressure**: Diagnostics expose queue watermarks, rejected work, dropped events,
+  underruns, render percentiles, active counts, and device generations
 
 ## High-level Goals
 

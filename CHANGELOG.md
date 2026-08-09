@@ -12,17 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added a world-owned output supervisor with automatic default-device recovery.
 - Added generational Emitters, optional controlled playback, fixed buses, atomic spatial frames,
-  immutable acoustic scene snapshots, quality profiles, and runtime health snapshots.
+  immutable acoustic scene snapshots, quality profiles, runtime health snapshots, and cumulative
+  queue/render/device diagnostics.
 
 ### Changed
 - Audio rendering now advances automatically for the lifetime of `PetalSonicWorld`.
 - The public API is centered on `PetalSonicWorld`, immutable `ResidentClip` resources, and
   opaque value handles; backend plans and render scheduling are internal.
 - Stable render paths reuse capacity-bounded voice and mixing storage.
+- Stop and destruction commands use reserved bounded capacity and audible voices retire through a
+  short de-click ramp. Output sessions fade in after recovery and map logical stereo explicitly to
+  the negotiated physical channel layout.
+- Static spatial-backend failures are returned during World creation; temporary device absence
+  remains recoverable with deterministic retry state.
 
 ### Removed
 - Removed caller-driven pumping, runtime backend switching, procedural render callbacks, and
   public access to playback, mixer, resampler, and spatial-renderer internals.
+- Removed the legacy public audio-data loader/options surface and the unused direct-path override.
 
 ## [0.5.0] - 2026-06-07
 

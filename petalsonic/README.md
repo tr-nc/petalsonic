@@ -161,6 +161,8 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 
 - **`PetalSonicEvent`**: Events emitted by the engine
   - `PlaybackCompleted` for controlled one-shots
+- **`RuntimeStatus` / `RuntimeDiagnostics`**: Current lifecycle state and cumulative bounded-runtime
+  health counters
 
 ### Math & Spatial
 
@@ -178,7 +180,8 @@ let config = PetalSonicWorldDesc {
     block_size: 512,              // Render block size (frames)
     max_emitters: 64,             // Maximum long-lived emitters
     max_voices: 128,              // Maximum simultaneous playback voices
-    control_queue_capacity: 256,  // Bounded non-blocking control queue
+    control_queue_capacity: 256,  // Bounded regular control queue
+    lifecycle_queue_capacity: 32, // Reserved stop/destroy capacity
     event_queue_capacity: 128,    // Bounded pull-event queue
     timing_queue_capacity: 128,   // Bounded diagnostics queue
     spatial_quality: SpatialQuality::Balanced,
@@ -223,6 +226,15 @@ for event in world.drain_timing_events() {
         event.total_time_us
     );
 }
+
+let health = world.diagnostics();
+println!(
+    "voices={}, underruns={}, render p99={}μs, device generation={}",
+    health.active_voices,
+    health.underrun_count,
+    health.render_time_p99_us,
+    health.device_generation,
+);
 ```
 
 ## Examples

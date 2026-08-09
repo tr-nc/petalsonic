@@ -283,9 +283,9 @@ impl Default for EmitterDesc {
 /// second handle to the caller.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayOptions {
-    pub loop_mode: LoopMode,
-    pub gain_db: f32,
-    pub detached: bool,
+    pub(crate) loop_mode: LoopMode,
+    pub(crate) gain_db: f32,
+    pub(crate) detached: bool,
     bus: Option<Bus>,
     playback_rate: f32,
 }

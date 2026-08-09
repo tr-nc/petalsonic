@@ -28,6 +28,9 @@ pub enum PetalSonicError {
     #[error("Audio runtime is closed")]
     RuntimeClosed,
 
+    #[error("Audio runtime has permanently failed")]
+    RuntimeFailed,
+
     #[error("Audio device error: {0}")]
     AudioDevice(String),
 

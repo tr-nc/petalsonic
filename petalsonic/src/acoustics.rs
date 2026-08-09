@@ -168,6 +168,7 @@ impl BatchedClosestHitRayTracer for AcousticSceneSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     struct AlwaysHit;
 
@@ -209,5 +210,47 @@ mod tests {
         assert_eq!(previous.version(), 1);
         slot.trace_any_hit_batch(&rays, &[0.0], &[10.0], &mut hits);
         assert_eq!(hits, [true]);
+    }
+
+    struct DropTrackedBackend {
+        dropped_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    }
+
+    impl Drop for DropTrackedBackend {
+        fn drop(&mut self) {
+            *self.dropped_on.lock().unwrap() = Some(std::thread::current().id());
+        }
+    }
+
+    impl BatchedAnyHitRayTracer for DropTrackedBackend {
+        fn trace_any_hit_batch(
+            &self,
+            _rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            hits.fill(false);
+        }
+    }
+
+    #[test]
+    fn replaced_snapshot_is_returned_for_non_render_thread_destruction() {
+        let dropped_on = Arc::new(Mutex::new(None));
+        let backend: Arc<dyn BatchedAnyHitRayTracer> = Arc::new(DropTrackedBackend {
+            dropped_on: dropped_on.clone(),
+        });
+        let slot = AcousticSceneSlot::new(Some(Arc::new(AcousticSceneSnapshot::new(
+            1,
+            Some(backend),
+            None,
+        ))));
+
+        let retired = slot.replace(None).unwrap().unwrap();
+        assert!(dropped_on.lock().unwrap().is_none());
+        let producer_thread = std::thread::current().id();
+        drop(retired);
+
+        assert_eq!(*dropped_on.lock().unwrap(), Some(producer_thread));
     }
 }

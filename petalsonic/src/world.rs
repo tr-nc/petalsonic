@@ -125,6 +125,12 @@ struct EmitterState {
     desc: EmitterDesc,
 }
 
+#[derive(Clone, Copy)]
+struct ControlledVoiceState {
+    emitter: Emitter,
+    detached: bool,
+}
+
 struct EmitterSlot {
     generation: u32,
     state: Option<EmitterState>,
@@ -265,7 +271,7 @@ pub struct PetalSonicWorld {
     emitters: Mutex<EmitterRegistry>,
     next_voice_id: AtomicU64,
     active_voice_count: Arc<AtomicUsize>,
-    controlled_voices: Mutex<HashMap<SourceId, Emitter>>,
+    controlled_voices: Mutex<HashMap<SourceId, ControlledVoiceState>>,
     retirement_receiver: Receiver<SourceId>,
     latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     spatial_retirement_receiver: Receiver<Arc<SpatialFrame>>,
@@ -283,6 +289,7 @@ pub struct PetalSonicWorld {
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
     supervisor_stop: Arc<AtomicBool>,
+    close_lock: Mutex<()>,
     supervisor_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -374,6 +381,7 @@ impl PetalSonicWorld {
             runtime_state,
             recovery_attempts,
             supervisor_stop,
+            close_lock: Mutex::new(()),
             supervisor_thread: Mutex::new(Some(supervisor_thread)),
         })
     }
@@ -529,6 +537,7 @@ impl PetalSonicWorld {
             value if value == RuntimeState::Running as u8 => RuntimeState::Running,
             value if value == RuntimeState::Recovering as u8 => RuntimeState::Recovering,
             value if value == RuntimeState::Failed as u8 => RuntimeState::Failed,
+            value if value == RuntimeState::Closing as u8 => RuntimeState::Closing,
             _ => RuntimeState::Closed,
         }
     }
@@ -695,7 +704,7 @@ impl PetalSonicWorld {
         self.try_send(PlaybackCommand::DestroyEmitter(emitter))?;
         emitters.remove(emitter)?;
         if let Ok(mut controlled) = self.controlled_voices.lock() {
-            controlled.retain(|_, owner| *owner != emitter);
+            controlled.retain(|_, voice| voice.emitter != emitter || voice.detached);
         }
         Ok(())
     }
@@ -737,7 +746,13 @@ impl PetalSonicWorld {
                     ));
                 }
             };
-            controlled.insert(voice_id, emitter);
+            controlled.insert(
+                voice_id,
+                ControlledVoiceState {
+                    emitter,
+                    detached: options.detached,
+                },
+            );
         }
         let command = PlaybackCommand::Play {
             voice_id,
@@ -789,7 +804,7 @@ impl PetalSonicWorld {
         self.emitter_state(emitter)?;
         self.try_send(PlaybackCommand::StopEmitter(emitter))?;
         if let Ok(mut controlled) = self.controlled_voices.lock() {
-            controlled.retain(|_, owner| *owner != emitter);
+            controlled.retain(|_, voice| voice.emitter != emitter);
         }
         Ok(())
     }
@@ -1035,6 +1050,13 @@ impl PetalSonicWorld {
                 .counters
                 .lifecycle_queue_high_water
                 .load(Ordering::Relaxed),
+            event_queue_depth: self.event_receiver.len(),
+            event_queue_high_water: self.counters.event_queue_high_water.load(Ordering::Relaxed),
+            timing_queue_depth: self.timing_receiver.len(),
+            timing_queue_high_water: self
+                .counters
+                .timing_queue_high_water
+                .load(Ordering::Relaxed),
             rejected_commands: self.counters.rejected_commands.load(Ordering::Relaxed),
             dropped_events: self.counters.dropped_events.load(Ordering::Relaxed),
             dropped_timing_events: self.counters.dropped_timing_events.load(Ordering::Relaxed),
@@ -1098,6 +1120,15 @@ impl PetalSonicWorld {
     }
 
     pub fn close(&self) -> Result<()> {
+        let _close_guard = self
+            .close_lock
+            .lock()
+            .map_err(|_| PetalSonicError::Engine("World close lock is poisoned".into()))?;
+        if Self::load_runtime_state(&self.runtime_state) == RuntimeState::Closed {
+            return Ok(());
+        }
+        self.runtime_state
+            .store(RuntimeState::Closing as u8, Ordering::Release);
         self.supervisor_stop.store(true, Ordering::Release);
         if let Some(supervisor) = self
             .supervisor_thread
@@ -1117,10 +1148,10 @@ impl PetalSonicWorld {
     }
 
     fn ensure_open(&self) -> Result<()> {
-        if Self::load_runtime_state(&self.runtime_state) == RuntimeState::Closed {
-            Err(PetalSonicError::RuntimeClosed)
-        } else {
-            Ok(())
+        match Self::load_runtime_state(&self.runtime_state) {
+            RuntimeState::Failed => Err(PetalSonicError::RuntimeFailed),
+            RuntimeState::Closing | RuntimeState::Closed => Err(PetalSonicError::RuntimeClosed),
+            _ => Ok(()),
         }
     }
 }
@@ -1531,6 +1562,54 @@ mod tests {
     }
 
     #[test]
+    fn spatial_publication_overwrites_unconsumed_frames_atomically() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new(desc).unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::spatial(Pose::default()))
+            .unwrap();
+        let first_listener = Pose::from_position(crate::math::Vec3::new(1.0, 0.0, 0.0));
+        let second_listener = Pose::from_position(crate::math::Vec3::new(2.0, 0.0, 0.0));
+        let first_emitter = Pose::from_position(crate::math::Vec3::new(10.0, 0.0, 0.0));
+        let second_emitter = Pose::from_position(crate::math::Vec3::new(20.0, 0.0, 0.0));
+
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                first_listener,
+                vec![crate::domain::EmitterSpatialState::new(
+                    emitter,
+                    first_emitter,
+                )],
+            ))
+            .unwrap();
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                second_listener,
+                vec![crate::domain::EmitterSpatialState::new(
+                    emitter,
+                    second_emitter,
+                )],
+            ))
+            .unwrap();
+
+        let latest = world
+            .latest_spatial_frame
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("latest frame should remain available while recovering");
+        assert_eq!(latest.listener(), second_listener);
+        assert_eq!(latest.emitters()[0].pose, second_emitter);
+        assert_eq!(world.diagnostics().control_queue_depth, 0);
+        world.close().unwrap();
+    }
+
+    #[test]
     fn worlds_close_idempotently_and_remain_isolated() {
         let desc = crate::config::PetalSonicWorldDesc {
             output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
@@ -1557,6 +1636,32 @@ mod tests {
             .expect("closing another world must not affect this runtime");
         assert_ne!(second.runtime_status().state, RuntimeState::Closed);
         second.close().unwrap();
+    }
+
+    #[test]
+    fn detached_control_survives_emitter_destruction() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new(desc).unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap();
+        let control = world
+            .play_controlled(emitter, PlayOptions::looping().detached(), PlaybackTag(7))
+            .unwrap();
+
+        world.destroy_emitter(emitter).unwrap();
+        assert!(matches!(
+            world.play(emitter, PlayOptions::once()),
+            Err(PetalSonicError::StaleEmitter)
+        ));
+        world.pause_playback(control).unwrap();
+        world.stop_playback(control).unwrap();
+        world.close().unwrap();
     }
 
     #[test]

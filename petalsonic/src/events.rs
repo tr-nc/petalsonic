@@ -11,7 +11,8 @@ pub enum RuntimeState {
     Running = 0,
     Recovering = 1,
     Failed = 2,
-    Closed = 3,
+    Closing = 3,
+    Closed = 4,
 }
 
 /// Pull-based health snapshot. Device names are diagnostic, not stable identifiers.
@@ -33,6 +34,10 @@ pub struct RuntimeDiagnostics {
     pub control_queue_high_water: usize,
     pub lifecycle_queue_depth: usize,
     pub lifecycle_queue_high_water: usize,
+    pub event_queue_depth: usize,
+    pub event_queue_high_water: usize,
+    pub timing_queue_depth: usize,
+    pub timing_queue_high_water: usize,
     pub rejected_commands: u64,
     pub dropped_events: u64,
     pub dropped_timing_events: u64,
@@ -52,6 +57,8 @@ pub struct RuntimeDiagnostics {
 pub(crate) struct RuntimeCounters {
     pub(crate) control_queue_high_water: AtomicUsize,
     pub(crate) lifecycle_queue_high_water: AtomicUsize,
+    pub(crate) event_queue_high_water: AtomicUsize,
+    pub(crate) timing_queue_high_water: AtomicUsize,
     pub(crate) rejected_commands: AtomicU64,
     pub(crate) dropped_events: AtomicU64,
     pub(crate) dropped_timing_events: AtomicU64,
@@ -67,6 +74,8 @@ impl Default for RuntimeCounters {
         Self {
             control_queue_high_water: AtomicUsize::new(0),
             lifecycle_queue_high_water: AtomicUsize::new(0),
+            event_queue_high_water: AtomicUsize::new(0),
+            timing_queue_high_water: AtomicUsize::new(0),
             rejected_commands: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
             dropped_timing_events: AtomicU64::new(0),
@@ -184,4 +193,24 @@ pub enum PetalSonicEvent {
     },
     /// The output runtime entered a different lifecycle state.
     RuntimeStateChanged(RuntimeState),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_histogram_reports_bounded_cumulative_percentiles() {
+        let counters = RuntimeCounters::default();
+        for elapsed in [1, 2, 3, 4, 100] {
+            counters.record_render_time(elapsed);
+        }
+
+        let (count, p50, p95, p99, max) = counters.render_summary();
+        assert_eq!(count, 5);
+        assert_eq!(p50, 4);
+        assert_eq!(p95, 128);
+        assert_eq!(p99, 128);
+        assert_eq!(max, 100);
+    }
 }

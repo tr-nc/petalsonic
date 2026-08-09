@@ -147,6 +147,11 @@ pub(crate) fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusPara
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_data::PetalSonicAudioData;
+    use crate::config::SourceConfig;
+    use crate::domain::Emitter;
+    use crate::playback::{LoopMode, VoiceStart};
+    use std::time::Duration;
 
     #[test]
     fn named_bus_controls_compose_directly_with_master() {
@@ -169,5 +174,119 @@ mod tests {
         assert!(effective.muted);
         assert!(!effective.paused);
         assert_eq!(effective.playback_rate, 1.0);
+    }
+
+    #[test]
+    fn paused_gameplay_freezes_while_music_keeps_rendering() {
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        for (id, bus_index, sample) in [(1, 1, 1.0), (2, 2, 0.5)] {
+            let audio = Arc::new(PetalSonicAudioData::new(
+                vec![sample; 16],
+                48_000,
+                1,
+                Duration::from_secs_f64(16.0 / 48_000.0),
+            ));
+            let mut voice = PlaybackInstance::from_source(VoiceStart {
+                emitter: Emitter {
+                    index: id,
+                    generation: 1,
+                },
+                audio_data: audio,
+                config: SourceConfig::non_spatial(),
+                loop_mode: LoopMode::Infinite,
+                bus_index,
+                playback_rate: 1.0,
+                detached: false,
+                completion_tag: None,
+                mono_scratch: vec![0.0; 4],
+            });
+            voice.play_from_beginning();
+            active
+                .lock()
+                .unwrap()
+                .insert(SourceId::from(id as u64), voice);
+        }
+
+        let buses = [
+            BusParams::default(),
+            BusParams {
+                paused: true,
+                ..BusParams::default()
+            },
+            BusParams::default(),
+        ];
+        let mut output = [0.0; 8];
+        let mut scratch = MixerScratch::new(2);
+        let mut completed = Vec::with_capacity(2);
+        mix_playback_instances_with_metrics(
+            &mut output,
+            2,
+            &active,
+            None,
+            &buses,
+            &mut scratch,
+            &mut completed,
+        );
+
+        assert_eq!(output, [0.5; 8]);
+        let active = active.lock().unwrap();
+        assert_eq!(active[&SourceId::from(1)].info.current_frame, 0);
+        assert_eq!(active[&SourceId::from(2)].info.current_frame, 4);
+    }
+
+    #[test]
+    fn playback_rate_only_changes_the_selected_bus() {
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        for (id, bus_index) in [(1, 1), (2, 2)] {
+            let audio = Arc::new(PetalSonicAudioData::new(
+                (0..32).map(|sample| sample as f32).collect(),
+                48_000,
+                1,
+                Duration::from_secs_f64(32.0 / 48_000.0),
+            ));
+            let mut voice = PlaybackInstance::from_source(VoiceStart {
+                emitter: Emitter {
+                    index: id,
+                    generation: 1,
+                },
+                audio_data: audio,
+                config: SourceConfig::non_spatial(),
+                loop_mode: LoopMode::Infinite,
+                bus_index,
+                playback_rate: 1.0,
+                detached: false,
+                completion_tag: None,
+                mono_scratch: vec![0.0; 4],
+            });
+            voice.play_from_beginning();
+            active
+                .lock()
+                .unwrap()
+                .insert(SourceId::from(id as u64), voice);
+        }
+        let buses = [
+            BusParams::default(),
+            BusParams {
+                playback_rate: 0.5,
+                ..BusParams::default()
+            },
+            BusParams::default(),
+        ];
+        let mut output = [0.0; 8];
+        let mut scratch = MixerScratch::new(2);
+        let mut completed = Vec::with_capacity(2);
+        mix_playback_instances_with_metrics(
+            &mut output,
+            2,
+            &active,
+            None,
+            &buses,
+            &mut scratch,
+            &mut completed,
+        );
+
+        let active = active.lock().unwrap();
+        assert_eq!(active[&SourceId::from(1)].info.current_frame, 2);
+        assert_eq!(active[&SourceId::from(2)].info.current_frame, 4);
     }
 }

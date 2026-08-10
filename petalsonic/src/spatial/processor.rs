@@ -21,7 +21,8 @@ use audionimbus::{
     Vector3, audio_buffer::AudioBuffer as AudioNimbusAudioBuffer,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 const STEAM_AMBISONICS_ORDER: u32 = 2;
@@ -29,6 +30,44 @@ const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
 const NATIVE_EARLY_REFLECTION_MAX_DELAY_SECONDS: f32 = 0.25;
 const NATIVE_EARLY_REFLECTION_MAX_TRACE_METERS: f32 = 120.0;
 const NATIVE_EARLY_REFLECTION_GAIN: f32 = 0.18;
+
+/// Process-lifetime Steam Audio kernel shared by every world-owned renderer.
+///
+/// Steam Audio documents its context as a typically single, application-lifetime
+/// object. Keeping that lifetime inside PetalSonic avoids exposing a second resource
+/// graph to callers and avoids unsafe context destruction/recreation in `phonon.dll`.
+struct SharedSteamAudioContext(Context);
+
+// SAFETY: Steam Audio documents its API objects as usable from multiple threads.
+// PetalSonic only shares the context itself; mutable effects remain owned by one
+// render runtime. Audionimbus separately serializes the non-thread-safe HRTF
+// creation call with its process-global lock.
+unsafe impl Sync for SharedSteamAudioContext {}
+
+impl Deref for SharedSteamAudioContext {
+    type Target = Context;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+static STEAM_AUDIO_CONTEXT: OnceLock<std::result::Result<Arc<SharedSteamAudioContext>, String>> =
+    OnceLock::new();
+
+fn shared_steam_audio_context() -> Result<Arc<SharedSteamAudioContext>> {
+    STEAM_AUDIO_CONTEXT
+        .get_or_init(|| {
+            Context::try_new(&audionimbus::ContextSettings::default())
+                .map(|context| Arc::new(SharedSteamAudioContext(context)))
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|reason| {
+            PetalSonicError::SpatialAudio(format!("Failed to create Steam Audio context: {reason}"))
+        })
+}
 
 #[derive(Debug, Clone)]
 struct NativeEarlyReflectionSourceState {
@@ -90,10 +129,11 @@ pub struct SpatialProcessor {
     native_ambisonics_state: Option<NativeAmbisonicsBinauralState>,
     native_reflection_source_states: HashMap<SourceId, NativeEarlyReflectionSourceState>,
 
-    // Steam Audio effects that do not call into host scene code.
+    // Steam Audio effects that do not call into host scene code. The context is
+    // process-lived; field order still ensures this world's effects drop first.
     ambisonics_decode_effect: Option<AmbisonicsDecodeEffect>,
     hrtf: Option<Hrtf>,
-    context: Context,
+    context: Arc<SharedSteamAudioContext>,
 
     // Configuration
     frame_size: usize,
@@ -179,10 +219,7 @@ impl SpatialProcessor {
             batched_any_hit_ray_tracer,
             batched_closest_hit_ray_tracer,
         } = config;
-        // Create Steam Audio context
-        let context = Context::try_new(&audionimbus::ContextSettings::default()).map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create Steam Audio context: {}", e))
-        })?;
+        let context = shared_steam_audio_context()?;
 
         let audio_settings = AudioSettings {
             sampling_rate: sample_rate,

@@ -219,7 +219,11 @@ impl SpatialProcessor {
             batched_any_hit_ray_tracer,
             batched_closest_hit_ray_tracer,
         } = config;
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] acquiring shared context");
         let context = shared_steam_audio_context()?;
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] acquired shared context");
 
         let audio_settings = AudioSettings {
             sampling_rate: sample_rate,
@@ -234,13 +238,19 @@ impl SpatialProcessor {
         let mut native_ambisonics_state = None;
 
         if hrtf_backend == HrtfBackend::SteamAudio {
+            #[cfg(all(test, target_os = "windows"))]
+            eprintln!("[DEBUG-win-context] creating HRTF");
             let loaded_hrtf =
                 create_steam_hrtf(&context, &audio_settings, steam_hrtf_path.as_deref())?;
+            #[cfg(all(test, target_os = "windows"))]
+            eprintln!("[DEBUG-win-context] created HRTF; creating decode effect");
             ambisonics_decode_effect = Some(create_ambisonics_decode_effect(
                 &context,
                 &audio_settings,
                 &loaded_hrtf,
             )?);
+            #[cfg(all(test, target_os = "windows"))]
+            eprintln!("[DEBUG-win-context] created decode effect");
             hrtf = Some(loaded_hrtf);
         }
 

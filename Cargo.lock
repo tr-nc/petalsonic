@@ -2588,6 +2588,7 @@ dependencies = [
  "rubato",
  "symphonia",
  "thiserror 1.0.69",
+ "windows 0.54.0",
 ]
 
 [[package]]

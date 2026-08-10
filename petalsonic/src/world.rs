@@ -26,6 +26,43 @@ const MAX_PLAYBACK_RATE: f32 = 4.0;
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(target_os = "windows")]
+struct WindowsComApartment {
+    initialized: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsComApartment {
+    fn initialize() -> Result<Self> {
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+
+        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if result.is_ok() {
+            Ok(Self { initialized: true })
+        } else if result == RPC_E_CHANGED_MODE {
+            // Another subsystem already selected an apartment model for this
+            // thread. COM is initialized and remains usable; this call must not
+            // be balanced with CoUninitialize.
+            Ok(Self { initialized: false })
+        } else {
+            Err(PetalSonicError::BackendUnavailable {
+                backend: "WASAPI",
+                reason: format!("failed to initialize COM on output supervisor: {result:?}"),
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsComApartment {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputPreparation {
     Ready,
@@ -516,6 +553,15 @@ impl PetalSonicWorld {
         let handle = std::thread::Builder::new()
             .name("petalsonic-output".into())
             .spawn(move || {
+                #[cfg(target_os = "windows")]
+                let _com_apartment = match WindowsComApartment::initialize() {
+                    Ok(apartment) => apartment,
+                    Err(error) => {
+                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
+                        let _ = startup_sender.send(Err(error));
+                        return;
+                    }
+                };
                 let mut engine = match PetalSonicEngine::new(startup) {
                     Ok(engine) => engine,
                     Err(error) => {

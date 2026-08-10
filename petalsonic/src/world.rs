@@ -16,6 +16,8 @@ use crate::math::Pose;
 use crate::playback::PlaybackCommand;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -25,6 +27,8 @@ const MIN_PLAYBACK_RATE: f32 = 0.01;
 const MAX_PLAYBACK_RATE: f32 = 4.0;
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "windows")]
+static WINDOWS_WASAPI_CONTEXT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 struct WindowsComApartment {
@@ -61,6 +65,52 @@ impl Drop for WindowsComApartment {
             unsafe { windows::Win32::System::Com::CoUninitialize() };
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_wasapi_context() -> Result<()> {
+    use cpal::traits::HostTrait;
+
+    let initialized = WINDOWS_WASAPI_CONTEXT.get_or_init(|| {
+        let (ready_sender, ready_receiver) = crossbeam_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("petalsonic-wasapi-context".into())
+            .spawn(move || {
+                let apartment = match WindowsComApartment::initialize() {
+                    Ok(apartment) => apartment,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+
+                // CPAL 0.15 keeps its IMMDeviceEnumerator in a process-global
+                // OnceLock even though COM apartments are thread-scoped. Create
+                // that singleton on a process-lifetime thread so later worlds do
+                // not inherit an enumerator from a supervisor that has exited.
+                let _ = cpal::default_host().default_output_device();
+                if ready_sender.send(Ok(())).is_err() {
+                    return;
+                }
+
+                let _apartment = apartment;
+                loop {
+                    std::thread::park();
+                }
+            })
+            .map_err(|error| format!("failed to start WASAPI context thread: {error}"))?;
+
+        ready_receiver
+            .recv()
+            .map_err(|_| "WASAPI context thread exited during initialization".to_string())?
+    });
+
+    initialized
+        .clone()
+        .map_err(|reason| PetalSonicError::BackendUnavailable {
+            backend: "WASAPI",
+            reason,
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,6 +403,8 @@ pub struct PetalSonicWorld {
 impl PetalSonicWorld {
     pub fn new(config: crate::config::PetalSonicWorldDesc) -> Result<Self> {
         Self::validate_config(&config)?;
+        #[cfg(target_os = "windows")]
+        ensure_windows_wasapi_context()?;
         let world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
 
         let (command_sender, command_receiver) =

@@ -1978,7 +1978,11 @@ impl PetalSonicEngine {
 
 impl Drop for PetalSonicEngine {
     fn drop(&mut self) {
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] engine drop: stopping");
         let _ = self.stop();
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] engine drop: stopped");
     }
 }
 

@@ -536,7 +536,14 @@ impl PetalSonicWorld {
 
                     std::thread::park_timeout(poll_interval);
                 }
+                #[cfg(all(test, target_os = "windows"))]
+                eprintln!("[DEBUG-win-context] supervisor: stopping output");
                 let _ = engine.stop_output();
+                #[cfg(all(test, target_os = "windows"))]
+                eprintln!("[DEBUG-win-context] supervisor: stopped output; dropping engine");
+                drop(engine);
+                #[cfg(all(test, target_os = "windows"))]
+                eprintln!("[DEBUG-win-context] supervisor: dropped engine");
             })
             .map_err(|error| {
                 PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))
@@ -1155,6 +1162,8 @@ impl PetalSonicWorld {
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
         self.supervisor_stop.store(true, Ordering::Release);
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] world close: joining supervisor");
         if let Some(supervisor) = self
             .supervisor_thread
             .lock()
@@ -1166,6 +1175,8 @@ impl PetalSonicWorld {
                 PetalSonicError::Engine("Output supervisor panicked while shutting down".into())
             })?;
         }
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] world close: joined supervisor");
         self.active_voice_count.store(0, Ordering::Release);
         self.runtime_state
             .store(RuntimeState::Closed as u8, Ordering::Release);
@@ -1935,6 +1946,12 @@ mod tests {
         debug_windows_boundary("detached: closing world");
         world.close().unwrap();
         debug_windows_boundary("detached: closed world");
+    }
+
+    #[test]
+    fn bounded_event_pressure_then_detached_shutdown() {
+        bounded_event_pressure_is_observable();
+        detached_control_survives_emitter_destruction();
     }
 
     #[test]

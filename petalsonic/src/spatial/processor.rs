@@ -1059,6 +1059,17 @@ impl SpatialProcessor {
     }
 }
 
+#[cfg(all(test, target_os = "windows"))]
+impl Drop for SpatialProcessor {
+    fn drop(&mut self) {
+        eprintln!("[DEBUG-win-context] spatial drop: dropping decode effect");
+        drop(self.ambisonics_decode_effect.take());
+        eprintln!("[DEBUG-win-context] spatial drop: dropped decode effect; dropping HRTF");
+        drop(self.hrtf.take());
+        eprintln!("[DEBUG-win-context] spatial drop: dropped HRTF");
+    }
+}
+
 fn create_steam_hrtf(
     context: &Context,
     audio_settings: &AudioSettings,

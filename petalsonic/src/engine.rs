@@ -1142,12 +1142,16 @@ impl PetalSonicEngine {
         buses: &mut [BusParams],
         elapsed: Duration,
     ) {
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] advance: processing commands");
         Self::process_playback_commands(
             command_receivers,
             &self.active_playback,
             &self.active_voice_count,
             buses,
         );
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] advance: processed commands");
 
         let frames = (elapsed.as_secs_f64() * self.desc.sample_rate as f64).floor() as usize;
         if frames == 0 {
@@ -1156,6 +1160,8 @@ impl PetalSonicEngine {
         let Ok(mut active) = self.active_playback.lock() else {
             return;
         };
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] advance: advancing voices");
         self.recovery_completed_playbacks.clear();
         for (voice_id, instance) in active.iter_mut() {
             if !matches!(instance.info.play_state, PlayState::Playing) {
@@ -1179,6 +1185,8 @@ impl PetalSonicEngine {
         }
         active.retain(|_, instance| !instance.should_reclaim());
         drop(active);
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] advance: advanced voices; retiring spatial sources");
 
         if let Some(processor) = &self.spatial_processor
             && let Ok(mut processor) = processor.lock()
@@ -1187,6 +1195,8 @@ impl PetalSonicEngine {
                 let _ = processor.retire_source(completed.voice_id);
             }
         }
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] advance: retired spatial sources; emitting completions");
 
         self.active_voice_count
             .fetch_sub(self.recovery_completed_playbacks.len(), Ordering::AcqRel);
@@ -1207,6 +1217,8 @@ impl PetalSonicEngine {
                 );
             }
         }
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] advance: emitted completions");
     }
 
     /// Create a typed audio stream

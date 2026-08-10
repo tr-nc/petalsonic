@@ -417,8 +417,12 @@ impl PetalSonicWorld {
         schedule: &mut SupervisorSchedule,
         now: Instant,
     ) {
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] tick: draining retired resources");
         driver.drain_retired_resources();
         let state = Self::load_runtime_state(runtime_state);
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] tick: checking recovery reason ({state:?})");
         let recovery_reason = (state == RuntimeState::Running && now >= schedule.next_health_probe)
             .then(|| driver.output_recovery_reason())
             .flatten();
@@ -460,7 +464,11 @@ impl PetalSonicWorld {
 
         let elapsed = now.saturating_duration_since(schedule.last_advance);
         schedule.last_advance = now;
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] tick: advancing without output");
         driver.advance_without_output(commands, recovery_buses, elapsed);
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] tick: advanced without output");
 
         if now < schedule.next_retry {
             return;
@@ -471,7 +479,12 @@ impl PetalSonicWorld {
             .lock()
             .map(|buses| buses.clone())
             .unwrap_or_else(|_| recovery_buses.clone());
-        match driver.start_output(commands.clone(), next_buses) {
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] tick: starting output");
+        let start_result = driver.start_output(commands.clone(), next_buses);
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] tick: start output returned");
+        match start_result {
             Ok(()) => {
                 runtime_state.store(RuntimeState::Running as u8, Ordering::Release);
                 schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;

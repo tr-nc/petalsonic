@@ -79,6 +79,7 @@ mod events;
 mod gain;
 mod math;
 mod mixer;
+mod platform;
 mod playback;
 mod spatial;
 mod world;

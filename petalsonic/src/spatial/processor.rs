@@ -21,8 +21,7 @@ use audionimbus::{
     Vector3, audio_buffer::AudioBuffer as AudioNimbusAudioBuffer,
 };
 use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 const STEAM_AMBISONICS_ORDER: u32 = 2;
@@ -30,44 +29,6 @@ const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
 const NATIVE_EARLY_REFLECTION_MAX_DELAY_SECONDS: f32 = 0.25;
 const NATIVE_EARLY_REFLECTION_MAX_TRACE_METERS: f32 = 120.0;
 const NATIVE_EARLY_REFLECTION_GAIN: f32 = 0.18;
-
-/// Process-lifetime Steam Audio kernel shared by every world-owned renderer.
-///
-/// Steam Audio documents its context as a typically single, application-lifetime
-/// object. Keeping that lifetime inside PetalSonic avoids exposing a second resource
-/// graph to callers and avoids unsafe context destruction/recreation in `phonon.dll`.
-struct SharedSteamAudioContext(Context);
-
-// SAFETY: Steam Audio documents its API objects as usable from multiple threads.
-// PetalSonic only shares the context itself; mutable effects remain owned by one
-// render runtime. Audionimbus separately serializes the non-thread-safe HRTF
-// creation call with its process-global lock.
-unsafe impl Sync for SharedSteamAudioContext {}
-
-impl Deref for SharedSteamAudioContext {
-    type Target = Context;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-static STEAM_AUDIO_CONTEXT: OnceLock<std::result::Result<Arc<SharedSteamAudioContext>, String>> =
-    OnceLock::new();
-
-fn shared_steam_audio_context() -> Result<Arc<SharedSteamAudioContext>> {
-    STEAM_AUDIO_CONTEXT
-        .get_or_init(|| {
-            Context::try_new(&audionimbus::ContextSettings::default())
-                .map(|context| Arc::new(SharedSteamAudioContext(context)))
-                .map_err(|error| error.to_string())
-        })
-        .as_ref()
-        .map(Arc::clone)
-        .map_err(|reason| {
-            PetalSonicError::SpatialAudio(format!("Failed to create Steam Audio context: {reason}"))
-        })
-}
 
 #[derive(Debug, Clone)]
 struct NativeEarlyReflectionSourceState {
@@ -129,11 +90,10 @@ pub struct SpatialProcessor {
     native_ambisonics_state: Option<NativeAmbisonicsBinauralState>,
     native_reflection_source_states: HashMap<SourceId, NativeEarlyReflectionSourceState>,
 
-    // Steam Audio effects that do not call into host scene code. The context is
-    // process-lived; field order still ensures this world's effects drop first.
+    // Steam Audio effects that do not call into host scene code.
     ambisonics_decode_effect: Option<AmbisonicsDecodeEffect>,
     hrtf: Option<Hrtf>,
-    context: Arc<SharedSteamAudioContext>,
+    context: Context,
 
     // Configuration
     frame_size: usize,
@@ -219,11 +179,10 @@ impl SpatialProcessor {
             batched_any_hit_ray_tracer,
             batched_closest_hit_ray_tracer,
         } = config;
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] acquiring shared context");
-        let context = shared_steam_audio_context()?;
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] acquired shared context");
+        // Create Steam Audio context
+        let context = Context::try_new(&audionimbus::ContextSettings::default()).map_err(|e| {
+            PetalSonicError::SpatialAudio(format!("Failed to create Steam Audio context: {}", e))
+        })?;
 
         let audio_settings = AudioSettings {
             sampling_rate: sample_rate,
@@ -238,19 +197,13 @@ impl SpatialProcessor {
         let mut native_ambisonics_state = None;
 
         if hrtf_backend == HrtfBackend::SteamAudio {
-            #[cfg(all(test, target_os = "windows"))]
-            eprintln!("[DEBUG-win-context] creating HRTF");
             let loaded_hrtf =
                 create_steam_hrtf(&context, &audio_settings, steam_hrtf_path.as_deref())?;
-            #[cfg(all(test, target_os = "windows"))]
-            eprintln!("[DEBUG-win-context] created HRTF; creating decode effect");
             ambisonics_decode_effect = Some(create_ambisonics_decode_effect(
                 &context,
                 &audio_settings,
                 &loaded_hrtf,
             )?);
-            #[cfg(all(test, target_os = "windows"))]
-            eprintln!("[DEBUG-win-context] created decode effect");
             hrtf = Some(loaded_hrtf);
         }
 
@@ -1056,17 +1009,6 @@ impl SpatialProcessor {
             target_direction.dot(self.listener_up),
             target_direction.dot(self.listener_front),
         )
-    }
-}
-
-#[cfg(all(test, target_os = "windows"))]
-impl Drop for SpatialProcessor {
-    fn drop(&mut self) {
-        eprintln!("[DEBUG-win-context] spatial drop: dropping decode effect");
-        drop(self.ambisonics_decode_effect.take());
-        eprintln!("[DEBUG-win-context] spatial drop: dropped decode effect; dropping HRTF");
-        drop(self.hrtf.take());
-        eprintln!("[DEBUG-win-context] spatial drop: dropped HRTF");
     }
 }
 

@@ -16,8 +16,6 @@ use crate::math::Pose;
 use crate::playback::PlaybackCommand;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::collections::{HashMap, HashSet};
-#[cfg(target_os = "windows")]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -27,91 +25,6 @@ const MIN_PLAYBACK_RATE: f32 = 0.01;
 const MAX_PLAYBACK_RATE: f32 = 4.0;
 const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(target_os = "windows")]
-static WINDOWS_WASAPI_CONTEXT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-
-#[cfg(target_os = "windows")]
-struct WindowsComApartment {
-    initialized: bool,
-}
-
-#[cfg(target_os = "windows")]
-impl WindowsComApartment {
-    fn initialize() -> Result<Self> {
-        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
-        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-
-        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        if result.is_ok() {
-            Ok(Self { initialized: true })
-        } else if result == RPC_E_CHANGED_MODE {
-            // Another subsystem already selected an apartment model for this
-            // thread. COM is initialized and remains usable; this call must not
-            // be balanced with CoUninitialize.
-            Ok(Self { initialized: false })
-        } else {
-            Err(PetalSonicError::BackendUnavailable {
-                backend: "WASAPI",
-                reason: format!("failed to initialize COM on output supervisor: {result:?}"),
-            })
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for WindowsComApartment {
-    fn drop(&mut self) {
-        if self.initialized {
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn ensure_windows_wasapi_context() -> Result<()> {
-    use cpal::traits::HostTrait;
-
-    let initialized = WINDOWS_WASAPI_CONTEXT.get_or_init(|| {
-        let (ready_sender, ready_receiver) = crossbeam_channel::bounded(1);
-        std::thread::Builder::new()
-            .name("petalsonic-wasapi-context".into())
-            .spawn(move || {
-                let apartment = match WindowsComApartment::initialize() {
-                    Ok(apartment) => apartment,
-                    Err(error) => {
-                        let _ = ready_sender.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-
-                // CPAL 0.15 keeps its IMMDeviceEnumerator in a process-global
-                // OnceLock even though COM apartments are thread-scoped. Create
-                // that singleton on a process-lifetime thread so later worlds do
-                // not inherit an enumerator from a supervisor that has exited.
-                let _ = cpal::default_host().default_output_device();
-                if ready_sender.send(Ok(())).is_err() {
-                    return;
-                }
-
-                let _apartment = apartment;
-                loop {
-                    std::thread::park();
-                }
-            })
-            .map_err(|error| format!("failed to start WASAPI context thread: {error}"))?;
-
-        ready_receiver
-            .recv()
-            .map_err(|_| "WASAPI context thread exited during initialization".to_string())?
-    });
-
-    initialized
-        .clone()
-        .map_err(|reason| PetalSonicError::BackendUnavailable {
-            backend: "WASAPI",
-            reason,
-        })
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputPreparation {
@@ -404,7 +317,7 @@ impl PetalSonicWorld {
     pub fn new(config: crate::config::PetalSonicWorldDesc) -> Result<Self> {
         Self::validate_config(&config)?;
         #[cfg(target_os = "windows")]
-        ensure_windows_wasapi_context()?;
+        crate::platform::ensure_audio_context()?;
         let world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
 
         let (command_sender, command_receiver) =
@@ -506,12 +419,8 @@ impl PetalSonicWorld {
         schedule: &mut SupervisorSchedule,
         now: Instant,
     ) {
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] tick: draining retired resources");
         driver.drain_retired_resources();
         let state = Self::load_runtime_state(runtime_state);
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] tick: checking recovery reason ({state:?})");
         let recovery_reason = (state == RuntimeState::Running && now >= schedule.next_health_probe)
             .then(|| driver.output_recovery_reason())
             .flatten();
@@ -553,11 +462,7 @@ impl PetalSonicWorld {
 
         let elapsed = now.saturating_duration_since(schedule.last_advance);
         schedule.last_advance = now;
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] tick: advancing without output");
         driver.advance_without_output(commands, recovery_buses, elapsed);
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] tick: advanced without output");
 
         if now < schedule.next_retry {
             return;
@@ -568,12 +473,7 @@ impl PetalSonicWorld {
             .lock()
             .map(|buses| buses.clone())
             .unwrap_or_else(|_| recovery_buses.clone());
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] tick: starting output");
-        let start_result = driver.start_output(commands.clone(), next_buses);
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] tick: start output returned");
-        match start_result {
+        match driver.start_output(commands.clone(), next_buses) {
             Ok(()) => {
                 runtime_state.store(RuntimeState::Running as u8, Ordering::Release);
                 schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
@@ -606,7 +506,7 @@ impl PetalSonicWorld {
             .name("petalsonic-output".into())
             .spawn(move || {
                 #[cfg(target_os = "windows")]
-                let _com_apartment = match WindowsComApartment::initialize() {
+                let _platform_thread = match crate::platform::initialize_output_thread() {
                     Ok(apartment) => apartment,
                     Err(error) => {
                         runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
@@ -647,14 +547,7 @@ impl PetalSonicWorld {
 
                     std::thread::park_timeout(poll_interval);
                 }
-                #[cfg(all(test, target_os = "windows"))]
-                eprintln!("[DEBUG-win-context] supervisor: stopping output");
                 let _ = engine.stop_output();
-                #[cfg(all(test, target_os = "windows"))]
-                eprintln!("[DEBUG-win-context] supervisor: stopped output; dropping engine");
-                drop(engine);
-                #[cfg(all(test, target_os = "windows"))]
-                eprintln!("[DEBUG-win-context] supervisor: dropped engine");
             })
             .map_err(|error| {
                 PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))
@@ -1273,8 +1166,6 @@ impl PetalSonicWorld {
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
         self.supervisor_stop.store(true, Ordering::Release);
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] world close: joining supervisor");
         if let Some(supervisor) = self
             .supervisor_thread
             .lock()
@@ -1286,8 +1177,6 @@ impl PetalSonicWorld {
                 PetalSonicError::Engine("Output supervisor panicked while shutting down".into())
             })?;
         }
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] world close: joined supervisor");
         self.active_voice_count.store(0, Ordering::Release);
         self.runtime_state
             .store(RuntimeState::Closed as u8, Ordering::Release);
@@ -1323,13 +1212,6 @@ mod tests {
             1,
             Duration::from_secs_f64(16.0 / 48_000.0),
         )))
-    }
-
-    fn debug_windows_boundary(message: &str) {
-        #[cfg(target_os = "windows")]
-        eprintln!("[DEBUG-win-context] {message}");
-        #[cfg(not(target_os = "windows"))]
-        let _ = message;
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2015,17 +1897,12 @@ mod tests {
             ..Default::default()
         };
 
-        debug_windows_boundary("recreate: creating first world");
         let first = PetalSonicWorld::new(desc.clone()).unwrap();
-        debug_windows_boundary("recreate: closing first world");
         first.close().unwrap();
         drop(first);
-        debug_windows_boundary("recreate: dropped first world; creating second world");
 
         let second = PetalSonicWorld::new(desc).unwrap();
-        debug_windows_boundary("recreate: closing second world");
         second.close().unwrap();
-        debug_windows_boundary("recreate: closed second world");
     }
 
     #[test]
@@ -2036,9 +1913,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        debug_windows_boundary("detached: creating world");
         let world = PetalSonicWorld::new(desc).unwrap();
-        debug_windows_boundary("detached: creating emitter");
         let emitter = world
             .create_emitter(clip(), EmitterDesc::non_spatial())
             .unwrap();
@@ -2046,7 +1921,6 @@ mod tests {
             .play_controlled(emitter, PlayOptions::looping().detached(), PlaybackTag(7))
             .unwrap();
 
-        debug_windows_boundary("detached: destroying emitter");
         world.destroy_emitter(emitter).unwrap();
         assert!(matches!(
             world.play(emitter, PlayOptions::once()),
@@ -2054,9 +1928,7 @@ mod tests {
         ));
         world.pause_playback(control).unwrap();
         world.stop_playback(control).unwrap();
-        debug_windows_boundary("detached: closing world");
         world.close().unwrap();
-        debug_windows_boundary("detached: closed world");
     }
 
     #[test]

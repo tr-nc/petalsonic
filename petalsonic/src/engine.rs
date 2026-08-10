@@ -594,11 +594,7 @@ impl PetalSonicEngine {
     fn init_audio_device(
         output_device_name_contains: Option<&str>,
     ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] device init: creating host");
         let host = cpal::default_host();
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] device init: created host");
         let device = match output_device_name_contains
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -642,19 +638,13 @@ impl PetalSonicEngine {
         host: &cpal::Host,
         name_contains: &str,
     ) -> Result<cpal::Device> {
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] device find: collecting candidates");
         let candidates = Self::output_device_candidates(host)?;
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] device find: collected candidates");
         let mut matches: Vec<_> = candidates
             .into_iter()
             .filter(|candidate| Self::output_device_matches(&candidate.info, name_contains))
             .collect();
 
         if matches.is_empty() {
-            #[cfg(all(test, target_os = "windows"))]
-            eprintln!("[DEBUG-win-context] device find: collecting candidates for error");
             let available_devices = Self::output_device_candidates(host)?
                 .into_iter()
                 .map(|candidate| candidate.info)
@@ -689,21 +679,15 @@ impl PetalSonicEngine {
     }
 
     fn output_device_candidates(host: &cpal::Host) -> Result<Vec<AudioOutputDeviceCandidate>> {
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] candidates: querying default device");
         let default_name = host
             .default_output_device()
             .and_then(|device| device.name().ok());
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] candidates: queried default device; enumerating outputs");
         let alsa_card_aliases = Self::alsa_card_aliases();
         let output_devices = host.output_devices().map_err(|e| {
             PetalSonicError::AudioDevice(format!("Failed to enumerate output devices: {}", e))
         })?;
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] candidates: enumerated outputs; collecting names");
 
-        let candidates = output_devices
+        Ok(output_devices
             .map(|device| {
                 let name = device
                     .name()
@@ -719,10 +703,7 @@ impl PetalSonicEngine {
                     },
                 }
             })
-            .collect();
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] candidates: collected names");
-        Ok(candidates)
+            .collect())
     }
 
     fn output_device_matches(info: &AudioOutputDeviceInfo, name_contains: &str) -> bool {
@@ -1161,16 +1142,12 @@ impl PetalSonicEngine {
         buses: &mut [BusParams],
         elapsed: Duration,
     ) {
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] advance: processing commands");
         Self::process_playback_commands(
             command_receivers,
             &self.active_playback,
             &self.active_voice_count,
             buses,
         );
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] advance: processed commands");
 
         let frames = (elapsed.as_secs_f64() * self.desc.sample_rate as f64).floor() as usize;
         if frames == 0 {
@@ -1179,8 +1156,6 @@ impl PetalSonicEngine {
         let Ok(mut active) = self.active_playback.lock() else {
             return;
         };
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] advance: advancing voices");
         self.recovery_completed_playbacks.clear();
         for (voice_id, instance) in active.iter_mut() {
             if !matches!(instance.info.play_state, PlayState::Playing) {
@@ -1204,8 +1179,6 @@ impl PetalSonicEngine {
         }
         active.retain(|_, instance| !instance.should_reclaim());
         drop(active);
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] advance: advanced voices; retiring spatial sources");
 
         if let Some(processor) = &self.spatial_processor
             && let Ok(mut processor) = processor.lock()
@@ -1214,8 +1187,6 @@ impl PetalSonicEngine {
                 let _ = processor.retire_source(completed.voice_id);
             }
         }
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] advance: retired spatial sources; emitting completions");
 
         self.active_voice_count
             .fetch_sub(self.recovery_completed_playbacks.len(), Ordering::AcqRel);
@@ -1236,8 +1207,6 @@ impl PetalSonicEngine {
                 );
             }
         }
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] advance: emitted completions");
     }
 
     /// Create a typed audio stream
@@ -2009,11 +1978,7 @@ impl PetalSonicEngine {
 
 impl Drop for PetalSonicEngine {
     fn drop(&mut self) {
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] engine drop: stopping");
         let _ = self.stop();
-        #[cfg(all(test, target_os = "windows"))]
-        eprintln!("[DEBUG-win-context] engine drop: stopped");
     }
 }
 

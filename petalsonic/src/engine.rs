@@ -594,7 +594,11 @@ impl PetalSonicEngine {
     fn init_audio_device(
         output_device_name_contains: Option<&str>,
     ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] device init: creating host");
         let host = cpal::default_host();
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] device init: created host");
         let device = match output_device_name_contains
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -638,13 +642,19 @@ impl PetalSonicEngine {
         host: &cpal::Host,
         name_contains: &str,
     ) -> Result<cpal::Device> {
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] device find: collecting candidates");
         let candidates = Self::output_device_candidates(host)?;
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] device find: collected candidates");
         let mut matches: Vec<_> = candidates
             .into_iter()
             .filter(|candidate| Self::output_device_matches(&candidate.info, name_contains))
             .collect();
 
         if matches.is_empty() {
+            #[cfg(all(test, target_os = "windows"))]
+            eprintln!("[DEBUG-win-context] device find: collecting candidates for error");
             let available_devices = Self::output_device_candidates(host)?
                 .into_iter()
                 .map(|candidate| candidate.info)
@@ -679,15 +689,21 @@ impl PetalSonicEngine {
     }
 
     fn output_device_candidates(host: &cpal::Host) -> Result<Vec<AudioOutputDeviceCandidate>> {
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] candidates: querying default device");
         let default_name = host
             .default_output_device()
             .and_then(|device| device.name().ok());
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] candidates: queried default device; enumerating outputs");
         let alsa_card_aliases = Self::alsa_card_aliases();
         let output_devices = host.output_devices().map_err(|e| {
             PetalSonicError::AudioDevice(format!("Failed to enumerate output devices: {}", e))
         })?;
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] candidates: enumerated outputs; collecting names");
 
-        Ok(output_devices
+        let candidates = output_devices
             .map(|device| {
                 let name = device
                     .name()
@@ -703,7 +719,10 @@ impl PetalSonicEngine {
                     },
                 }
             })
-            .collect())
+            .collect();
+        #[cfg(all(test, target_os = "windows"))]
+        eprintln!("[DEBUG-win-context] candidates: collected names");
+        Ok(candidates)
     }
 
     fn output_device_matches(info: &AudioOutputDeviceInfo, name_contains: &str) -> bool {

@@ -1203,6 +1203,13 @@ mod tests {
         )))
     }
 
+    fn debug_windows_boundary(message: &str) {
+        #[cfg(target_os = "windows")]
+        eprintln!("[DEBUG-win-context] {message}");
+        #[cfg(not(target_os = "windows"))]
+        let _ = message;
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct FakeDevice {
         name: &'static str,
@@ -1886,12 +1893,17 @@ mod tests {
             ..Default::default()
         };
 
+        debug_windows_boundary("recreate: creating first world");
         let first = PetalSonicWorld::new(desc.clone()).unwrap();
+        debug_windows_boundary("recreate: closing first world");
         first.close().unwrap();
         drop(first);
+        debug_windows_boundary("recreate: dropped first world; creating second world");
 
         let second = PetalSonicWorld::new(desc).unwrap();
+        debug_windows_boundary("recreate: closing second world");
         second.close().unwrap();
+        debug_windows_boundary("recreate: closed second world");
     }
 
     #[test]
@@ -1902,7 +1914,9 @@ mod tests {
             ),
             ..Default::default()
         };
+        debug_windows_boundary("detached: creating world");
         let world = PetalSonicWorld::new(desc).unwrap();
+        debug_windows_boundary("detached: creating emitter");
         let emitter = world
             .create_emitter(clip(), EmitterDesc::non_spatial())
             .unwrap();
@@ -1910,6 +1924,7 @@ mod tests {
             .play_controlled(emitter, PlayOptions::looping().detached(), PlaybackTag(7))
             .unwrap();
 
+        debug_windows_boundary("detached: destroying emitter");
         world.destroy_emitter(emitter).unwrap();
         assert!(matches!(
             world.play(emitter, PlayOptions::once()),
@@ -1917,7 +1932,9 @@ mod tests {
         ));
         world.pause_playback(control).unwrap();
         world.stop_playback(control).unwrap();
+        debug_windows_boundary("detached: closing world");
         world.close().unwrap();
+        debug_windows_boundary("detached: closed world");
     }
 
     #[test]

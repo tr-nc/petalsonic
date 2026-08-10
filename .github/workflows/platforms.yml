@@ -27,4 +27,12 @@ jobs:
         # Steam Audio's Windows DLL can fault when independent test cases create
         # and release process-level contexts concurrently. The suite still covers
         # multiple simultaneous PetalSonic worlds inside one dedicated test.
+        run: cargo test -p petalsonic --lib world::tests::world_can_be_recreated_after_close -- --exact --test-threads=1 --nocapture
+        continue-on-error: true
+      - name: Isolate detached playback lifecycle on Windows
+        if: runner.os == 'Windows'
+        run: cargo test -p petalsonic --lib world::tests::detached_control_survives_emitter_destruction -- --exact --test-threads=1 --nocapture
+        continue-on-error: true
+      - name: Run complete workspace tests serially on Windows
+        if: runner.os == 'Windows'
         run: cargo test --workspace --all-targets -- --test-threads=1 --nocapture

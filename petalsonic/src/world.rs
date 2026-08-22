@@ -345,6 +345,7 @@ impl PetalSonicWorld {
         let acoustic_propagation = AcousticPropagation::new(
             config.distance_scaler,
             environmental_acoustics_enabled.clone(),
+            config.environmental_acoustics_quality,
         )
         .map_err(|error| {
             PetalSonicError::Engine(format!(
@@ -629,6 +630,14 @@ impl PetalSonicWorld {
                 reason: "must be finite and greater than zero".into(),
             });
         }
+        if !config.environmental_acoustics_quality.is_finite()
+            || !(0.0..=1.0).contains(&config.environmental_acoustics_quality)
+        {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "environmental_acoustics_quality",
+                reason: "must be finite and in the inclusive range 0.0..=1.0".into(),
+            });
+        }
         if config.buses.len() > config.max_buses {
             return Err(PetalSonicError::CapacityExceeded {
                 resource: "bus",
@@ -795,6 +804,25 @@ impl PetalSonicWorld {
 
     pub fn environmental_acoustics_enabled(&self) -> bool {
         self.environmental_acoustics_enabled.load(Ordering::Acquire)
+    }
+
+    /// Changes the bounded geometry-driven acoustics quality at the next propagation solve.
+    ///
+    /// This latest-value control does not rebuild the output runtime or interrupt playback.
+    pub fn set_environmental_acoustics_quality(&self, quality: f32) -> Result<()> {
+        self.ensure_open()?;
+        if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "environmental_acoustics_quality",
+                reason: "must be finite and in the inclusive range 0.0..=1.0".into(),
+            });
+        }
+        self.acoustic_propagation.set_quality(quality);
+        Ok(())
+    }
+
+    pub fn environmental_acoustics_quality(&self) -> f32 {
+        self.acoustic_propagation.quality()
     }
 
     pub fn destroy_emitter(&self, emitter: Emitter) -> Result<()> {
@@ -1465,6 +1493,20 @@ mod tests {
                 ..
             })
         ));
+
+        for environmental_acoustics_quality in [-0.01, 1.01, f32::NAN] {
+            let desc = crate::config::PetalSonicWorldDesc {
+                environmental_acoustics_quality,
+                ..Default::default()
+            };
+            assert!(matches!(
+                PetalSonicWorld::validate_config(&desc),
+                Err(PetalSonicError::InvalidConfiguration {
+                    field: "environmental_acoustics_quality",
+                    ..
+                })
+            ));
+        }
 
         let desc = crate::config::PetalSonicWorldDesc {
             spatial_quality: crate::config::SpatialQuality::LowLatency,

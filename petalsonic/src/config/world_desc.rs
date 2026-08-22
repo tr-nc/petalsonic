@@ -91,6 +91,12 @@ pub struct PetalSonicWorldDesc {
     /// Native HRTF spatialization, distance attenuation, air absorption, and playback stay
     /// active when this is disabled. The setting can also be changed while the world is running.
     pub environmental_acoustics_enabled: bool,
+    /// Normalized geometry-driven acoustics quality in the inclusive range `0.0..=1.0`.
+    ///
+    /// The default `0.5` preserves the balanced native propagation plan. The value controls a
+    /// bounded internal ray budget and can also be changed while the world is running without
+    /// rebuilding the output runtime.
+    pub environmental_acoustics_quality: f32,
     /// Optional immutable acoustic scene available when the runtime starts.
     pub acoustic_scene: Option<AcousticSceneSnapshot>,
 }
@@ -118,6 +124,7 @@ impl Default for PetalSonicWorldDesc {
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
             environmental_acoustics_enabled: true,
+            environmental_acoustics_quality: 0.5,
             acoustic_scene: None,
         }
     }
@@ -145,6 +152,10 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field(
                 "environmental_acoustics_enabled",
                 &self.environmental_acoustics_enabled,
+            )
+            .field(
+                "environmental_acoustics_quality",
+                &self.environmental_acoustics_quality,
             )
             .field("acoustic_scene", &self.acoustic_scene)
             .finish()

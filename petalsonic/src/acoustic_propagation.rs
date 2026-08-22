@@ -10,16 +10,46 @@ use std::time::{Duration, Instant};
 
 const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
 const SOLVE_INTERVAL: Duration = Duration::from_millis(33);
-const MAX_DIRECT_SOURCES: usize = 32;
-const MAX_EARLY_REFLECTION_SOURCES: usize = 8;
 pub(crate) const MAX_EARLY_REFLECTION_TAPS: usize = 2;
-const EARLY_REFLECTION_RAY_COUNT: usize = 64;
 const EARLY_REFLECTION_MAX_DELAY_SECONDS: f32 = 0.25;
 const EARLY_REFLECTION_GAIN: f32 = 0.6;
-const LATE_RAY_COUNT: usize = 256;
-const LATE_BOUNCE_COUNT: usize = 8;
 const MAX_TRACE_DISTANCE_METERS: f32 = 120.0;
 const RAY_EPSILON_METERS: f32 = 0.05;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AcousticSolvePlan {
+    max_direct_sources: usize,
+    max_early_reflection_sources: usize,
+    early_reflection_taps: usize,
+    early_reflection_ray_count: usize,
+    late_ray_count: usize,
+    late_bounce_count: usize,
+}
+
+impl AcousticSolvePlan {
+    fn for_quality(quality: f32) -> Self {
+        let quality = quality.clamp(0.0, 1.0);
+        Self {
+            max_direct_sources: quality_count(32, 32, 64, quality),
+            // Keep the existing bounded crossfade pool; higher quality improves path sampling
+            // without imposing more persistent render-thread state on lower settings.
+            max_early_reflection_sources: quality_count(4, 8, 8, quality),
+            early_reflection_taps: if quality < 0.25 { 1 } else { 2 },
+            early_reflection_ray_count: quality_count(32, 64, 256, quality),
+            late_ray_count: quality_count(128, 256, 1_024, quality),
+            late_bounce_count: quality_count(4, 8, 12, quality),
+        }
+    }
+}
+
+fn quality_count(low: usize, balanced: usize, high: usize, quality: f32) -> usize {
+    let (start, end, progress) = if quality <= 0.5 {
+        (low, balanced, quality * 2.0)
+    } else {
+        (balanced, high, (quality - 0.5) * 2.0)
+    };
+    (start as f32 + (end as f32 - start as f32) * progress).round() as usize
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EarlyReflectionTap {
@@ -69,21 +99,32 @@ struct SolveInput {
     generation: u64,
     spatial: Arc<SpatialFrame>,
     scene: Arc<AcousticSceneSnapshot>,
+    environmental_acoustics_quality: f32,
 }
 
-#[derive(Default)]
 struct InputState {
     generation: u64,
     spatial: Option<Arc<SpatialFrame>>,
     scene: Option<Arc<AcousticSceneSnapshot>>,
+    environmental_acoustics_quality: f32,
 }
 
 impl InputState {
+    fn new(environmental_acoustics_quality: f32) -> Self {
+        Self {
+            generation: 0,
+            spatial: None,
+            scene: None,
+            environmental_acoustics_quality,
+        }
+    }
+
     fn capture(&self) -> Option<SolveInput> {
         Some(SolveInput {
             generation: self.generation,
             spatial: self.spatial.clone()?,
             scene: self.scene.clone()?,
+            environmental_acoustics_quality: self.environmental_acoustics_quality,
         })
     }
 }
@@ -184,9 +225,13 @@ pub(crate) struct AcousticPropagation {
 }
 
 impl AcousticPropagation {
-    pub(crate) fn new(distance_scaler: f32, enabled: Arc<AtomicBool>) -> std::io::Result<Self> {
+    pub(crate) fn new(
+        distance_scaler: f32,
+        enabled: Arc<AtomicBool>,
+        environmental_acoustics_quality: f32,
+    ) -> std::io::Result<Self> {
         let input = Arc::new(SharedInput {
-            state: Mutex::new(InputState::default()),
+            state: Mutex::new(InputState::new(environmental_acoustics_quality)),
             changed: Condvar::new(),
         });
         let latest_response = Arc::new(Mutex::new(None));
@@ -264,6 +309,27 @@ impl AcousticPropagation {
         self.enabled.store(enabled, Ordering::Release);
         drop(state);
         self.input.changed.notify_one();
+    }
+
+    pub(crate) fn set_quality(&self, quality: f32) {
+        let Ok(mut state) = self.input.state.lock() else {
+            return;
+        };
+        if state.environmental_acoustics_quality.to_bits() == quality.to_bits() {
+            return;
+        }
+        state.environmental_acoustics_quality = quality;
+        state.generation = state.generation.wrapping_add(1).max(1);
+        drop(state);
+        self.input.changed.notify_one();
+    }
+
+    pub(crate) fn quality(&self) -> f32 {
+        self.input
+            .state
+            .lock()
+            .map(|state| state.environmental_acoustics_quality)
+            .unwrap_or(0.5)
     }
 
     pub(crate) fn close(&self) {
@@ -378,20 +444,21 @@ fn propagation_loop(
 }
 
 fn solve_response(input: &SolveInput, distance_scaler: f32) -> AcousticResponse {
-    let candidates = ranked_emitters(input);
+    let plan = AcousticSolvePlan::for_quality(input.environmental_acoustics_quality);
+    let candidates = ranked_emitters(input, plan);
     let mut direct = solve_direct(input, &candidates, distance_scaler);
-    solve_early_reflections(input, &candidates, distance_scaler, &mut direct);
+    solve_early_reflections(input, &candidates, distance_scaler, plan, &mut direct);
     AcousticResponse {
         spatial_revision: input.spatial.revision(),
         geometry_version: input.scene.version(),
         direct,
-        late_reverb: solve_late_reverb(input, distance_scaler),
+        late_reverb: solve_late_reverb(input, distance_scaler, plan),
         published_at: Instant::now(),
         solve_time_us: 0,
     }
 }
 
-fn ranked_emitters(input: &SolveInput) -> Vec<&EmitterSpatialState> {
+fn ranked_emitters(input: &SolveInput, plan: AcousticSolvePlan) -> Vec<&EmitterSpatialState> {
     let listener = input.spatial.listener().position;
     let mut candidates: Vec<(f32, &EmitterSpatialState)> = input
         .spatial
@@ -405,7 +472,7 @@ fn ranked_emitters(input: &SolveInput) -> Vec<&EmitterSpatialState> {
         })
         .collect();
     candidates.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(CmpOrdering::Equal));
-    candidates.truncate(MAX_DIRECT_SOURCES);
+    candidates.truncate(plan.max_direct_sources);
     candidates.into_iter().map(|(_, emitter)| emitter).collect()
 }
 
@@ -462,20 +529,21 @@ fn solve_early_reflections(
     input: &SolveInput,
     candidates: &[&EmitterSpatialState],
     distance_scaler: f32,
+    plan: AcousticSolvePlan,
     responses: &mut [DirectAcousticResponse],
 ) {
     let listener = input.spatial.listener().position;
     let ray_epsilon_world = RAY_EPSILON_METERS / distance_scaler.max(0.001);
     let max_distance_world = MAX_TRACE_DISTANCE_METERS / distance_scaler.max(0.001);
-    let probe_rays: Vec<_> = (0..EARLY_REFLECTION_RAY_COUNT)
+    let probe_rays: Vec<_> = (0..plan.early_reflection_ray_count)
         .map(|index| AcousticRay {
             origin: listener,
-            direction: fibonacci_direction(index, EARLY_REFLECTION_RAY_COUNT),
+            direction: fibonacci_direction(index, plan.early_reflection_ray_count),
         })
         .collect();
-    let min_distances = vec![ray_epsilon_world; EARLY_REFLECTION_RAY_COUNT];
-    let max_distances = vec![max_distance_world; EARLY_REFLECTION_RAY_COUNT];
-    let mut surface_hits = vec![None; EARLY_REFLECTION_RAY_COUNT];
+    let min_distances = vec![ray_epsilon_world; plan.early_reflection_ray_count];
+    let max_distances = vec![max_distance_world; plan.early_reflection_ray_count];
+    let mut surface_hits = vec![None; plan.early_reflection_ray_count];
     input.scene.query().trace_closest_hit_batch(
         &probe_rays,
         &min_distances,
@@ -483,16 +551,16 @@ fn solve_early_reflections(
         &mut surface_hits,
     );
 
-    for emitter in candidates.iter().take(MAX_EARLY_REFLECTION_SOURCES) {
+    for emitter in candidates.iter().take(plan.max_early_reflection_sources) {
         let source_position = emitter.pose.position;
         let direct_distance_world = source_position.distance(listener);
         if !direct_distance_world.is_finite() {
             continue;
         }
-        let mut visibility_rays = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
-        let mut visibility_min = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
-        let mut visibility_max = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
-        let mut candidates_for_visibility = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
+        let mut visibility_rays = Vec::with_capacity(plan.early_reflection_ray_count);
+        let mut visibility_min = Vec::with_capacity(plan.early_reflection_ray_count);
+        let mut visibility_max = Vec::with_capacity(plan.early_reflection_ray_count);
+        let mut candidates_for_visibility = Vec::with_capacity(plan.early_reflection_ray_count);
 
         for (path_id, (probe_ray, hit)) in probe_rays.iter().zip(&surface_hits).enumerate() {
             let Some(hit) = hit.filter(|hit| {
@@ -590,7 +658,7 @@ fn solve_early_reflections(
                 .partial_cmp(&reflection_strength(left))
                 .unwrap_or(CmpOrdering::Equal)
         });
-        taps.truncate(MAX_EARLY_REFLECTION_TAPS);
+        taps.truncate(plan.early_reflection_taps);
         taps.sort_by_key(|tap| tap.path_id);
         if let Some(response) = responses
             .iter_mut()
@@ -613,21 +681,25 @@ fn propagation_air_absorption(distance_meters: f32) -> f32 {
     (-0.0002 * distance_meters.max(0.0)).exp().clamp(0.2, 1.0)
 }
 
-fn solve_late_reverb(input: &SolveInput, distance_scaler: f32) -> LateReverbParameters {
+fn solve_late_reverb(
+    input: &SolveInput,
+    distance_scaler: f32,
+    plan: AcousticSolvePlan,
+) -> LateReverbParameters {
     let listener = input.spatial.listener().position;
     let max_distance_world = MAX_TRACE_DISTANCE_METERS / distance_scaler.max(0.001);
     let ray_epsilon_world = RAY_EPSILON_METERS / distance_scaler.max(0.001);
-    let mut rays: Vec<AcousticRay> = (0..LATE_RAY_COUNT)
+    let mut rays: Vec<AcousticRay> = (0..plan.late_ray_count)
         .map(|index| AcousticRay {
             origin: listener,
-            direction: fibonacci_direction(index, LATE_RAY_COUNT),
+            direction: fibonacci_direction(index, plan.late_ray_count),
         })
         .collect();
-    let min_distances = vec![ray_epsilon_world; LATE_RAY_COUNT];
-    let max_distances = vec![max_distance_world; LATE_RAY_COUNT];
-    let mut hits = vec![None; LATE_RAY_COUNT];
-    let mut active = vec![true; LATE_RAY_COUNT];
-    let mut energy = vec![[1.0f32; 3]; LATE_RAY_COUNT];
+    let min_distances = vec![ray_epsilon_world; plan.late_ray_count];
+    let max_distances = vec![max_distance_world; plan.late_ray_count];
+    let mut hits = vec![None; plan.late_ray_count];
+    let mut active = vec![true; plan.late_ray_count];
+    let mut energy = vec![[1.0f32; 3]; plan.late_ray_count];
     let mut hit_segments = 0usize;
     let mut first_bounce_hits = 0usize;
     let mut minimum_hit_distance_meters = f32::INFINITY;
@@ -635,7 +707,7 @@ fn solve_late_reverb(input: &SolveInput, distance_scaler: f32) -> LateReverbPara
     let mut log_reflectivity_sum = [0.0f32; 3];
     let mut reflected_energy_sum = [0.0f32; 3];
 
-    for bounce in 0..LATE_BOUNCE_COUNT {
+    for bounce in 0..plan.late_bounce_count {
         hits.fill(None);
         input.scene.query().trace_closest_hit_batch(
             &rays,
@@ -643,7 +715,7 @@ fn solve_late_reverb(input: &SolveInput, distance_scaler: f32) -> LateReverbPara
             &max_distances,
             &mut hits,
         );
-        for index in 0..LATE_RAY_COUNT {
+        for index in 0..plan.late_ray_count {
             if !active[index] {
                 continue;
             }
@@ -706,7 +778,7 @@ fn solve_late_reverb(input: &SolveInput, distance_scaler: f32) -> LateReverbPara
                 .clamp(0.05, 20.0)
         }
     });
-    let enclosure = first_bounce_hits as f32 / LATE_RAY_COUNT as f32;
+    let enclosure = first_bounce_hits as f32 / plan.late_ray_count as f32;
     let reflected_energy =
         reflected_energy_sum.iter().sum::<f32>() / (hit_segments.max(1) * 3) as f32;
     LateReverbParameters {
@@ -977,6 +1049,56 @@ mod tests {
                 )],
             )),
             scene: Arc::new(AcousticSceneSnapshot::new(17, query)),
+            environmental_acoustics_quality: 0.5,
+        }
+    }
+
+    #[test]
+    fn quality_plans_preserve_the_existing_default_and_scale_monotonically() {
+        assert_eq!(
+            AcousticSolvePlan::for_quality(0.0),
+            AcousticSolvePlan {
+                max_direct_sources: 32,
+                max_early_reflection_sources: 4,
+                early_reflection_taps: 1,
+                early_reflection_ray_count: 32,
+                late_ray_count: 128,
+                late_bounce_count: 4,
+            }
+        );
+        assert_eq!(
+            AcousticSolvePlan::for_quality(0.5),
+            AcousticSolvePlan {
+                max_direct_sources: 32,
+                max_early_reflection_sources: 8,
+                early_reflection_taps: 2,
+                early_reflection_ray_count: 64,
+                late_ray_count: 256,
+                late_bounce_count: 8,
+            }
+        );
+        assert_eq!(
+            AcousticSolvePlan::for_quality(1.0),
+            AcousticSolvePlan {
+                max_direct_sources: 64,
+                max_early_reflection_sources: 8,
+                early_reflection_taps: 2,
+                early_reflection_ray_count: 256,
+                late_ray_count: 1_024,
+                late_bounce_count: 12,
+            }
+        );
+
+        let mut previous = AcousticSolvePlan::for_quality(0.0);
+        for step in 1..=100 {
+            let plan = AcousticSolvePlan::for_quality(step as f32 / 100.0);
+            assert!(plan.max_direct_sources >= previous.max_direct_sources);
+            assert!(plan.max_early_reflection_sources >= previous.max_early_reflection_sources);
+            assert!(plan.early_reflection_taps >= previous.early_reflection_taps);
+            assert!(plan.early_reflection_ray_count >= previous.early_reflection_ray_count);
+            assert!(plan.late_ray_count >= previous.late_ray_count);
+            assert!(plan.late_bounce_count >= previous.late_bounce_count);
+            previous = plan;
         }
     }
 
@@ -1056,7 +1178,8 @@ mod tests {
 
     #[test]
     fn worker_keeps_only_latest_complete_input_and_closes_cleanly() {
-        let propagation = AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true))).unwrap();
+        let propagation =
+            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5).unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(17, Arc::new(UnitRoom))))
             .unwrap();
@@ -1109,7 +1232,8 @@ mod tests {
 
     #[test]
     fn disabled_worker_waits_for_reenable_before_solving() {
-        let propagation = AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(false))).unwrap();
+        let propagation =
+            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(false)), 0.5).unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();
@@ -1134,6 +1258,63 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        propagation.close();
+    }
+
+    #[test]
+    fn quality_change_wakes_the_existing_worker_without_new_scene_input() {
+        let propagation =
+            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5).unwrap();
+        propagation
+            .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
+            .unwrap();
+        propagation
+            .publish_spatial_frame(Arc::new(SpatialFrame::new(
+                4,
+                0.04,
+                Pose::from_position(Vec3::ZERO),
+                Vec::new(),
+            )))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while propagation.diagnostics().solve_count == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not solve initial input"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let initial_solve_count = propagation.diagnostics().solve_count;
+        let worker_thread_id = propagation
+            .worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .thread()
+            .id();
+
+        propagation.set_quality(1.0);
+        assert_eq!(propagation.quality(), 1.0);
+        while propagation.diagnostics().solve_count == initial_solve_count {
+            assert!(
+                Instant::now() < deadline,
+                "quality change did not wake the propagation worker"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            propagation
+                .worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .thread()
+                .id(),
+            worker_thread_id
+        );
         propagation.close();
     }
 }

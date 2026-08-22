@@ -1,26 +1,6 @@
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::domain::BusDesc;
 
-/// Backend used for binaural/HRTF rendering.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum HrtfBackend {
-    /// Use Steam Audio HRTF data and binaural rendering.
-    #[default]
-    SteamAudio,
-    /// Use PetalSonic's native `.petalhrtf` table and FIR renderer.
-    Native,
-}
-
-/// Backend used to encode sources into an Ambisonics field.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum AmbisonicsBackend {
-    /// Use Steam Audio's Ambisonics encode effect.
-    #[default]
-    SteamAudio,
-    /// Use PetalSonic's native real spherical-harmonic encoder.
-    Native,
-}
-
 /// Effect-oriented spatial quality selected once for the world lifetime.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SpatialQuality {
@@ -84,9 +64,7 @@ pub struct PetalSonicWorldDesc {
     pub output_device: OutputDevicePolicy,
     pub spatial_quality: SpatialQuality,
     pub latency_profile: LatencyProfile,
-    /// Optional SOFA path used by Steam Audio HRTF rendering.
-    pub steam_hrtf_path: Option<String>,
-    /// Optional `.petalhrtf` path used by native HRTF rendering.
+    /// Optional custom `.petalhrtf` path. The embedded native HRTF is used when absent.
     pub native_hrtf_path: Option<String>,
     /// HRTF gain compensation in decibels (default: 0.0 dB = no change)
     ///
@@ -102,9 +80,8 @@ pub struct PetalSonicWorldDesc {
     pub hrtf_gain: f32,
     /// Distance scale factor to convert world units to meters for spatialization.
     ///
-    /// Steam Audio operates in meters. This factor controls how your application's
-    /// coordinate system maps to real-world meters when running the spatial
-    /// simulation.
+    /// This factor controls how your application's coordinate system maps to real-world meters
+    /// when running the native spatial simulation.
     ///
     /// - `1.0`: 1 world unit = 1 meter
     /// - `10.0`: 1 world unit = 10 meters (larger-scale worlds)
@@ -132,7 +109,6 @@ impl Default for PetalSonicWorldDesc {
             output_device: OutputDevicePolicy::default(),
             spatial_quality: SpatialQuality::default(),
             latency_profile: LatencyProfile::default(),
-            steam_hrtf_path: None,
             native_hrtf_path: None,
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
@@ -157,7 +133,6 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("output_device", &self.output_device)
             .field("spatial_quality", &self.spatial_quality)
             .field("latency_profile", &self.latency_profile)
-            .field("steam_hrtf_path", &self.steam_hrtf_path)
             .field("native_hrtf_path", &self.native_hrtf_path)
             .field("hrtf_gain", &self.hrtf_gain)
             .field("distance_scaler", &self.distance_scaler)

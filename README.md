@@ -1,6 +1,6 @@
 # PetalSonic
 
-A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spatialization.
+A real-time safe native spatial audio library for Rust.
 
 ## Overview
 
@@ -12,7 +12,7 @@ Add PetalSonic to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-petalsonic = "0.6"
+petalsonic = "0.7"
 ```
 
 Basic usage example:
@@ -48,7 +48,7 @@ fn main() -> Result<(), PetalSonicError> {
 
 ## Features
 
-- **High-Quality 3D Spatialization**: Powered by Steam Audio with HRTF-based binaural rendering
+- **High-Quality 3D Spatialization**: Native HRTF and Ambisonics binaural rendering
 - **Real-Time Safe**: Zero allocations and locks in the audio thread
 - **Easy to Use**: Simple world-driven API - just load audio, position sources, and play
 - **Flexible**: Supports both spatial and non-spatial audio in the same world
@@ -79,7 +79,7 @@ petalsonic/
 
 **Contains**: Audio engine, world management, spatialization, data loading
 
-**Dependencies**: Only audio-related crates (cpal, audionimbus, symphonia, etc.)
+**Dependencies**: Rust audio and DSP crates such as CPAL, Symphonia, Rubato, and RealFFT
 
 See the [petalsonic README](./petalsonic/README.md) for detailed API documentation.
 
@@ -99,7 +99,7 @@ cargo run --package petalsonic-demo
 ### PetalSonic Core Library (petalsonic)
 
 - Pure spatial audio processing
-- Steam Audio integration
+- Native HRTF, Ambisonics, and geometry acoustics
 - Thread-safe audio pipeline
 - Audio data loading/resampling
 - Real-time safe operations
@@ -160,7 +160,7 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 ## High-level Goals
 
 - World-driven API on the main thread: you own and update a 3D world (listener + sources).
-- Fixed-size audio processing thread(s) that use audionimbus (Steam Audio) for spatialization.
+- Fixed-size audio processing threads with PetalSonic-owned native spatialization.
 - Decoding with Symphonia; optional resampling on load to a world-wide sample rate.
 - Playback via CPAL, with a lock-free SPSC ring buffer bridging fixed-size producer blocks to variable-size device callbacks.
 - Real-time safe in the audio callback; no allocations/locks on the RT path.
@@ -221,6 +221,5 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Links
 
-- [Steam Audio](https://valvesoftware.github.io/steam-audio/)
 - [Symphonia](https://github.com/pdeljanov/Symphonia)
 - [CPAL](https://github.com/RustAudio/cpal)

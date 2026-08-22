@@ -1,6 +1,6 @@
 //! # PetalSonic Core
 //!
-//! A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spatialization.
+//! A real-time safe native spatial audio library for Rust.
 //!
 //! PetalSonic provides a world-driven API where the main thread owns and updates a 3D world
 //! (listener + sources), while fixed-size audio processing threads handle spatialization and
@@ -61,7 +61,7 @@
 //!
 //! ## Features
 //!
-//! - Steam Audio integration for high-quality HRTF-based spatialization
+//! - Native HRTF and Ambisonics rendering for high-quality spatialization
 //! - Support for both spatial and non-spatial audio sources
 //! - Real-time safe audio processing
 //! - Automatic resampling to world sample rate

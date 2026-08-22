@@ -1,11 +1,11 @@
 [package]
 name = "petalsonic"
-description = "Real-time safe spatial audio library for Rust using Steam Audio for 3D spatialization"
-version = "0.6.0"
+description = "Real-time safe native spatial audio library for Rust"
+version = "0.7.0"
 edition = "2024"
 authors = ["Ruitian Yang <ruitian0716@gmail.com>"]
 license = "MIT"
-keywords = ["audio", "spatial", "3d", "steam-audio", "game"]
+keywords = ["audio", "spatial", "3d", "hrtf", "game"]
 categories = ["multimedia::audio", "game-development"]
 repository = "https://github.com/tr-nc/petalsonic"
 readme = "README.md"
@@ -16,7 +16,6 @@ cpal = "0.15.3"
 rubato = "0.14.1"
 realfft = "3.5.0"
 crossbeam-channel = "0.5.13"
-audionimbus = "0.12.0"
 ringbuf = "0.4.7"
 log = { workspace = true }
 glam = { workspace = true }
@@ -24,11 +23,3 @@ thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.54", features = ["Win32_Foundation", "Win32_System_Com"] }
-
-[features]
-default = ["auto-install"]
-auto-install = ["audionimbus/auto-install"]
-
-[package.metadata.docs.rs]
-# turn off default features (thus disabling steam-audio download).
-no-default-features = true

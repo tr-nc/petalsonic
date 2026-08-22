@@ -169,7 +169,6 @@ impl SpatialAudioDemo {
         let world_desc = PetalSonicWorldDesc {
             sample_rate: 48000,
             block_size: 1024,
-            steam_hrtf_path: Some("petalsonic-demo/asset/hrtf/hrtf_b_nh172.sofa".to_string()),
             hrtf_gain: 20.0,
             ..Default::default()
         };

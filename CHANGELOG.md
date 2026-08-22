@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- PetalSonic now uses its native HRTF, Ambisonics, direct-path, and early-reflection renderers for
+  every spatial quality profile. A converted NH172 PetalHRTF table is embedded as the default.
+
+### Removed
+- Removed the Steam Audio and AudioNimbus backends, native-library auto-install feature, SOFA
+  runtime configuration, and the associated FFI lifecycle.
+
 ## [0.6.0] - 2026-08-10
 
 ### Added

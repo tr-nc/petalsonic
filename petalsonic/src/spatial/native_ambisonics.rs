@@ -10,15 +10,13 @@ use std::time::Instant;
 pub const DEFAULT_NATIVE_AMBISONICS_ORDER: u32 = 4;
 const MAX_NATIVE_AMBISONICS_ORDER: u32 = 4;
 const MAX_NATIVE_AMBISONICS_CHANNELS: usize = 25;
-const STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT: usize = 24;
-const STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT: f32 =
-    4.0 * PI / STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT as f32;
+const AMBISONICS_VIRTUAL_SPEAKER_COUNT: usize = 24;
+const AMBISONICS_VIRTUAL_SPEAKER_WEIGHT: f32 = 4.0 * PI / AMBISONICS_VIRTUAL_SPEAKER_COUNT as f32;
 const HIGH_ORDER_NATIVE_AMBISONICS_VIRTUAL_SPEAKER_COUNT: usize = 256;
 
-// Steam Audio uses this 24-point spherical design to precompute Ambisonics HRTFs.
-// Keeping the same decode projection avoids the overly smooth/high-frequency-dull
+// This 24-point spherical design avoids the overly smooth/high-frequency-dull
 // result that came from equally averaging every native HRTF table entry.
-const STEAM_AMBISONICS_VIRTUAL_SPEAKERS: [[f32; 3]; STEAM_AMBISONICS_VIRTUAL_SPEAKER_COUNT] = [
+const AMBISONICS_VIRTUAL_SPEAKERS: [[f32; 3]; AMBISONICS_VIRTUAL_SPEAKER_COUNT] = [
     [0.866_246_8, 0.422_518_64, 0.266_635_4],
     [0.866_246_8, -0.422_518_64, -0.266_635_4],
     [0.866_246_8, 0.266_635_4, -0.422_518_64],
@@ -153,7 +151,7 @@ fn legendre_polynomial(order: u32, x: f32) -> f32 {
 fn native_ambisonics_decoder_speaker_directions(order: u32) -> Result<Vec<Vec3>> {
     native_ambisonics_channel_count(order)?;
     if order <= 3 {
-        Ok(STEAM_AMBISONICS_VIRTUAL_SPEAKERS
+        Ok(AMBISONICS_VIRTUAL_SPEAKERS
             .iter()
             .map(|speaker| Vec3::new(speaker[0], speaker[1], speaker[2]))
             .collect())
@@ -525,13 +523,13 @@ impl NativeAmbisonicsBinauralDecoder {
         }
 
         // Project native HRTFs from an equal-area virtual-speaker grid with max-rE
-        // order weighting. Orders 0..=3 keep Steam Audio's 24-point design for
-        // parity; order 4 uses a denser Fibonacci grid because the 24-point design
+        // order weighting. Orders 0..=3 keep the 24-point design; order 4 uses a denser
+        // Fibonacci grid because the smaller design
         // is not intended for fourth-order binaural Ambisonics.
         let order_weights = native_ambisonics_max_re_weights(order)?;
         let speaker_directions = native_ambisonics_decoder_speaker_directions(order)?;
         let speaker_weight = if order <= 3 {
-            STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT
+            AMBISONICS_VIRTUAL_SPEAKER_WEIGHT
         } else {
             4.0 * PI / speaker_directions.len() as f32
         };
@@ -935,10 +933,10 @@ mod tests {
     }
 
     #[test]
-    fn steam_virtual_speakers_are_order_two_orthonormal() {
+    fn virtual_speakers_are_order_two_orthonormal() {
         let channel_count = native_ambisonics_channel_count(2).unwrap();
         let mut basis = Vec::new();
-        for speaker in STEAM_AMBISONICS_VIRTUAL_SPEAKERS {
+        for speaker in AMBISONICS_VIRTUAL_SPEAKERS {
             basis.push(
                 native_ambisonics_coefficients(2, Vec3::new(speaker[0], speaker[1], speaker[2]))
                     .unwrap(),
@@ -949,7 +947,7 @@ mod tests {
             for b in 0..channel_count {
                 let integral = basis
                     .iter()
-                    .map(|coeffs| coeffs[a] * coeffs[b] * STEAM_AMBISONICS_VIRTUAL_SPEAKER_WEIGHT)
+                    .map(|coeffs| coeffs[a] * coeffs[b] * AMBISONICS_VIRTUAL_SPEAKER_WEIGHT)
                     .sum::<f32>();
                 let expected = if a == b { 1.0 } else { 0.0 };
                 assert!(
@@ -989,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn max_re_weights_match_steam_audio_channel_groups() {
+    fn max_re_weights_match_ambisonic_channel_groups() {
         let weights = native_ambisonics_max_re_weights(2).unwrap();
 
         assert!((weights[0] - 1.0).abs() < 1e-6);

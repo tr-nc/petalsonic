@@ -1,9 +1,6 @@
 use crate::acoustics::{AcousticSceneSlot, AcousticSceneSnapshot};
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::{
-    AmbisonicsBackend, HrtfBackend, LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc,
-    SpatialQuality,
-};
+use crate::config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame};
 use crate::error::PetalSonicError;
 use crate::error::Result;
@@ -51,9 +48,7 @@ const LOGICAL_CHANNELS: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SpatialBackendPlan {
-    hrtf: HrtfBackend,
     use_ambisonics: bool,
-    ambisonics: AmbisonicsBackend,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -308,12 +303,9 @@ impl PetalSonicEngine {
             frame_size: desc.block_size,
             max_voices: desc.max_voices,
             distance_scaler: desc.distance_scaler,
-            steam_hrtf_path: desc.steam_hrtf_path.clone(),
             native_hrtf_path: desc.native_hrtf_path.clone(),
             hrtf_gain: desc.hrtf_gain,
-            hrtf_backend: backend_plan.hrtf,
             use_ambisonics: backend_plan.use_ambisonics,
-            ambisonics_backend: backend_plan.ambisonics,
             batched_any_hit_ray_tracer: Some(any_hit_adapter),
             batched_closest_hit_ray_tracer: Some(closest_hit_adapter),
         })
@@ -367,30 +359,15 @@ impl PetalSonicEngine {
     }
 
     fn resolve_spatial_backend_plan(desc: &PetalSonicWorldDesc) -> SpatialBackendPlan {
-        let native_hrtf_available = desc.native_hrtf_path.is_some();
         match desc.spatial_quality {
             SpatialQuality::LowLatency => SpatialBackendPlan {
-                hrtf: if native_hrtf_available {
-                    HrtfBackend::Native
-                } else {
-                    HrtfBackend::SteamAudio
-                },
                 use_ambisonics: false,
-                ambisonics: AmbisonicsBackend::Native,
             },
             SpatialQuality::Balanced => SpatialBackendPlan {
-                hrtf: if native_hrtf_available {
-                    HrtfBackend::Native
-                } else {
-                    HrtfBackend::SteamAudio
-                },
                 use_ambisonics: true,
-                ambisonics: AmbisonicsBackend::Native,
             },
             SpatialQuality::HighQuality => SpatialBackendPlan {
-                hrtf: HrtfBackend::SteamAudio,
                 use_ambisonics: true,
-                ambisonics: AmbisonicsBackend::SteamAudio,
             },
         }
     }
@@ -2191,18 +2168,14 @@ mod tests {
             ..PetalSonicWorldDesc::default()
         };
         let low_latency = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
-        assert_eq!(low_latency.hrtf, HrtfBackend::SteamAudio);
         assert!(!low_latency.use_ambisonics);
 
-        desc.native_hrtf_path = Some("headset.petalhrtf".into());
         desc.spatial_quality = SpatialQuality::Balanced;
         let balanced = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
-        assert_eq!(balanced.hrtf, HrtfBackend::Native);
         assert!(balanced.use_ambisonics);
 
         desc.spatial_quality = SpatialQuality::HighQuality;
         let high_quality = PetalSonicEngine::resolve_spatial_backend_plan(&desc);
-        assert_eq!(high_quality.hrtf, HrtfBackend::SteamAudio);
         assert!(high_quality.use_ambisonics);
     }
 

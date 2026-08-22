@@ -1,13 +1,13 @@
 # PetalSonic
 
-A real-time safe spatial audio library for Rust that uses Steam Audio for 3D spatialization.
+A real-time safe native spatial audio library for Rust.
 
 [![Crates.io](https://img.shields.io/crates/v/petalsonic.svg)](https://crates.io/crates/petalsonic)
 [![Documentation](https://docs.rs/petalsonic/badge.svg)](https://docs.rs/petalsonic)
 
 ## Features
 
-- **High-Quality 3D Spatialization**: Steam Audio integration for HRTF-based binaural audio
+- **High-Quality 3D Spatialization**: Native HRTF and Ambisonics binaural rendering
 - **Real-Time Safe**: No allocations or locks in the audio callback path
 - **Flexible Source Management**: Support for both spatial and non-spatial audio sources
 - **Automatic Resampling**: Audio is automatically resampled to match the world's sample rate
@@ -21,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-petalsonic = "0.6"
+petalsonic = "0.7"
 ```
 
 ### Basic Example
@@ -186,8 +186,7 @@ let config = PetalSonicWorldDesc {
     timing_queue_capacity: 128,   // Bounded diagnostics queue
     spatial_quality: SpatialQuality::Balanced,
     latency_profile: LatencyProfile::Balanced,
-    steam_hrtf_path: None,        // Optional Steam Audio SOFA path
-    native_hrtf_path: None,       // Optional native .petalhrtf path
+    native_hrtf_path: None,       // Optional custom .petalhrtf; uses the embedded HRTF otherwise
     hrtf_gain: 0.0,               // HRTF gain compensation (dB)
     distance_scaler: 10.0,        // 1 world unit = 10 meters for acoustic queries
     ..Default::default()
@@ -256,7 +255,7 @@ PetalSonic uses:
 
 - **CPAL** for cross-platform audio output (Windows, macOS, Linux, iOS, Android, Web)
 - **Symphonia** for audio decoding (supports most common formats)
-- **Steam Audio** (audionimbus) for spatialization (auto-installs native library)
+- **Native PetalSonic DSP** for HRTF, Ambisonics, and geometry acoustics
 
 ## License
 
@@ -269,4 +268,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Links
 
 - [Documentation](https://docs.rs/petalsonic)
-- [Steam Audio](https://valvesoftware.github.io/steam-audio/)

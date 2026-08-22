@@ -6,29 +6,21 @@ use super::native_hrtf::{
     NativeHrtfRenderMetrics, NativeHrtfRenderer, NativeHrtfSourceState, NativeHrtfTable,
 };
 use crate::acoustics::{AcousticRay, BatchedAnyHitRayTracer, BatchedClosestHitRayTracer};
-use crate::config::{AmbisonicsBackend, HrtfBackend, SourceConfig};
+use crate::config::SourceConfig;
 use crate::error::{PetalSonicError, Result};
 use crate::gain;
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackInstance;
-use crate::spatial::effects::SpatialEffectsManager;
-use crate::spatial::hrtf;
 use crate::world::SourceId;
-use audionimbus::{
-    AmbisonicsDecodeEffect, AmbisonicsDecodeEffectParams, AmbisonicsDecodeEffectSettings,
-    AmbisonicsEncodeEffectParams, AudioBufferSettings, AudioSettings, BinauralEffectParams,
-    Context, CoordinateSystem, Direction, Hrtf, HrtfInterpolation, Rendering, SpeakerLayout,
-    Vector3, audio_buffer::AudioBuffer as AudioNimbusAudioBuffer,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-const STEAM_AMBISONICS_ORDER: u32 = 2;
 const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
 const NATIVE_EARLY_REFLECTION_MAX_DELAY_SECONDS: f32 = 0.25;
 const NATIVE_EARLY_REFLECTION_MAX_TRACE_METERS: f32 = 120.0;
 const NATIVE_EARLY_REFLECTION_GAIN: f32 = 0.18;
+const DEFAULT_NATIVE_HRTF_BYTES: &[u8] = include_bytes!("../../asset/hrtf/hrtf_b_nh172.petalhrtf");
 
 #[derive(Debug, Clone)]
 struct NativeEarlyReflectionSourceState {
@@ -57,7 +49,6 @@ struct NativeReflectionTap {
 /// Backend allocations removed from active rendering and transferred to the
 /// non-render supervisor for destruction.
 pub(crate) struct RetiredSpatialSource {
-    _steam: Option<crate::spatial::effects::SpatialSourceEffects>,
     _native_hrtf: Option<NativeHrtfSourceState>,
     _native_reflection: Option<NativeEarlyReflectionSourceState>,
 }
@@ -67,41 +58,28 @@ pub(crate) struct SpatialProcessorConfig {
     pub frame_size: usize,
     pub max_voices: usize,
     pub distance_scaler: f32,
-    pub steam_hrtf_path: Option<String>,
     pub native_hrtf_path: Option<String>,
     pub hrtf_gain: f32,
-    pub hrtf_backend: HrtfBackend,
     pub use_ambisonics: bool,
-    pub ambisonics_backend: AmbisonicsBackend,
     pub batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
     pub batched_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
 }
 
-/// Spatial audio processor that manages Steam Audio integration
+/// PetalSonic's native HRTF, Ambisonics, and geometry-acoustics renderer.
 pub struct SpatialProcessor {
-    // Drop source/effect wrappers before the context they use.
-    effects_manager: SpatialEffectsManager,
-
     // Native HRTF/Ambisonics renderer and delay state
-    native_hrtf_renderer: Option<NativeHrtfRenderer>,
+    native_hrtf_renderer: NativeHrtfRenderer,
     native_hrtf_source_states: HashMap<SourceId, NativeHrtfSourceState>,
     native_ambisonics_encoder: NativeAmbisonicsEncoder,
     native_ambisonics_decoder: Option<NativeAmbisonicsBinauralDecoder>,
     native_ambisonics_state: Option<NativeAmbisonicsBinauralState>,
     native_reflection_source_states: HashMap<SourceId, NativeEarlyReflectionSourceState>,
 
-    // Steam Audio effects that do not call into host scene code.
-    ambisonics_decode_effect: Option<AmbisonicsDecodeEffect>,
-    hrtf: Option<Hrtf>,
-    context: Context,
-
     // Configuration
     frame_size: usize,
     sample_rate: u32,
     distance_scaler: f32,
-    hrtf_backend: HrtfBackend,
     use_ambisonics: bool,
-    ambisonics_backend: AmbisonicsBackend,
     direct_occlusion_enabled: bool,
     native_early_reflections_enabled: bool,
     native_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
@@ -112,9 +90,7 @@ pub struct SpatialProcessor {
     // Cached buffers to avoid allocations
     cached_input_buf: Vec<f32>,             // Input mono samples
     cached_direct_buf: Vec<f32>,            // After DirectEffect
-    cached_summed_encoded_buf: Vec<f32>,    // Accumulated ambisonics (9 channels for order 2)
-    cached_ambisonics_encode_buf: Vec<f32>, // Temp buffer for encoding
-    cached_ambisonics_decode_buf: Vec<f32>, // After AmbisonicsDecode (stereo)
+    cached_summed_encoded_buf: Vec<f32>,    // Accumulated native Ambisonics field
     cached_binaural_processed: Vec<f32>,    // Final binaural output (interleaved stereo)
     cached_native_reflection_buf: Vec<f32>, // Delayed mono early reflection scratch
 
@@ -170,67 +146,32 @@ impl SpatialProcessor {
             frame_size,
             max_voices,
             distance_scaler,
-            steam_hrtf_path,
             native_hrtf_path,
             hrtf_gain,
-            hrtf_backend,
             use_ambisonics,
-            ambisonics_backend,
             batched_any_hit_ray_tracer,
             batched_closest_hit_ray_tracer,
         } = config;
-        // Create Steam Audio context
-        let context = Context::try_new(&audionimbus::ContextSettings::default()).map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create Steam Audio context: {}", e))
-        })?;
-
-        let audio_settings = AudioSettings {
-            sampling_rate: sample_rate,
-            frame_size: frame_size as u32,
-        };
-
-        // Create only the fixed backend resources selected for this world.
-        let mut hrtf = None;
-        let mut ambisonics_decode_effect = None;
-        let mut native_hrtf_renderer = None;
+        let table = load_native_hrtf_table(sample_rate, native_hrtf_path.as_deref())?;
+        let native_hrtf_renderer = NativeHrtfRenderer::with_frame_size(table.clone(), frame_size)?;
         let mut native_ambisonics_decoder = None;
         let mut native_ambisonics_state = None;
-
-        if hrtf_backend == HrtfBackend::SteamAudio {
-            let loaded_hrtf =
-                create_steam_hrtf(&context, &audio_settings, steam_hrtf_path.as_deref())?;
-            ambisonics_decode_effect = Some(create_ambisonics_decode_effect(
-                &context,
-                &audio_settings,
-                &loaded_hrtf,
-            )?);
-            hrtf = Some(loaded_hrtf);
-        }
-
-        if hrtf_backend == HrtfBackend::Native {
-            let table = load_native_hrtf_table(sample_rate, native_hrtf_path.as_deref())?;
-            native_hrtf_renderer = Some(NativeHrtfRenderer::with_frame_size(
+        if use_ambisonics {
+            let decoder = NativeAmbisonicsBinauralDecoder::with_frame_size(
                 table.clone(),
+                DEFAULT_NATIVE_AMBISONICS_ORDER,
                 frame_size,
-            )?);
-            if use_ambisonics && hrtf_backend == HrtfBackend::Native {
-                let decoder = NativeAmbisonicsBinauralDecoder::with_frame_size(
-                    table.clone(),
-                    DEFAULT_NATIVE_AMBISONICS_ORDER,
-                    frame_size,
-                )?;
-                native_ambisonics_state = Some(decoder.create_state());
-                native_ambisonics_decoder = Some(decoder);
-            }
+            )?;
+            native_ambisonics_state = Some(decoder.create_state());
+            native_ambisonics_decoder = Some(decoder);
         }
 
         let native_ambisonics_encoder =
             NativeAmbisonicsEncoder::new(DEFAULT_NATIVE_AMBISONICS_ORDER)?;
 
         let direct_occlusion_enabled = batched_any_hit_ray_tracer.is_some();
-        let native_early_reflections_enabled = batched_closest_hit_ray_tracer.is_some()
-            && hrtf_backend == HrtfBackend::Native
-            && !use_ambisonics;
+        let native_early_reflections_enabled =
+            batched_closest_hit_ray_tracer.is_some() && !use_ambisonics;
 
         // Pre-allocate buffers
         let cached_input_buf = vec![0.0; frame_size];
@@ -238,8 +179,6 @@ impl SpatialProcessor {
         let ambisonics_channel_count =
             native_ambisonics_channel_count(DEFAULT_NATIVE_AMBISONICS_ORDER)?;
         let cached_summed_encoded_buf = vec![0.0; frame_size * ambisonics_channel_count];
-        let cached_ambisonics_encode_buf = vec![0.0; frame_size * ambisonics_channel_count];
-        let cached_ambisonics_decode_buf = vec![0.0; frame_size * 2]; // Planar stereo
         let cached_binaural_processed = vec![0.0; frame_size * 2];
         let cached_native_reflection_buf = vec![0.0; frame_size];
 
@@ -247,31 +186,23 @@ impl SpatialProcessor {
         let hrtf_gain_linear = gain::db_to_linear(hrtf_gain);
 
         log::info!(
-            "PetalSonic spatial processor: hrtf_backend={:?}, acoustics_backend=Native, use_ambisonics={}, ambisonics_backend={:?}, direct_occlusion_enabled={}, native_early_reflections_enabled={}",
-            hrtf_backend,
+            "PetalSonic spatial processor: hrtf_backend=Native, acoustics_backend=Native, use_ambisonics={}, ambisonics_backend=Native, direct_occlusion_enabled={}, native_early_reflections_enabled={}",
             use_ambisonics,
-            ambisonics_backend,
             direct_occlusion_enabled,
             native_early_reflections_enabled
         );
 
         Ok(Self {
-            effects_manager: SpatialEffectsManager::new(max_voices),
             native_hrtf_renderer,
             native_hrtf_source_states: HashMap::with_capacity(max_voices),
             native_ambisonics_encoder,
             native_ambisonics_decoder,
             native_ambisonics_state,
             native_reflection_source_states: HashMap::with_capacity(max_voices),
-            ambisonics_decode_effect,
-            hrtf,
-            context,
             frame_size,
             sample_rate,
             distance_scaler,
-            hrtf_backend,
             use_ambisonics,
-            ambisonics_backend,
             direct_occlusion_enabled,
             native_early_reflections_enabled,
             native_any_hit_ray_tracer: batched_any_hit_ray_tracer,
@@ -280,8 +211,6 @@ impl SpatialProcessor {
             cached_input_buf,
             cached_direct_buf,
             cached_summed_encoded_buf,
-            cached_ambisonics_encode_buf,
-            cached_ambisonics_decode_buf,
             cached_binaural_processed,
             cached_native_reflection_buf,
             listener_position: Vec3::ZERO,
@@ -310,57 +239,25 @@ impl SpatialProcessor {
         supports_reflections: bool,
     ) {
         self.direct_occlusion_enabled = supports_occlusion;
-        self.native_early_reflections_enabled = supports_reflections
-            && self.hrtf_backend == HrtfBackend::Native
-            && !self.use_ambisonics;
-    }
-
-    /// Create effects for a spatial source
-    pub fn create_effects_for_source(&mut self, source_id: SourceId) -> Result<()> {
-        let audio_settings = AudioSettings {
-            sampling_rate: self.sample_rate,
-            frame_size: self.frame_size as u32,
-        };
-
-        self.effects_manager.create_effects_for_source(
-            source_id,
-            &self.context,
-            &audio_settings,
-            self.hrtf.as_ref(),
-        )
+        self.native_early_reflections_enabled = supports_reflections && !self.use_ambisonics;
     }
 
     pub(crate) fn retire_source(&mut self, source_id: SourceId) -> Option<RetiredSpatialSource> {
-        let steam = self.effects_manager.retire_source(source_id);
         let native_hrtf = self.native_hrtf_source_states.remove(&source_id);
         let native_reflection = self.native_reflection_source_states.remove(&source_id);
-        (steam.is_some() || native_hrtf.is_some() || native_reflection.is_some()).then_some(
-            RetiredSpatialSource {
-                _steam: steam,
-                _native_hrtf: native_hrtf,
-                _native_reflection: native_reflection,
-            },
-        )
-    }
-
-    fn uses_steam_source_effects(&self) -> bool {
-        (self.use_ambisonics && self.ambisonics_backend == AmbisonicsBackend::SteamAudio)
-            || (!self.use_ambisonics && self.hrtf_backend == HrtfBackend::SteamAudio)
+        (native_hrtf.is_some() || native_reflection.is_some()).then_some(RetiredSpatialSource {
+            _native_hrtf: native_hrtf,
+            _native_reflection: native_reflection,
+        })
     }
 
     fn ensure_native_hrtf_state_for_source(&mut self, source_id: SourceId) -> Result<()> {
-        if self.hrtf_backend != HrtfBackend::Native
-            || self.use_ambisonics
-            || self.native_hrtf_source_states.contains_key(&source_id)
-        {
+        if self.use_ambisonics || self.native_hrtf_source_states.contains_key(&source_id) {
             return Ok(());
         }
 
-        let renderer = self.native_hrtf_renderer.as_ref().ok_or_else(|| {
-            PetalSonicError::SpatialAudio("native HRTF renderer is not initialized".to_string())
-        })?;
         self.native_hrtf_source_states
-            .insert(source_id, renderer.create_source_state());
+            .insert(source_id, self.native_hrtf_renderer.create_source_state());
         Ok(())
     }
 
@@ -373,16 +270,13 @@ impl SpatialProcessor {
             return Ok(());
         }
 
-        let renderer = self.native_hrtf_renderer.as_ref().ok_or_else(|| {
-            PetalSonicError::SpatialAudio("native HRTF renderer is not initialized".to_string())
-        })?;
         let max_delay_samples =
             (self.sample_rate as f32 * NATIVE_EARLY_REFLECTION_MAX_DELAY_SECONDS).ceil() as usize;
         self.native_reflection_source_states.insert(
             source_id,
             NativeEarlyReflectionSourceState::new(
                 max_delay_samples,
-                renderer.create_source_state(),
+                self.native_hrtf_renderer.create_source_state(),
             ),
         );
         Ok(())
@@ -409,7 +303,6 @@ impl SpatialProcessor {
         // This guarantees newly played spatial sources participate in the very first
         // block, avoiding a "first block louder" case where distance attenuation /
         // air absorption would still be at their default values.
-        let uses_steam_source_effects = self.uses_steam_source_effects();
         for source_id in spatial_ids {
             let Some(instance) = instances.get(source_id) else {
                 continue;
@@ -418,9 +311,6 @@ impl SpatialProcessor {
                 continue;
             }
 
-            if uses_steam_source_effects && !self.effects_manager.has_effects(*source_id) {
-                self.create_effects_for_source(*source_id)?;
-            }
             self.ensure_native_hrtf_state_for_source(*source_id)?;
             self.ensure_native_reflection_state_for_source(*source_id)?;
         }
@@ -446,20 +336,14 @@ impl SpatialProcessor {
 
         if self.use_ambisonics {
             let decoding_start = Instant::now();
-            match self.hrtf_backend {
-                HrtfBackend::SteamAudio => self.apply_ambisonics_decode_effect()?,
-                HrtfBackend::Native => {
-                    let native_metrics = self.apply_native_ambisonics_decode_effect()?;
-                    metrics.native_hrtf_direction_lookup_time_us +=
-                        native_metrics.direction_lookup_time_us;
-                    metrics.native_hrtf_convolution_time_us += native_metrics.convolution_time_us;
-                }
-            }
+            let native_metrics = self.apply_native_ambisonics_decode_effect()?;
+            metrics.native_hrtf_direction_lookup_time_us += native_metrics.direction_lookup_time_us;
+            metrics.native_hrtf_convolution_time_us += native_metrics.convolution_time_us;
             let decode_elapsed = decoding_start.elapsed().as_micros() as u64;
             metrics.ambisonics_decoding_time_us = decode_elapsed;
             metrics.hrtf_rendering_time_us += decode_elapsed;
 
-            if self.hrtf_backend == HrtfBackend::Native && self.hrtf_gain_linear != 1.0 {
+            if self.hrtf_gain_linear != 1.0 {
                 self.apply_hrtf_gain();
             }
         } else if self.hrtf_gain_linear != 1.0 {
@@ -503,25 +387,13 @@ impl SpatialProcessor {
 
         if self.use_ambisonics {
             let encoding_start = Instant::now();
-            match self.ambisonics_backend {
-                AmbisonicsBackend::SteamAudio => {
-                    self.apply_steam_ambisonics_encode_effect(source_id, position)?
-                }
-                AmbisonicsBackend::Native => {
-                    self.apply_native_ambisonics_encode_effect(position)?
-                }
-            }
+            self.apply_native_ambisonics_encode_effect(position)?;
             metrics.ambisonics_encoding_time_us = encoding_start.elapsed().as_micros() as u64;
         } else {
             let render_start = Instant::now();
-            match self.hrtf_backend {
-                HrtfBackend::SteamAudio => self.apply_steam_binaural_effect(source_id, position)?,
-                HrtfBackend::Native => {
-                    let native_metrics = self.apply_native_hrtf_effect(source_id, position)?;
-                    metrics.add_native_hrtf_metrics(native_metrics);
-                    self.apply_native_early_reflection_effect(source_id, position)?;
-                }
-            }
+            let native_metrics = self.apply_native_hrtf_effect(source_id, position)?;
+            metrics.add_native_hrtf_metrics(native_metrics);
+            self.apply_native_early_reflection_effect(source_id, position)?;
             metrics.hrtf_rendering_time_us = render_start.elapsed().as_micros() as u64;
         }
 
@@ -589,9 +461,6 @@ impl SpatialProcessor {
         source_position: Vec3,
     ) -> Result<NativeHrtfRenderMetrics> {
         let direction = self.get_target_direction(source_position);
-        let renderer = self.native_hrtf_renderer.as_ref().ok_or_else(|| {
-            PetalSonicError::SpatialAudio("native HRTF renderer is not initialized".to_string())
-        })?;
         let state = self
             .native_hrtf_source_states
             .get_mut(&source_id)
@@ -602,7 +471,7 @@ impl SpatialProcessor {
                 ))
             })?;
 
-        renderer.render_source_with_metrics(
+        self.native_hrtf_renderer.render_source_with_metrics(
             state,
             direction,
             &self.cached_direct_buf,
@@ -643,10 +512,7 @@ impl SpatialProcessor {
             state.write_index = (state.write_index + 1) % state.delay_line.len();
         }
 
-        let renderer = self.native_hrtf_renderer.as_ref().ok_or_else(|| {
-            PetalSonicError::SpatialAudio("native HRTF renderer is not initialized".to_string())
-        })?;
-        renderer.render_source(
+        self.native_hrtf_renderer.render_source(
             &mut state.hrtf_state,
             direction,
             &self.cached_native_reflection_buf,
@@ -746,70 +612,6 @@ impl SpatialProcessor {
         })
     }
 
-    /// Apply Steam Audio's ambisonics encode effect.
-    fn apply_steam_ambisonics_encode_effect(
-        &mut self,
-        source_id: SourceId,
-        source_position: Vec3,
-    ) -> Result<()> {
-        // Calculate direction first to avoid borrow checker issues
-        let direction = self.get_target_direction(source_position);
-
-        let effects = self
-            .effects_manager
-            .get_effects_mut(source_id)
-            .ok_or_else(|| {
-                PetalSonicError::SpatialAudio(format!("No effects found for source {}", source_id))
-            })?;
-
-        let ambisonics_encode_effect_params = AmbisonicsEncodeEffectParams {
-            direction: Direction::new(direction.x, direction.y, direction.z),
-            order: STEAM_AMBISONICS_ORDER,
-        };
-
-        let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &self.cached_direct_buf,
-            AudioBufferSettings {
-                num_channels: Some(1),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create input buffer: {}", e))
-        })?;
-
-        self.cached_ambisonics_encode_buf.fill(0.0);
-        let steam_channel_count = native_ambisonics_channel_count(STEAM_AMBISONICS_ORDER)?;
-        let steam_sample_count = self.frame_size * steam_channel_count;
-        let output_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &mut self.cached_ambisonics_encode_buf[..steam_sample_count],
-            AudioBufferSettings {
-                num_channels: Some(steam_channel_count as u32),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create output buffer: {}", e))
-        })?;
-
-        effects
-            .ambisonics_encode_effect
-            .apply(&ambisonics_encode_effect_params, &input_buf, &output_buf)
-            .map_err(|e| {
-                PetalSonicError::SpatialAudio(format!(
-                    "Failed to apply AmbisonicsEncodeEffect: {}",
-                    e
-                ))
-            })?;
-
-        // Accumulate encoded output to summed buffer
-        for i in 0..steam_sample_count {
-            self.cached_summed_encoded_buf[i] += self.cached_ambisonics_encode_buf[i];
-        }
-
-        Ok(())
-    }
-
     fn apply_native_ambisonics_encode_effect(&mut self, source_position: Vec3) -> Result<()> {
         let direction = self.get_target_direction(source_position);
         self.native_ambisonics_encoder.encode_source_accumulate(
@@ -817,75 +619,6 @@ impl SpatialProcessor {
             &self.cached_direct_buf,
             &mut self.cached_summed_encoded_buf,
         )
-    }
-
-    fn apply_steam_binaural_effect(
-        &mut self,
-        source_id: SourceId,
-        source_position: Vec3,
-    ) -> Result<()> {
-        let direction = self.get_target_direction(source_position);
-        let hrtf = self.hrtf.as_ref().ok_or_else(|| {
-            PetalSonicError::SpatialAudio("Steam Audio HRTF is not initialized".to_string())
-        })?;
-        let effects = self
-            .effects_manager
-            .get_effects_mut(source_id)
-            .ok_or_else(|| {
-                PetalSonicError::SpatialAudio(format!("No effects found for source {}", source_id))
-            })?;
-        let binaural_effect = effects.binaural_effect.as_mut().ok_or_else(|| {
-            PetalSonicError::SpatialAudio(format!(
-                "No Steam Audio BinauralEffect found for source {}",
-                source_id
-            ))
-        })?;
-
-        self.cached_ambisonics_decode_buf.fill(0.0);
-        let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &self.cached_direct_buf,
-            AudioBufferSettings {
-                num_channels: Some(1),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create binaural input buffer: {}", e))
-        })?;
-        let output_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &mut self.cached_ambisonics_decode_buf,
-            AudioBufferSettings {
-                num_channels: Some(2),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create binaural output buffer: {}", e))
-        })?;
-
-        let params = BinauralEffectParams {
-            direction: petal_to_steam_hrtf_direction(direction),
-            interpolation: HrtfInterpolation::Nearest,
-            spatial_blend: 1.0,
-            hrtf,
-            peak_delays: None,
-        };
-
-        binaural_effect
-            .apply(&params, &input_buf, &output_buf)
-            .map_err(|e| {
-                PetalSonicError::SpatialAudio(format!("Failed to apply BinauralEffect: {}", e))
-            })?;
-
-        let frames = self.frame_size;
-        let (left, right) = self.cached_ambisonics_decode_buf.split_at(frames);
-        for frame in 0..frames {
-            let out_index = frame * 2;
-            self.cached_binaural_processed[out_index] += left[frame];
-            self.cached_binaural_processed[out_index + 1] += right[frame];
-        }
-
-        Ok(())
     }
 
     fn apply_native_ambisonics_decode_effect(&mut self) -> Result<NativeHrtfRenderMetrics> {
@@ -913,87 +646,6 @@ impl SpatialProcessor {
         }
     }
 
-    /// Apply ambisonics decode effect to convert accumulated ambisonics to binaural stereo
-    fn apply_ambisonics_decode_effect(&mut self) -> Result<()> {
-        let hrtf = self.hrtf.as_ref().ok_or_else(|| {
-            PetalSonicError::SpatialAudio("Steam Audio HRTF is not initialized".to_string())
-        })?;
-        let ambisonics_decode_effect = self.ambisonics_decode_effect.as_mut().ok_or_else(|| {
-            PetalSonicError::SpatialAudio(
-                "Steam Audio AmbisonicsDecodeEffect is not initialized".to_string(),
-            )
-        })?;
-
-        let ambisonics_decode_effect_params = AmbisonicsDecodeEffectParams {
-            order: STEAM_AMBISONICS_ORDER,
-            hrtf,
-            orientation: CoordinateSystem {
-                ahead: Vector3::new(0.0, 0.0, -1.0),
-                ..Default::default()
-            },
-        };
-
-        let steam_channel_count = native_ambisonics_channel_count(STEAM_AMBISONICS_ORDER)?;
-        let steam_sample_count = self.frame_size * steam_channel_count;
-        let input_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &self.cached_summed_encoded_buf[..steam_sample_count],
-            AudioBufferSettings {
-                num_channels: Some(steam_channel_count as u32),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create input buffer: {}", e))
-        })?;
-
-        let output_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &mut self.cached_ambisonics_decode_buf,
-            AudioBufferSettings {
-                num_channels: Some(2), // Stereo
-                ..Default::default()
-            },
-        )
-        .map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create output buffer: {}", e))
-        })?;
-
-        ambisonics_decode_effect
-            .apply(&ambisonics_decode_effect_params, &input_buf, &output_buf)
-            .map_err(|e| {
-                PetalSonicError::SpatialAudio(format!(
-                    "Failed to apply AmbisonicsDecodeEffect: {}",
-                    e
-                ))
-            })?;
-
-        // Interleave to binaural_processed buffer
-        let decoded_buf = AudioNimbusAudioBuffer::try_with_data_and_settings(
-            &mut self.cached_ambisonics_decode_buf,
-            AudioBufferSettings {
-                num_channels: Some(2),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| {
-            PetalSonicError::SpatialAudio(format!("Failed to create decoded buffer: {}", e))
-        })?;
-
-        decoded_buf
-            .interleave(&self.context, &mut self.cached_binaural_processed)
-            .map_err(|e| {
-                PetalSonicError::SpatialAudio(format!("Failed to interleave decoded audio: {}", e))
-            })?;
-
-        // Apply HRTF gain compensation (linear multiplier derived from dB)
-        if self.hrtf_gain_linear != 1.0 {
-            for sample in self.cached_binaural_processed.iter_mut() {
-                *sample *= self.hrtf_gain_linear;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Calculate direction from listener to source in listener's coordinate system.
     ///
     /// PetalSonic's listener-local convention is x=right, y=up, z=front.
@@ -1012,49 +664,15 @@ impl SpatialProcessor {
     }
 }
 
-fn create_steam_hrtf(
-    context: &Context,
-    audio_settings: &AudioSettings,
-    steam_hrtf_path: Option<&str>,
-) -> Result<Hrtf> {
-    if let Some(path) = steam_hrtf_path {
-        hrtf::create_hrtf_from_file(context, audio_settings, path)
-    } else {
-        hrtf::create_default_hrtf(context, audio_settings)
-    }
-}
-
-fn create_ambisonics_decode_effect(
-    context: &Context,
-    audio_settings: &AudioSettings,
-    hrtf: &Hrtf,
-) -> Result<AmbisonicsDecodeEffect> {
-    AmbisonicsDecodeEffect::try_new(
-        context,
-        audio_settings,
-        &AmbisonicsDecodeEffectSettings {
-            max_order: STEAM_AMBISONICS_ORDER,
-            speaker_layout: SpeakerLayout::Stereo,
-            hrtf,
-            rendering: Rendering::Binaural,
-        },
-    )
-    .map_err(|e| {
-        PetalSonicError::SpatialAudio(format!("Failed to create AmbisonicsDecodeEffect: {}", e))
-    })
-}
-
 fn load_native_hrtf_table(
     sample_rate: u32,
     native_hrtf_path: Option<&str>,
 ) -> Result<Arc<NativeHrtfTable>> {
-    let path = native_hrtf_path.ok_or_else(|| {
-        PetalSonicError::Configuration(
-            "native HRTF backend requires native_hrtf_path or hrtf_path to point to a .petalhrtf file"
-                .to_string(),
-        )
-    })?;
-    let table = NativeHrtfTable::from_petalhrtf_file(path)?;
+    let table = if let Some(path) = native_hrtf_path {
+        NativeHrtfTable::from_petalhrtf_file(path)?
+    } else {
+        NativeHrtfTable::from_petalhrtf_bytes(DEFAULT_NATIVE_HRTF_BYTES)?
+    };
     if table.sample_rate() != sample_rate {
         return Err(PetalSonicError::Configuration(format!(
             "native HRTF sample rate {} does not match world sample rate {}",
@@ -1072,12 +690,6 @@ fn normalize_or_default(direction: Vec3) -> Vec3 {
     } else {
         Vec3::Z
     }
-}
-
-fn petal_to_steam_hrtf_direction(direction: Vec3) -> Direction {
-    // PetalSonic native HRTF uses listener-local z=front. Steam Audio's HRTF API uses
-    // right-handed coordinates where -z is ahead, so flip z for apples-to-apples SOFA lookup.
-    Direction::new(direction.x, direction.y, -direction.z)
 }
 
 fn native_distance_attenuation(distance_meters: f32) -> f32 {
@@ -1101,12 +713,6 @@ fn native_air_absorption(distance_meters: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn steam_hrtf_direction_uses_steam_ahead_axis() {
-        let direction = petal_to_steam_hrtf_direction(Vec3::new(0.25, 0.5, 1.0));
-        assert_eq!(direction, Direction::new(0.25, 0.5, -1.0));
-    }
 
     #[test]
     fn native_distance_attenuation_is_clamped_near_listener() {

@@ -363,8 +363,8 @@ impl NativeHrtfSourceState {
 ///
 /// The gameplay path uses a fixed-size frequency-domain overlap-add convolution plan,
 /// with the original time-domain FIR kept as a fallback/reference for unusual block sizes.
-/// Direction selection is still nearest-neighbor so Native-vs-Steam HRTF comparisons stay
-/// apples-to-apples.
+/// Direction selection remains nearest-neighbor so movement and regression tests stay
+/// deterministic.
 #[derive(Debug, Clone)]
 pub struct NativeHrtfRenderer {
     table: Arc<NativeHrtfTable>,

@@ -9,7 +9,7 @@ pub enum SourceConfig {
         /// Volume in decibels relative to unity (0.0 dB = 1.0 linear).
         volume_db: f32,
     },
-    /// Spatial audio - uses 3D pose (position + orientation) and Steam Audio for spatialization
+    /// Spatial audio using a 3D pose and PetalSonic's native spatial renderer.
     Spatial {
         /// 3D pose (position and orientation) of the audio source
         pose: Pose,

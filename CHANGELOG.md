@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added a latest-value runtime control for geometry-driven environmental acoustics. Disabling it
+  bypasses occlusion, reflections, and reverberation while preserving native HRTF, distance,
+  air absorption, and playback state.
+
 ### Changed
 - PetalSonic now uses its native HRTF, Ambisonics, direct-path, and early-reflection renderers for
   every spatial quality profile. A converted NH172 PetalHRTF table is embedded as the default.

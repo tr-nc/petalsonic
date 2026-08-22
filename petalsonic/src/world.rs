@@ -298,6 +298,7 @@ pub struct PetalSonicWorld {
     latest_acoustic_scene: Arc<Mutex<Option<Arc<AcousticSceneSnapshot>>>>,
     acoustic_retirement_receiver: Receiver<Arc<AcousticSceneSnapshot>>,
     acoustic_scene_version: AtomicU64,
+    environmental_acoustics_enabled: Arc<AtomicBool>,
     command_sender: Sender<PlaybackCommand>,
     lifecycle_sender: Sender<PlaybackCommand>,
     counters: Arc<RuntimeCounters>,
@@ -337,6 +338,8 @@ impl PetalSonicWorld {
             .map(|scene| scene.version())
             .unwrap_or(0);
         let acoustic_scene_slot = Arc::new(AcousticSceneSlot::new(initial_acoustic_scene));
+        let environmental_acoustics_enabled =
+            Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
         let latest_acoustic_scene = Arc::new(Mutex::new(None));
         let (acoustic_retirement_sender, acoustic_retirement_receiver) =
             crossbeam_channel::bounded(2);
@@ -356,6 +359,7 @@ impl PetalSonicWorld {
             latest_acoustic_scene: latest_acoustic_scene.clone(),
             acoustic_scene_slot,
             acoustic_retirement_sender,
+            environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
             ports,
         };
         let EngineObservability {
@@ -392,6 +396,7 @@ impl PetalSonicWorld {
             latest_acoustic_scene,
             acoustic_retirement_receiver,
             acoustic_scene_version: AtomicU64::new(acoustic_scene_version),
+            environmental_acoustics_enabled,
             command_sender,
             lifecycle_sender,
             counters,
@@ -725,6 +730,21 @@ impl PetalSonicWorld {
             .store(snapshot.version(), Ordering::Release);
         *latest = Some(Arc::new(snapshot));
         Ok(())
+    }
+
+    /// Enables or disables all geometry-driven environmental effects at the next render block.
+    ///
+    /// This latest-value control does not rebuild the output runtime. Native HRTF
+    /// spatialization, distance attenuation, air absorption, and playback remain active.
+    pub fn set_environmental_acoustics_enabled(&self, enabled: bool) -> Result<()> {
+        self.ensure_open()?;
+        self.environmental_acoustics_enabled
+            .store(enabled, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn environmental_acoustics_enabled(&self) -> bool {
+        self.environmental_acoustics_enabled.load(Ordering::Acquire)
     }
 
     pub fn destroy_emitter(&self, emitter: Emitter) -> Result<()> {

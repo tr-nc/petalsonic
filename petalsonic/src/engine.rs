@@ -227,6 +227,7 @@ pub(crate) struct EngineStartup {
     pub latest_acoustic_scene: Arc<Mutex<Option<Arc<AcousticSceneSnapshot>>>>,
     pub acoustic_scene_slot: Arc<AcousticSceneSlot>,
     pub acoustic_retirement_sender: Sender<Arc<AcousticSceneSnapshot>>,
+    pub environmental_acoustics_enabled: Arc<AtomicBool>,
     pub ports: EngineRuntimePorts,
 }
 
@@ -285,6 +286,7 @@ impl PetalSonicEngine {
             latest_acoustic_scene,
             acoustic_scene_slot,
             acoustic_retirement_sender,
+            environmental_acoustics_enabled,
             ports,
         } = startup;
         let backend_plan = Self::resolve_spatial_backend_plan(&desc);
@@ -306,6 +308,7 @@ impl PetalSonicEngine {
             native_hrtf_path: desc.native_hrtf_path.clone(),
             hrtf_gain: desc.hrtf_gain,
             use_ambisonics: backend_plan.use_ambisonics,
+            environmental_acoustics_enabled,
             batched_any_hit_ray_tracer: Some(any_hit_adapter),
             batched_closest_hit_ray_tracer: Some(closest_hit_adapter),
         })

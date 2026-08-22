@@ -86,6 +86,11 @@ pub struct PetalSonicWorldDesc {
     /// - `1.0`: 1 world unit = 1 meter
     /// - `10.0`: 1 world unit = 10 meters (larger-scale worlds)
     pub distance_scaler: f32,
+    /// Enables geometry-driven occlusion, reflections, and reverberation.
+    ///
+    /// Native HRTF spatialization, distance attenuation, air absorption, and playback stay
+    /// active when this is disabled. The setting can also be changed while the world is running.
+    pub environmental_acoustics_enabled: bool,
     /// Optional immutable acoustic scene available when the runtime starts.
     pub acoustic_scene: Option<AcousticSceneSnapshot>,
 }
@@ -112,6 +117,7 @@ impl Default for PetalSonicWorldDesc {
             native_hrtf_path: None,
             hrtf_gain: 0.0,
             distance_scaler: 10.0,
+            environmental_acoustics_enabled: true,
             acoustic_scene: None,
         }
     }
@@ -136,6 +142,10 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field("native_hrtf_path", &self.native_hrtf_path)
             .field("hrtf_gain", &self.hrtf_gain)
             .field("distance_scaler", &self.distance_scaler)
+            .field(
+                "environmental_acoustics_enabled",
+                &self.environmental_acoustics_enabled,
+            )
             .field("acoustic_scene", &self.acoustic_scene)
             .finish()
     }

@@ -56,6 +56,8 @@ fn main() -> Result<(), PetalSonicError> {
 - **Pull-Based Events**: Observe controlled completion and runtime state on the caller thread
 - **Multiple Formats**: Load WAV, MP3, FLAC, OGG, and more via Symphonia
 - **Ray Tracing**: Optional ray tracing support for occlusion and reverb effects
+- **Runtime Acoustics Control**: Toggle geometry-driven occlusion, reflections, and reverb without
+  rebuilding the world or disabling HRTF spatialization
 - **Cross-Platform**: Works on Windows, macOS, Linux, and more via CPAL
 
 ## Project Structure

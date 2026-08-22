@@ -14,6 +14,7 @@ use crate::playback::PlaybackInstance;
 use crate::world::SourceId;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
@@ -61,6 +62,7 @@ pub(crate) struct SpatialProcessorConfig {
     pub native_hrtf_path: Option<String>,
     pub hrtf_gain: f32,
     pub use_ambisonics: bool,
+    pub environmental_acoustics_enabled: Arc<AtomicBool>,
     pub batched_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
     pub batched_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
 }
@@ -80,8 +82,9 @@ pub struct SpatialProcessor {
     sample_rate: u32,
     distance_scaler: f32,
     use_ambisonics: bool,
-    direct_occlusion_enabled: bool,
-    native_early_reflections_enabled: bool,
+    environmental_acoustics_enabled: Arc<AtomicBool>,
+    acoustic_scene_supports_occlusion: bool,
+    acoustic_scene_supports_reflections: bool,
     native_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
     native_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
     /// HRTF gain as linear multiplier.
@@ -149,6 +152,7 @@ impl SpatialProcessor {
             native_hrtf_path,
             hrtf_gain,
             use_ambisonics,
+            environmental_acoustics_enabled,
             batched_any_hit_ray_tracer,
             batched_closest_hit_ray_tracer,
         } = config;
@@ -169,8 +173,8 @@ impl SpatialProcessor {
         let native_ambisonics_encoder =
             NativeAmbisonicsEncoder::new(DEFAULT_NATIVE_AMBISONICS_ORDER)?;
 
-        let direct_occlusion_enabled = batched_any_hit_ray_tracer.is_some();
-        let native_early_reflections_enabled =
+        let acoustic_scene_supports_occlusion = batched_any_hit_ray_tracer.is_some();
+        let acoustic_scene_supports_reflections =
             batched_closest_hit_ray_tracer.is_some() && !use_ambisonics;
 
         // Pre-allocate buffers
@@ -186,10 +190,11 @@ impl SpatialProcessor {
         let hrtf_gain_linear = gain::db_to_linear(hrtf_gain);
 
         log::info!(
-            "PetalSonic spatial processor: hrtf_backend=Native, acoustics_backend=Native, use_ambisonics={}, ambisonics_backend=Native, direct_occlusion_enabled={}, native_early_reflections_enabled={}",
+            "PetalSonic spatial processor: hrtf_backend=Native, acoustics_backend=Native, use_ambisonics={}, ambisonics_backend=Native, environmental_acoustics_enabled={}, direct_occlusion_available={}, native_early_reflections_available={}",
             use_ambisonics,
-            direct_occlusion_enabled,
-            native_early_reflections_enabled
+            environmental_acoustics_enabled.load(Ordering::Acquire),
+            acoustic_scene_supports_occlusion,
+            acoustic_scene_supports_reflections
         );
 
         Ok(Self {
@@ -203,8 +208,9 @@ impl SpatialProcessor {
             sample_rate,
             distance_scaler,
             use_ambisonics,
-            direct_occlusion_enabled,
-            native_early_reflections_enabled,
+            environmental_acoustics_enabled,
+            acoustic_scene_supports_occlusion,
+            acoustic_scene_supports_reflections,
             native_any_hit_ray_tracer: batched_any_hit_ray_tracer,
             native_closest_hit_ray_tracer: batched_closest_hit_ray_tracer,
             hrtf_gain_linear,
@@ -238,8 +244,8 @@ impl SpatialProcessor {
         supports_occlusion: bool,
         supports_reflections: bool,
     ) {
-        self.direct_occlusion_enabled = supports_occlusion;
-        self.native_early_reflections_enabled = supports_reflections && !self.use_ambisonics;
+        self.acoustic_scene_supports_occlusion = supports_occlusion;
+        self.acoustic_scene_supports_reflections = supports_reflections && !self.use_ambisonics;
     }
 
     pub(crate) fn retire_source(&mut self, source_id: SourceId) -> Option<RetiredSpatialSource> {
@@ -262,7 +268,7 @@ impl SpatialProcessor {
     }
 
     fn ensure_native_reflection_state_for_source(&mut self, source_id: SourceId) -> Result<()> {
-        if !self.native_early_reflections_enabled
+        if !self.early_reflections_enabled()
             || self
                 .native_reflection_source_states
                 .contains_key(&source_id)
@@ -414,7 +420,7 @@ impl SpatialProcessor {
         let distance_attenuation = native_distance_attenuation(distance_meters);
         let air_absorption = native_air_absorption(distance_meters);
 
-        let occlusion = if self.direct_occlusion_enabled {
+        let occlusion = if self.direct_occlusion_enabled() {
             self.native_direct_occlusion(source_position, distance_world)
         } else {
             1.0
@@ -484,7 +490,7 @@ impl SpatialProcessor {
         source_id: SourceId,
         source_position: Vec3,
     ) -> Result<()> {
-        if !self.native_early_reflections_enabled {
+        if !self.early_reflections_enabled() {
             return Ok(());
         }
 
@@ -662,6 +668,16 @@ impl SpatialProcessor {
             target_direction.dot(self.listener_front),
         )
     }
+
+    fn direct_occlusion_enabled(&self) -> bool {
+        self.acoustic_scene_supports_occlusion
+            && self.environmental_acoustics_enabled.load(Ordering::Acquire)
+    }
+
+    fn early_reflections_enabled(&self) -> bool {
+        self.acoustic_scene_supports_reflections
+            && self.environmental_acoustics_enabled.load(Ordering::Acquire)
+    }
 }
 
 fn load_native_hrtf_table(
@@ -714,6 +730,20 @@ fn native_air_absorption(distance_meters: f32) -> f32 {
 mod tests {
     use super::*;
 
+    struct AlwaysOccluded;
+
+    impl BatchedAnyHitRayTracer for AlwaysOccluded {
+        fn trace_any_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            hits[..rays.len()].fill(true);
+        }
+    }
+
     #[test]
     fn native_distance_attenuation_is_clamped_near_listener() {
         assert_eq!(native_distance_attenuation(0.0), 1.0);
@@ -727,5 +757,37 @@ mod tests {
         assert_eq!(native_air_absorption(f32::NAN), 0.0);
         assert_eq!(native_air_absorption(-10.0), 1.0);
         assert!((0.2..=1.0).contains(&native_air_absorption(10_000.0)));
+    }
+
+    #[test]
+    fn environmental_acoustics_toggle_bypasses_geometry_but_keeps_native_direct_path() {
+        let enabled = Arc::new(AtomicBool::new(true));
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: enabled.clone(),
+            batched_any_hit_ray_tracer: Some(Arc::new(AlwaysOccluded)),
+            batched_closest_hit_ray_tracer: None,
+        })
+        .unwrap();
+        processor.set_acoustic_scene_capabilities(true, false);
+        processor.cached_input_buf.fill(1.0);
+
+        processor.apply_native_direct_effect(Vec3::Z);
+        assert_eq!(processor.cached_direct_buf, vec![0.0; 8]);
+
+        enabled.store(false, Ordering::Release);
+        processor.apply_native_direct_effect(Vec3::Z);
+        assert!(
+            processor
+                .cached_direct_buf
+                .iter()
+                .all(|sample| *sample > 0.99)
+        );
     }
 }

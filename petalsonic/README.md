@@ -13,6 +13,7 @@ A real-time safe native spatial audio library for Rust.
 - **Automatic Resampling**: Audio is automatically resampled to match the world's sample rate
 - **Automatic Recovery**: Keeps logical audio state while output devices change or disappear
 - **Pull-Based Events**: Controlled completion and runtime state are observed on the caller thread
+- **Runtime Acoustics Control**: Toggle geometry-driven effects without rebuilding spatial audio
 - **Multiple Audio Formats**: Support for WAV, MP3, FLAC, OGG, and more via Symphonia
 
 ## Quick Start
@@ -59,6 +60,9 @@ fn main() -> Result<(), PetalSonicError> {
             Pose::from_position(Vec3::new(5.0, 0.0, 0.0)),
         )],
     ))?;
+
+    // This can be changed live. HRTF, distance, and playback remain active.
+    world.set_environmental_acoustics_enabled(false)?;
 
     // Poll for events
     for event in world.drain_events() {

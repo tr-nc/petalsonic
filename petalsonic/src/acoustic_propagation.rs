@@ -3,7 +3,7 @@ use crate::domain::{Emitter, EmitterSpatialState, SpatialFrame};
 use crate::math::Vec3;
 use crate::spatial::LateReverbParameters;
 use std::cmp::Ordering as CmpOrdering;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -220,6 +220,7 @@ pub(crate) struct AcousticPropagation {
     latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     counters: Arc<AcousticPropagationCounters>,
     enabled: Arc<AtomicBool>,
+    quality_bits: AtomicU32,
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -261,6 +262,7 @@ impl AcousticPropagation {
             latest_response,
             counters,
             enabled,
+            quality_bits: AtomicU32::new(environmental_acoustics_quality.to_bits()),
             stop,
             worker: Mutex::new(Some(worker)),
         })
@@ -303,6 +305,9 @@ impl AcousticPropagation {
     }
 
     pub(crate) fn set_enabled(&self, enabled: bool) {
+        if self.enabled.load(Ordering::Acquire) == enabled {
+            return;
+        }
         // Change the predicate while holding the waiter's mutex so this notification cannot land
         // between the worker's predicate check and Condvar::wait.
         let state = self.input.state.lock().ok();
@@ -312,24 +317,26 @@ impl AcousticPropagation {
     }
 
     pub(crate) fn set_quality(&self, quality: f32) {
+        let quality_bits = quality.to_bits();
+        if self.quality_bits.load(Ordering::Acquire) == quality_bits {
+            return;
+        }
         let Ok(mut state) = self.input.state.lock() else {
             return;
         };
-        if state.environmental_acoustics_quality.to_bits() == quality.to_bits() {
+        if state.environmental_acoustics_quality.to_bits() == quality_bits {
+            self.quality_bits.store(quality_bits, Ordering::Release);
             return;
         }
         state.environmental_acoustics_quality = quality;
         state.generation = state.generation.wrapping_add(1).max(1);
+        self.quality_bits.store(quality_bits, Ordering::Release);
         drop(state);
         self.input.changed.notify_one();
     }
 
     pub(crate) fn quality(&self) -> f32 {
-        self.input
-            .state
-            .lock()
-            .map(|state| state.environmental_acoustics_quality)
-            .unwrap_or(0.5)
+        f32::from_bits(self.quality_bits.load(Ordering::Acquire))
     }
 
     pub(crate) fn close(&self) {
@@ -1315,6 +1322,11 @@ mod tests {
                 .id(),
             worker_thread_id
         );
+
+        let settled_solve_count = propagation.diagnostics().solve_count;
+        propagation.set_quality(1.0);
+        std::thread::sleep(Duration::from_millis(75));
+        assert_eq!(propagation.diagnostics().solve_count, settled_solve_count);
         propagation.close();
     }
 }

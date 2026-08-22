@@ -93,7 +93,7 @@ pub fn mix_playback_instances_with_metrics(
 
     // Process spatial sources if spatial processor is available
     if let Some(processor) = spatial_processor {
-        if !scratch.spatial_ids.is_empty() {
+        if !scratch.spatial_ids.is_empty() || processor.has_late_reverb_tail() {
             let spatial_start = Instant::now();
             if let Ok(metrics) = processor.process_spatial_sources_with_metrics(
                 &scratch.spatial_ids,

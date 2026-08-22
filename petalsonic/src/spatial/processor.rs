@@ -1,3 +1,4 @@
+use super::late_reverb::{LateReverbParameters, ThreeBandFdn};
 use super::native_ambisonics::{
     DEFAULT_NATIVE_AMBISONICS_ORDER, NativeAmbisonicsBinauralDecoder,
     NativeAmbisonicsBinauralState, NativeAmbisonicsEncoder, native_ambisonics_channel_count,
@@ -83,10 +84,12 @@ pub struct SpatialProcessor {
     distance_scaler: f32,
     use_ambisonics: bool,
     environmental_acoustics_enabled: Arc<AtomicBool>,
+    environmental_acoustics_active: bool,
     acoustic_scene_supports_occlusion: bool,
     acoustic_scene_supports_reflections: bool,
     native_any_hit_ray_tracer: Option<Arc<dyn BatchedAnyHitRayTracer>>,
     native_closest_hit_ray_tracer: Option<Arc<dyn BatchedClosestHitRayTracer>>,
+    late_reverb: ThreeBandFdn,
     /// HRTF gain as linear multiplier.
     hrtf_gain_linear: f32,
 
@@ -96,6 +99,7 @@ pub struct SpatialProcessor {
     cached_summed_encoded_buf: Vec<f32>,    // Accumulated native Ambisonics field
     cached_binaural_processed: Vec<f32>,    // Final binaural output (interleaved stereo)
     cached_native_reflection_buf: Vec<f32>, // Delayed mono early reflection scratch
+    cached_late_reverb_input: Vec<f32>,     // Shared listener-centric mono send
 
     // Listener state
     listener_position: Vec3,
@@ -119,6 +123,8 @@ pub struct SpatialProcessingMetrics {
     pub ambisonics_decoding_time_us: u64,
     /// Time spent rendering HRTF/binaural output.
     pub hrtf_rendering_time_us: u64,
+    /// Time spent rendering the shared three-band FDN late-reverb bus.
+    pub late_reverb_time_us: u64,
     /// Time spent selecting native HRTF directions.
     pub native_hrtf_direction_lookup_time_us: u64,
     /// Time spent in native HRTF FIR convolution.
@@ -185,6 +191,9 @@ impl SpatialProcessor {
         let cached_summed_encoded_buf = vec![0.0; frame_size * ambisonics_channel_count];
         let cached_binaural_processed = vec![0.0; frame_size * 2];
         let cached_native_reflection_buf = vec![0.0; frame_size];
+        let cached_late_reverb_input = vec![0.0; frame_size];
+        let mut late_reverb = ThreeBandFdn::new(sample_rate);
+        late_reverb.set_parameters(LateReverbParameters::SILENT);
 
         // Pre-compute HRTF gain in linear space for efficient application.
         let hrtf_gain_linear = gain::db_to_linear(hrtf_gain);
@@ -197,6 +206,8 @@ impl SpatialProcessor {
             acoustic_scene_supports_reflections
         );
 
+        let environmental_acoustics_active =
+            environmental_acoustics_enabled.load(Ordering::Acquire);
         Ok(Self {
             native_hrtf_renderer,
             native_hrtf_source_states: HashMap::with_capacity(max_voices),
@@ -209,16 +220,19 @@ impl SpatialProcessor {
             distance_scaler,
             use_ambisonics,
             environmental_acoustics_enabled,
+            environmental_acoustics_active,
             acoustic_scene_supports_occlusion,
             acoustic_scene_supports_reflections,
             native_any_hit_ray_tracer: batched_any_hit_ray_tracer,
             native_closest_hit_ray_tracer: batched_closest_hit_ray_tracer,
+            late_reverb,
             hrtf_gain_linear,
             cached_input_buf,
             cached_direct_buf,
             cached_summed_encoded_buf,
             cached_binaural_processed,
             cached_native_reflection_buf,
+            cached_late_reverb_input,
             listener_position: Vec3::ZERO,
             listener_up: Vec3::new(0.0, 1.0, 0.0),
             listener_front: Vec3::new(0.0, 0.0, -1.0),
@@ -295,10 +309,7 @@ impl SpatialProcessor {
         instances: &mut HashMap<SourceId, PlaybackInstance>,
         output_buffer: &mut [f32],
     ) -> Result<SpatialProcessingMetrics> {
-        if spatial_ids.is_empty() {
-            // No spatial sources, don't modify the buffer (may contain non-spatial audio)
-            return Ok(SpatialProcessingMetrics::default());
-        }
+        self.capture_environmental_acoustics_state();
 
         let mut metrics = SpatialProcessingMetrics {
             spatial_source_count: spatial_ids.len(),
@@ -324,6 +335,7 @@ impl SpatialProcessor {
         // Clear accumulation buffers
         self.cached_summed_encoded_buf.fill(0.0);
         self.cached_binaural_processed.fill(0.0);
+        self.cached_late_reverb_input.fill(0.0);
 
         // Process each spatial source and accumulate detailed timing.
         for source_id in spatial_ids {
@@ -356,6 +368,14 @@ impl SpatialProcessor {
             self.apply_hrtf_gain();
         }
 
+        let late_reverb_start = Instant::now();
+        self.late_reverb.process_block(
+            &self.cached_late_reverb_input,
+            &mut self.cached_binaural_processed,
+            self.environmental_acoustics_active,
+        );
+        metrics.late_reverb_time_us = late_reverb_start.elapsed().as_micros() as u64;
+
         // Add to output buffer (don't overwrite - allow mixing with non-spatial sources)
         let frames_to_copy = (output_buffer.len() / 2).min(self.frame_size);
         for i in 0..frames_to_copy {
@@ -364,6 +384,10 @@ impl SpatialProcessor {
         }
 
         Ok(metrics)
+    }
+
+    pub(crate) fn has_late_reverb_tail(&self) -> bool {
+        self.late_reverb.needs_processing()
     }
 
     /// Process a single spatial source
@@ -389,6 +413,13 @@ impl SpatialProcessor {
         // Apply direct effect (distance attenuation + air absorption)
         let direct_start = Instant::now();
         self.apply_native_direct_effect(position);
+        for (send, direct) in self
+            .cached_late_reverb_input
+            .iter_mut()
+            .zip(self.cached_direct_buf.iter())
+        {
+            *send += *direct;
+        }
         metrics.direct_processing_time_us = direct_start.elapsed().as_micros() as u64;
 
         if self.use_ambisonics {
@@ -670,13 +701,16 @@ impl SpatialProcessor {
     }
 
     fn direct_occlusion_enabled(&self) -> bool {
-        self.acoustic_scene_supports_occlusion
-            && self.environmental_acoustics_enabled.load(Ordering::Acquire)
+        self.acoustic_scene_supports_occlusion && self.environmental_acoustics_active
+    }
+
+    fn capture_environmental_acoustics_state(&mut self) {
+        self.environmental_acoustics_active =
+            self.environmental_acoustics_enabled.load(Ordering::Acquire);
     }
 
     fn early_reflections_enabled(&self) -> bool {
-        self.acoustic_scene_supports_reflections
-            && self.environmental_acoustics_enabled.load(Ordering::Acquire)
+        self.acoustic_scene_supports_reflections && self.environmental_acoustics_active
     }
 }
 
@@ -782,6 +816,7 @@ mod tests {
         assert_eq!(processor.cached_direct_buf, vec![0.0; 8]);
 
         enabled.store(false, Ordering::Release);
+        processor.capture_environmental_acoustics_state();
         processor.apply_native_direct_effect(Vec3::Z);
         assert!(
             processor

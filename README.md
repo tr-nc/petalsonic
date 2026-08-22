@@ -49,6 +49,7 @@ fn main() -> Result<(), PetalSonicError> {
 ## Features
 
 - **High-Quality 3D Spatialization**: Native HRTF and Ambisonics binaural rendering
+- **Native Late Reverb**: Shared three-band FDN with independent frequency decay
 - **Real-Time Safe**: Zero allocations and locks in the audio thread
 - **Easy to Use**: Simple world-driven API - just load audio, position sources, and play
 - **Flexible**: Supports both spatial and non-spatial audio in the same world

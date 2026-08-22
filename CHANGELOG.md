@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a latest-value runtime control for geometry-driven environmental acoustics. Disabling it
   bypasses occlusion, reflections, and reverberation while preserving native HRTF, distance,
   air absorption, and playback state.
+- Added a shared listener-centric eight-line FDN late-reverb renderer with independent low, mid,
+  and high RT60 decay, smoothed parameters, pre-delay, and bounded render-time diagnostics.
 
 ### Changed
 - PetalSonic now uses its native HRTF, Ambisonics, direct-path, and early-reflection renderers for

@@ -340,19 +340,22 @@ impl PetalSonicWorld {
             .as_ref()
             .map(|scene| scene.version())
             .unwrap_or(0);
-        let acoustic_propagation =
-            AcousticPropagation::new(config.distance_scaler).map_err(|error| {
-                PetalSonicError::Engine(format!(
-                    "Failed to start acoustic propagation worker: {error}"
-                ))
-            })?;
+        let environmental_acoustics_enabled =
+            Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
+        let acoustic_propagation = AcousticPropagation::new(
+            config.distance_scaler,
+            environmental_acoustics_enabled.clone(),
+        )
+        .map_err(|error| {
+            PetalSonicError::Engine(format!(
+                "Failed to start acoustic propagation worker: {error}"
+            ))
+        })?;
         if let Some(scene) = initial_acoustic_scene {
             acoustic_propagation.publish_scene(scene).map_err(|_| {
                 PetalSonicError::Engine("Failed to publish initial acoustic scene".into())
             })?;
         }
-        let environmental_acoustics_enabled =
-            Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
         let (acoustic_response_retirement_sender, acoustic_response_retirement_receiver) =
             crossbeam_channel::bounded(2);
         let bus_params = Arc::new(Mutex::new(
@@ -786,8 +789,7 @@ impl PetalSonicWorld {
     /// spatialization, distance attenuation, air absorption, and playback remain active.
     pub fn set_environmental_acoustics_enabled(&self, enabled: bool) -> Result<()> {
         self.ensure_open()?;
-        self.environmental_acoustics_enabled
-            .store(enabled, Ordering::Release);
+        self.acoustic_propagation.set_enabled(enabled);
         Ok(())
     }
 

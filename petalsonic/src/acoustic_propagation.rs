@@ -178,12 +178,13 @@ pub(crate) struct AcousticPropagation {
     input: Arc<SharedInput>,
     latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     counters: Arc<AcousticPropagationCounters>,
+    enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AcousticPropagation {
-    pub(crate) fn new(distance_scaler: f32) -> std::io::Result<Self> {
+    pub(crate) fn new(distance_scaler: f32, enabled: Arc<AtomicBool>) -> std::io::Result<Self> {
         let input = Arc::new(SharedInput {
             state: Mutex::new(InputState::default()),
             changed: Condvar::new(),
@@ -195,17 +196,26 @@ impl AcousticPropagation {
             let input = input.clone();
             let latest_response = latest_response.clone();
             let counters = counters.clone();
+            let enabled = enabled.clone();
             let stop = stop.clone();
             std::thread::Builder::new()
                 .name("petalsonic-acoustics".into())
                 .spawn(move || {
-                    propagation_loop(&input, &latest_response, &counters, &stop, distance_scaler)
+                    propagation_loop(
+                        &input,
+                        &latest_response,
+                        &counters,
+                        &enabled,
+                        &stop,
+                        distance_scaler,
+                    )
                 })?
         };
         Ok(Self {
             input,
             latest_response,
             counters,
+            enabled,
             stop,
             worker: Mutex::new(Some(worker)),
         })
@@ -247,8 +257,19 @@ impl AcousticPropagation {
         self.counters.snapshot()
     }
 
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        // Change the predicate while holding the waiter's mutex so this notification cannot land
+        // between the worker's predicate check and Condvar::wait.
+        let state = self.input.state.lock().ok();
+        self.enabled.store(enabled, Ordering::Release);
+        drop(state);
+        self.input.changed.notify_one();
+    }
+
     pub(crate) fn close(&self) {
+        let state = self.input.state.lock().ok();
         self.stop.store(true, Ordering::Release);
+        drop(state);
         self.input.changed.notify_one();
         if let Ok(mut worker) = self.worker.lock()
             && let Some(worker) = worker.take()
@@ -271,6 +292,7 @@ fn propagation_loop(
     input: &SharedInput,
     latest_response: &Mutex<Option<Arc<AcousticResponse>>>,
     counters: &AcousticPropagationCounters,
+    enabled: &AtomicBool,
     stop: &AtomicBool,
     distance_scaler: f32,
 ) {
@@ -284,6 +306,13 @@ fn propagation_loop(
             loop {
                 if stop.load(Ordering::Acquire) {
                     return;
+                }
+                if !enabled.load(Ordering::Acquire) {
+                    let Ok(next_state) = input.changed.wait(state) else {
+                        return;
+                    };
+                    state = next_state;
+                    continue;
                 }
                 let captured = (state.generation != consumed_generation)
                     .then(|| state.capture())
@@ -1027,7 +1056,7 @@ mod tests {
 
     #[test]
     fn worker_keeps_only_latest_complete_input_and_closes_cleanly() {
-        let propagation = AcousticPropagation::new(1.0).unwrap();
+        let propagation = AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true))).unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(17, Arc::new(UnitRoom))))
             .unwrap();
@@ -1076,5 +1105,35 @@ mod tests {
         assert_eq!(diagnostics.latest_geometry_version, 17);
         propagation.close();
         assert!(propagation.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn disabled_worker_waits_for_reenable_before_solving() {
+        let propagation = AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(false))).unwrap();
+        propagation
+            .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
+            .unwrap();
+        propagation
+            .publish_spatial_frame(Arc::new(SpatialFrame::new(
+                4,
+                0.04,
+                Pose::from_position(Vec3::ZERO),
+                Vec::new(),
+            )))
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(75));
+        assert_eq!(propagation.diagnostics().solve_count, 0);
+
+        propagation.set_enabled(true);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while propagation.diagnostics().solve_count == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not resume after reenable"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        propagation.close();
     }
 }

@@ -1,4 +1,4 @@
-use crate::acoustics::{AcousticSceneSlot, AcousticSceneSnapshot};
+use crate::acoustic_propagation::AcousticResponse;
 use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame};
@@ -138,10 +138,9 @@ struct PumpState {
     current_spatial_frame: Option<Arc<SpatialFrame>>,
     pending_spatial_retirement: Option<Arc<SpatialFrame>>,
     spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
-    latest_acoustic_scene: Arc<Mutex<Option<Arc<AcousticSceneSnapshot>>>>,
-    acoustic_scene_slot: Arc<AcousticSceneSlot>,
-    pending_acoustic_retirement: Option<Arc<AcousticSceneSnapshot>>,
-    acoustic_retirement_sender: Sender<Arc<AcousticSceneSnapshot>>,
+    latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    pending_acoustic_response_retirement: Option<Arc<AcousticResponse>>,
+    acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
     resampler: Arc<Mutex<StreamingResampler>>,
     /// Producer end of ring buffer - writes pre-rendered audio samples (lock-free)
     ring_buffer_producer: HeapProd<StereoFrame>,
@@ -224,9 +223,8 @@ pub(crate) struct EngineStartup {
     pub retirement_sender: Sender<SourceId>,
     pub latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     pub spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
-    pub latest_acoustic_scene: Arc<Mutex<Option<Arc<AcousticSceneSnapshot>>>>,
-    pub acoustic_scene_slot: Arc<AcousticSceneSlot>,
-    pub acoustic_retirement_sender: Sender<Arc<AcousticSceneSnapshot>>,
+    pub latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    pub acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
     pub environmental_acoustics_enabled: Arc<AtomicBool>,
     pub ports: EngineRuntimePorts,
 }
@@ -246,9 +244,8 @@ pub(crate) struct PetalSonicEngine {
     retirement_sender: Sender<SourceId>,
     latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
-    latest_acoustic_scene: Arc<Mutex<Option<Arc<AcousticSceneSnapshot>>>>,
-    acoustic_scene_slot: Arc<AcousticSceneSlot>,
-    acoustic_retirement_sender: Sender<Arc<AcousticSceneSnapshot>>,
+    latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
     /// The actual sample rate used by the audio device (may differ from desc.sample_rate)
     device_sample_rate: u32,
     pump_state: Option<Arc<Mutex<PumpState>>>,
@@ -283,9 +280,8 @@ impl PetalSonicEngine {
             retirement_sender,
             latest_spatial_frame,
             spatial_retirement_sender,
-            latest_acoustic_scene,
-            acoustic_scene_slot,
-            acoustic_retirement_sender,
+            latest_acoustic_response,
+            acoustic_response_retirement_sender,
             environmental_acoustics_enabled,
             ports,
         } = startup;
@@ -296,11 +292,7 @@ impl PetalSonicEngine {
             crossbeam_channel::bounded(max_voices);
         // Initialize spatial processor
         // Use distance_scaler from world configuration (converts world units to meters)
-        let any_hit_adapter: Arc<dyn crate::acoustics::BatchedAnyHitRayTracer> =
-            acoustic_scene_slot.clone();
-        let closest_hit_adapter: Arc<dyn crate::acoustics::BatchedClosestHitRayTracer> =
-            acoustic_scene_slot.clone();
-        let mut spatial_processor = SpatialProcessor::new(SpatialProcessorConfig {
+        let spatial_processor = SpatialProcessor::new(SpatialProcessorConfig {
             sample_rate: desc.sample_rate,
             frame_size: desc.block_size,
             max_voices: desc.max_voices,
@@ -309,18 +301,11 @@ impl PetalSonicEngine {
             hrtf_gain: desc.hrtf_gain,
             use_ambisonics: backend_plan.use_ambisonics,
             environmental_acoustics_enabled,
-            batched_any_hit_ray_tracer: Some(any_hit_adapter),
-            batched_closest_hit_ray_tracer: Some(closest_hit_adapter),
         })
         .map_err(|error| PetalSonicError::BackendUnavailable {
             backend: "spatial renderer",
             reason: error.to_string(),
         })?;
-        let initial = desc.acoustic_scene.as_ref();
-        spatial_processor.set_acoustic_scene_capabilities(
-            initial.is_some_and(AcousticSceneSnapshot::supports_occlusion),
-            initial.is_some_and(AcousticSceneSnapshot::supports_reflections),
-        );
         let spatial_processor = Some(Arc::new(Mutex::new(spatial_processor)));
 
         let master_headroom_db = MASTER_HEADROOM_DB;
@@ -341,9 +326,8 @@ impl PetalSonicEngine {
             retirement_sender,
             latest_spatial_frame,
             spatial_retirement_sender,
-            latest_acoustic_scene,
-            acoustic_scene_slot,
-            acoustic_retirement_sender,
+            latest_acoustic_response,
+            acoustic_response_retirement_sender,
             pump_state: None,
             render_thread: None,
             spatial_processor,
@@ -1246,10 +1230,9 @@ impl PetalSonicEngine {
             current_spatial_frame: None,
             pending_spatial_retirement: None,
             spatial_retirement_sender: self.spatial_retirement_sender.clone(),
-            latest_acoustic_scene: self.latest_acoustic_scene.clone(),
-            acoustic_scene_slot: self.acoustic_scene_slot.clone(),
-            pending_acoustic_retirement: None,
-            acoustic_retirement_sender: self.acoustic_retirement_sender.clone(),
+            latest_acoustic_response: self.latest_acoustic_response.clone(),
+            pending_acoustic_response_retirement: None,
+            acoustic_response_retirement_sender: self.acoustic_response_retirement_sender.clone(),
             resampler: resampler.clone(),
             ring_buffer_producer: producer,
             channels: config.channels,
@@ -1329,7 +1312,7 @@ impl PetalSonicEngine {
 
         Self::flush_backend_retirements(ctx);
         Self::consume_latest_spatial_frame(ctx);
-        Self::consume_latest_acoustic_scene(ctx);
+        Self::consume_latest_acoustic_response(ctx);
 
         // Update listener pose in spatial processor if available.
         if let Some(ref spatial_processor) = ctx.spatial_processor
@@ -1520,19 +1503,19 @@ impl PetalSonicEngine {
         }
     }
 
-    fn consume_latest_acoustic_scene(ctx: &mut PumpState) {
-        if let Some(pending) = ctx.pending_acoustic_retirement.take() {
-            match ctx.acoustic_retirement_sender.try_send(pending) {
+    fn consume_latest_acoustic_response(ctx: &mut PumpState) {
+        if let Some(pending) = ctx.pending_acoustic_response_retirement.take() {
+            match ctx.acoustic_response_retirement_sender.try_send(pending) {
                 Ok(()) => {}
                 Err(error) => {
-                    ctx.pending_acoustic_retirement = Some(error.into_inner());
+                    ctx.pending_acoustic_response_retirement = Some(error.into_inner());
                     return;
                 }
             }
         }
 
         let next = ctx
-            .latest_acoustic_scene
+            .latest_acoustic_response
             .try_lock()
             .ok()
             .and_then(|mut latest| latest.take());
@@ -1540,31 +1523,32 @@ impl PetalSonicEngine {
             return;
         };
 
-        let supports_occlusion = next.supports_occlusion();
-        let supports_reflections = next.supports_reflections();
-        let replaced = match ctx.acoustic_scene_slot.replace(Some(next)) {
-            Ok(previous) => previous,
-            Err(Some(next)) => {
-                if let Ok(mut latest) = ctx.latest_acoustic_scene.try_lock()
-                    && latest.is_none()
-                {
-                    *latest = Some(next);
-                }
-                return;
+        let Some(processor) = &ctx.spatial_processor else {
+            if let Err(error) = ctx.acoustic_response_retirement_sender.try_send(next) {
+                ctx.pending_acoustic_response_retirement = Some(error.into_inner());
             }
-            Err(None) => return,
+            return;
         };
-
-        if let Some(processor) = &ctx.spatial_processor
-            && let Ok(mut processor) = processor.try_lock()
-        {
-            processor.set_acoustic_scene_capabilities(supports_occlusion, supports_reflections);
-        }
+        let Ok(mut processor) = processor.try_lock() else {
+            let mut next = Some(next);
+            if let Ok(mut latest) = ctx.latest_acoustic_response.try_lock()
+                && latest.is_none()
+            {
+                *latest = next.take();
+            }
+            if let Some(next) = next
+                && let Err(error) = ctx.acoustic_response_retirement_sender.try_send(next)
+            {
+                ctx.pending_acoustic_response_retirement = Some(error.into_inner());
+            }
+            return;
+        };
+        let replaced = processor.replace_acoustic_response(next);
 
         if let Some(previous) = replaced
-            && let Err(error) = ctx.acoustic_retirement_sender.try_send(previous)
+            && let Err(error) = ctx.acoustic_response_retirement_sender.try_send(previous)
         {
-            ctx.pending_acoustic_retirement = Some(error.into_inner());
+            ctx.pending_acoustic_response_retirement = Some(error.into_inner());
         }
     }
 
@@ -2249,10 +2233,9 @@ mod tests {
             current_spatial_frame: None,
             pending_spatial_retirement: None,
             spatial_retirement_sender: crossbeam_channel::bounded(1).0,
-            latest_acoustic_scene: Arc::new(Mutex::new(None)),
-            acoustic_scene_slot: Arc::new(AcousticSceneSlot::new(None)),
-            pending_acoustic_retirement: None,
-            acoustic_retirement_sender: crossbeam_channel::bounded(2).0,
+            latest_acoustic_response: Arc::new(Mutex::new(None)),
+            pending_acoustic_response_retirement: None,
+            acoustic_response_retirement_sender: crossbeam_channel::bounded(2).0,
             // Exercise the non-bypass path used when the physical device rate differs
             // from the world's logical 48 kHz rate.
             resampler: PetalSonicEngine::create_resampler(sample_rate, 44_100, 2, block_size)
@@ -2351,10 +2334,9 @@ mod tests {
             current_spatial_frame: None,
             pending_spatial_retirement: None,
             spatial_retirement_sender: crossbeam_channel::bounded(1).0,
-            latest_acoustic_scene: Arc::new(Mutex::new(None)),
-            acoustic_scene_slot: Arc::new(AcousticSceneSlot::new(None)),
-            pending_acoustic_retirement: None,
-            acoustic_retirement_sender: crossbeam_channel::bounded(2).0,
+            latest_acoustic_response: Arc::new(Mutex::new(None)),
+            pending_acoustic_response_retirement: None,
+            acoustic_response_retirement_sender: crossbeam_channel::bounded(2).0,
             resampler: PetalSonicEngine::create_resampler(
                 sample_rate,
                 device_sample_rate,
@@ -2547,6 +2529,8 @@ mod tests {
             );
         }
         let frame = SpatialFrame::new(
+            1,
+            0.0,
             Pose::default(),
             vec![crate::domain::EmitterSpatialState::new(emitter, new_pose)],
         );

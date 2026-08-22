@@ -13,10 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   air absorption, and playback state.
 - Added a shared listener-centric eight-line FDN late-reverb renderer with independent low, mid,
   and high RT60 decay, smoothed parameters, pre-delay, and bounded render-time diagnostics.
+- Added a world-owned asynchronous acoustic-propagation worker. It consumes versioned complete
+  spatial frames and immutable geometry generations, prioritizes a bounded source set, estimates
+  three-band direct transmission and late decay, and exposes solve latency and response age.
 
 ### Changed
-- PetalSonic now uses its native HRTF, Ambisonics, direct-path, and early-reflection renderers for
-  every spatial quality profile. A converted NH172 PetalHRTF table is embedded as the default.
+- PetalSonic now uses its native HRTF, Ambisonics, direct-path, and late-reverb renderers for every
+  spatial quality profile. A converted NH172 PetalHRTF table is embedded as the default.
+- Geometry traversal no longer runs on the render thread. Hosts publish an immutable
+  `AcousticRayQuerySnapshot`; the render path only swaps a completed, bounded response.
+- `SpatialFrame` now carries a monotonic revision and simulation timestamp so propagation never
+  combines listener and emitter state from different game generations.
 
 ### Removed
 - Removed the Steam Audio and AudioNimbus backends, native-library auto-install feature, SOFA

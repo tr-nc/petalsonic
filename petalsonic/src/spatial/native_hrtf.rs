@@ -395,6 +395,7 @@ impl NativeHrtfRenderer {
     /// Render a mono source block into an interleaved stereo output buffer.
     ///
     /// Output is accumulated, not cleared, so callers can mix multiple sources.
+    #[cfg(test)]
     pub fn render_source(
         &self,
         state: &mut NativeHrtfSourceState,

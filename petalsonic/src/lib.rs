@@ -30,6 +30,8 @@
 //!
 //! // Publish listener and every spatial emitter as one complete generation.
 //! world.publish_spatial_frame(SpatialFrame::new(
+//!     1,
+//!     0.0,
 //!     Pose::from_position(Vec3::new(0.0, 0.0, 0.0)),
 //!     vec![EmitterSpatialState::new(
 //!         emitter,
@@ -69,6 +71,7 @@
 //! - Event-driven architecture for playback notifications
 //! - Performance profiling via timing events
 
+mod acoustic_propagation;
 mod acoustics;
 mod audio_data;
 mod config;
@@ -85,8 +88,7 @@ mod spatial;
 mod world;
 
 pub use acoustics::{
-    AcousticHit, AcousticMaterial, AcousticRay, AcousticSceneSnapshot, BatchedAnyHitRayTracer,
-    BatchedClosestHitRayTracer,
+    AcousticHit, AcousticMaterial, AcousticRay, AcousticRayQuerySnapshot, AcousticSceneSnapshot,
 };
 pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 pub use domain::{

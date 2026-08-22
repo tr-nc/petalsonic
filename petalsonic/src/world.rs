@@ -1,4 +1,5 @@
-use crate::acoustics::{AcousticSceneSlot, AcousticSceneSnapshot};
+use crate::acoustic_propagation::{AcousticPropagation, AcousticResponse};
+use crate::acoustics::AcousticSceneSnapshot;
 use crate::domain::{
     Bus, BusParams, Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
     SpatialFrame,
@@ -295,8 +296,10 @@ pub struct PetalSonicWorld {
     retirement_receiver: Receiver<SourceId>,
     latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     spatial_retirement_receiver: Receiver<Arc<SpatialFrame>>,
-    latest_acoustic_scene: Arc<Mutex<Option<Arc<AcousticSceneSnapshot>>>>,
-    acoustic_retirement_receiver: Receiver<Arc<AcousticSceneSnapshot>>,
+    spatial_frame_revision: AtomicU64,
+    spatial_sim_time_bits: AtomicU64,
+    acoustic_propagation: AcousticPropagation,
+    acoustic_response_retirement_receiver: Receiver<Arc<AcousticResponse>>,
     acoustic_scene_version: AtomicU64,
     environmental_acoustics_enabled: Arc<AtomicBool>,
     command_sender: Sender<PlaybackCommand>,
@@ -337,11 +340,20 @@ impl PetalSonicWorld {
             .as_ref()
             .map(|scene| scene.version())
             .unwrap_or(0);
-        let acoustic_scene_slot = Arc::new(AcousticSceneSlot::new(initial_acoustic_scene));
+        let acoustic_propagation =
+            AcousticPropagation::new(config.distance_scaler).map_err(|error| {
+                PetalSonicError::Engine(format!(
+                    "Failed to start acoustic propagation worker: {error}"
+                ))
+            })?;
+        if let Some(scene) = initial_acoustic_scene {
+            acoustic_propagation.publish_scene(scene).map_err(|_| {
+                PetalSonicError::Engine("Failed to publish initial acoustic scene".into())
+            })?;
+        }
         let environmental_acoustics_enabled =
             Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
-        let latest_acoustic_scene = Arc::new(Mutex::new(None));
-        let (acoustic_retirement_sender, acoustic_retirement_receiver) =
+        let (acoustic_response_retirement_sender, acoustic_response_retirement_receiver) =
             crossbeam_channel::bounded(2);
         let bus_params = Arc::new(Mutex::new(
             std::iter::once(BusParams::default())
@@ -356,9 +368,8 @@ impl PetalSonicWorld {
             retirement_sender,
             latest_spatial_frame: latest_spatial_frame.clone(),
             spatial_retirement_sender,
-            latest_acoustic_scene: latest_acoustic_scene.clone(),
-            acoustic_scene_slot,
-            acoustic_retirement_sender,
+            latest_acoustic_response: acoustic_propagation.latest_response_slot(),
+            acoustic_response_retirement_sender,
             environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
             ports,
         };
@@ -393,8 +404,10 @@ impl PetalSonicWorld {
             retirement_receiver,
             latest_spatial_frame,
             spatial_retirement_receiver,
-            latest_acoustic_scene,
-            acoustic_retirement_receiver,
+            spatial_frame_revision: AtomicU64::new(0),
+            spatial_sim_time_bits: AtomicU64::new(0.0f64.to_bits()),
+            acoustic_propagation,
+            acoustic_response_retirement_receiver,
             acoustic_scene_version: AtomicU64::new(acoustic_scene_version),
             environmental_acoustics_enabled,
             command_sender,
@@ -696,7 +709,35 @@ impl PetalSonicWorld {
     /// An unconsumed older frame is replaced on the caller thread. The render thread
     /// observes only complete frame generations and never accumulates stale movement.
     pub fn publish_spatial_frame(&self, frame: SpatialFrame) -> Result<()> {
+        self.ensure_open()?;
         self.drain_retired_spatial_frames();
+        self.drain_retired_acoustic_responses();
+        let current_revision = self.spatial_frame_revision.load(Ordering::Acquire);
+        if frame.revision() <= current_revision {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.revision",
+                reason: format!(
+                    "must increase monotonically beyond the current revision {current_revision}"
+                ),
+            });
+        }
+        let current_sim_time = f64::from_bits(self.spatial_sim_time_bits.load(Ordering::Acquire));
+        if !frame.sim_time_seconds().is_finite() || frame.sim_time_seconds() < current_sim_time {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.sim_time_seconds",
+                reason: format!(
+                    "must be finite and monotonic beyond the current time {current_sim_time}"
+                ),
+            });
+        }
+        if frame.emitters().iter().any(|emitter| {
+            !emitter.acoustic_priority().is_finite() || emitter.acoustic_priority() < 0.0
+        }) {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.emitters.acoustic_priority",
+                reason: "must be finite and non-negative".into(),
+            });
+        }
         let mut latest = self
             .latest_spatial_frame
             .try_lock()
@@ -706,7 +747,15 @@ impl PetalSonicWorld {
             .try_lock()
             .map_err(|_| PetalSonicError::QueuePressure)?;
         emitters.apply_spatial_frame(&frame)?;
-        *latest = Some(Arc::new(frame));
+        let frame = Arc::new(frame);
+        self.acoustic_propagation
+            .publish_spatial_frame(frame.clone())
+            .map_err(|_| PetalSonicError::QueuePressure)?;
+        self.spatial_frame_revision
+            .store(frame.revision(), Ordering::Release);
+        self.spatial_sim_time_bits
+            .store(frame.sim_time_seconds().to_bits(), Ordering::Release);
+        *latest = Some(frame);
         Ok(())
     }
 
@@ -714,11 +763,7 @@ impl PetalSonicWorld {
     /// Geometry and unchanged BVH chunks remain owned and shared by the snapshot backend.
     pub fn publish_acoustic_scene(&self, snapshot: AcousticSceneSnapshot) -> Result<()> {
         self.ensure_open()?;
-        self.drain_retired_acoustic_scenes();
-        let mut latest = self
-            .latest_acoustic_scene
-            .try_lock()
-            .map_err(|_| PetalSonicError::QueuePressure)?;
+        self.drain_retired_acoustic_responses();
         let current = self.acoustic_scene_version.load(Ordering::Acquire);
         if snapshot.version() <= current {
             return Err(PetalSonicError::InvalidConfiguration {
@@ -726,9 +771,12 @@ impl PetalSonicWorld {
                 reason: format!("must increase monotonically beyond the current version {current}"),
             });
         }
+        let snapshot = Arc::new(snapshot);
+        self.acoustic_propagation
+            .publish_scene(snapshot.clone())
+            .map_err(|_| PetalSonicError::QueuePressure)?;
         self.acoustic_scene_version
             .store(snapshot.version(), Ordering::Release);
-        *latest = Some(Arc::new(snapshot));
         Ok(())
     }
 
@@ -1087,6 +1135,7 @@ impl PetalSonicWorld {
             render_time_p99_us,
             render_time_max_us,
         ) = self.counters.render_summary();
+        let acoustics = self.acoustic_propagation.diagnostics();
         RuntimeDiagnostics {
             frames_processed: self.frames_processed.load(Ordering::Relaxed),
             underrun_count: self.underrun_count.load(Ordering::Relaxed),
@@ -1121,6 +1170,17 @@ impl PetalSonicWorld {
             render_time_p95_us,
             render_time_p99_us,
             render_time_max_us,
+            acoustic_solve_count: acoustics.solve_count,
+            acoustic_superseded_solve_count: acoustics.superseded_solve_count,
+            acoustic_published_response_count: acoustics.published_response_count,
+            acoustic_response_spatial_revision: acoustics.latest_spatial_revision,
+            acoustic_response_geometry_version: acoustics.latest_geometry_version,
+            acoustic_last_solve_time_us: acoustics.last_solve_time_us,
+            acoustic_solve_time_p50_us: acoustics.solve_time_p50_us,
+            acoustic_solve_time_p95_us: acoustics.solve_time_p95_us,
+            acoustic_solve_time_p99_us: acoustics.solve_time_p99_us,
+            acoustic_solve_time_max_us: acoustics.solve_time_max_us,
+            acoustic_response_age_ms: acoustics.response_age_ms,
             device_generation: self.counters.device_generation.load(Ordering::Relaxed),
             recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
             output_sample_rate: self.counters.output_sample_rate.load(Ordering::Relaxed) as u32,
@@ -1167,8 +1227,12 @@ impl PetalSonicWorld {
         while self.spatial_retirement_receiver.try_recv().is_ok() {}
     }
 
-    fn drain_retired_acoustic_scenes(&self) {
-        while self.acoustic_retirement_receiver.try_recv().is_ok() {}
+    fn drain_retired_acoustic_responses(&self) {
+        while self
+            .acoustic_response_retirement_receiver
+            .try_recv()
+            .is_ok()
+        {}
     }
 
     pub fn drain_timing_events(&self) -> Vec<RenderTimingEvent> {
@@ -1185,6 +1249,7 @@ impl PetalSonicWorld {
         }
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
+        self.acoustic_propagation.close();
         self.supervisor_stop.store(true, Ordering::Release);
         if let Some(supervisor) = self
             .supervisor_thread
@@ -1737,7 +1802,12 @@ mod tests {
                 })
                 .collect();
             world
-                .publish_spatial_frame(SpatialFrame::new(Pose::default(), states))
+                .publish_spatial_frame(SpatialFrame::new(
+                    generation as u64 + 1,
+                    generation as f64 * 0.001,
+                    Pose::default(),
+                    states,
+                ))
                 .unwrap();
 
             let params = BusParams {
@@ -1831,6 +1901,8 @@ mod tests {
 
         world
             .publish_spatial_frame(SpatialFrame::new(
+                1,
+                0.0,
                 first_listener,
                 vec![crate::domain::EmitterSpatialState::new(
                     emitter,
@@ -1840,6 +1912,8 @@ mod tests {
             .unwrap();
         world
             .publish_spatial_frame(SpatialFrame::new(
+                2,
+                0.1,
                 second_listener,
                 vec![crate::domain::EmitterSpatialState::new(
                     emitter,
@@ -1857,6 +1931,56 @@ mod tests {
         assert_eq!(latest.listener(), second_listener);
         assert_eq!(latest.emitters()[0].pose, second_emitter);
         assert_eq!(world.diagnostics().control_queue_depth, 0);
+        world.close().unwrap();
+    }
+
+    #[test]
+    fn spatial_publication_rejects_torn_or_non_monotonic_solver_inputs() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new(desc).unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::spatial(Pose::default()))
+            .unwrap();
+        let frame = |revision, sim_time_seconds, priority| {
+            SpatialFrame::new(
+                revision,
+                sim_time_seconds,
+                Pose::default(),
+                vec![
+                    crate::domain::EmitterSpatialState::new(emitter, Pose::default())
+                        .with_acoustic_priority(priority),
+                ],
+            )
+        };
+
+        world.publish_spatial_frame(frame(1, 1.0, 1.0)).unwrap();
+        assert!(matches!(
+            world.publish_spatial_frame(frame(1, 2.0, 1.0)),
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.revision",
+                ..
+            })
+        ));
+        assert!(matches!(
+            world.publish_spatial_frame(frame(2, 0.5, 1.0)),
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.sim_time_seconds",
+                ..
+            })
+        ));
+        assert!(matches!(
+            world.publish_spatial_frame(frame(2, 1.0, f32::NAN)),
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.emitters.acoustic_priority",
+                ..
+            })
+        ));
+        world.publish_spatial_frame(frame(2, 1.0, 0.0)).unwrap();
         world.close().unwrap();
     }
 
@@ -2075,6 +2199,8 @@ mod tests {
         let moved = Pose::from_position(crate::math::Vec3::new(1.0, 2.0, 3.0));
 
         let incomplete = SpatialFrame::new(
+            1,
+            0.0,
             Pose::default(),
             vec![crate::domain::EmitterSpatialState::new(first, moved)],
         );
@@ -2091,6 +2217,8 @@ mod tests {
         );
 
         let complete = SpatialFrame::new(
+            2,
+            0.1,
             Pose::default(),
             vec![
                 crate::domain::EmitterSpatialState::new(first, moved),

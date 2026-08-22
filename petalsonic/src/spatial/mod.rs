@@ -5,6 +5,7 @@ mod native_ambisonics;
 mod native_hrtf;
 mod processor;
 
+pub(crate) use late_reverb::LateReverbParameters;
 pub(crate) use processor::{
     RetiredSpatialSource, SpatialProcessingMetrics, SpatialProcessor, SpatialProcessorConfig,
 };

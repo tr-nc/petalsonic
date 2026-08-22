@@ -1,5 +1,5 @@
 use crate::math::Vec3;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// A world-space acoustics ray.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11,8 +11,11 @@ pub struct AcousticRay {
 /// Acoustic material properties used by custom ray tracing backends.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AcousticMaterial {
+    /// Low, mid, and high band absorption in the inclusive range 0..=1.
     pub absorption: [f32; 3],
+    /// Diffuse reflection ratio in the inclusive range 0..=1.
     pub scattering: f32,
+    /// Low, mid, and high direct-path transmission in the inclusive range 0..=1.
     pub transmission: [f32; 3],
 }
 
@@ -34,12 +37,14 @@ pub struct AcousticHit {
     pub material: AcousticMaterial,
 }
 
-/// Immutable batched any-hit query backend captured by an acoustic-scene snapshot.
+/// Immutable ray-query view of exactly one captured geometry generation.
 ///
-/// PetalSonic invokes this on its render thread with caller-provided result storage;
-/// implementations must have bounded work and must not allocate, block, or access mutable
-/// game-world state.
-pub trait BatchedAnyHitRayTracer: Send + Sync {
+/// Implementations may share immutable acceleration chunks with the host, but must never hide a
+/// mutable scene behind this interface. PetalSonic calls these methods only from its acoustics
+/// worker, so implementations may use ordinary CPU traversal; they must still keep batch work
+/// bounded and must not access mutable game state.
+pub trait AcousticRayQuerySnapshot: Send + Sync {
+    /// Writes one result per ray. All input and output slices have the same length.
     fn trace_any_hit_batch(
         &self,
         rays: &[AcousticRay],
@@ -47,14 +52,8 @@ pub trait BatchedAnyHitRayTracer: Send + Sync {
         max_distances: &[f32],
         hits: &mut [bool],
     );
-}
 
-/// Immutable batched closest-hit query backend captured by an acoustic-scene snapshot.
-///
-/// PetalSonic invokes this on its render thread with caller-provided result storage;
-/// implementations must have bounded work and must not allocate, block, or access mutable
-/// game-world state.
-pub trait BatchedClosestHitRayTracer: Send + Sync {
+    /// Writes one closest-hit result per ray. All input and output slices have the same length.
     fn trace_closest_hit_batch(
         &self,
         rays: &[AcousticRay],
@@ -64,40 +63,24 @@ pub trait BatchedClosestHitRayTracer: Send + Sync {
     );
 }
 
-/// Immutable, shareable acoustic-scene version.
-///
-/// The contained query backends are expected to share immutable BVH chunks with the host;
-/// publishing a new snapshot swaps this small handle and does not deep-copy geometry.
+/// Immutable, shareable acoustic-scene generation.
 #[derive(Clone)]
 pub struct AcousticSceneSnapshot {
     version: u64,
-    any_hit: Option<Arc<dyn BatchedAnyHitRayTracer>>,
-    closest_hit: Option<Arc<dyn BatchedClosestHitRayTracer>>,
+    query: Arc<dyn AcousticRayQuerySnapshot>,
 }
 
 impl AcousticSceneSnapshot {
-    pub fn new(
-        version: u64,
-        any_hit: Option<Arc<dyn BatchedAnyHitRayTracer>>,
-        closest_hit: Option<Arc<dyn BatchedClosestHitRayTracer>>,
-    ) -> Self {
-        Self {
-            version,
-            any_hit,
-            closest_hit,
-        }
+    pub fn new(version: u64, query: Arc<dyn AcousticRayQuerySnapshot>) -> Self {
+        Self { version, query }
     }
 
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    pub fn supports_occlusion(&self) -> bool {
-        self.any_hit.is_some()
-    }
-
-    pub fn supports_reflections(&self) -> bool {
-        self.closest_hit.is_some()
+    pub(crate) fn query(&self) -> &Arc<dyn AcousticRayQuerySnapshot> {
+        &self.query
     }
 }
 
@@ -105,82 +88,17 @@ impl std::fmt::Debug for AcousticSceneSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcousticSceneSnapshot")
             .field("version", &self.version)
-            .field("supports_occlusion", &self.supports_occlusion())
-            .field("supports_reflections", &self.supports_reflections())
-            .finish()
-    }
-}
-
-/// Stable adapter captured by the spatial backend while scene versions change behind it.
-pub(crate) struct AcousticSceneSlot {
-    active: RwLock<Option<Arc<AcousticSceneSnapshot>>>,
-}
-
-impl AcousticSceneSlot {
-    pub(crate) fn new(initial: Option<Arc<AcousticSceneSnapshot>>) -> Self {
-        Self {
-            active: RwLock::new(initial),
-        }
-    }
-
-    pub(crate) fn replace(
-        &self,
-        next: Option<Arc<AcousticSceneSnapshot>>,
-    ) -> std::result::Result<Option<Arc<AcousticSceneSnapshot>>, Option<Arc<AcousticSceneSnapshot>>>
-    {
-        let Ok(mut active) = self.active.try_write() else {
-            return Err(next);
-        };
-        Ok(std::mem::replace(&mut *active, next))
-    }
-}
-
-impl BatchedAnyHitRayTracer for AcousticSceneSlot {
-    fn trace_any_hit_batch(
-        &self,
-        rays: &[AcousticRay],
-        min_distances: &[f32],
-        max_distances: &[f32],
-        hits: &mut [bool],
-    ) {
-        hits.fill(false);
-        let _ = self.active.try_read().ok().and_then(|snapshot| {
-            snapshot.as_ref().and_then(|snapshot| {
-                snapshot.any_hit.as_ref().map(|backend| {
-                    backend.trace_any_hit_batch(rays, min_distances, max_distances, hits)
-                })
-            })
-        });
-    }
-}
-
-impl BatchedClosestHitRayTracer for AcousticSceneSlot {
-    fn trace_closest_hit_batch(
-        &self,
-        rays: &[AcousticRay],
-        min_distances: &[f32],
-        max_distances: &[f32],
-        hits: &mut [Option<AcousticHit>],
-    ) {
-        hits.fill(None);
-        let _ = self.active.try_read().ok().and_then(|snapshot| {
-            snapshot.as_ref().and_then(|snapshot| {
-                snapshot.closest_hit.as_ref().map(|backend| {
-                    backend.trace_closest_hit_batch(rays, min_distances, max_distances, hits)
-                })
-            })
-        });
+            .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    struct AlwaysHit;
+    struct PlaneSnapshot;
 
-    impl BatchedAnyHitRayTracer for AlwaysHit {
+    impl AcousticRayQuerySnapshot for PlaneSnapshot {
         fn trace_any_hit_batch(
             &self,
             rays: &[AcousticRay],
@@ -188,77 +106,40 @@ mod tests {
             _max_distances: &[f32],
             hits: &mut [bool],
         ) {
-            hits[..rays.len()].fill(true);
+            for (ray, hit) in rays.iter().zip(hits.iter_mut()) {
+                *hit = ray.direction.y < 0.0;
+            }
         }
-    }
 
-    #[test]
-    fn scene_versions_swap_shallow_shared_query_backends() {
-        let backend: Arc<dyn BatchedAnyHitRayTracer> = Arc::new(AlwaysHit);
-        let snapshot = AcousticSceneSnapshot::new(1, Some(backend.clone()), None);
-        let slot = AcousticSceneSlot::new(Some(Arc::new(snapshot.clone())));
-        let rays = [AcousticRay {
-            origin: Vec3::ZERO,
-            direction: Vec3::X,
-        }];
-
-        let mut hits = [false];
-        slot.trace_any_hit_batch(&rays, &[0.0], &[10.0], &mut hits);
-        assert_eq!(hits, [true]);
-        assert!(Arc::strong_count(&backend) >= 3);
-
-        let previous = slot
-            .replace(Some(Arc::new(AcousticSceneSnapshot::new(
-                2,
-                Some(backend.clone()),
-                None,
-            ))))
-            .unwrap()
-            .unwrap();
-        assert_eq!(previous.version(), 1);
-        slot.trace_any_hit_batch(&rays, &[0.0], &[10.0], &mut hits);
-        assert_eq!(hits, [true]);
-    }
-
-    struct DropTrackedBackend {
-        dropped_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
-    }
-
-    impl Drop for DropTrackedBackend {
-        fn drop(&mut self) {
-            *self.dropped_on.lock().unwrap() = Some(std::thread::current().id());
-        }
-    }
-
-    impl BatchedAnyHitRayTracer for DropTrackedBackend {
-        fn trace_any_hit_batch(
+        fn trace_closest_hit_batch(
             &self,
-            _rays: &[AcousticRay],
+            rays: &[AcousticRay],
             _min_distances: &[f32],
             _max_distances: &[f32],
-            hits: &mut [bool],
+            hits: &mut [Option<AcousticHit>],
         ) {
-            hits.fill(false);
+            for (ray, hit) in rays.iter().zip(hits.iter_mut()) {
+                *hit = (ray.direction.y < 0.0).then_some(AcousticHit {
+                    distance: 1.0,
+                    normal: Vec3::Y,
+                    material: AcousticMaterial::default(),
+                });
+            }
         }
     }
 
     #[test]
-    fn replaced_snapshot_is_returned_for_non_render_thread_destruction() {
-        let dropped_on = Arc::new(Mutex::new(None));
-        let backend: Arc<dyn BatchedAnyHitRayTracer> = Arc::new(DropTrackedBackend {
-            dropped_on: dropped_on.clone(),
-        });
-        let slot = AcousticSceneSlot::new(Some(Arc::new(AcousticSceneSnapshot::new(
-            1,
-            Some(backend),
-            None,
-        ))));
-
-        let retired = slot.replace(None).unwrap().unwrap();
-        assert!(dropped_on.lock().unwrap().is_none());
-        let producer_thread = std::thread::current().id();
-        drop(retired);
-
-        assert_eq!(*dropped_on.lock().unwrap(), Some(producer_thread));
+    fn scene_snapshot_keeps_one_immutable_query_generation() {
+        let scene = AcousticSceneSnapshot::new(7, Arc::new(PlaneSnapshot));
+        let rays = [AcousticRay {
+            origin: Vec3::ZERO,
+            direction: -Vec3::Y,
+        }];
+        let mut hits = [false];
+        scene
+            .query()
+            .trace_any_hit_batch(&rays, &[0.0], &[10.0], &mut hits);
+        assert_eq!(scene.version(), 7);
+        assert_eq!(hits, [true]);
     }
 }

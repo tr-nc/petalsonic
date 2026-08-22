@@ -4,6 +4,7 @@ use petalsonic::{
     PlaybackControl, PlaybackTag, Pose, Quat, RenderTimingEvent, ResidentClip, SpatialFrame, Vec3,
 };
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use super::profiling;
 
@@ -149,6 +150,8 @@ pub struct SpatialAudioDemo {
     max_history_size: usize,
     max_frame_time_us: u64, // Hard constraint: block_size / sample_rate in microseconds
     next_playback_tag: u64,
+    spatial_frame_revision: u64,
+    started_at: Instant,
 }
 
 impl SpatialAudioDemo {
@@ -176,11 +179,12 @@ impl SpatialAudioDemo {
         // Create world
         let world =
             PetalSonicWorld::new(world_desc.clone()).expect("Failed to create PetalSonicWorld");
+        let started_at = Instant::now();
 
         // Set up listener pose at origin (0, 0, 0) with identity rotation
         let listener_pose = Pose::new(Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY);
         world
-            .publish_spatial_frame(SpatialFrame::new(listener_pose, Vec::new()))
+            .publish_spatial_frame(SpatialFrame::new(1, 0.0, listener_pose, Vec::new()))
             .expect("Failed to publish initial spatial frame");
 
         // Calculate maximum frame time constraint (block_size / sample_rate)
@@ -230,6 +234,8 @@ impl SpatialAudioDemo {
             max_history_size: 100,
             max_frame_time_us,
             next_playback_tag: 0,
+            spatial_frame_revision: 1,
+            started_at,
         }
     }
 
@@ -618,17 +624,20 @@ impl SpatialAudioDemo {
         tag
     }
 
-    fn publish_spatial_frame(&self) {
+    fn publish_spatial_frame(&mut self) {
+        self.spatial_frame_revision = self.spatial_frame_revision.wrapping_add(1).max(1);
         let listener = Pose::new(self.listener_position, Quat::IDENTITY);
         let emitters = self
             .spatial_sources
             .iter()
             .map(|source| EmitterSpatialState::new(source.id, Pose::from_position(source.position)))
             .collect();
-        if let Err(error) = self
-            .world
-            .publish_spatial_frame(SpatialFrame::new(listener, emitters))
-        {
+        if let Err(error) = self.world.publish_spatial_frame(SpatialFrame::new(
+            self.spatial_frame_revision,
+            self.started_at.elapsed().as_secs_f64(),
+            listener,
+            emitters,
+        )) {
             log::debug!("Spatial frame publication deferred: {error}");
         }
     }

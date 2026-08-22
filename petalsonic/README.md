@@ -54,6 +54,8 @@ fn main() -> Result<(), PetalSonicError> {
 
     // Publish one complete listener + Emitter generation per game frame.
     world.publish_spatial_frame(SpatialFrame::new(
+        1,
+        0.0,
         Pose::from_position(Vec3::ZERO),
         vec![EmitterSpatialState::new(
             emitter,
@@ -107,9 +109,21 @@ use petalsonic::ResidentClip;
 let clip = ResidentClip::from_mono_pcm(decoded_samples, 48_000)?;
 ```
 
+## Environmental acoustics
+
+PetalSonic owns a bounded asynchronous propagation worker. The host publishes immutable,
+monotonically versioned `AcousticSceneSnapshot` values backed by an
+`AcousticRayQuerySnapshot`; the worker performs geometry traversal while the audio render path
+only swaps completed responses. `SpatialFrame` revisions and simulation timestamps keep listener
+and emitter inputs from different game frames from being mixed.
+
+`set_environmental_acoustics_enabled` changes the complete geometry-driven effect live. Turning it
+off smoothly bypasses direct transmission and late reverberation while native HRTF, distance
+attenuation, air absorption, playback position, and the worker lifecycle remain intact.
+
 ## Architecture
 
-PetalSonic uses a three-layer threading model to ensure real-time safety:
+PetalSonic uses a three-layer audio-output path plus a world-owned propagation worker:
 
 ```plaintext
 ┌──────────────────────────────────────────────────────────────┐
@@ -119,7 +133,13 @@ PetalSonic uses a three-layer threading model to ensure real-time safety:
 │ - play(), pause(), stop()                                    │
 │ - drain_events()                                             │
 └──────────────────────────────────────────────────────────────┘
-                             ↓ Commands via channel
+             ↓ Commands via channel        ↓ Immutable snapshots
+                                      ┌────────────────────────┐
+                                      │ Acoustics Worker       │
+                                      │ - bounded ray queries  │
+                                      │ - completed responses  │
+                                      └────────────────────────┘
+                                                   ↓ Latest response
 ┌──────────────────────────────────────────────────────────────┐
 │ Render Thread (generates samples at world rate)              │
 │ - Process playback commands                                  │

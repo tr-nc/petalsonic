@@ -356,24 +356,64 @@ impl Default for PlayOptions {
 pub struct EmitterSpatialState {
     pub emitter: Emitter,
     pub pose: Pose,
+    acoustic_priority: f32,
 }
 
 impl EmitterSpatialState {
     pub fn new(emitter: Emitter, pose: Pose) -> Self {
-        Self { emitter, pose }
+        Self {
+            emitter,
+            pose,
+            acoustic_priority: 1.0,
+        }
+    }
+
+    /// Sets relative priority for bounded acoustics solves. Non-finite and negative values are
+    /// rejected when the complete spatial frame is published.
+    pub fn with_acoustic_priority(mut self, acoustic_priority: f32) -> Self {
+        self.acoustic_priority = acoustic_priority;
+        self
+    }
+
+    pub fn acoustic_priority(&self) -> f32 {
+        self.acoustic_priority
     }
 }
 
 /// Atomic listener + emitter transform snapshot consumed at render-quantum edges.
+///
+/// Revisions must increase for each published frame. Simulation time is expressed in seconds and
+/// may stay equal between revisions, but must never move backwards.
 #[derive(Clone, Debug)]
 pub struct SpatialFrame {
+    revision: u64,
+    sim_time_seconds: f64,
     listener: Pose,
     emitters: Vec<EmitterSpatialState>,
 }
 
 impl SpatialFrame {
-    pub fn new(listener: Pose, emitters: Vec<EmitterSpatialState>) -> Self {
-        Self { listener, emitters }
+    /// Creates one complete, versioned spatial state generation.
+    pub fn new(
+        revision: u64,
+        sim_time_seconds: f64,
+        listener: Pose,
+        emitters: Vec<EmitterSpatialState>,
+    ) -> Self {
+        Self {
+            revision,
+            sim_time_seconds,
+            listener,
+            emitters,
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn sim_time_seconds(&self) -> f64 {
+        self.sim_time_seconds
     }
 
     pub fn listener(&self) -> Pose {

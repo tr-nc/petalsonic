@@ -357,6 +357,25 @@ impl NativeHrtfSourceState {
             fft_state: fft_plan.map(NativeHrtfFftSourceState::new),
         }
     }
+
+    pub(crate) fn reset(&mut self) {
+        self.delay_line.fill(0.0);
+        self.write_index = 0;
+        self.cached_direction = DEFAULT_DIRECTION;
+        self.cached_direction_index = None;
+        if let Some(state) = &mut self.fft_state {
+            state.forward_input.fill(0.0);
+            state.input_spectrum.fill(Complex32::new(0.0, 0.0));
+            state.left_spectrum.fill(Complex32::new(0.0, 0.0));
+            state.right_spectrum.fill(Complex32::new(0.0, 0.0));
+            state.left_time.fill(0.0);
+            state.right_time.fill(0.0);
+            state.left_overlap.fill(0.0);
+            state.right_overlap.fill(0.0);
+            state.forward_scratch.fill(Complex32::new(0.0, 0.0));
+            state.inverse_scratch.fill(Complex32::new(0.0, 0.0));
+        }
+    }
 }
 
 /// Native HRTF renderer.

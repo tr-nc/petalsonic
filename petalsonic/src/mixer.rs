@@ -19,6 +19,7 @@ pub struct CompletedPlayback {
 /// Reusable identity lists for one render quantum.
 pub struct MixerScratch {
     spatial_ids: Vec<SourceId>,
+    muted_spatial_ids: Vec<SourceId>,
     non_spatial_ids: Vec<SourceId>,
 }
 
@@ -26,6 +27,7 @@ impl MixerScratch {
     pub fn new(max_voices: usize) -> Self {
         Self {
             spatial_ids: Vec::with_capacity(max_voices),
+            muted_spatial_ids: Vec::with_capacity(max_voices),
             non_spatial_ids: Vec::with_capacity(max_voices),
         }
     }
@@ -54,6 +56,7 @@ pub fn mix_playback_instances_with_metrics(
     };
 
     scratch.spatial_ids.clear();
+    scratch.muted_spatial_ids.clear();
     scratch.non_spatial_ids.clear();
 
     let output_frames = world_buffer.len() / channels.max(1) as usize;
@@ -68,12 +71,16 @@ pub fn mix_playback_instances_with_metrics(
             continue;
         }
         instance.set_mix_parameters(bus);
+        let is_spatial = instance.config.is_spatial();
         if bus.muted || gain::db_to_linear(bus.gain_db) == 0.0 {
             instance.advance_silently(output_frames);
+            if is_spatial {
+                scratch.muted_spatial_ids.push(*source_id);
+            }
             continue;
         }
 
-        if instance.config.is_spatial() {
+        if is_spatial {
             scratch.spatial_ids.push(*source_id);
         } else {
             scratch.non_spatial_ids.push(*source_id);
@@ -93,6 +100,9 @@ pub fn mix_playback_instances_with_metrics(
 
     // Process spatial sources if spatial processor is available
     if let Some(processor) = spatial_processor {
+        for source_id in &scratch.muted_spatial_ids {
+            processor.silence_source_state(*source_id);
+        }
         if !scratch.spatial_ids.is_empty() || processor.has_late_reverb_tail() {
             let spatial_start = Instant::now();
             if let Ok(metrics) = processor.process_spatial_sources_with_metrics(

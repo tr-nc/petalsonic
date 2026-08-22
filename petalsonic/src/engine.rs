@@ -1823,6 +1823,7 @@ impl PetalSonicEngine {
         let mut total_ambisonics_decoding_time_us = 0u64;
         let mut total_hrtf_rendering_time_us = 0u64;
         let mut total_late_reverb_time_us = 0u64;
+        let mut total_early_reflection_time_us = 0u64;
         let mut total_native_hrtf_direction_lookup_time_us = 0u64;
         let mut total_native_hrtf_convolution_time_us = 0u64;
         let mut total_resampling_time_us = 0u64;
@@ -1840,6 +1841,7 @@ impl PetalSonicEngine {
                 ambisonics_decoding_time_us: 0,
                 hrtf_rendering_time_us: 0,
                 late_reverb_time_us: 0,
+                early_reflection_time_us: 0,
                 native_hrtf_direction_lookup_time_us: 0,
                 native_hrtf_convolution_time_us: 0,
                 resampling_time_us: 0,
@@ -1877,6 +1879,7 @@ impl PetalSonicEngine {
                 total_ambisonics_decoding_time_us += spatial_metrics.ambisonics_decoding_time_us;
                 total_hrtf_rendering_time_us += spatial_metrics.hrtf_rendering_time_us;
                 total_late_reverb_time_us += spatial_metrics.late_reverb_time_us;
+                total_early_reflection_time_us += spatial_metrics.early_reflection_time_us;
                 total_native_hrtf_direction_lookup_time_us +=
                     spatial_metrics.native_hrtf_direction_lookup_time_us;
                 total_native_hrtf_convolution_time_us +=
@@ -1936,6 +1939,7 @@ impl PetalSonicEngine {
             ambisonics_decoding_time_us: total_ambisonics_decoding_time_us,
             hrtf_rendering_time_us: total_hrtf_rendering_time_us,
             late_reverb_time_us: total_late_reverb_time_us,
+            early_reflection_time_us: total_early_reflection_time_us,
             native_hrtf_direction_lookup_time_us: total_native_hrtf_direction_lookup_time_us,
             native_hrtf_convolution_time_us: total_native_hrtf_convolution_time_us,
             resampling_time_us: total_resampling_time_us,

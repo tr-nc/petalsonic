@@ -118,8 +118,9 @@ only swaps completed responses. `SpatialFrame` revisions and simulation timestam
 and emitter inputs from different game frames from being mixed.
 
 `set_environmental_acoustics_enabled` changes the complete geometry-driven effect live. Turning it
-off smoothly bypasses direct transmission and late reverberation while native HRTF, distance
-attenuation, air absorption, playback position, and the worker lifecycle remain intact.
+off smoothly bypasses direct transmission, early reflections, and late reverberation while native
+HRTF, distance attenuation, air absorption, playback position, and the worker lifecycle remain
+intact.
 
 ## Architecture
 

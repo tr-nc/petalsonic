@@ -101,6 +101,14 @@ pub fn draw_profiling_widget(
                 format_time_auto(latest.hrtf_rendering_time_us)
             ));
             ui.label(format!(
+                "Early reflections: {}",
+                format_time_auto(latest.early_reflection_time_us)
+            ));
+            ui.label(format!(
+                "Late reverb: {}",
+                format_time_auto(latest.late_reverb_time_us)
+            ));
+            ui.label(format!(
                 "Native HRTF lookup: {}",
                 format_time_auto(latest.native_hrtf_direction_lookup_time_us)
             ));

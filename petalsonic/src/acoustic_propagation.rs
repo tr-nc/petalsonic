@@ -11,15 +11,29 @@ use std::time::{Duration, Instant};
 const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
 const SOLVE_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_DIRECT_SOURCES: usize = 32;
+const MAX_EARLY_REFLECTION_SOURCES: usize = 8;
+pub(crate) const MAX_EARLY_REFLECTION_TAPS: usize = 2;
+const EARLY_REFLECTION_RAY_COUNT: usize = 64;
+const EARLY_REFLECTION_MAX_DELAY_SECONDS: f32 = 0.25;
+const EARLY_REFLECTION_GAIN: f32 = 0.6;
 const LATE_RAY_COUNT: usize = 256;
 const LATE_BOUNCE_COUNT: usize = 8;
 const MAX_TRACE_DISTANCE_METERS: f32 = 120.0;
 const RAY_EPSILON_METERS: f32 = 0.05;
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct EarlyReflectionTap {
+    pub path_id: u16,
+    pub arrival_direction: Vec3,
+    pub delay_seconds: f32,
+    pub gain: [f32; 3],
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct DirectAcousticResponse {
     pub emitter: Emitter,
     pub gain: [f32; 3],
+    pub early_reflections: Vec<EarlyReflectionTap>,
 }
 
 #[derive(Debug)]
@@ -39,6 +53,14 @@ impl AcousticResponse {
             .find(|response| response.emitter == emitter)
             .map(|response| response.gain)
             .unwrap_or([1.0; 3])
+    }
+
+    pub(crate) fn early_reflections(&self, emitter: Emitter) -> &[EarlyReflectionTap] {
+        self.direct
+            .iter()
+            .find(|response| response.emitter == emitter)
+            .map(|response| response.early_reflections.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -327,19 +349,21 @@ fn propagation_loop(
 }
 
 fn solve_response(input: &SolveInput, distance_scaler: f32) -> AcousticResponse {
+    let candidates = ranked_emitters(input);
+    let mut direct = solve_direct(input, &candidates, distance_scaler);
+    solve_early_reflections(input, &candidates, distance_scaler, &mut direct);
     AcousticResponse {
         spatial_revision: input.spatial.revision(),
         geometry_version: input.scene.version(),
-        direct: solve_direct(input, distance_scaler),
+        direct,
         late_reverb: solve_late_reverb(input, distance_scaler),
         published_at: Instant::now(),
         solve_time_us: 0,
     }
 }
 
-fn solve_direct(input: &SolveInput, distance_scaler: f32) -> Vec<DirectAcousticResponse> {
+fn ranked_emitters(input: &SolveInput) -> Vec<&EmitterSpatialState> {
     let listener = input.spatial.listener().position;
-    let ray_epsilon_world = RAY_EPSILON_METERS / distance_scaler.max(0.001);
     let mut candidates: Vec<(f32, &EmitterSpatialState)> = input
         .spatial
         .emitters()
@@ -353,11 +377,21 @@ fn solve_direct(input: &SolveInput, distance_scaler: f32) -> Vec<DirectAcousticR
         .collect();
     candidates.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(CmpOrdering::Equal));
     candidates.truncate(MAX_DIRECT_SOURCES);
+    candidates.into_iter().map(|(_, emitter)| emitter).collect()
+}
+
+fn solve_direct(
+    input: &SolveInput,
+    candidates: &[&EmitterSpatialState],
+    distance_scaler: f32,
+) -> Vec<DirectAcousticResponse> {
+    let listener = input.spatial.listener().position;
+    let ray_epsilon_world = RAY_EPSILON_METERS / distance_scaler.max(0.001);
 
     let mut rays = Vec::with_capacity(candidates.len());
     let mut min_distances = Vec::with_capacity(candidates.len());
     let mut max_distances = Vec::with_capacity(candidates.len());
-    for (_, emitter) in &candidates {
+    for emitter in candidates {
         let delta = emitter.pose.position - listener;
         let distance = delta.length();
         rays.push(AcousticRay {
@@ -375,11 +409,11 @@ fn solve_direct(input: &SolveInput, distance_scaler: f32) -> Vec<DirectAcousticR
         .trace_closest_hit_batch(&rays, &min_distances, &max_distances, &mut hits);
 
     candidates
-        .into_iter()
+        .iter()
         .zip(hits)
         .zip(min_distances.into_iter().zip(max_distances))
         .map(
-            |(((_, emitter), hit), (min_distance, max_distance))| DirectAcousticResponse {
+            |((emitter, hit), (min_distance, max_distance))| DirectAcousticResponse {
                 emitter: emitter.emitter,
                 gain: hit
                     .filter(|hit| valid_hit_distance(hit.distance, min_distance, max_distance))
@@ -389,9 +423,165 @@ fn solve_direct(input: &SolveInput, distance_scaler: f32) -> Vec<DirectAcousticR
                             .map(|gain| sanitize_unit(gain, 1.0))
                     })
                     .unwrap_or([1.0; 3]),
+                early_reflections: Vec::with_capacity(MAX_EARLY_REFLECTION_TAPS),
             },
         )
         .collect()
+}
+
+fn solve_early_reflections(
+    input: &SolveInput,
+    candidates: &[&EmitterSpatialState],
+    distance_scaler: f32,
+    responses: &mut [DirectAcousticResponse],
+) {
+    let listener = input.spatial.listener().position;
+    let ray_epsilon_world = RAY_EPSILON_METERS / distance_scaler.max(0.001);
+    let max_distance_world = MAX_TRACE_DISTANCE_METERS / distance_scaler.max(0.001);
+    let probe_rays: Vec<_> = (0..EARLY_REFLECTION_RAY_COUNT)
+        .map(|index| AcousticRay {
+            origin: listener,
+            direction: fibonacci_direction(index, EARLY_REFLECTION_RAY_COUNT),
+        })
+        .collect();
+    let min_distances = vec![ray_epsilon_world; EARLY_REFLECTION_RAY_COUNT];
+    let max_distances = vec![max_distance_world; EARLY_REFLECTION_RAY_COUNT];
+    let mut surface_hits = vec![None; EARLY_REFLECTION_RAY_COUNT];
+    input.scene.query().trace_closest_hit_batch(
+        &probe_rays,
+        &min_distances,
+        &max_distances,
+        &mut surface_hits,
+    );
+
+    for emitter in candidates.iter().take(MAX_EARLY_REFLECTION_SOURCES) {
+        let source_position = emitter.pose.position;
+        let direct_distance_world = source_position.distance(listener);
+        if !direct_distance_world.is_finite() {
+            continue;
+        }
+        let mut visibility_rays = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
+        let mut visibility_min = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
+        let mut visibility_max = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
+        let mut candidates_for_visibility = Vec::with_capacity(EARLY_REFLECTION_RAY_COUNT);
+
+        for (path_id, (probe_ray, hit)) in probe_rays.iter().zip(&surface_hits).enumerate() {
+            let Some(hit) = hit.filter(|hit| {
+                valid_hit_distance(hit.distance, ray_epsilon_world, max_distance_world)
+            }) else {
+                continue;
+            };
+            let hit_position = listener + probe_ray.direction * hit.distance;
+            let hit_to_source = source_position - hit_position;
+            let hit_to_source_distance = hit_to_source.length();
+            if !hit_to_source_distance.is_finite()
+                || hit_to_source_distance <= ray_epsilon_world * 2.0
+            {
+                continue;
+            }
+            let to_source = hit_to_source / hit_to_source_distance;
+            let incoming = -to_source;
+            let mut normal = normalize_or(hit.normal, -incoming);
+            if normal.dot(incoming) > 0.0 {
+                normal = -normal;
+            }
+            let to_listener = -probe_ray.direction;
+            let reflected =
+                normalize_or(incoming - 2.0 * incoming.dot(normal) * normal, to_listener);
+            let specular_alignment = reflected.dot(to_listener).max(0.0).powi(8);
+            let cosine_in = normal.dot(-incoming).max(0.0);
+            let cosine_out = normal.dot(to_listener).max(0.0);
+            let scattering = sanitize_unit(
+                hit.material.scattering,
+                AcousticMaterial::default().scattering,
+            );
+            let path_weight = (specular_alignment * (1.0 - scattering)
+                + cosine_in * cosine_out * scattering * 0.25)
+                .clamp(0.0, 1.0);
+            if path_weight <= 1.0e-4 {
+                continue;
+            }
+            let total_distance_world = hit.distance + hit_to_source_distance;
+            let excess_distance_meters =
+                (total_distance_world - direct_distance_world).max(0.0) * distance_scaler;
+            let delay_seconds = excess_distance_meters / SPEED_OF_SOUND_METERS_PER_SECOND;
+            if !delay_seconds.is_finite()
+                || !(f32::EPSILON..=EARLY_REFLECTION_MAX_DELAY_SECONDS).contains(&delay_seconds)
+            {
+                continue;
+            }
+            let total_distance_meters = total_distance_world * distance_scaler;
+            let propagation_gain = EARLY_REFLECTION_GAIN
+                * path_weight
+                * propagation_air_absorption(total_distance_meters)
+                * propagation_distance_attenuation(total_distance_meters);
+            let gain = std::array::from_fn(|band| {
+                propagation_gain
+                    * (1.0
+                        - sanitize_unit(
+                            hit.material.absorption[band],
+                            AcousticMaterial::default().absorption[band],
+                        ))
+            });
+            if gain.iter().all(|gain| *gain <= 1.0e-5) {
+                continue;
+            }
+
+            visibility_rays.push(AcousticRay {
+                origin: hit_position + to_source * ray_epsilon_world,
+                direction: to_source,
+            });
+            visibility_min.push(0.0);
+            visibility_max.push((hit_to_source_distance - ray_epsilon_world * 2.0).max(0.0));
+            candidates_for_visibility.push(EarlyReflectionTap {
+                path_id: path_id as u16,
+                arrival_direction: probe_ray.direction,
+                delay_seconds,
+                gain,
+            });
+        }
+
+        if visibility_rays.is_empty() {
+            continue;
+        }
+        let mut blocked = vec![false; visibility_rays.len()];
+        input.scene.query().trace_any_hit_batch(
+            &visibility_rays,
+            &visibility_min,
+            &visibility_max,
+            &mut blocked,
+        );
+        let mut taps: Vec<_> = candidates_for_visibility
+            .into_iter()
+            .zip(blocked)
+            .filter_map(|(tap, blocked)| (!blocked).then_some(tap))
+            .collect();
+        taps.sort_by(|left, right| {
+            reflection_strength(right)
+                .partial_cmp(&reflection_strength(left))
+                .unwrap_or(CmpOrdering::Equal)
+        });
+        taps.truncate(MAX_EARLY_REFLECTION_TAPS);
+        taps.sort_by_key(|tap| tap.path_id);
+        if let Some(response) = responses
+            .iter_mut()
+            .find(|response| response.emitter == emitter.emitter)
+        {
+            response.early_reflections = taps;
+        }
+    }
+}
+
+fn reflection_strength(tap: &EarlyReflectionTap) -> f32 {
+    tap.gain.iter().sum()
+}
+
+fn propagation_distance_attenuation(distance_meters: f32) -> f32 {
+    1.0 / distance_meters.max(1.0)
+}
+
+fn propagation_air_absorption(distance_meters: f32) -> f32 {
+    (-0.0002 * distance_meters.max(0.0)).exp().clamp(0.2, 1.0)
 }
 
 fn solve_late_reverb(input: &SolveInput, distance_scaler: f32) -> LateReverbParameters {
@@ -696,6 +886,50 @@ mod tests {
         }
     }
 
+    struct ReflectiveFloor {
+        blocks_visibility: bool,
+    }
+
+    impl AcousticRayQuerySnapshot for ReflectiveFloor {
+        fn trace_any_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            hits[..rays.len()].fill(self.blocks_visibility);
+        }
+
+        fn trace_closest_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            min_distances: &[f32],
+            max_distances: &[f32],
+            hits: &mut [Option<AcousticHit>],
+        ) {
+            for (((ray, min_distance), max_distance), hit) in rays
+                .iter()
+                .zip(min_distances.iter().copied())
+                .zip(max_distances.iter().copied())
+                .zip(hits.iter_mut())
+            {
+                let distance = (-1.0 - ray.origin.y) / ray.direction.y;
+                *hit = (ray.direction.y < -1.0e-4
+                    && valid_hit_distance(distance, min_distance, max_distance))
+                .then_some(AcousticHit {
+                    distance,
+                    normal: Vec3::Y,
+                    material: AcousticMaterial {
+                        absorption: [0.1, 0.3, 0.6],
+                        scattering: 0.8,
+                        transmission: [0.05; 3],
+                    },
+                });
+            }
+        }
+    }
+
     fn input(query: Arc<dyn AcousticRayQuerySnapshot>) -> SolveInput {
         let emitter = Emitter {
             world_id: 1,
@@ -759,6 +993,36 @@ mod tests {
                 .iter()
                 .all(|value| value.is_finite())
         );
+    }
+
+    #[test]
+    fn visible_first_bounce_paths_produce_bounded_frequency_dependent_taps() {
+        let response = solve_response(
+            &input(Arc::new(ReflectiveFloor {
+                blocks_visibility: false,
+            })),
+            1.0,
+        );
+        let taps = &response.direct[0].early_reflections;
+        assert!(!taps.is_empty());
+        assert!(taps.len() <= MAX_EARLY_REFLECTION_TAPS);
+        for tap in taps {
+            assert!(tap.arrival_direction.is_finite());
+            assert!((0.0..=EARLY_REFLECTION_MAX_DELAY_SECONDS).contains(&tap.delay_seconds));
+            assert!(tap.gain[0] > tap.gain[2]);
+            assert!(tap.gain.iter().all(|gain| gain.is_finite() && *gain >= 0.0));
+        }
+    }
+
+    #[test]
+    fn blocked_second_segments_reject_early_reflection_candidates() {
+        let response = solve_response(
+            &input(Arc::new(ReflectiveFloor {
+                blocks_visibility: true,
+            })),
+            1.0,
+        );
+        assert!(response.direct[0].early_reflections.is_empty());
     }
 
     #[test]

@@ -16,10 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a world-owned asynchronous acoustic-propagation worker. It consumes versioned complete
   spatial frames and immutable geometry generations, prioritizes a bounded source set, estimates
   three-band direct transmission and late decay, and exposes solve latency and response age.
+- Added bounded first-bounce path sampling with second-segment visibility, frequency-dependent
+  material response, fractional delay, and native HRTF or Ambisonics rendering for early
+  reflections. Path identities and gains are smoothed across asynchronous response updates.
 
 ### Changed
-- PetalSonic now uses its native HRTF, Ambisonics, direct-path, and late-reverb renderers for every
-  spatial quality profile. A converted NH172 PetalHRTF table is embedded as the default.
+- PetalSonic now uses its native HRTF, Ambisonics, direct-path, early-reflection, and late-reverb
+  renderers for every spatial quality profile. A converted NH172 PetalHRTF table is embedded as
+  the default.
 - Geometry traversal no longer runs on the render thread. Hosts publish an immutable
   `AcousticRayQuerySnapshot`; the render path only swaps a completed, bounded response.
 - `SpatialFrame` now carries a monotonic revision and simulation timestamp so propagation never

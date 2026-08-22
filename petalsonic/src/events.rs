@@ -186,6 +186,8 @@ pub struct RenderTimingEvent {
     pub hrtf_rendering_time_us: u64,
     /// Time spent rendering the shared late-reverb bus (microseconds)
     pub late_reverb_time_us: u64,
+    /// Time spent filtering, delaying, and spatializing early reflections (microseconds)
+    pub early_reflection_time_us: u64,
     /// Time spent selecting native HRTF directions (microseconds)
     pub native_hrtf_direction_lookup_time_us: u64,
     /// Time spent in native HRTF FIR convolution (microseconds)

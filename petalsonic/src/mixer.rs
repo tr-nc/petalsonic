@@ -103,7 +103,7 @@ pub fn mix_playback_instances_with_metrics(
         for source_id in &scratch.muted_spatial_ids {
             processor.silence_source_state(*source_id);
         }
-        if !scratch.spatial_ids.is_empty() || processor.has_late_reverb_tail() {
+        if !scratch.spatial_ids.is_empty() || processor.has_environment_tail() {
             let spatial_start = Instant::now();
             if let Ok(metrics) = processor.process_spatial_sources_with_metrics(
                 &scratch.spatial_ids,
@@ -209,6 +209,8 @@ mod tests {
                 playback_rate: 1.0,
                 detached: false,
                 completion_tag: None,
+                direct_path: crate::domain::DirectPath::default(),
+                environment_send: crate::domain::EnvironmentSend::default(),
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
@@ -268,6 +270,8 @@ mod tests {
                 playback_rate: 1.0,
                 detached: false,
                 completion_tag: None,
+                direct_path: crate::domain::DirectPath::default(),
+                environment_send: crate::domain::EnvironmentSend::default(),
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();

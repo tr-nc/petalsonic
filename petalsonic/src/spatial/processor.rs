@@ -8,6 +8,7 @@ use super::native_hrtf::{
 };
 use crate::acoustic_propagation::{AcousticResponse, MAX_EARLY_REFLECTION_TAPS};
 use crate::config::SourceConfig;
+use crate::domain::{DirectGeometry, DirectPlacement, EnvironmentOrigin};
 use crate::error::{PetalSonicError, Result};
 use crate::gain;
 use crate::math::{Pose, Vec3};
@@ -33,6 +34,13 @@ struct NativeDirectSourceState {
     low_state: f32,
     low_mid_state: f32,
     current_gain: [f32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct ThreeBandCoefficients {
+    low: f32,
+    low_mid: f32,
+    smoothing: f32,
 }
 
 impl NativeDirectSourceState {
@@ -78,8 +86,9 @@ impl NativeEarlyReflectionTapState {
 
 #[derive(Debug, Clone)]
 struct NativeEarlyReflectionSourceState {
-    emitter: Option<crate::domain::Emitter>,
+    voice_id: Option<SourceId>,
     silenced: bool,
+    draining: bool,
     delay_line: Vec<f32>,
     write_index: usize,
     taps: Vec<NativeEarlyReflectionTapState>,
@@ -87,7 +96,7 @@ struct NativeEarlyReflectionSourceState {
 
 impl NativeEarlyReflectionSourceState {
     fn new(
-        emitter: Option<crate::domain::Emitter>,
+        voice_id: Option<SourceId>,
         sample_rate: u32,
         renderer: &NativeHrtfRenderer,
         use_ambisonics: bool,
@@ -102,17 +111,19 @@ impl NativeEarlyReflectionSourceState {
             })
             .collect();
         Self {
-            emitter,
+            voice_id,
             silenced: true,
+            draining: false,
             delay_line: vec![0.0; delay_samples],
             write_index: 0,
             taps,
         }
     }
 
-    fn reset_for_emitter(&mut self, emitter: Option<crate::domain::Emitter>) {
-        self.emitter = emitter;
+    fn reset_for_voice(&mut self, voice_id: Option<SourceId>) {
+        self.voice_id = voice_id;
         self.silenced = true;
+        self.draining = false;
         self.delay_line.fill(0.0);
         self.write_index = 0;
         for tap in &mut self.taps {
@@ -160,8 +171,10 @@ pub struct SpatialProcessor {
     native_ambisonics_decoder: Option<NativeAmbisonicsBinauralDecoder>,
     native_ambisonics_state: Option<NativeAmbisonicsBinauralState>,
     native_direct_source_states: HashMap<SourceId, NativeDirectSourceState>,
+    native_environment_source_states: HashMap<SourceId, NativeDirectSourceState>,
     native_early_reflection_source_states: HashMap<SourceId, NativeEarlyReflectionSourceState>,
     free_native_early_reflection_source_states: Vec<NativeEarlyReflectionSourceState>,
+    draining_early_reflection_ids: Vec<SourceId>,
     acoustic_response: Option<Arc<AcousticResponse>>,
 
     // Configuration
@@ -182,6 +195,7 @@ pub struct SpatialProcessor {
     // Cached buffers to avoid allocations
     cached_input_buf: Vec<f32>,             // Input mono samples
     cached_direct_buf: Vec<f32>,            // After DirectEffect
+    cached_environment_send_buf: Vec<f32>,  // Voice block routed to the shared environment
     cached_summed_encoded_buf: Vec<f32>,    // Accumulated native Ambisonics field
     cached_binaural_processed: Vec<f32>,    // Final binaural output (interleaved stereo)
     cached_early_reflection_bufs: Vec<f32>, // One mono block per bounded reflection tap
@@ -269,6 +283,7 @@ impl SpatialProcessor {
         // Pre-allocate buffers
         let cached_input_buf = vec![0.0; frame_size];
         let cached_direct_buf = vec![0.0; frame_size];
+        let cached_environment_send_buf = vec![0.0; frame_size];
         let ambisonics_channel_count =
             native_ambisonics_channel_count(DEFAULT_NATIVE_AMBISONICS_ORDER)?;
         let cached_summed_encoded_buf = vec![0.0; frame_size * ambisonics_channel_count];
@@ -307,10 +322,12 @@ impl SpatialProcessor {
             native_ambisonics_decoder,
             native_ambisonics_state,
             native_direct_source_states: HashMap::with_capacity(max_voices),
+            native_environment_source_states: HashMap::with_capacity(max_voices),
             native_early_reflection_source_states: HashMap::with_capacity(
                 early_reflection_pool_size,
             ),
             free_native_early_reflection_source_states,
+            draining_early_reflection_ids: Vec::with_capacity(early_reflection_pool_size),
             acoustic_response: None,
             frame_size,
             sample_rate,
@@ -332,6 +349,7 @@ impl SpatialProcessor {
             hrtf_gain_linear,
             cached_input_buf,
             cached_direct_buf,
+            cached_environment_send_buf,
             cached_summed_encoded_buf,
             cached_binaural_processed,
             cached_early_reflection_bufs,
@@ -367,12 +385,24 @@ impl SpatialProcessor {
     pub(crate) fn retire_source(&mut self, source_id: SourceId) -> Option<RetiredSpatialSource> {
         let native_hrtf = self.native_hrtf_source_states.remove(&source_id);
         let native_direct = self.native_direct_source_states.remove(&source_id);
-        if let Some(mut state) = self
+        self.native_environment_source_states.remove(&source_id);
+        let release_early_state = self
             .native_early_reflection_source_states
-            .remove(&source_id)
+            .get(&source_id)
+            .is_some_and(NativeEarlyReflectionSourceState::is_released);
+        if release_early_state {
+            if let Some(mut state) = self
+                .native_early_reflection_source_states
+                .remove(&source_id)
+            {
+                state.reset_for_voice(None);
+                self.free_native_early_reflection_source_states.push(state);
+            }
+        } else if let Some(state) = self
+            .native_early_reflection_source_states
+            .get_mut(&source_id)
         {
-            state.reset_for_emitter(None);
-            self.free_native_early_reflection_source_states.push(state);
+            state.draining = true;
         }
         (native_hrtf.is_some() || native_direct.is_some()).then_some(RetiredSpatialSource {
             _native_hrtf: native_hrtf,
@@ -396,11 +426,13 @@ impl SpatialProcessor {
             .or_insert_with(NativeDirectSourceState::new);
     }
 
-    fn ensure_native_early_reflection_state_for_source(
-        &mut self,
-        source_id: SourceId,
-        emitter: crate::domain::Emitter,
-    ) {
+    fn ensure_native_environment_state_for_source(&mut self, source_id: SourceId) {
+        self.native_environment_source_states
+            .entry(source_id)
+            .or_insert_with(NativeDirectSourceState::new);
+    }
+
+    fn ensure_native_early_reflection_state_for_source(&mut self, source_id: SourceId) {
         if self
             .native_early_reflection_source_states
             .contains_key(&source_id)
@@ -408,12 +440,12 @@ impl SpatialProcessor {
             || self
                 .acoustic_response
                 .as_ref()
-                .is_none_or(|response| response.early_reflections(emitter).is_empty())
+                .is_none_or(|response| response.early_reflections(source_id).is_empty())
         {
             return;
         }
         if let Some(mut state) = self.free_native_early_reflection_source_states.pop() {
-            state.reset_for_emitter(Some(emitter));
+            state.reset_for_voice(Some(source_id));
             self.native_early_reflection_source_states
                 .insert(source_id, state);
             return;
@@ -422,10 +454,10 @@ impl SpatialProcessor {
         let reusable_source_id = self.native_early_reflection_source_states.iter().find_map(
             |(candidate_source_id, state)| {
                 (state.is_released()
-                    && state.emitter.is_none_or(|emitter| {
+                    && state.voice_id.is_none_or(|voice_id| {
                         self.acoustic_response
                             .as_ref()
-                            .is_none_or(|response| response.early_reflections(emitter).is_empty())
+                            .is_none_or(|response| response.early_reflections(voice_id).is_empty())
                     }))
                 .then_some(*candidate_source_id)
             },
@@ -435,7 +467,7 @@ impl SpatialProcessor {
                 .native_early_reflection_source_states
                 .remove(&reusable_source_id)
         {
-            state.reset_for_emitter(Some(emitter));
+            state.reset_for_voice(Some(source_id));
             self.native_early_reflection_source_states
                 .insert(source_id, state);
         }
@@ -447,7 +479,7 @@ impl SpatialProcessor {
             .get_mut(&source_id)
             && !state.silenced
         {
-            state.reset_for_emitter(state.emitter);
+            state.reset_for_voice(state.voice_id);
         }
     }
 
@@ -477,9 +509,17 @@ impl SpatialProcessor {
                 continue;
             }
 
-            self.ensure_native_hrtf_state_for_source(*source_id)?;
-            self.ensure_native_direct_state_for_source(*source_id);
-            self.ensure_native_early_reflection_state_for_source(*source_id, instance.emitter);
+            if !matches!(instance.direct_path.placement(), DirectPlacement::Disabled) {
+                self.ensure_native_hrtf_state_for_source(*source_id)?;
+                self.ensure_native_direct_state_for_source(*source_id);
+            }
+            if !matches!(
+                instance.environment_send.origin(),
+                EnvironmentOrigin::Disabled
+            ) {
+                self.ensure_native_environment_state_for_source(*source_id);
+                self.ensure_native_early_reflection_state_for_source(*source_id);
+            }
         }
 
         // Clear accumulation buffers
@@ -502,6 +542,13 @@ impl SpatialProcessor {
             metrics.native_hrtf_convolution_time_us +=
                 source_metrics.native_hrtf_convolution_time_us;
         }
+
+        let drain_started = Instant::now();
+        let draining_metrics = self.process_draining_early_reflections()?;
+        metrics.early_reflection_time_us += drain_started.elapsed().as_micros() as u64;
+        metrics.hrtf_rendering_time_us += draining_metrics.convolution_time_us;
+        metrics.native_hrtf_direction_lookup_time_us += draining_metrics.direction_lookup_time_us;
+        metrics.native_hrtf_convolution_time_us += draining_metrics.convolution_time_us;
 
         if self.use_ambisonics {
             let decoding_start = Instant::now();
@@ -537,8 +584,45 @@ impl SpatialProcessor {
         Ok(metrics)
     }
 
-    pub(crate) fn has_late_reverb_tail(&self) -> bool {
+    pub(crate) fn has_environment_tail(&self) -> bool {
         self.late_reverb.needs_processing()
+            || self
+                .native_early_reflection_source_states
+                .values()
+                .any(|state| state.draining)
+    }
+
+    fn process_draining_early_reflections(&mut self) -> Result<NativeHrtfRenderMetrics> {
+        self.draining_early_reflection_ids.clear();
+        self.draining_early_reflection_ids.extend(
+            self.native_early_reflection_source_states
+                .iter()
+                .filter_map(|(source_id, state)| state.draining.then_some(*source_id)),
+        );
+        self.cached_input_buf.fill(0.0);
+        let mut metrics = NativeHrtfRenderMetrics::default();
+        for index in 0..self.draining_early_reflection_ids.len() {
+            let source_id = self.draining_early_reflection_ids[index];
+            let source_metrics = self.apply_native_early_reflections(source_id, 0.0, false)?;
+            metrics.direction_lookup_time_us += source_metrics.direction_lookup_time_us;
+            metrics.convolution_time_us += source_metrics.convolution_time_us;
+        }
+        for index in 0..self.draining_early_reflection_ids.len() {
+            let source_id = self.draining_early_reflection_ids[index];
+            let released = self
+                .native_early_reflection_source_states
+                .get(&source_id)
+                .is_some_and(NativeEarlyReflectionSourceState::is_released);
+            if released
+                && let Some(mut state) = self
+                    .native_early_reflection_source_states
+                    .remove(&source_id)
+            {
+                state.reset_for_voice(None);
+                self.free_native_early_reflection_source_states.push(state);
+            }
+        }
+        Ok(metrics)
     }
 
     /// Process a single spatial source
@@ -548,7 +632,7 @@ impl SpatialProcessor {
         instance: &mut PlaybackInstance,
     ) -> Result<SourceProcessingMetrics> {
         // Get spatial configuration (position + per-source volume)
-        let position = match &instance.config {
+        let emitter_position = match &instance.config {
             SourceConfig::Spatial { pose, .. } => pose.position,
             _ => return Ok(SourceProcessingMetrics::default()), // Not a spatial source, skip
         };
@@ -561,31 +645,87 @@ impl SpatialProcessor {
 
         let mut metrics = SourceProcessingMetrics::default();
 
-        // Apply direct effect (distance attenuation + air absorption)
+        // Direct and environment paths derive from this one cursor block. Neither path asks the
+        // Voice to decode or advance a second time.
         let direct_start = Instant::now();
-        self.apply_native_direct_effect(source_id, instance.emitter, position)?;
-        for (send, direct) in self
-            .cached_late_reverb_input
-            .iter_mut()
-            .zip(self.cached_direct_buf.iter())
-        {
-            *send += *direct;
+        let direct_local_position =
+            self.resolve_direct_local_position(instance.direct_path.placement(), emitter_position);
+        self.cached_direct_buf.fill(0.0);
+        if let Some(direct_local_position) = direct_local_position {
+            self.apply_native_direct_effect(
+                source_id,
+                direct_local_position,
+                instance.direct_path.geometry(),
+            )?;
+        }
+
+        let environment_local_position = match instance.environment_send.origin() {
+            EnvironmentOrigin::FollowEmitter => {
+                Some(self.world_to_listener_position(emitter_position))
+            }
+            EnvironmentOrigin::World(origin) => {
+                Some(self.world_to_listener_position(origin.position))
+            }
+            EnvironmentOrigin::Disabled => None,
+        };
+        let environment_send_gain = gain::db_to_linear(instance.environment_send.gain_db());
+        self.cached_environment_send_buf.fill(0.0);
+        if let Some(environment_local_position) = environment_local_position {
+            let compatible_shared_path =
+                matches!(instance.direct_path.placement(), DirectPlacement::World)
+                    && matches!(
+                        instance.direct_path.geometry(),
+                        DirectGeometry::SimulatedTransmission
+                    )
+                    && matches!(
+                        instance.environment_send.origin(),
+                        EnvironmentOrigin::FollowEmitter
+                    );
+            if compatible_shared_path {
+                for (send, direct) in self
+                    .cached_environment_send_buf
+                    .iter_mut()
+                    .zip(&self.cached_direct_buf)
+                {
+                    *send = *direct * environment_send_gain;
+                }
+            } else {
+                self.apply_native_environment_send_effect(
+                    source_id,
+                    environment_local_position,
+                    environment_send_gain,
+                )?;
+            }
+            for (sum, send) in self
+                .cached_late_reverb_input
+                .iter_mut()
+                .zip(&self.cached_environment_send_buf)
+            {
+                *sum += *send;
+            }
         }
         metrics.direct_processing_time_us = direct_start.elapsed().as_micros() as u64;
 
-        if self.use_ambisonics {
-            let encoding_start = Instant::now();
-            self.apply_native_ambisonics_encode_effect(position)?;
-            metrics.ambisonics_encoding_time_us = encoding_start.elapsed().as_micros() as u64;
-        } else {
-            let render_start = Instant::now();
-            let native_metrics = self.apply_native_hrtf_effect(source_id, position)?;
-            metrics.add_native_hrtf_metrics(native_metrics);
-            metrics.hrtf_rendering_time_us = render_start.elapsed().as_micros() as u64;
+        if let Some(direct_local_position) = direct_local_position {
+            if self.use_ambisonics {
+                let encoding_start = Instant::now();
+                self.apply_native_ambisonics_encode_effect(direct_local_position)?;
+                metrics.ambisonics_encoding_time_us = encoding_start.elapsed().as_micros() as u64;
+            } else {
+                let render_start = Instant::now();
+                let native_metrics =
+                    self.apply_native_hrtf_effect(source_id, direct_local_position)?;
+                metrics.add_native_hrtf_metrics(native_metrics);
+                metrics.hrtf_rendering_time_us = render_start.elapsed().as_micros() as u64;
+            }
         }
 
         let reflection_start = Instant::now();
-        let native_metrics = self.apply_native_early_reflections(source_id, instance.emitter)?;
+        let native_metrics = self.apply_native_early_reflections(
+            source_id,
+            environment_send_gain,
+            environment_local_position.is_some(),
+        )?;
         metrics.add_native_hrtf_metrics(native_metrics);
         metrics.early_reflection_time_us = reflection_start.elapsed().as_micros() as u64;
         metrics.hrtf_rendering_time_us += native_metrics.convolution_time_us;
@@ -603,18 +743,19 @@ impl SpatialProcessor {
     fn apply_native_direct_effect(
         &mut self,
         source_id: SourceId,
-        emitter: crate::domain::Emitter,
-        source_position: Vec3,
+        direct_local_position: Vec3,
+        geometry: DirectGeometry,
     ) -> Result<()> {
-        let source_delta = source_position - self.listener_position;
-        let distance_world = source_delta.length();
+        let distance_world = direct_local_position.length();
         let distance_meters = distance_world * self.distance_scaler;
         let distance_attenuation = native_distance_attenuation(distance_meters);
         let air_absorption = native_air_absorption(distance_meters);
-        let target_gain = if self.environmental_acoustics_active {
+        let target_gain = if self.environmental_acoustics_active
+            && matches!(geometry, DirectGeometry::SimulatedTransmission)
+        {
             self.acoustic_response
                 .as_ref()
-                .map(|response| response.direct_gain(emitter))
+                .map(|response| response.direct_gain(source_id))
                 .unwrap_or([1.0; 3])
         } else {
             [1.0; 3]
@@ -630,40 +771,99 @@ impl SpatialProcessor {
                 ))
             })?;
 
-        self.cached_direct_buf.fill(0.0);
-        for (output, input) in self
-            .cached_direct_buf
-            .iter_mut()
-            .zip(self.cached_input_buf.iter())
-        {
-            state.low_state += self.direct_low_coefficient * (*input - state.low_state);
-            state.low_mid_state += self.direct_low_mid_coefficient * (*input - state.low_mid_state);
-            let bands = [
-                state.low_state,
-                state.low_mid_state - state.low_state,
-                *input - state.low_mid_state,
-            ];
-            for (current, target) in state.current_gain.iter_mut().zip(target_gain) {
-                *current += self.direct_gain_smoothing_coefficient * (target - *current);
-            }
-            *output = (bands[0] * state.current_gain[0]
-                + bands[1] * state.current_gain[1]
-                + bands[2] * state.current_gain[2])
-                * distance_gain;
-        }
+        apply_three_band_gain(
+            &self.cached_input_buf,
+            &mut self.cached_direct_buf,
+            state,
+            ThreeBandCoefficients {
+                low: self.direct_low_coefficient,
+                low_mid: self.direct_low_mid_coefficient,
+                smoothing: self.direct_gain_smoothing_coefficient,
+            },
+            target_gain,
+            distance_gain,
+        );
         Ok(())
+    }
+
+    fn apply_native_environment_send_effect(
+        &mut self,
+        source_id: SourceId,
+        environment_local_position: Vec3,
+        send_gain: f32,
+    ) -> Result<()> {
+        let distance_meters = environment_local_position.length() * self.distance_scaler;
+        let distance_gain = native_distance_attenuation(distance_meters)
+            * native_air_absorption(distance_meters)
+            * send_gain;
+        let target_gain = if self.environmental_acoustics_active {
+            self.acoustic_response
+                .as_ref()
+                .map(|response| response.environment_gain(source_id))
+                .unwrap_or([1.0; 3])
+        } else {
+            [1.0; 3]
+        };
+        let state = self
+            .native_environment_source_states
+            .get_mut(&source_id)
+            .ok_or_else(|| {
+                PetalSonicError::SpatialAudio(format!(
+                    "No native environment-send state found for source {}",
+                    source_id
+                ))
+            })?;
+        apply_three_band_gain(
+            &self.cached_input_buf,
+            &mut self.cached_environment_send_buf,
+            state,
+            ThreeBandCoefficients {
+                low: self.direct_low_coefficient,
+                low_mid: self.direct_low_mid_coefficient,
+                smoothing: self.direct_gain_smoothing_coefficient,
+            },
+            target_gain,
+            distance_gain,
+        );
+        Ok(())
+    }
+
+    fn world_to_listener_position(&self, world_position: Vec3) -> Vec3 {
+        let delta = world_position - self.listener_position;
+        Vec3::new(
+            delta.dot(self.listener_right),
+            delta.dot(self.listener_up),
+            delta.dot(self.listener_front),
+        )
+    }
+
+    fn resolve_direct_local_position(
+        &self,
+        placement: DirectPlacement,
+        emitter_world_position: Vec3,
+    ) -> Option<Vec3> {
+        match placement {
+            DirectPlacement::World => Some(self.world_to_listener_position(emitter_world_position)),
+            DirectPlacement::ListenerRelative(local_pose) => Some(local_pose.position),
+            DirectPlacement::Disabled => None,
+        }
     }
 
     fn apply_native_early_reflections(
         &mut self,
         source_id: SourceId,
-        emitter: crate::domain::Emitter,
+        send_gain: f32,
+        send_enabled: bool,
     ) -> Result<NativeHrtfRenderMetrics> {
         let mut targets = [None; MAX_EARLY_REFLECTION_TAPS];
-        if self.environmental_acoustics_active
+        if send_enabled
+            && self.environmental_acoustics_active
             && let Some(response) = &self.acoustic_response
         {
-            for (target, tap) in targets.iter_mut().zip(response.early_reflections(emitter)) {
+            for (target, tap) in targets
+                .iter_mut()
+                .zip(response.early_reflections(source_id))
+            {
                 *target = Some(*tap);
             }
         }
@@ -719,7 +919,7 @@ impl SpatialProcessor {
         self.cached_early_reflection_bufs.fill(0.0);
         let mut write_index = state.write_index;
         for (sample_index, input) in self.cached_input_buf.iter().copied().enumerate() {
-            state.delay_line[write_index] = input;
+            state.delay_line[write_index] = input * send_gain;
             for (slot_index, slot) in state.taps.iter_mut().enumerate() {
                 let target = slot_targets[slot_index];
                 let target_delay = target
@@ -807,9 +1007,9 @@ impl SpatialProcessor {
     fn apply_native_hrtf_effect(
         &mut self,
         source_id: SourceId,
-        source_position: Vec3,
+        direct_local_position: Vec3,
     ) -> Result<NativeHrtfRenderMetrics> {
-        let direction = self.get_target_direction(source_position);
+        let direction = normalized_direction(direct_local_position);
         let state = self
             .native_hrtf_source_states
             .get_mut(&source_id)
@@ -828,8 +1028,8 @@ impl SpatialProcessor {
         )
     }
 
-    fn apply_native_ambisonics_encode_effect(&mut self, source_position: Vec3) -> Result<()> {
-        let direction = self.get_target_direction(source_position);
+    fn apply_native_ambisonics_encode_effect(&mut self, direct_local_position: Vec3) -> Result<()> {
+        let direction = normalized_direction(direct_local_position);
         self.native_ambisonics_encoder.encode_source_accumulate(
             direction,
             &self.cached_direct_buf,
@@ -862,26 +1062,44 @@ impl SpatialProcessor {
         }
     }
 
-    /// Calculate direction from listener to source in listener's coordinate system.
-    ///
-    /// PetalSonic's listener-local convention is x=right, y=up, z=front.
-    fn get_target_direction(&self, source_position: Vec3) -> Vec3 {
-        let delta = source_position - self.listener_position;
-        if !delta.is_finite() || delta.length_squared() <= f32::EPSILON {
-            return Vec3::Z;
-        }
-
-        let target_direction = delta.normalize();
-        Vec3::new(
-            target_direction.dot(self.listener_right),
-            target_direction.dot(self.listener_up),
-            target_direction.dot(self.listener_front),
-        )
-    }
-
     fn capture_environmental_acoustics_state(&mut self) {
         self.environmental_acoustics_active =
             self.environmental_acoustics_enabled.load(Ordering::Acquire);
+    }
+}
+
+fn apply_three_band_gain(
+    input: &[f32],
+    output: &mut [f32],
+    state: &mut NativeDirectSourceState,
+    coefficients: ThreeBandCoefficients,
+    target_gain: [f32; 3],
+    broadband_gain: f32,
+) {
+    output.fill(0.0);
+    for (output, input) in output.iter_mut().zip(input) {
+        state.low_state += coefficients.low * (*input - state.low_state);
+        state.low_mid_state += coefficients.low_mid * (*input - state.low_mid_state);
+        let bands = [
+            state.low_state,
+            state.low_mid_state - state.low_state,
+            *input - state.low_mid_state,
+        ];
+        for (current, target) in state.current_gain.iter_mut().zip(target_gain) {
+            *current += coefficients.smoothing * (target - *current);
+        }
+        *output = (bands[0] * state.current_gain[0]
+            + bands[1] * state.current_gain[1]
+            + bands[2] * state.current_gain[2])
+            * broadband_gain;
+    }
+}
+
+fn normalized_direction(position: Vec3) -> Vec3 {
+    if position.is_finite() && position.length_squared() > f32::EPSILON {
+        position.normalize()
+    } else {
+        Vec3::Z
     }
 }
 
@@ -963,7 +1181,11 @@ fn native_air_absorption(distance_meters: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::acoustic_propagation::{DirectAcousticResponse, EarlyReflectionTap};
-    use crate::domain::Emitter;
+    use crate::audio_data::PetalSonicAudioData;
+    use crate::domain::{DirectPath, Emitter, EnvironmentSend};
+    use crate::math::Quat;
+    use crate::playback::{LoopMode, VoiceStart};
+    use std::time::Duration;
 
     #[test]
     fn native_distance_attenuation_is_clamped_near_listener() {
@@ -981,13 +1203,89 @@ mod tests {
     }
 
     #[test]
-    fn environmental_acoustics_toggle_bypasses_geometry_but_keeps_native_direct_path() {
-        let enabled = Arc::new(AtomicBool::new(true));
+    fn listener_relative_direct_pose_is_invariant_under_world_motion() {
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let local_pose = Pose::from_position(Vec3::new(0.02, -0.08, 0.0));
+        for listener in [
+            Pose::identity(),
+            Pose::new(Vec3::new(40.0, -3.0, 12.0), Quat::from_rotation_y(1.7)),
+            Pose::new(Vec3::new(-8.0, 6.0, 2.0), Quat::from_rotation_x(-0.4)),
+        ] {
+            processor.set_listener_pose(listener).unwrap();
+            assert_eq!(
+                processor.resolve_direct_local_position(
+                    DirectPlacement::ListenerRelative(local_pose),
+                    Vec3::new(999.0, 999.0, 999.0),
+                ),
+                Some(local_pose.position)
+            );
+        }
+    }
+
+    #[test]
+    fn split_routing_advances_one_cursor_and_never_adds_a_second_direct_copy() {
+        let source_id = SourceId::from(3);
         let emitter = Emitter {
             world_id: 1,
             index: 0,
             generation: 1,
         };
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![1.0; 32],
+            48_000,
+            1,
+            Duration::from_secs_f64(32.0 / 48_000.0),
+        ));
+        let mut voice = PlaybackInstance::from_source(VoiceStart {
+            emitter,
+            audio_data: audio,
+            config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
+            loop_mode: LoopMode::Once,
+            bus_index: 0,
+            playback_rate: 1.0,
+            detached: false,
+            completion_tag: None,
+            direct_path: DirectPath::listener_relative(Pose::from_position(-Vec3::Y * 0.08))
+                .with_geometry(DirectGeometry::BypassTransmission),
+            environment_send: EnvironmentSend::from_world_pose(Pose::from_position(Vec3::X)),
+            mono_scratch: vec![0.0; 8],
+        });
+        voice.play_from_beginning();
+        voice.set_mix_parameters(crate::domain::BusParams::default());
+        let mut voices = HashMap::from([(source_id, voice)]);
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let mut output = [0.0; 16];
+        processor
+            .process_spatial_sources_with_metrics(&[source_id], &mut voices, &mut output)
+            .unwrap();
+
+        assert_eq!(voices[&source_id].info.current_frame, 8);
+        assert!(output.iter().any(|sample| sample.abs() > 0.0));
+    }
+
+    #[test]
+    fn environmental_acoustics_toggle_bypasses_geometry_but_keeps_native_direct_path() {
+        let enabled = Arc::new(AtomicBool::new(true));
         let source_id = SourceId::from(1);
         let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
             sample_rate: 48_000,
@@ -1005,8 +1303,9 @@ mod tests {
             spatial_revision: 1,
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
-                emitter,
+                voice_id: source_id,
                 gain: [0.0; 3],
+                environment_gain: [0.0; 3],
                 early_reflections: Vec::new(),
             }],
             late_reverb: LateReverbParameters::SILENT,
@@ -1017,7 +1316,11 @@ mod tests {
         for _ in 0..1_200 {
             processor.cached_input_buf.fill(1.0);
             processor
-                .apply_native_direct_effect(source_id, emitter, Vec3::Z)
+                .apply_native_direct_effect(
+                    source_id,
+                    Vec3::Z,
+                    DirectGeometry::SimulatedTransmission,
+                )
                 .unwrap();
         }
         assert!(
@@ -1032,7 +1335,11 @@ mod tests {
         for _ in 0..1_200 {
             processor.cached_input_buf.fill(1.0);
             processor
-                .apply_native_direct_effect(source_id, emitter, Vec3::Z)
+                .apply_native_direct_effect(
+                    source_id,
+                    Vec3::Z,
+                    DirectGeometry::SimulatedTransmission,
+                )
                 .unwrap();
         }
         assert!(
@@ -1046,11 +1353,6 @@ mod tests {
     #[test]
     fn early_reflection_delay_and_runtime_fade_remain_finite() {
         let enabled = Arc::new(AtomicBool::new(true));
-        let emitter = Emitter {
-            world_id: 1,
-            index: 0,
-            generation: 1,
-        };
         let source_id = SourceId::from(1);
         let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
             sample_rate: 48_000,
@@ -1067,8 +1369,9 @@ mod tests {
             spatial_revision: 1,
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
-                emitter,
+                voice_id: source_id,
                 gain: [1.0; 3],
+                environment_gain: [1.0; 3],
                 early_reflections: vec![EarlyReflectionTap {
                     path_id: 7,
                     arrival_direction: Vec3::Z,
@@ -1080,7 +1383,7 @@ mod tests {
             published_at: Instant::now(),
             solve_time_us: 1,
         }));
-        processor.ensure_native_early_reflection_state_for_source(source_id, emitter);
+        processor.ensure_native_early_reflection_state_for_source(source_id);
 
         let mut reflected_energy = 0.0;
         for block in 0..8 {
@@ -1090,7 +1393,7 @@ mod tests {
             }
             processor.cached_binaural_processed.fill(0.0);
             processor
-                .apply_native_early_reflections(source_id, emitter)
+                .apply_native_early_reflections(source_id, 1.0, true)
                 .unwrap();
             reflected_energy += processor
                 .cached_binaural_processed
@@ -1112,11 +1415,83 @@ mod tests {
             processor.cached_input_buf.fill(0.0);
             processor.cached_binaural_processed.fill(0.0);
             processor
-                .apply_native_early_reflections(source_id, emitter)
+                .apply_native_early_reflections(source_id, 1.0, true)
                 .unwrap();
         }
         let state = &processor.native_early_reflection_source_states[&source_id];
         assert!(state.taps.iter().all(|tap| tap.path_id.is_none()));
+    }
+
+    #[test]
+    fn completed_direct_voice_drains_bounded_early_reflection_tail() {
+        let source_id = SourceId::from(7);
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 1_024,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
+        })
+        .unwrap();
+        processor.replace_acoustic_response(Arc::new(AcousticResponse {
+            spatial_revision: 1,
+            geometry_version: 1,
+            direct: vec![DirectAcousticResponse {
+                voice_id: source_id,
+                gain: [1.0; 3],
+                environment_gain: [1.0; 3],
+                early_reflections: vec![EarlyReflectionTap {
+                    path_id: 4,
+                    arrival_direction: Vec3::Z,
+                    delay_seconds: 0.03,
+                    gain: [0.8; 3],
+                }],
+            }],
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 1,
+        }));
+        processor.ensure_native_early_reflection_state_for_source(source_id);
+        processor.cached_input_buf.fill(0.0);
+        processor.cached_input_buf[0] = 1.0;
+        processor.cached_binaural_processed.fill(0.0);
+        processor
+            .apply_native_early_reflections(source_id, 1.0, true)
+            .unwrap();
+
+        let _ = processor.retire_source(source_id);
+        assert!(processor.has_environment_tail());
+        assert!(processor.native_early_reflection_source_states[&source_id].draining);
+
+        let mut tail_energy = 0.0;
+        for _ in 0..128 {
+            processor.cached_binaural_processed.fill(0.0);
+            processor.process_draining_early_reflections().unwrap();
+            tail_energy += processor
+                .cached_binaural_processed
+                .iter()
+                .map(|sample| sample * sample)
+                .sum::<f32>();
+            if !processor
+                .native_early_reflection_source_states
+                .contains_key(&source_id)
+            {
+                break;
+            }
+        }
+        assert!(
+            tail_energy > 0.0,
+            "delayed environment response was truncated"
+        );
+        assert!(
+            !processor
+                .native_early_reflection_source_states
+                .contains_key(&source_id),
+            "early tail did not finish in bound"
+        );
     }
 
     #[test]
@@ -1138,12 +1513,9 @@ mod tests {
             let first_index = generation * EARLY_REFLECTION_SOURCE_STATE_CAPACITY;
             let direct = (first_index..first_index + EARLY_REFLECTION_SOURCE_STATE_CAPACITY)
                 .map(|index| DirectAcousticResponse {
-                    emitter: Emitter {
-                        world_id: 1,
-                        index: index as u32,
-                        generation: 1,
-                    },
+                    voice_id: SourceId::from(index as u64),
                     gain: [1.0; 3],
+                    environment_gain: [1.0; 3],
                     early_reflections: vec![EarlyReflectionTap {
                         path_id: index as u16,
                         arrival_direction: Vec3::Z,
@@ -1161,14 +1533,8 @@ mod tests {
                 solve_time_us: 1,
             }));
             for index in first_index..first_index + EARLY_REFLECTION_SOURCE_STATE_CAPACITY {
-                processor.ensure_native_early_reflection_state_for_source(
-                    SourceId::from(index as u64),
-                    Emitter {
-                        world_id: 1,
-                        index: index as u32,
-                        generation: 1,
-                    },
-                );
+                processor
+                    .ensure_native_early_reflection_state_for_source(SourceId::from(index as u64));
             }
             assert!(
                 processor.native_early_reflection_source_states.len()
@@ -1211,9 +1577,10 @@ mod tests {
             .collect();
         let direct = sources
             .iter()
-            .map(|(_, emitter)| DirectAcousticResponse {
-                emitter: *emitter,
+            .map(|(source_id, _)| DirectAcousticResponse {
+                voice_id: *source_id,
                 gain: [1.0; 3],
+                environment_gain: [1.0; 3],
                 early_reflections: (0..MAX_EARLY_REFLECTION_TAPS)
                     .map(|path_id| EarlyReflectionTap {
                         path_id: path_id as u16,
@@ -1232,15 +1599,15 @@ mod tests {
             published_at: Instant::now(),
             solve_time_us: 1,
         }));
-        for (source_id, emitter) in &sources {
-            processor.ensure_native_early_reflection_state_for_source(*source_id, *emitter);
+        for (source_id, _) in &sources {
+            processor.ensure_native_early_reflection_state_for_source(*source_id);
         }
         processor.cached_input_buf.fill(0.1);
         for _ in 0..32 {
             processor.cached_binaural_processed.fill(0.0);
-            for (source_id, emitter) in &sources {
+            for (source_id, _) in &sources {
                 processor
-                    .apply_native_early_reflections(*source_id, *emitter)
+                    .apply_native_early_reflections(*source_id, 1.0, true)
                     .unwrap();
             }
         }
@@ -1248,9 +1615,9 @@ mod tests {
         let started = Instant::now();
         for _ in 0..BLOCKS {
             processor.cached_binaural_processed.fill(0.0);
-            for (source_id, emitter) in black_box(&sources) {
+            for (source_id, _) in black_box(&sources) {
                 processor
-                    .apply_native_early_reflections(*source_id, *emitter)
+                    .apply_native_early_reflections(*source_id, 1.0, true)
                     .unwrap();
             }
         }

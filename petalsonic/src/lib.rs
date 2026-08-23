@@ -92,7 +92,8 @@ pub use acoustics::{
 };
 pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 pub use domain::{
-    Bus, BusDesc, BusParams, Emitter, EmitterDesc, EmitterSpatialState, PlayOptions,
+    Bus, BusDesc, BusParams, DirectGeometry, DirectPath, DirectPlacement, DirectPropagation,
+    Emitter, EmitterDesc, EmitterSpatialState, EnvironmentOrigin, EnvironmentSend, PlayOptions,
     PlaybackControl, PlaybackTag, ResidentClip, SpatialFrame,
 };
 pub use error::PetalSonicError;

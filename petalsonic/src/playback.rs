@@ -12,7 +12,7 @@
 
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
-use crate::domain::{BusParams, Emitter, PlaybackTag};
+use crate::domain::{BusParams, DirectPath, Emitter, EnvironmentSend, PlaybackTag};
 use crate::world::SourceId;
 use std::fmt;
 use std::sync::Arc;
@@ -83,6 +83,8 @@ pub(crate) struct VoiceStart {
     pub playback_rate: f32,
     pub detached: bool,
     pub completion_tag: Option<PlaybackTag>,
+    pub direct_path: DirectPath,
+    pub environment_send: EnvironmentSend,
     pub mono_scratch: Vec<f32>,
 }
 
@@ -95,6 +97,10 @@ pub struct PlaybackInstance {
     pub detached: bool,
     /// Present only for explicitly controlled playback.
     pub completion_tag: Option<PlaybackTag>,
+    /// Immutable direct-path semantics captured when this Voice was created.
+    pub direct_path: DirectPath,
+    /// Immutable environment routing captured when this Voice was created.
+    pub environment_send: EnvironmentSend,
     /// Immutable resident PCM shared by playback voices.
     pub audio_data: Arc<PetalSonicAudioData>,
     /// Current playback information
@@ -129,6 +135,8 @@ impl PlaybackInstance {
             playback_rate,
             detached,
             completion_tag,
+            direct_path,
+            environment_send,
             mono_scratch,
         } = start;
         let total_frames = audio_data.total_frames();
@@ -139,6 +147,8 @@ impl PlaybackInstance {
             emitter,
             detached,
             completion_tag,
+            direct_path,
+            environment_send,
             audio_data,
             info,
             config,
@@ -449,6 +459,8 @@ pub enum PlaybackCommand {
         completion_tag: Option<PlaybackTag>,
         bus_index: usize,
         playback_rate: f32,
+        direct_path: DirectPath,
+        environment_send: EnvironmentSend,
         mono_scratch: Vec<f32>,
     },
     PauseVoice(SourceId),
@@ -479,6 +491,8 @@ impl fmt::Debug for PlaybackCommand {
                 completion_tag,
                 bus_index,
                 playback_rate,
+                direct_path,
+                environment_send,
                 mono_scratch,
             } => f
                 .debug_struct("Play")
@@ -491,6 +505,8 @@ impl fmt::Debug for PlaybackCommand {
                 .field("completion_tag", completion_tag)
                 .field("bus_index", bus_index)
                 .field("playback_rate", playback_rate)
+                .field("direct_path", direct_path)
+                .field("environment_send", environment_send)
                 .field("mono_scratch_len", &mono_scratch.len())
                 .finish(),
             Self::PauseVoice(voice_id) => f.debug_tuple("PauseVoice").field(voice_id).finish(),
@@ -560,6 +576,8 @@ mod tests {
             playback_rate: 1.0,
             detached: false,
             completion_tag: None,
+            direct_path: DirectPath::default(),
+            environment_send: EnvironmentSend::default(),
             mono_scratch: vec![0.0; 4],
         });
 
@@ -601,6 +619,8 @@ mod tests {
             playback_rate: 2.0,
             detached: false,
             completion_tag: None,
+            direct_path: DirectPath::default(),
+            environment_send: EnvironmentSend::default(),
             mono_scratch: vec![0.0; 4],
         });
         instance.play_from_beginning();
@@ -643,6 +663,8 @@ mod tests {
             playback_rate: 1.0,
             detached: false,
             completion_tag: Some(PlaybackTag(9)),
+            direct_path: DirectPath::default(),
+            environment_send: EnvironmentSend::default(),
             mono_scratch: vec![0.0; 256],
         });
         instance.play_from_beginning();

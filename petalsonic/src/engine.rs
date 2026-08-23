@@ -1,6 +1,8 @@
-use crate::acoustic_propagation::AcousticResponse;
+use crate::acoustic_propagation::{AcousticResponse, AcousticVoice, AcousticVoiceInput};
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
+use crate::config::{
+    LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SourceConfig, SpatialQuality,
+};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame};
 use crate::error::PetalSonicError;
 use crate::error::Result;
@@ -141,6 +143,7 @@ struct PumpState {
     latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     pending_acoustic_response_retirement: Option<Arc<AcousticResponse>>,
     acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
+    acoustic_voice_input: AcousticVoiceInput,
     resampler: Arc<Mutex<StreamingResampler>>,
     /// Producer end of ring buffer - writes pre-rendered audio samples (lock-free)
     ring_buffer_producer: HeapProd<StereoFrame>,
@@ -225,6 +228,7 @@ pub(crate) struct EngineStartup {
     pub spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
     pub latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     pub acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
+    pub acoustic_voice_input: AcousticVoiceInput,
     pub environmental_acoustics_enabled: Arc<AtomicBool>,
     pub ports: EngineRuntimePorts,
 }
@@ -246,6 +250,7 @@ pub(crate) struct PetalSonicEngine {
     spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
     latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
+    acoustic_voice_input: AcousticVoiceInput,
     /// The actual sample rate used by the audio device (may differ from desc.sample_rate)
     device_sample_rate: u32,
     pump_state: Option<Arc<Mutex<PumpState>>>,
@@ -282,6 +287,7 @@ impl PetalSonicEngine {
             spatial_retirement_sender,
             latest_acoustic_response,
             acoustic_response_retirement_sender,
+            acoustic_voice_input,
             environmental_acoustics_enabled,
             ports,
         } = startup;
@@ -328,6 +334,7 @@ impl PetalSonicEngine {
             spatial_retirement_sender,
             latest_acoustic_response,
             acoustic_response_retirement_sender,
+            acoustic_voice_input,
             pump_state: None,
             render_thread: None,
             spatial_processor,
@@ -1110,6 +1117,7 @@ impl PetalSonicEngine {
             command_receivers,
             &self.active_playback,
             &self.active_voice_count,
+            &self.acoustic_voice_input,
             buses,
         );
 
@@ -1150,6 +1158,9 @@ impl PetalSonicEngine {
             for completed in &self.recovery_completed_playbacks {
                 let _ = processor.retire_source(completed.voice_id);
             }
+        }
+        for completed in &self.recovery_completed_playbacks {
+            self.acoustic_voice_input.retire(completed.voice_id);
         }
 
         self.active_voice_count
@@ -1233,6 +1244,7 @@ impl PetalSonicEngine {
             latest_acoustic_response: self.latest_acoustic_response.clone(),
             pending_acoustic_response_retirement: None,
             acoustic_response_retirement_sender: self.acoustic_response_retirement_sender.clone(),
+            acoustic_voice_input: self.acoustic_voice_input.clone(),
             resampler: resampler.clone(),
             ring_buffer_producer: producer,
             channels: config.channels,
@@ -1326,6 +1338,7 @@ impl PetalSonicEngine {
             &ctx.command_receivers,
             &ctx.active_playback,
             &ctx.active_voice_count,
+            &ctx.acoustic_voice_input,
             &mut ctx.buses,
         );
 
@@ -1380,6 +1393,9 @@ impl PetalSonicEngine {
         }
 
         let deferred_retirements = Self::retire_completed_spatial_sources(ctx);
+        for completed in &ctx.completed_playbacks {
+            ctx.acoustic_voice_input.retire(completed.voice_id);
+        }
 
         ctx.active_voice_count.fetch_sub(
             ctx.completed_playbacks.len() - deferred_retirements,
@@ -1654,6 +1670,7 @@ impl PetalSonicEngine {
         command_receivers: &EngineCommandReceivers,
         active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
         active_voice_count: &Arc<AtomicUsize>,
+        acoustic_voice_input: &AcousticVoiceInput,
         buses: &mut [BusParams],
     ) {
         // Important real-time rule:
@@ -1671,10 +1688,22 @@ impl PetalSonicEngine {
             let Ok(command) = command_receivers.regular.try_recv() else {
                 break;
             };
-            Self::apply_playback_command(command, &mut active_playback, active_voice_count, buses);
+            Self::apply_playback_command(
+                command,
+                &mut active_playback,
+                active_voice_count,
+                acoustic_voice_input,
+                buses,
+            );
         }
         while let Ok(command) = command_receivers.lifecycle.try_recv() {
-            Self::apply_playback_command(command, &mut active_playback, active_voice_count, buses);
+            Self::apply_playback_command(
+                command,
+                &mut active_playback,
+                active_voice_count,
+                acoustic_voice_input,
+                buses,
+            );
         }
     }
 
@@ -1682,6 +1711,7 @@ impl PetalSonicEngine {
         command: PlaybackCommand,
         active_playback: &mut HashMap<SourceId, PlaybackInstance>,
         active_voice_count: &AtomicUsize,
+        acoustic_voice_input: &AcousticVoiceInput,
         buses: &mut [BusParams],
     ) {
         match command {
@@ -1695,8 +1725,22 @@ impl PetalSonicEngine {
                 completion_tag,
                 bus_index,
                 playback_rate,
+                direct_path,
+                environment_send,
                 mono_scratch,
             } => {
+                let acoustic_voice = match &config {
+                    SourceConfig::Spatial { pose, .. } => Some(AcousticVoice {
+                        voice_id,
+                        emitter,
+                        emitter_world_pose: *pose,
+                        acoustic_priority: 1.0,
+                        detached,
+                        direct_path,
+                        environment_send,
+                    }),
+                    SourceConfig::NonSpatial { .. } => None,
+                };
                 let mut instance = PlaybackInstance::from_source(VoiceStart {
                     emitter,
                     audio_data: source,
@@ -1704,6 +1748,8 @@ impl PetalSonicEngine {
                     loop_mode,
                     bus_index,
                     playback_rate,
+                    direct_path,
+                    environment_send,
                     detached,
                     completion_tag,
                     mono_scratch,
@@ -1711,6 +1757,9 @@ impl PetalSonicEngine {
                 instance.play_from_beginning();
                 if active_playback.insert(voice_id, instance).is_some() {
                     active_voice_count.fetch_sub(1, Ordering::AcqRel);
+                }
+                if let Some(acoustic_voice) = acoustic_voice {
+                    acoustic_voice_input.activate(acoustic_voice);
                 }
             }
             PlaybackCommand::PauseVoice(voice_id) => {
@@ -2218,6 +2267,8 @@ mod tests {
                 completion_tag: None,
                 bus_index: 0,
                 playback_rate: 1.0,
+                direct_path: crate::domain::DirectPath::default(),
+                environment_send: crate::domain::EnvironmentSend::default(),
                 mono_scratch: vec![0.0; block_size],
             })
             .unwrap();
@@ -2240,6 +2291,7 @@ mod tests {
             latest_acoustic_response: Arc::new(Mutex::new(None)),
             pending_acoustic_response_retirement: None,
             acoustic_response_retirement_sender: crossbeam_channel::bounded(2).0,
+            acoustic_voice_input: AcousticVoiceInput::isolated(8),
             // Exercise the non-bypass path used when the physical device rate differs
             // from the world's logical 48 kHz rate.
             resampler: PetalSonicEngine::create_resampler(sample_rate, 44_100, 2, block_size)
@@ -2320,6 +2372,8 @@ mod tests {
                     completion_tag: None,
                     bus_index: 0,
                     playback_rate: 1.0,
+                    direct_path: crate::domain::DirectPath::default(),
+                    environment_send: crate::domain::EnvironmentSend::default(),
                     mono_scratch: vec![0.0; block_size],
                 })
                 .unwrap();
@@ -2341,6 +2395,7 @@ mod tests {
             latest_acoustic_response: Arc::new(Mutex::new(None)),
             pending_acoustic_response_retirement: None,
             acoustic_response_retirement_sender: crossbeam_channel::bounded(2).0,
+            acoustic_voice_input: AcousticVoiceInput::isolated(VOICES),
             resampler: PetalSonicEngine::create_resampler(
                 sample_rate,
                 device_sample_rate,
@@ -2476,6 +2531,8 @@ mod tests {
                     completion_tag: None,
                     bus_index: 0,
                     playback_rate: 1.0,
+                    direct_path: crate::domain::DirectPath::default(),
+                    environment_send: crate::domain::EnvironmentSend::default(),
                     mono_scratch: vec![0.0; 32],
                 })
                 .unwrap();
@@ -2483,14 +2540,27 @@ mod tests {
 
         let active = Arc::new(Mutex::new(HashMap::new()));
         let active_count = Arc::new(AtomicUsize::new(2));
+        let acoustic_voice_input = AcousticVoiceInput::isolated(8);
         let mut buses = [BusParams::default()];
-        PetalSonicEngine::process_playback_commands(&receivers, &active, &active_count, &mut buses);
+        PetalSonicEngine::process_playback_commands(
+            &receivers,
+            &active,
+            &active_count,
+            &acoustic_voice_input,
+            &mut buses,
+        );
         assert_eq!(active.lock().unwrap().len(), 2);
 
         lifecycle_sender
             .try_send(PlaybackCommand::DestroyEmitter(emitter))
             .unwrap();
-        PetalSonicEngine::process_playback_commands(&receivers, &active, &active_count, &mut buses);
+        PetalSonicEngine::process_playback_commands(
+            &receivers,
+            &active,
+            &active_count,
+            &acoustic_voice_input,
+            &mut buses,
+        );
 
         let mut active = active.lock().unwrap();
         assert_eq!(active.len(), 2, "attached voice fades before retirement");
@@ -2528,6 +2598,8 @@ mod tests {
                     playback_rate: 1.0,
                     detached,
                     completion_tag: None,
+                    direct_path: crate::domain::DirectPath::default(),
+                    environment_send: crate::domain::EnvironmentSend::default(),
                     mono_scratch: vec![0.0; 32],
                 }),
             );

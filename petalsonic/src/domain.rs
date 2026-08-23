@@ -88,7 +88,7 @@ impl ResidentClip {
 
 #[cfg(test)]
 mod tests {
-    use super::ResidentClip;
+    use super::*;
 
     #[test]
     fn resident_pcm_constructor_takes_valid_interleaved_data() {
@@ -104,6 +104,43 @@ mod tests {
         assert!(ResidentClip::from_interleaved_pcm(vec![0.0], 48_000, 2).is_err());
         assert!(ResidentClip::from_mono_pcm(vec![f32::NAN], 48_000).is_err());
         assert!(ResidentClip::from_mono_pcm(vec![0.0], 0).is_err());
+    }
+
+    #[test]
+    fn play_options_default_to_compatible_world_routing() {
+        let options = PlayOptions::once();
+        assert_eq!(options.direct_path(), DirectPath::world());
+        assert_eq!(
+            options.environment_send(),
+            EnvironmentSend::follow_emitter()
+        );
+        assert!(!options.has_spatial_routing_override());
+    }
+
+    #[test]
+    fn split_routing_is_copied_as_per_play_value_state() {
+        let local_pose = Pose::from_position(crate::math::Vec3::new(0.0, -0.08, 0.0));
+        let contact = Pose::from_position(crate::math::Vec3::new(3.0, 1.0, -2.0));
+        let options = PlayOptions::once()
+            .with_direct_path(
+                DirectPath::listener_relative(local_pose)
+                    .with_geometry(DirectGeometry::BypassTransmission),
+            )
+            .with_environment_send(EnvironmentSend::from_world_pose(contact).with_gain_db(-12.0));
+
+        assert_eq!(
+            options.direct_path().placement(),
+            DirectPlacement::ListenerRelative(local_pose)
+        );
+        assert_eq!(
+            options.direct_path().geometry(),
+            DirectGeometry::BypassTransmission
+        );
+        assert_eq!(
+            options.environment_send().origin(),
+            EnvironmentOrigin::World(contact)
+        );
+        assert_eq!(options.environment_send().gain_db(), -12.0);
     }
 }
 
@@ -141,6 +178,168 @@ impl std::fmt::Display for PlaybackControl {
 /// Caller-owned correlation value returned with controlled playback events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackTag(pub u64);
+
+/// Placement of the audible direct path for one playback Voice.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DirectPlacement {
+    /// Use the Voice's current world-space emitter pose.
+    World,
+    /// Preserve this pose directly in listener-local coordinates.
+    ///
+    /// The position convention is x=right, y=up, z=front. The renderer does not convert this
+    /// through a cached world pose, so listener translation and rotation cannot age the offset.
+    ListenerRelative(Pose),
+    /// Do not render an audible direct path. An EnvironmentSend may remain active.
+    Disabled,
+}
+
+/// Geometry policy for the direct path, independent of its placement and propagation timing.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectGeometry {
+    /// Apply the latest bounded asynchronous transmission response.
+    SimulatedTransmission,
+    /// Bypass geometry transmission while retaining placement, HRTF, distance, and air effects.
+    BypassTransmission,
+}
+
+/// Propagation timing policy for the direct path.
+///
+/// PetalSonic currently renders direct paths immediately. This explicit policy keeps timing
+/// independent from geometry so future propagation models do not overload obstruction controls.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectPropagation {
+    Immediate,
+}
+
+/// Immutable direct-path routing captured by one playback Voice.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirectPath {
+    placement: DirectPlacement,
+    geometry: DirectGeometry,
+    propagation: DirectPropagation,
+}
+
+impl DirectPath {
+    /// Current-version-compatible world placement with simulated transmission.
+    pub fn world() -> Self {
+        Self {
+            placement: DirectPlacement::World,
+            geometry: DirectGeometry::SimulatedTransmission,
+            propagation: DirectPropagation::Immediate,
+        }
+    }
+
+    /// A direct path whose pose remains invariant in listener-local coordinates.
+    pub fn listener_relative(local_pose: Pose) -> Self {
+        Self {
+            placement: DirectPlacement::ListenerRelative(local_pose),
+            geometry: DirectGeometry::SimulatedTransmission,
+            propagation: DirectPropagation::Immediate,
+        }
+    }
+
+    /// No audible direct contribution. Environment routing remains an independent choice.
+    pub fn disabled() -> Self {
+        Self {
+            placement: DirectPlacement::Disabled,
+            geometry: DirectGeometry::BypassTransmission,
+            propagation: DirectPropagation::Immediate,
+        }
+    }
+
+    pub fn with_geometry(mut self, geometry: DirectGeometry) -> Self {
+        self.geometry = geometry;
+        self
+    }
+
+    pub fn with_propagation(mut self, propagation: DirectPropagation) -> Self {
+        self.propagation = propagation;
+        self
+    }
+
+    pub fn placement(self) -> DirectPlacement {
+        self.placement
+    }
+
+    pub fn geometry(self) -> DirectGeometry {
+        self.geometry
+    }
+
+    pub fn propagation(self) -> DirectPropagation {
+        self.propagation
+    }
+}
+
+impl Default for DirectPath {
+    fn default() -> Self {
+        Self::world()
+    }
+}
+
+/// Immutable acoustic origin used by one Voice's environment send.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EnvironmentOrigin {
+    /// Follow the Voice's current world-space emitter pose.
+    FollowEmitter,
+    /// Keep a world-space origin captured when the Voice is created.
+    World(Pose),
+    Disabled,
+}
+
+/// Routing from one Voice cursor into environmental responses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnvironmentSend {
+    origin: EnvironmentOrigin,
+    gain_db: f32,
+}
+
+impl EnvironmentSend {
+    /// Current-version-compatible environment routing that follows the emitter at unity gain.
+    pub fn follow_emitter() -> Self {
+        Self {
+            origin: EnvironmentOrigin::FollowEmitter,
+            gain_db: 0.0,
+        }
+    }
+
+    /// Capture an independent world-space acoustic origin for this playback Voice.
+    pub fn from_world_pose(origin: Pose) -> Self {
+        Self {
+            origin: EnvironmentOrigin::World(origin),
+            gain_db: 0.0,
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            origin: EnvironmentOrigin::Disabled,
+            gain_db: 0.0,
+        }
+    }
+
+    pub fn with_gain_db(mut self, gain_db: f32) -> Self {
+        self.gain_db = gain_db;
+        self
+    }
+
+    pub fn origin(self) -> EnvironmentOrigin {
+        self.origin
+    }
+
+    pub fn gain_db(self) -> f32 {
+        self.gain_db
+    }
+}
+
+impl Default for EnvironmentSend {
+    fn default() -> Self {
+        Self::follow_emitter()
+    }
+}
 
 /// Stable handle for one world-owned mix bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -294,6 +493,8 @@ pub struct PlayOptions {
     pub(crate) detached: bool,
     bus: Option<Bus>,
     playback_rate: f32,
+    direct_path: Option<DirectPath>,
+    environment_send: Option<EnvironmentSend>,
 }
 
 impl PlayOptions {
@@ -330,12 +531,36 @@ impl PlayOptions {
         self
     }
 
+    /// Captures direct-path routing for the new Voice without changing the reusable emitter.
+    pub fn with_direct_path(mut self, direct_path: DirectPath) -> Self {
+        self.direct_path = Some(direct_path);
+        self
+    }
+
+    /// Captures environment routing, including any fixed world origin, for the new Voice.
+    pub fn with_environment_send(mut self, environment_send: EnvironmentSend) -> Self {
+        self.environment_send = Some(environment_send);
+        self
+    }
+
     pub(crate) fn bus(self) -> Option<Bus> {
         self.bus
     }
 
     pub(crate) fn playback_rate(self) -> f32 {
         self.playback_rate
+    }
+
+    pub(crate) fn direct_path(self) -> DirectPath {
+        self.direct_path.unwrap_or_default()
+    }
+
+    pub(crate) fn environment_send(self) -> EnvironmentSend {
+        self.environment_send.unwrap_or_default()
+    }
+
+    pub(crate) fn has_spatial_routing_override(self) -> bool {
+        self.direct_path.is_some() || self.environment_send.is_some()
     }
 }
 
@@ -347,6 +572,8 @@ impl Default for PlayOptions {
             detached: false,
             bus: None,
             playback_rate: 1.0,
+            direct_path: None,
+            environment_send: None,
         }
     }
 }

@@ -14,6 +14,7 @@ A real-time safe native spatial audio library for Rust.
 - **Automatic Recovery**: Keeps logical audio state while output devices change or disappear
 - **Pull-Based Events**: Controlled completion and runtime state are observed on the caller thread
 - **Runtime Acoustics Control**: Toggle geometry-driven effects without rebuilding spatial audio
+- **Per-Voice Spatial Routing**: Give one cursor independent direct and environment semantics
 - **Multiple Audio Formats**: Support for WAV, MP3, FLAC, OGG, and more via Symphonia
 
 ## Quick Start
@@ -75,6 +76,7 @@ fn main() -> Result<(), PetalSonicError> {
             PetalSonicEvent::RuntimeStateChanged(state) => {
                 println!("audio runtime is now {state:?}");
             }
+            _ => {}
         }
     }
 
@@ -121,6 +123,18 @@ and emitter inputs from different game frames from being mixed.
 off smoothly bypasses direct transmission, early reflections, and late reverberation while native
 HRTF, distance attenuation, air absorption, playback position, and the worker lifecycle remain
 intact.
+
+### Direct Path and Environment Send
+
+Each spatial Voice has one PCM cursor and two independent routes. `DirectPath` selects world,
+listener-relative, or disabled placement, plus orthogonal geometry and propagation policies.
+`EnvironmentSend` selects a following, fixed world, or disabled acoustic origin. Both routes use
+the same decoded block; the send is not mixed as a second direct signal.
+
+See the workspace's
+[Direct Path and Environment Routing contract](../docs/direct-environment-routing.md) for the
+listener-local footstep integration, compatibility defaults, tail lifecycle, validation rules,
+and correlated telemetry.
 
 ## Architecture
 
@@ -180,12 +194,15 @@ PetalSonic uses a three-layer audio-output path plus a world-owned propagation w
 ### Playback Control
 
 - **`PlayOptions`**: One-shot or looping intent plus bus, gain, and detachment
+- **`DirectPath`**: Per-Voice direct placement, geometry, and propagation policy
+- **`EnvironmentSend`**: Per-Voice environment origin and send gain
 - **`PlaybackControl`**: Optional handle for one explicitly controlled Voice
 
 ### Events
 
 - **`PetalSonicEvent`**: Events emitted by the engine
   - `PlaybackCompleted` for controlled one-shots
+  - `VoiceFirstRendered` and `VoiceEnvironmentResponse` for opted-in spatial telemetry
 - **`RuntimeStatus` / `RuntimeDiagnostics`**: Current lifecycle state and cumulative bounded-runtime
   health counters
 

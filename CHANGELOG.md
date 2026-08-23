@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added immutable per-Voice `DirectPath` and `EnvironmentSend` routing. One PCM cursor now feeds
+  independent direct and environmental semantics, including listener-relative direct placement,
+  fixed world acoustic origins, direct disablement, and environment disablement.
+- Added orthogonal `DirectGeometry` and `DirectPropagation` policies. Local sounds can bypass
+  asynchronous transmission while retaining immediate native spatialization.
+- Added opt-in `PlayCommandId` telemetry for the first PCM render block and first matching
+  asynchronous environment response, including spatial revisions, placement/origin, geometry
+  version, and response age.
+
+### Changed
+- Acoustic propagation now tracks active Voices rather than only reusable Emitters, preserving
+  independent fixed origins for overlapping playbacks. Early reflections drain per Voice after PCM
+  completion and the shared late response continues its bounded decay.
+- Existing spatial playback defaults remain world-placed direct audio with simulated transmission
+  and an environment send that follows the Emitter.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

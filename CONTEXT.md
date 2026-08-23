@@ -28,3 +28,16 @@ One complete, versioned listener and dynamic-emitter world snapshot consumed ato
 
 **Acoustic Origin**:
 The world-space origin captured by an Environment Send. A fixed origin belongs to a Voice, not its reusable Emitter.
+
+**Direct Placement**:
+The coordinate semantics of the Direct Path: world, listener-relative, or disabled. It does not
+decide geometry transmission or propagation timing.
+
+**Direct Geometry**:
+The Direct Path's obstruction/transmission policy. It is independent of Direct Placement.
+
+**Direct Propagation**:
+The Direct Path's timing policy. `Immediate` is the currently supported model.
+
+**Play Command ID**:
+A caller-owned correlation value used only when per-Voice render telemetry is requested.

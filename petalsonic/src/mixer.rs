@@ -226,6 +226,8 @@ mod tests {
                 direct_path: crate::domain::DirectPath::default(),
                 environment_send: crate::domain::EnvironmentSend::default(),
                 play_command_id: None,
+                source_extent: crate::domain::SourceExtent::Point,
+                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
@@ -289,6 +291,8 @@ mod tests {
                 direct_path: crate::domain::DirectPath::default(),
                 environment_send: crate::domain::EnvironmentSend::default(),
                 play_command_id: None,
+                source_extent: crate::domain::SourceExtent::Point,
+                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();

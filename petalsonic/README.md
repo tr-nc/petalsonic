@@ -15,6 +15,7 @@ A real-time safe native spatial audio library for Rust.
 - **Pull-Based Events**: Controlled completion and runtime state are observed on the caller thread
 - **Runtime Acoustics Control**: Toggle geometry-driven effects without rebuilding spatial audio
 - **Per-Voice Spatial Routing**: Give one cursor independent direct and environment semantics
+- **Native Extended Sources**: Render bounded distributed power as one Voice and stable direction field
 - **Multiple Audio Formats**: Support for WAV, MP3, FLAC, OGG, and more via Symphonia
 
 ## Quick Start
@@ -135,6 +136,19 @@ See the workspace's
 listener-local footstep integration, compatibility defaults, tail lifecycle, validation rules,
 and correlated telemetry.
 
+### Extended sources
+
+`SourceExtent::WeightedSamples` gives one spatial Voice a bounded local power distribution with
+stable representative IDs. The async worker aggregates three-band transmission as energy and the
+renderer maps it to at most four deterministic, decorrelated direction lobes without duplicating
+PCM or playback cursors. Extent, route placement, and `OcclusionProfile` remain independent.
+
+Dynamic extents are published with Emitter poses in complete `SpatialFrame` revisions. Every
+accepted play captures the current extent; later frame updates do not reshape an older Voice. See
+the [Extended Source contract](../docs/extended-source-routing.md). Its independent bounded
+acoustic telemetry includes per-route stable sample IDs, normalized power, world positions, hit
+state, and the exact three-band material transmission used to compute the aggregate response.
+
 ## Architecture
 
 PetalSonic uses a three-layer audio-output path plus a world-owned propagation worker:
@@ -195,6 +209,8 @@ PetalSonic uses a three-layer audio-output path plus a world-owned propagation w
 - **`PlayOptions`**: One-shot or looping intent plus bus, gain, and detachment
 - **`DirectPath`**: Per-Voice direct placement, geometry, and propagation policy
 - **`EnvironmentSend`**: Per-Voice environment origin and send gain
+- **`SourceExtent`**: Point or bounded stable weighted representatives captured per Voice
+- **`OcclusionProfile`**: Independent exact-point or stable distributed response policy
 - **`PlaybackControl`**: Optional handle for one explicitly controlled Voice
 
 ### Events
@@ -203,6 +219,8 @@ PetalSonic uses a three-layer audio-output path plus a world-owned propagation w
   - `PlaybackCompleted` for controlled one-shots
 - **`VoiceTelemetryEvent`**: Independently drained opt-in spatial telemetry
   - `FirstRendered` and `EnvironmentResponse`, correlated by `PlayCommandId`
+- **`AcousticTelemetryEvent`**: Independently drained worker extent, route, lobe, budget, cache,
+  and discard telemetry
 - **`RuntimeStatus` / `RuntimeDiagnostics`**: Current lifecycle state and cumulative bounded-runtime
   health counters
 
@@ -224,7 +242,7 @@ let config = PetalSonicWorldDesc {
     max_voices: 128,              // Maximum simultaneous playback voices
     control_queue_capacity: 256,  // Bounded regular control queue
     lifecycle_queue_capacity: 32, // Reserved stop/destroy capacity
-    event_queue_capacity: 128,    // Bound for each lifecycle/Voice-telemetry queue
+    event_queue_capacity: 128,    // Bound for each lifecycle/telemetry queue
     timing_queue_capacity: 128,   // Bounded diagnostics queue
     spatial_quality: SpatialQuality::Balanced,
     latency_profile: LatencyProfile::Balanced,

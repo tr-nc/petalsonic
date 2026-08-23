@@ -7,6 +7,6 @@ mod processor;
 
 pub(crate) use late_reverb::LateReverbParameters;
 pub(crate) use processor::{
-    RetiredSpatialSource, SpatialProcessingMetrics, SpatialProcessor, SpatialProcessorConfig,
-    SpatialRenderContext,
+    AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessingMetrics, SpatialProcessor,
+    SpatialProcessorConfig, SpatialRenderContext,
 };

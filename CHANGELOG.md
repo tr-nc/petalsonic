@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added generic `SourceExtent::{Point, WeightedSamples}` with stable sample IDs, strict bounded
+  validation, normalized source power, and immutable per-Voice capture from complete spatial
+  frames.
+- Added `OcclusionProfile::AmbientDistributed` with configurable gain floors, attack/release,
+  Schmitt thresholds, dwell, retained-response age, and bounded lobe count.
+- Added a native one-cursor extended-source solve and renderer: energy-domain three-band
+  transmission, stable decorrelated direction lobes, bounded multi-representative early
+  reflections, shared late injection, revision-safe caching/publication, and configurable global
+  extent/ray budgets.
+- Added an independently bounded `AcousticTelemetryEvent` stream with per-route stable sample
+  observations (normalized power, world position, hit state, and three-band material
+  transmission) plus cumulative ray, cache, extent, lobe, retained, and deferred diagnostics.
 - Added immutable per-Voice `DirectPath` and `EnvironmentSend` routing. One PCM cursor now feeds
   independent direct and environmental semantics, including listener-relative direct placement,
   fixed world acoustic origins, direct disablement, and environment disablement.

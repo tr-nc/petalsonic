@@ -73,6 +73,16 @@ does not bypass HRTF, distance attenuation, or air absorption.
 Disabling a Direct Path requires `BypassTransmission`. A disabled Environment Send uses `0 dB`.
 All supplied poses and gains must be finite.
 
+`SourceExtent` is a fourth independent concern: it describes local source power, not route
+placement or obstruction policy. Both routes transform the Voice-captured extent independently.
+See the [Extended Source contract](extended-source-routing.md) for ownership, stable sample,
+energy, lobe, budget, and telemetry rules.
+
+Worker acoustic telemetry preserves this route separation: `AcousticExtentTelemetry::direct` and
+`::environment` each carry their own bounded stable-ID sample observations, world positions, hit
+states, and three-band transmission snapshots. A cache hit reuses the observation for that exact
+route; it is not reported as a miss on either route.
+
 ## Response and tail lifecycle
 
 Early reflections are owned by bounded per-Voice state. When direct PCM completes, active early

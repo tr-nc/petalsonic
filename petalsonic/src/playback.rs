@@ -13,7 +13,8 @@
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
 use crate::domain::{
-    BusParams, DirectPath, Emitter, EnvironmentOrigin, EnvironmentSend, PlayCommandId, PlaybackTag,
+    BusParams, DirectPath, Emitter, EnvironmentOrigin, EnvironmentSend, OcclusionProfile,
+    PlayCommandId, PlaybackTag, SourceExtent,
 };
 use crate::world::SourceId;
 use std::fmt;
@@ -88,6 +89,8 @@ pub(crate) struct VoiceStart {
     pub direct_path: DirectPath,
     pub environment_send: EnvironmentSend,
     pub play_command_id: Option<PlayCommandId>,
+    pub source_extent: SourceExtent,
+    pub occlusion_profile: OcclusionProfile,
     pub mono_scratch: Vec<f32>,
 }
 
@@ -104,6 +107,10 @@ pub struct PlaybackInstance {
     pub direct_path: DirectPath,
     /// Immutable environment routing captured when this Voice was created.
     pub environment_send: EnvironmentSend,
+    /// Immutable local source domain captured when this Voice was created.
+    pub source_extent: SourceExtent,
+    /// Immutable geometry-response policy, orthogonal to extent and route placement.
+    pub occlusion_profile: OcclusionProfile,
     play_command_id: Option<PlayCommandId>,
     first_render_pending: bool,
     environment_response_pending: bool,
@@ -144,6 +151,8 @@ impl PlaybackInstance {
             direct_path,
             environment_send,
             play_command_id,
+            source_extent,
+            occlusion_profile,
             mono_scratch,
         } = start;
         let total_frames = audio_data.total_frames();
@@ -156,6 +165,8 @@ impl PlaybackInstance {
             completion_tag,
             direct_path,
             environment_send,
+            source_extent,
+            occlusion_profile,
             play_command_id,
             first_render_pending: play_command_id.is_some(),
             environment_response_pending: play_command_id.is_some()
@@ -494,6 +505,8 @@ pub enum PlaybackCommand {
         direct_path: DirectPath,
         environment_send: EnvironmentSend,
         play_command_id: Option<PlayCommandId>,
+        source_extent: SourceExtent,
+        occlusion_profile: OcclusionProfile,
         mono_scratch: Vec<f32>,
     },
     PauseVoice(SourceId),
@@ -527,6 +540,8 @@ impl fmt::Debug for PlaybackCommand {
                 direct_path,
                 environment_send,
                 play_command_id,
+                source_extent,
+                occlusion_profile,
                 mono_scratch,
             } => f
                 .debug_struct("Play")
@@ -542,6 +557,8 @@ impl fmt::Debug for PlaybackCommand {
                 .field("direct_path", direct_path)
                 .field("environment_send", environment_send)
                 .field("play_command_id", play_command_id)
+                .field("source_extent", source_extent)
+                .field("occlusion_profile", occlusion_profile)
                 .field("mono_scratch_len", &mono_scratch.len())
                 .finish(),
             Self::PauseVoice(voice_id) => f.debug_tuple("PauseVoice").field(voice_id).finish(),
@@ -614,6 +631,8 @@ mod tests {
             direct_path: DirectPath::default(),
             environment_send: EnvironmentSend::default(),
             play_command_id: None,
+            source_extent: SourceExtent::Point,
+            occlusion_profile: OcclusionProfile::PointExact,
             mono_scratch: vec![0.0; 4],
         });
 
@@ -658,6 +677,8 @@ mod tests {
             direct_path: DirectPath::default(),
             environment_send: EnvironmentSend::default(),
             play_command_id: None,
+            source_extent: SourceExtent::Point,
+            occlusion_profile: OcclusionProfile::PointExact,
             mono_scratch: vec![0.0; 4],
         });
         instance.play_from_beginning();
@@ -703,6 +724,8 @@ mod tests {
             direct_path: DirectPath::default(),
             environment_send: EnvironmentSend::default(),
             play_command_id: None,
+            source_extent: SourceExtent::Point,
+            occlusion_profile: OcclusionProfile::PointExact,
             mono_scratch: vec![0.0; 256],
         });
         instance.play_from_beginning();

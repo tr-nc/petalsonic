@@ -10,8 +10,9 @@ use crate::engine::{
 };
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
-    PetalSonicEvent, RenderTimingEvent, RuntimeCounters, RuntimeDiagnostics, RuntimeState,
-    RuntimeStatus, VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
+    AcousticTelemetryDiagnostics, AcousticTelemetryEvent, PetalSonicEvent, RenderTimingEvent,
+    RuntimeCounters, RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceTelemetryDiagnostics,
+    VoiceTelemetryEvent,
 };
 use crate::math::Pose;
 use crate::playback::PlaybackCommand;
@@ -124,6 +125,12 @@ impl std::fmt::Display for SourceId {
 impl From<u64> for SourceId {
     fn from(value: u64) -> Self {
         Self(value)
+    }
+}
+
+impl SourceId {
+    pub(crate) fn value(self) -> u64 {
+        self.0
     }
 }
 
@@ -275,7 +282,9 @@ impl EmitterRegistry {
         }
 
         for spatial in frame.emitters() {
-            self.get_mut(spatial.emitter)?.desc.set_pose(spatial.pose);
+            let desc = &mut self.get_mut(spatial.emitter)?.desc;
+            desc.set_pose(spatial.pose);
+            desc.set_extent(spatial.extent().clone());
         }
         Ok(())
     }
@@ -300,7 +309,7 @@ pub struct PetalSonicWorld {
     spatial_sim_time_bits: AtomicU64,
     acoustic_propagation: AcousticPropagation,
     acoustic_response_retirement_receiver: Receiver<Arc<AcousticResponse>>,
-    acoustic_scene_version: AtomicU64,
+    acoustic_scene_version: Arc<AtomicU64>,
     environmental_acoustics_enabled: Arc<AtomicBool>,
     command_sender: Sender<PlaybackCommand>,
     lifecycle_sender: Sender<PlaybackCommand>,
@@ -310,6 +319,7 @@ pub struct PetalSonicWorld {
     active_output_device: Arc<Mutex<Option<String>>>,
     event_receiver: Receiver<PetalSonicEvent>,
     voice_telemetry_receiver: Receiver<VoiceTelemetryEvent>,
+    acoustic_telemetry_receiver: Receiver<AcousticTelemetryEvent>,
     timing_receiver: Receiver<RenderTimingEvent>,
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
@@ -337,23 +347,28 @@ impl PetalSonicWorld {
         let (spatial_retirement_sender, spatial_retirement_receiver) =
             crossbeam_channel::bounded(1);
         let initial_acoustic_scene = config.acoustic_scene.clone().map(Arc::new);
-        let acoustic_scene_version = initial_acoustic_scene
-            .as_ref()
-            .map(|scene| scene.version())
-            .unwrap_or(0);
+        let acoustic_scene_version = Arc::new(AtomicU64::new(
+            initial_acoustic_scene
+                .as_ref()
+                .map(|scene| scene.version())
+                .unwrap_or(0),
+        ));
         let environmental_acoustics_enabled =
             Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
         let acoustic_propagation = AcousticPropagation::new(
             config.distance_scaler,
             environmental_acoustics_enabled.clone(),
             config.environmental_acoustics_quality,
+            config.environmental_acoustics_budget,
             config.max_voices,
+            config.event_queue_capacity,
         )
         .map_err(|error| {
             PetalSonicError::Engine(format!(
                 "Failed to start acoustic propagation worker: {error}"
             ))
         })?;
+        let acoustic_telemetry_receiver = acoustic_propagation.telemetry_receiver();
         if let Some(scene) = initial_acoustic_scene {
             acoustic_propagation.publish_scene(scene).map_err(|_| {
                 PetalSonicError::Engine("Failed to publish initial acoustic scene".into())
@@ -377,6 +392,7 @@ impl PetalSonicWorld {
             latest_acoustic_response: acoustic_propagation.latest_response_slot(),
             acoustic_response_retirement_sender,
             acoustic_voice_input: acoustic_propagation.voice_input(),
+            acoustic_scene_version: acoustic_scene_version.clone(),
             environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
             ports,
         };
@@ -416,7 +432,7 @@ impl PetalSonicWorld {
             spatial_sim_time_bits: AtomicU64::new(0.0f64.to_bits()),
             acoustic_propagation,
             acoustic_response_retirement_receiver,
-            acoustic_scene_version: AtomicU64::new(acoustic_scene_version),
+            acoustic_scene_version,
             environmental_acoustics_enabled,
             command_sender,
             lifecycle_sender,
@@ -426,6 +442,7 @@ impl PetalSonicWorld {
             active_output_device: active_device_name,
             event_receiver,
             voice_telemetry_receiver,
+            acoustic_telemetry_receiver,
             timing_receiver,
             runtime_state,
             recovery_attempts,
@@ -643,6 +660,23 @@ impl PetalSonicWorld {
                 reason: "must be finite and in the inclusive range 0.0..=1.0".into(),
             });
         }
+        for (field, value) in [
+            (
+                "environmental_acoustics_budget.max_processed_extents",
+                config.environmental_acoustics_budget.max_processed_extents,
+            ),
+            (
+                "environmental_acoustics_budget.max_direct_rays",
+                config.environmental_acoustics_budget.max_direct_rays,
+            ),
+        ] {
+            if value == 0 {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field,
+                    reason: "must be greater than zero".into(),
+                });
+            }
+        }
         if config.buses.len() > config.max_buses {
             return Err(PetalSonicError::CapacityExceeded {
                 resource: "bus",
@@ -681,6 +715,7 @@ impl PetalSonicWorld {
 
     pub fn create_emitter(&self, clip: ResidentClip, desc: EmitterDesc) -> Result<Emitter> {
         self.ensure_open()?;
+        Self::validate_emitter_desc(&desc)?;
         self.validate_optional_bus(desc.bus())?;
         let clip = self.prepare_clip(clip)?;
         self.emitters
@@ -699,6 +734,7 @@ impl PetalSonicWorld {
     }
 
     pub fn update_emitter(&self, emitter: Emitter, desc: EmitterDesc) -> Result<()> {
+        Self::validate_emitter_desc(&desc)?;
         self.validate_optional_bus(desc.bus())?;
         let bus_index = self.resolve_bus(desc.bus())?;
         let mut emitters = self
@@ -710,6 +746,12 @@ impl PetalSonicWorld {
             return Err(PetalSonicError::InvalidConfiguration {
                 field: "emitter_desc",
                 reason: "spatial placement cannot change after emitter creation".into(),
+            });
+        }
+        if state.desc.extent() != desc.extent() {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "emitter_desc.extent",
+                reason: "extent changes must be published in a complete SpatialFrame".into(),
             });
         }
         self.try_send(PlaybackCommand::UpdateEmitter(
@@ -754,6 +796,15 @@ impl PetalSonicWorld {
                 field: "spatial_frame.emitters.acoustic_priority",
                 reason: "must be finite and non-negative".into(),
             });
+        }
+        Self::validate_route_pose("spatial_frame.listener", frame.listener())?;
+        for emitter in frame.emitters() {
+            Self::validate_route_pose("spatial_frame.emitters.pose", emitter.pose)?;
+            Self::validate_extent_pose(
+                "spatial_frame.emitters.extent",
+                emitter.pose,
+                emitter.extent(),
+            )?;
         }
         let mut latest = self
             .latest_spatial_frame
@@ -872,6 +923,29 @@ impl PetalSonicWorld {
         let state = self.emitter_state(emitter)?;
         Self::validate_playback_rate(options.playback_rate())?;
         Self::validate_spatial_routing(state.desc.is_spatial(), options)?;
+        let total_gain_db = state.desc.gain_db() + options.gain_db;
+        if !options.gain_db.is_finite() || !total_gain_db.is_finite() {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "play_options.gain_db",
+                reason: "Voice and combined emitter gain must be finite".into(),
+            });
+        }
+        if let crate::domain::DirectPlacement::ListenerRelative(pose) =
+            options.direct_path().placement()
+        {
+            Self::validate_extent_pose(
+                "play_options.direct_path.listener_relative",
+                pose,
+                state.desc.extent(),
+            )?;
+        }
+        if let crate::domain::EnvironmentOrigin::World(pose) = options.environment_send().origin() {
+            Self::validate_extent_pose(
+                "play_options.environment_send.origin",
+                pose,
+                state.desc.extent(),
+            )?;
+        }
         let bus_index = self.resolve_bus(options.bus().or(state.desc.bus()))?;
         self.reserve_voice()?;
         let voice_id = SourceId(self.next_voice_id.fetch_add(1, Ordering::Relaxed));
@@ -906,6 +980,8 @@ impl PetalSonicWorld {
             direct_path: options.direct_path(),
             environment_send: options.environment_send(),
             play_command_id: options.play_command_id(),
+            source_extent: state.desc.extent().clone(),
+            occlusion_profile: options.occlusion_profile(state.desc.occlusion_profile()),
             mono_scratch: vec![0.0; self.desc.block_size],
         };
         if let Err(error) = self.try_send(command) {
@@ -1135,6 +1211,33 @@ impl PetalSonicWorld {
         Ok(())
     }
 
+    fn validate_emitter_desc(desc: &EmitterDesc) -> Result<()> {
+        if !desc.gain_db().is_finite() {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "emitter_desc.gain_db",
+                reason: "must be finite".into(),
+            });
+        }
+        match desc.pose() {
+            Some(pose) => {
+                Self::validate_route_pose("emitter_desc.pose", pose)?;
+                Self::validate_extent_pose("emitter_desc.extent", pose, desc.extent())
+            }
+            None if !matches!(desc.extent(), crate::domain::SourceExtent::Point)
+                || !matches!(
+                    desc.occlusion_profile(),
+                    crate::domain::OcclusionProfile::PointExact
+                ) =>
+            {
+                Err(PetalSonicError::InvalidConfiguration {
+                    field: "emitter_desc.extent",
+                    reason: "source extent and occlusion profile require a spatial emitter".into(),
+                })
+            }
+            None => Ok(()),
+        }
+    }
+
     fn validate_route_pose(field: &'static str, pose: Pose) -> Result<()> {
         let rotation_length_squared = pose.rotation.length_squared();
         if !pose.position.is_finite()
@@ -1145,6 +1248,24 @@ impl PetalSonicWorld {
             return Err(PetalSonicError::InvalidConfiguration {
                 field,
                 reason: "position and rotation must be finite, with a non-zero rotation".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_extent_pose(
+        field: &'static str,
+        pose: Pose,
+        extent: &crate::domain::SourceExtent,
+    ) -> Result<()> {
+        if let Some(weighted) = extent.weighted()
+            && weighted.samples().iter().any(|sample| {
+                !(pose.position + pose.rotation * sample.local_position()).is_finite()
+            })
+        {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field,
+                reason: "extent samples must remain finite after pose transformation".into(),
             });
         }
         Ok(())
@@ -1287,6 +1408,16 @@ impl PetalSonicWorld {
             acoustic_solve_time_p99_us: acoustics.solve_time_p99_us,
             acoustic_solve_time_max_us: acoustics.solve_time_max_us,
             acoustic_response_age_ms: acoustics.response_age_ms,
+            acoustic_direct_ray_count: acoustics.direct_ray_count,
+            acoustic_sample_cache_hit_count: acoustics.cache_hit_count,
+            acoustic_processed_extent_count: acoustics.processed_extent_count,
+            acoustic_lobe_count: acoustics.lobe_count,
+            acoustic_retained_response_count: acoustics.retained_response_count,
+            acoustic_deferred_response_count: acoustics.deferred_response_count,
+            acoustic_render_rejected_response_count: self
+                .counters
+                .acoustic_render_rejected_responses
+                .load(Ordering::Relaxed),
             device_generation: self.counters.device_generation.load(Ordering::Relaxed),
             recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
             output_sample_rate: self.counters.output_sample_rate.load(Ordering::Relaxed) as u32,
@@ -1338,6 +1469,21 @@ impl PetalSonicWorld {
                 .counters
                 .dropped_voice_telemetry
                 .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Drains worker-side source-extent telemetry without consuming Voice or lifecycle events.
+    pub fn drain_acoustic_telemetry(&self) -> Vec<AcousticTelemetryEvent> {
+        self.acoustic_telemetry_receiver.try_iter().collect()
+    }
+
+    /// Reports pressure on the independently bounded acoustics telemetry queue.
+    pub fn acoustic_telemetry_diagnostics(&self) -> AcousticTelemetryDiagnostics {
+        let (queue_high_water, dropped_events) = self.acoustic_propagation.telemetry_pressure();
+        AcousticTelemetryDiagnostics {
+            queue_depth: self.acoustic_telemetry_receiver.len(),
+            queue_high_water,
+            dropped_events,
         }
     }
 
@@ -1627,6 +1773,23 @@ mod tests {
                     ..
                 })
             ));
+        }
+
+        for environmental_acoustics_budget in [
+            crate::config::EnvironmentalAcousticsBudget {
+                max_processed_extents: 0,
+                ..Default::default()
+            },
+            crate::config::EnvironmentalAcousticsBudget {
+                max_direct_rays: 0,
+                ..Default::default()
+            },
+        ] {
+            let desc = crate::config::PetalSonicWorldDesc {
+                environmental_acoustics_budget,
+                ..Default::default()
+            };
+            assert!(PetalSonicWorld::validate_config(&desc).is_err());
         }
 
         let desc = crate::config::PetalSonicWorldDesc {
@@ -2392,5 +2555,38 @@ mod tests {
         );
         registry.apply_spatial_frame(&complete).unwrap();
         assert_eq!(registry.get(first).unwrap().desc.pose(), Some(moved));
+    }
+
+    #[test]
+    fn emitter_and_spatial_frame_poses_require_finite_nonzero_rotations() {
+        use crate::math::{Quat, Vec3};
+
+        assert!(
+            PetalSonicWorld::validate_emitter_desc(&EmitterDesc::spatial(Pose::from_position(
+                Vec3::splat(f32::NAN)
+            )))
+            .is_err()
+        );
+        assert!(
+            PetalSonicWorld::validate_route_pose(
+                "spatial_frame.listener",
+                Pose::from_rotation(Quat::from_xyzw(0.0, 0.0, 0.0, 0.0)),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn non_spatial_emitters_reject_source_extent_semantics() {
+        use crate::domain::{ExtentSample, ExtentSampleId, SourceExtent};
+
+        let extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::ZERO, 1.0).unwrap(),
+        ])
+        .unwrap();
+        assert!(
+            PetalSonicWorld::validate_emitter_desc(&EmitterDesc::non_spatial().with_extent(extent))
+                .is_err()
+        );
     }
 }

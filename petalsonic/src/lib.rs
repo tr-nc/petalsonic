@@ -99,7 +99,7 @@ pub use domain::{
 pub use error::PetalSonicError;
 pub use events::{
     EnvironmentResponse, PetalSonicEvent, RenderTimingEvent, RuntimeDiagnostics, RuntimeState,
-    RuntimeStatus, VoiceFirstRenderTelemetry,
+    RuntimeStatus, VoiceFirstRenderTelemetry, VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
 };
 pub use math::{Pose, Quat, Vec3};
 pub use world::PetalSonicWorld;

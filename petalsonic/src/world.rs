@@ -11,7 +11,7 @@ use crate::engine::{
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
     PetalSonicEvent, RenderTimingEvent, RuntimeCounters, RuntimeDiagnostics, RuntimeState,
-    RuntimeStatus,
+    RuntimeStatus, VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
 };
 use crate::math::Pose;
 use crate::playback::PlaybackCommand;
@@ -309,6 +309,7 @@ pub struct PetalSonicWorld {
     underrun_count: Arc<AtomicUsize>,
     active_output_device: Arc<Mutex<Option<String>>>,
     event_receiver: Receiver<PetalSonicEvent>,
+    voice_telemetry_receiver: Receiver<VoiceTelemetryEvent>,
     timing_receiver: Receiver<RenderTimingEvent>,
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
@@ -384,6 +385,7 @@ impl PetalSonicWorld {
             underrun_count,
             active_device_name,
             event_receiver,
+            voice_telemetry_receiver,
             timing_receiver,
             counters,
         } = observability;
@@ -423,6 +425,7 @@ impl PetalSonicWorld {
             underrun_count,
             active_output_device: active_device_name,
             event_receiver,
+            voice_telemetry_receiver,
             timing_receiver,
             runtime_state,
             recovery_attempts,
@@ -1316,6 +1319,26 @@ impl PetalSonicWorld {
             }
         }
         events
+    }
+
+    /// Drains opt-in per-Voice render telemetry without consuming lifecycle events.
+    pub fn drain_voice_telemetry(&self) -> Vec<VoiceTelemetryEvent> {
+        self.voice_telemetry_receiver.try_iter().collect()
+    }
+
+    /// Reports pressure on the independently bounded Voice telemetry queue.
+    pub fn voice_telemetry_diagnostics(&self) -> VoiceTelemetryDiagnostics {
+        VoiceTelemetryDiagnostics {
+            queue_depth: self.voice_telemetry_receiver.len(),
+            queue_high_water: self
+                .counters
+                .voice_telemetry_queue_high_water
+                .load(Ordering::Relaxed),
+            dropped_events: self
+                .counters
+                .dropped_voice_telemetry
+                .load(Ordering::Relaxed),
+        }
     }
 
     fn drain_retired_controls(&self) {

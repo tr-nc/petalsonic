@@ -10,7 +10,7 @@ use crate::acoustic_propagation::{AcousticResponse, MAX_EARLY_REFLECTION_TAPS};
 use crate::config::SourceConfig;
 use crate::domain::{DirectGeometry, DirectPlacement, EnvironmentOrigin};
 use crate::error::{PetalSonicError, Result};
-use crate::events::{PetalSonicEvent, VoiceFirstRenderTelemetry};
+use crate::events::{VoiceFirstRenderTelemetry, VoiceTelemetryEvent};
 use crate::gain;
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackInstance;
@@ -497,7 +497,7 @@ impl SpatialProcessor {
         instances: &mut HashMap<SourceId, PlaybackInstance>,
         output_buffer: &mut [f32],
         render_context: SpatialRenderContext,
-        events: &mut Vec<PetalSonicEvent>,
+        events: &mut Vec<VoiceTelemetryEvent>,
     ) -> Result<SpatialProcessingMetrics> {
         self.capture_environmental_acoustics_state();
 
@@ -641,7 +641,7 @@ impl SpatialProcessor {
         source_id: SourceId,
         instance: &mut PlaybackInstance,
         render_context: SpatialRenderContext,
-        events: &mut Vec<PetalSonicEvent>,
+        events: &mut Vec<VoiceTelemetryEvent>,
     ) -> Result<SourceProcessingMetrics> {
         // Get spatial configuration (position + per-source volume)
         let emitter_position = match &instance.config {
@@ -768,7 +768,7 @@ impl SpatialProcessor {
         emitter_position: Vec3,
         direct_local_position: Option<Vec3>,
         render_context: SpatialRenderContext,
-        events: &mut Vec<PetalSonicEvent>,
+        events: &mut Vec<VoiceTelemetryEvent>,
     ) {
         let environment_response = self
             .acoustic_response
@@ -785,7 +785,7 @@ impl SpatialProcessor {
                 EnvironmentOrigin::World(origin) => Some(origin),
                 EnvironmentOrigin::Disabled => None,
             };
-            events.push(PetalSonicEvent::VoiceFirstRendered(
+            events.push(VoiceTelemetryEvent::FirstRendered(
                 VoiceFirstRenderTelemetry {
                     play_command_id,
                     emitter: instance.emitter,
@@ -804,7 +804,7 @@ impl SpatialProcessor {
             instance.pending_environment_response_id(),
             environment_response,
         ) {
-            events.push(PetalSonicEvent::VoiceEnvironmentResponse {
+            events.push(VoiceTelemetryEvent::EnvironmentResponse {
                 play_command_id,
                 response,
             });
@@ -1434,7 +1434,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events.len(), 1);
-        let PetalSonicEvent::VoiceFirstRendered(first) = events[0] else {
+        let VoiceTelemetryEvent::FirstRendered(first) = events[0] else {
             panic!("expected first-render telemetry");
         };
         assert_eq!(first.play_command_id, play_command_id);
@@ -1472,7 +1472,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events.len(), 1);
-        let PetalSonicEvent::VoiceEnvironmentResponse {
+        let VoiceTelemetryEvent::EnvironmentResponse {
             play_command_id: response_id,
             response,
         } = events[0]

@@ -76,7 +76,6 @@ fn main() -> Result<(), PetalSonicError> {
             PetalSonicEvent::RuntimeStateChanged(state) => {
                 println!("audio runtime is now {state:?}");
             }
-            _ => {}
         }
     }
 
@@ -202,7 +201,8 @@ PetalSonic uses a three-layer audio-output path plus a world-owned propagation w
 
 - **`PetalSonicEvent`**: Events emitted by the engine
   - `PlaybackCompleted` for controlled one-shots
-  - `VoiceFirstRendered` and `VoiceEnvironmentResponse` for opted-in spatial telemetry
+- **`VoiceTelemetryEvent`**: Independently drained opt-in spatial telemetry
+  - `FirstRendered` and `EnvironmentResponse`, correlated by `PlayCommandId`
 - **`RuntimeStatus` / `RuntimeDiagnostics`**: Current lifecycle state and cumulative bounded-runtime
   health counters
 
@@ -224,7 +224,7 @@ let config = PetalSonicWorldDesc {
     max_voices: 128,              // Maximum simultaneous playback voices
     control_queue_capacity: 256,  // Bounded regular control queue
     lifecycle_queue_capacity: 32, // Reserved stop/destroy capacity
-    event_queue_capacity: 128,    // Bounded pull-event queue
+    event_queue_capacity: 128,    // Bound for each lifecycle/Voice-telemetry queue
     timing_queue_capacity: 128,   // Bounded diagnostics queue
     spatial_quality: SpatialQuality::Balanced,
     latency_profile: LatencyProfile::Balanced,

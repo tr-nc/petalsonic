@@ -13,9 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed world acoustic origins, direct disablement, and environment disablement.
 - Added orthogonal `DirectGeometry` and `DirectPropagation` policies. Local sounds can bypass
   asynchronous transmission while retaining immediate native spatialization.
-- Added opt-in `PlayCommandId` telemetry for the first PCM render block and first matching
-  asynchronous environment response, including spatial revisions, placement/origin, geometry
-  version, and response age.
+- Added an independently bounded, opt-in `VoiceTelemetryEvent` stream correlated by
+  `PlayCommandId`. It reports the first PCM render block and first matching asynchronous
+  environment response, including spatial revisions, placement/origin, geometry version, and
+  response age without extending the existing lifecycle-event enum.
 
 ### Changed
 - Acoustic propagation now tracks active Voices rather than only reusable Emitters, preserving

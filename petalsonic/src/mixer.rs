@@ -1,7 +1,7 @@
 // Mixer module - handles mixing of audio sources
 // This contains the mixing logic for both spatial and non-spatial sources
 
-use crate::events::PetalSonicEvent;
+use crate::events::VoiceTelemetryEvent;
 use crate::playback::{PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor, SpatialRenderContext};
 use crate::world::SourceId;
@@ -22,7 +22,7 @@ pub struct MixerScratch {
     spatial_ids: Vec<SourceId>,
     muted_spatial_ids: Vec<SourceId>,
     non_spatial_ids: Vec<SourceId>,
-    voice_events: Vec<PetalSonicEvent>,
+    voice_telemetry: Vec<VoiceTelemetryEvent>,
 }
 
 impl MixerScratch {
@@ -31,12 +31,14 @@ impl MixerScratch {
             spatial_ids: Vec::with_capacity(max_voices),
             muted_spatial_ids: Vec::with_capacity(max_voices),
             non_spatial_ids: Vec::with_capacity(max_voices),
-            voice_events: Vec::with_capacity(max_voices.saturating_mul(2)),
+            voice_telemetry: Vec::with_capacity(max_voices.saturating_mul(2)),
         }
     }
 
-    pub(crate) fn drain_voice_events(&mut self) -> impl Iterator<Item = PetalSonicEvent> + '_ {
-        self.voice_events.drain(..)
+    pub(crate) fn drain_voice_telemetry(
+        &mut self,
+    ) -> impl Iterator<Item = VoiceTelemetryEvent> + '_ {
+        self.voice_telemetry.drain(..)
     }
 }
 
@@ -67,7 +69,7 @@ pub fn mix_playback_instances_with_metrics(
     scratch.spatial_ids.clear();
     scratch.muted_spatial_ids.clear();
     scratch.non_spatial_ids.clear();
-    scratch.voice_events.clear();
+    scratch.voice_telemetry.clear();
 
     let output_frames = world_buffer.len() / channels.max(1) as usize;
     for (source_id, instance) in active_playback.iter_mut() {
@@ -120,7 +122,7 @@ pub fn mix_playback_instances_with_metrics(
                 &mut active_playback,
                 world_buffer,
                 render_context,
-                &mut scratch.voice_events,
+                &mut scratch.voice_telemetry,
             ) {
                 profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
                 profiling.spatial_metrics = Some(metrics);

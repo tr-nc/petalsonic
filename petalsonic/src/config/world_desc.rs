@@ -57,7 +57,7 @@ pub struct PetalSonicWorldDesc {
     /// This queue is independent from regular control traffic so overload cannot
     /// consume the capacity needed to retire voices and emitters.
     pub lifecycle_queue_capacity: usize,
-    /// Capacity of the bounded event queue.
+    /// Capacity of each bounded pull-event queue (lifecycle and opt-in Voice telemetry).
     pub event_queue_capacity: usize,
     /// Capacity of the bounded timing/diagnostics queue.
     pub timing_queue_capacity: usize,

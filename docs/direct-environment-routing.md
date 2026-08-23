@@ -84,15 +84,19 @@ cursor alive or decodes the clip again.
 ## Correlated telemetry
 
 Telemetry is opt-in through `PlayOptions::with_play_command_id`. The caller owns ID uniqueness.
-PetalSonic emits:
+PetalSonic exposes these through `PetalSonicWorld::drain_voice_telemetry`, independently of
+existing lifecycle events:
 
-- `VoiceFirstRendered` when the spatial Voice first advances its PCM cursor in an active render
-  pass. It reports the render-block index, current complete `SpatialFrame` revision, listener-local
-  direct pose, captured world acoustic origin, and any response already available for that Voice.
-- `VoiceEnvironmentResponse` once if the first matching asynchronous response arrives later. It
-  reports the response's spatial revision, geometry version, and age when observed by rendering.
+- `VoiceTelemetryEvent::FirstRendered` when the spatial Voice first advances its PCM cursor in an
+  active render pass. It reports the render-block index, current complete `SpatialFrame` revision,
+  listener-local direct pose, captured world acoustic origin, and any response already available
+  for that Voice.
+- `VoiceTelemetryEvent::EnvironmentResponse` once if the first matching asynchronous response
+  arrives later. It reports the response's spatial revision, geometry version, and age when
+  observed by rendering.
 
-If a matching response exists on the first render block, it is embedded in `VoiceFirstRendered`
-and no second response event is emitted. Events use the world's bounded event queue; consumers that
-depend on telemetry should size `event_queue_capacity`, drain regularly, and monitor
-`RuntimeDiagnostics::dropped_events`.
+If a matching response exists on the first render block, it is embedded in `FirstRendered` and no
+second response event is emitted. Telemetry uses a separate queue bounded by
+`event_queue_capacity`; consumers should drain it regularly and monitor
+`PetalSonicWorld::voice_telemetry_diagnostics`. Keeping the stream separate preserves exhaustive
+matches over the pre-existing `PetalSonicEvent` lifecycle API.

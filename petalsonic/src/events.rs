@@ -71,9 +71,11 @@ pub(crate) struct RuntimeCounters {
     pub(crate) control_queue_high_water: AtomicUsize,
     pub(crate) lifecycle_queue_high_water: AtomicUsize,
     pub(crate) event_queue_high_water: AtomicUsize,
+    pub(crate) voice_telemetry_queue_high_water: AtomicUsize,
     pub(crate) timing_queue_high_water: AtomicUsize,
     pub(crate) rejected_commands: AtomicU64,
     pub(crate) dropped_events: AtomicU64,
+    pub(crate) dropped_voice_telemetry: AtomicU64,
     pub(crate) dropped_timing_events: AtomicU64,
     pub(crate) device_generation: AtomicU64,
     pub(crate) output_sample_rate: AtomicUsize,
@@ -88,9 +90,11 @@ impl Default for RuntimeCounters {
             control_queue_high_water: AtomicUsize::new(0),
             lifecycle_queue_high_water: AtomicUsize::new(0),
             event_queue_high_water: AtomicUsize::new(0),
+            voice_telemetry_queue_high_water: AtomicUsize::new(0),
             timing_queue_high_water: AtomicUsize::new(0),
             rejected_commands: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
+            dropped_voice_telemetry: AtomicU64::new(0),
             dropped_timing_events: AtomicU64::new(0),
             device_generation: AtomicU64::new(0),
             output_sample_rate: AtomicUsize::new(0),
@@ -230,7 +234,6 @@ pub struct VoiceFirstRenderTelemetry {
     pub environment_response: Option<EnvironmentResponse>,
 }
 
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PetalSonicEvent {
     /// A controlled one-shot reached its natural end.
@@ -241,13 +244,31 @@ pub enum PetalSonicEvent {
     },
     /// The output runtime entered a different lifecycle state.
     RuntimeStateChanged(RuntimeState),
+}
+
+/// Opt-in per-Voice spatial telemetry, kept separate from lifecycle events for source
+/// compatibility and independent bounded consumption.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VoiceTelemetryEvent {
     /// An opted-in spatial Voice advanced its PCM cursor for the first time.
-    VoiceFirstRendered(VoiceFirstRenderTelemetry),
+    FirstRendered(VoiceFirstRenderTelemetry),
     /// The opted-in Voice first received an asynchronous environment response.
-    VoiceEnvironmentResponse {
+    EnvironmentResponse {
         play_command_id: PlayCommandId,
         response: EnvironmentResponse,
     },
+}
+
+/// Current pressure on the independently bounded per-Voice telemetry queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceTelemetryDiagnostics {
+    /// Events currently waiting for the caller.
+    pub queue_depth: usize,
+    /// Maximum observed queue depth since World creation.
+    pub queue_high_water: usize,
+    /// Events rejected because the queue was full or disconnected.
+    pub dropped_events: u64,
 }
 
 #[cfg(test)]

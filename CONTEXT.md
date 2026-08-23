@@ -8,8 +8,21 @@ PetalSonic owns playback progress and turns immutable resident audio into bounde
 A reusable logical sound origin and its low-frequency defaults. It is not an individual playback or acoustic event.
 
 **Voice**:
-One playback of a Resident Clip with its own cursor, immutable spatial routing, and lifecycle.
+One playback of a Resident Clip with its own cursor, immutable spatial routing, captured source
+extent and occlusion policy, and lifecycle.
 _Avoid_: Source, playback instance
+
+**Source Extent**:
+The finite local domain over which one Voice's source power is distributed. It is Point or bounded
+stable weighted representatives, never a collection of playback Voices.
+
+**Occlusion Profile**:
+The policy that converts sampled material transmission into direct/environment gains and optional
+stable classification. It is independent of Source Extent and route placement.
+
+**Direction Field**:
+The bounded set of energy-normalized direct lobes rendered from one extended Voice and one decoded
+PCM block.
 
 **Direct Path**:
 The audible source-to-listener contribution, with independent placement, geometry, and propagation semantics.
@@ -24,7 +37,8 @@ The bounded early-reflection and late-tail contribution produced from Environmen
 _Avoid_: Wet signal
 
 **Spatial Frame**:
-One complete, versioned listener and dynamic-emitter world snapshot consumed atomically by rendering and acoustics.
+One complete, versioned listener and dynamic-emitter pose/extent snapshot consumed atomically by
+rendering and acoustics.
 
 **Acoustic Origin**:
 The world-space origin captured by an Environment Send. A fixed origin belongs to a Voice, not its reusable Emitter.

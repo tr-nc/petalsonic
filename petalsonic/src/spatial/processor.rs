@@ -1307,60 +1307,69 @@ mod tests {
 
     #[test]
     fn split_routing_advances_one_cursor_and_never_adds_a_second_direct_copy() {
-        let source_id = SourceId::from(3);
-        let emitter = Emitter {
-            world_id: 1,
-            index: 0,
-            generation: 1,
-        };
-        let audio = Arc::new(PetalSonicAudioData::new(
-            vec![1.0; 32],
-            48_000,
-            1,
-            Duration::from_secs_f64(32.0 / 48_000.0),
-        ));
-        let mut voice = PlaybackInstance::from_source(VoiceStart {
-            emitter,
-            audio_data: audio,
-            config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
-            loop_mode: LoopMode::Once,
-            bus_index: 0,
-            playback_rate: 1.0,
-            detached: false,
-            completion_tag: None,
-            direct_path: DirectPath::listener_relative(Pose::from_position(-Vec3::Y * 0.08))
-                .with_geometry(DirectGeometry::BypassTransmission),
-            environment_send: EnvironmentSend::from_world_pose(Pose::from_position(Vec3::X)),
-            play_command_id: None,
-            mono_scratch: vec![0.0; 8],
-        });
-        voice.play_from_beginning();
-        voice.set_mix_parameters(crate::domain::BusParams::default());
-        let mut voices = HashMap::from([(source_id, voice)]);
-        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
-            sample_rate: 48_000,
-            frame_size: 8,
-            max_voices: 1,
-            distance_scaler: 1.0,
-            native_hrtf_path: None,
-            hrtf_gain: 0.0,
-            use_ambisonics: false,
-            environmental_acoustics_enabled: Arc::new(AtomicBool::new(false)),
-        })
-        .unwrap();
-        let mut output = [0.0; 16];
-        processor
-            .process_spatial_sources_with_metrics(
-                &[source_id],
-                &mut voices,
-                &mut output,
-                SpatialRenderContext::default(),
-                &mut Vec::new(),
-            )
+        fn render_once(environment_send: EnvironmentSend) -> ([f32; 16], usize) {
+            let source_id = SourceId::from(3);
+            let audio = Arc::new(PetalSonicAudioData::new(
+                (1..=32).map(|sample| sample as f32 / 32.0).collect(),
+                48_000,
+                1,
+                Duration::from_secs_f64(32.0 / 48_000.0),
+            ));
+            let mut voice = PlaybackInstance::from_source(VoiceStart {
+                emitter: Emitter {
+                    world_id: 1,
+                    index: 0,
+                    generation: 1,
+                },
+                audio_data: audio,
+                config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
+                loop_mode: LoopMode::Once,
+                bus_index: 0,
+                playback_rate: 1.0,
+                detached: false,
+                completion_tag: None,
+                direct_path: DirectPath::listener_relative(Pose::from_position(Vec3::X))
+                    .with_geometry(DirectGeometry::BypassTransmission),
+                environment_send,
+                play_command_id: None,
+                mono_scratch: vec![0.0; 8],
+            });
+            voice.play_from_beginning();
+            voice.set_mix_parameters(crate::domain::BusParams::default());
+            let mut voices = HashMap::from([(source_id, voice)]);
+            let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+                sample_rate: 48_000,
+                frame_size: 8,
+                max_voices: 1,
+                distance_scaler: 1.0,
+                native_hrtf_path: None,
+                hrtf_gain: 0.0,
+                use_ambisonics: false,
+                environmental_acoustics_enabled: Arc::new(AtomicBool::new(false)),
+            })
             .unwrap();
+            let mut output = [0.0; 16];
+            processor
+                .process_spatial_sources_with_metrics(
+                    &[source_id],
+                    &mut voices,
+                    &mut output,
+                    SpatialRenderContext::default(),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            (output, voices[&source_id].info.current_frame)
+        }
 
-        assert_eq!(voices[&source_id].info.current_frame, 8);
-        assert!(output.iter().any(|sample| sample.abs() > 0.0));
+        let (split_output, split_cursor) = render_once(EnvironmentSend::from_world_pose(
+            Pose::from_position(Vec3::X),
+        ));
+        let (direct_only_output, direct_only_cursor) = render_once(EnvironmentSend::disabled());
+
+        assert_eq!(split_cursor, 8);
+        assert_eq!(direct_only_cursor, 8);
+        assert_eq!(split_output, direct_only_output);
+        assert!(split_output.iter().any(|sample| sample.abs() > 0.0));
     }
 
     #[test]
@@ -1845,5 +1854,132 @@ mod tests {
                 .iter()
                 .all(|sample| sample.is_finite())
         );
+    }
+
+    #[test]
+    #[ignore = "release-mode performance probe"]
+    fn split_direct_environment_routing_release_budget() {
+        use std::hint::black_box;
+
+        const SAMPLE_RATE: u32 = 48_000;
+        const FRAMES: usize = 1_024;
+        const VOICES: usize = 8;
+        const BLOCKS: usize = 1_000;
+        let source_ids: Vec<_> = (1..=VOICES)
+            .map(|voice| SourceId::from(voice as u64))
+            .collect();
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.1 / VOICES as f32; FRAMES],
+            SAMPLE_RATE,
+            1,
+            Duration::from_secs_f64(FRAMES as f64 / SAMPLE_RATE as f64),
+        ));
+        let mut voices = source_ids
+            .iter()
+            .enumerate()
+            .map(|(index, source_id)| {
+                let mut voice = PlaybackInstance::from_source(VoiceStart {
+                    emitter: Emitter {
+                        world_id: 1,
+                        index: index as u32,
+                        generation: 1,
+                    },
+                    audio_data: audio.clone(),
+                    config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
+                    loop_mode: LoopMode::Infinite,
+                    bus_index: 0,
+                    playback_rate: 1.0,
+                    detached: false,
+                    completion_tag: None,
+                    direct_path: DirectPath::listener_relative(Pose::from_position(Vec3::new(
+                        index as f32 * 0.02 - 0.07,
+                        -0.08,
+                        0.2,
+                    )))
+                    .with_geometry(DirectGeometry::BypassTransmission),
+                    environment_send: EnvironmentSend::from_world_pose(Pose::from_position(
+                        Vec3::new(index as f32 - 3.5, 0.0, 4.0),
+                    )),
+                    play_command_id: None,
+                    mono_scratch: vec![0.0; FRAMES],
+                });
+                voice.play_from_beginning();
+                voice.set_mix_parameters(crate::domain::BusParams::default());
+                (*source_id, voice)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: SAMPLE_RATE,
+            frame_size: FRAMES,
+            max_voices: VOICES,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
+        })
+        .unwrap();
+        processor.replace_acoustic_response(Arc::new(AcousticResponse {
+            spatial_revision: 1,
+            geometry_version: 1,
+            direct: source_ids
+                .iter()
+                .map(|source_id| DirectAcousticResponse {
+                    voice_id: *source_id,
+                    gain: [1.0; 3],
+                    environment_gain: [1.0; 3],
+                    early_reflections: vec![EarlyReflectionTap {
+                        path_id: 1,
+                        arrival_direction: Vec3::Z,
+                        delay_seconds: 0.01,
+                        gain: [0.1, 0.08, 0.05],
+                    }],
+                })
+                .collect(),
+            late_reverb: LateReverbParameters {
+                pre_delay_seconds: 0.02,
+                rt60_seconds: [0.8, 1.2, 0.9],
+                wet_gain: 0.2,
+            },
+            published_at: Instant::now(),
+            solve_time_us: 1,
+        }));
+        let mut output = vec![0.0; FRAMES * 2];
+        let mut events = Vec::with_capacity(VOICES * 2);
+        for _ in 0..32 {
+            output.fill(0.0);
+            processor
+                .process_spatial_sources_with_metrics(
+                    &source_ids,
+                    &mut voices,
+                    &mut output,
+                    SpatialRenderContext::default(),
+                    &mut events,
+                )
+                .unwrap();
+        }
+
+        let started = Instant::now();
+        for _ in 0..BLOCKS {
+            output.fill(0.0);
+            processor
+                .process_spatial_sources_with_metrics(
+                    black_box(&source_ids),
+                    black_box(&mut voices),
+                    black_box(&mut output),
+                    SpatialRenderContext::default(),
+                    black_box(&mut events),
+                )
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+        let audio_seconds = FRAMES as f64 * BLOCKS as f64 / SAMPLE_RATE as f64;
+        println!(
+            "split direct/environment routing: voices={VOICES} blocks={BLOCKS} frames={FRAMES} elapsed_ms={:.3} us_per_block={:.3} realtime_cpu_percent={:.3}",
+            elapsed.as_secs_f64() * 1_000.0,
+            elapsed.as_secs_f64() * 1_000_000.0 / BLOCKS as f64,
+            elapsed.as_secs_f64() / audio_seconds * 100.0,
+        );
+        assert!(output.iter().all(|sample| sample.is_finite()));
     }
 }

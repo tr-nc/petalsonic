@@ -3,6 +3,7 @@
 use crate::config::{LatencyProfile, SpatialQuality};
 use crate::domain::{Emitter, PlayCommandId, PlaybackControl, PlaybackTag};
 use crate::math::Pose;
+use crate::math::Vec3;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -59,6 +60,13 @@ pub struct RuntimeDiagnostics {
     pub acoustic_solve_time_p99_us: u64,
     pub acoustic_solve_time_max_us: u64,
     pub acoustic_response_age_ms: u64,
+    pub acoustic_direct_ray_count: u64,
+    pub acoustic_sample_cache_hit_count: u64,
+    pub acoustic_processed_extent_count: u64,
+    pub acoustic_lobe_count: u64,
+    pub acoustic_retained_response_count: u64,
+    pub acoustic_deferred_response_count: u64,
+    pub acoustic_render_rejected_response_count: u64,
     pub device_generation: u64,
     pub recovery_attempts: u64,
     pub output_sample_rate: u32,
@@ -77,6 +85,7 @@ pub(crate) struct RuntimeCounters {
     pub(crate) dropped_events: AtomicU64,
     pub(crate) dropped_voice_telemetry: AtomicU64,
     pub(crate) dropped_timing_events: AtomicU64,
+    pub(crate) acoustic_render_rejected_responses: AtomicU64,
     pub(crate) device_generation: AtomicU64,
     pub(crate) output_sample_rate: AtomicUsize,
     pub(crate) output_channels: AtomicUsize,
@@ -96,6 +105,7 @@ impl Default for RuntimeCounters {
             dropped_events: AtomicU64::new(0),
             dropped_voice_telemetry: AtomicU64::new(0),
             dropped_timing_events: AtomicU64::new(0),
+            acoustic_render_rejected_responses: AtomicU64::new(0),
             device_generation: AtomicU64::new(0),
             output_sample_rate: AtomicUsize::new(0),
             output_channels: AtomicUsize::new(0),
@@ -268,6 +278,91 @@ pub struct VoiceTelemetryDiagnostics {
     /// Maximum observed queue depth since World creation.
     pub queue_high_water: usize,
     /// Events rejected because the queue was full or disconnected.
+    pub dropped_events: u64,
+}
+
+/// Publication state for one Voice in an asynchronous direct-acoustics solve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcousticSolveStatus {
+    Solved,
+    Retained,
+    Deferred,
+}
+
+/// Stable Schmitt-classified state of one direct or environment route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcousticOcclusionState {
+    Visible,
+    Occluded,
+}
+
+/// Per-route measurements captured entirely on the acoustics worker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcousticRouteTelemetry {
+    pub sample_count: usize,
+    pub ray_count: usize,
+    pub cache_hit_count: usize,
+    pub hit_count: usize,
+    pub visible_fraction: f32,
+    pub raw_gain: [f32; 3],
+    pub filtered_gain: [f32; 3],
+    pub classified_state: AcousticOcclusionState,
+    pub dwell_seconds: f32,
+}
+
+/// One bounded renderer lobe derived deterministically from stable extent samples.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcousticLobeTelemetry {
+    pub lobe_id: u8,
+    pub direction: Vec3,
+    pub gain: [f32; 3],
+    pub power: f32,
+}
+
+/// Worker-side extended-source measurements for one immutable Voice route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcousticExtentTelemetry {
+    pub voice_id: u64,
+    pub emitter: Emitter,
+    pub spatial_revision: u64,
+    pub geometry_version: u64,
+    /// Spatial revision that actually produced the response (older while retained).
+    pub response_spatial_revision: u64,
+    /// Geometry version that actually produced the response (older while retained).
+    pub response_geometry_version: u64,
+    pub extent_sample_count: usize,
+    pub direct: AcousticRouteTelemetry,
+    pub environment: AcousticRouteTelemetry,
+    pub lobes: Vec<AcousticLobeTelemetry>,
+    pub solve_status: AcousticSolveStatus,
+    pub cache_age_seconds: f32,
+    pub budget_member: bool,
+}
+
+/// Why a completed worker result was deliberately not published.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcousticDiscardReason {
+    Superseded,
+}
+
+/// Independently bounded acoustics-worker telemetry; never mixed with lifecycle events.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum AcousticTelemetryEvent {
+    ExtentResponse(Box<AcousticExtentTelemetry>),
+    SolveDiscarded {
+        spatial_revision: u64,
+        geometry_version: u64,
+        reason: AcousticDiscardReason,
+    },
+}
+
+/// Current pressure on the independently bounded acoustics telemetry queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcousticTelemetryDiagnostics {
+    pub queue_depth: usize,
+    pub queue_high_water: usize,
     pub dropped_events: u64,
 }
 

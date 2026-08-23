@@ -1,7 +1,12 @@
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
 use crate::math::Pose;
+pub use crate::occlusion::{DistributedOcclusionProfile, MAX_DIRECT_LOBES, OcclusionProfile};
 use crate::playback::LoopMode;
+pub use crate::source_extent::{
+    ExtentSample, ExtentSampleId, MAX_EXTENT_RADIUS_WORLD_UNITS, MAX_EXTENT_SAMPLES, SourceExtent,
+    WeightedSamples,
+};
 use crate::world::SourceId;
 use std::sync::Arc;
 use std::time::Duration;
@@ -141,6 +146,127 @@ mod tests {
             EnvironmentOrigin::World(contact)
         );
         assert_eq!(options.environment_send().gain_db(), -12.0);
+    }
+
+    #[test]
+    fn source_extent_defaults_to_a_compatible_point() {
+        assert_eq!(SourceExtent::default(), SourceExtent::Point);
+        assert_eq!(SourceExtent::Point.sample_count(), 1);
+        assert_eq!(
+            EmitterDesc::spatial(Pose::identity()).extent(),
+            &SourceExtent::Point
+        );
+    }
+
+    #[test]
+    fn weighted_extent_normalizes_power_and_orders_stable_ids() {
+        let extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(9), crate::math::Vec3::X, 3.0).unwrap(),
+            ExtentSample::new(ExtentSampleId(2), -crate::math::Vec3::X, 1.0).unwrap(),
+        ])
+        .unwrap();
+        let samples = extent.weighted().unwrap().samples();
+
+        assert_eq!(samples[0].id(), ExtentSampleId(2));
+        assert_eq!(samples[1].id(), ExtentSampleId(9));
+        assert!((samples[0].power_weight() - 0.25).abs() < 1.0e-6);
+        assert!((samples[1].power_weight() - 0.75).abs() < 1.0e-6);
+        assert!((samples.iter().map(ExtentSample::power_weight).sum::<f32>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn weighted_extent_rejects_invalid_samples() {
+        assert!(SourceExtent::weighted_samples(Vec::new()).is_err());
+        assert!(
+            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::splat(f32::NAN), 1.0).is_err()
+        );
+        assert!(ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::ZERO, f32::NAN).is_err());
+        assert!(ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::ZERO, 0.0).is_err());
+
+        let duplicate = ExtentSample::new(ExtentSampleId(4), crate::math::Vec3::ZERO, 1.0).unwrap();
+        assert!(SourceExtent::weighted_samples(vec![duplicate.clone(), duplicate]).is_err());
+
+        let too_many = (0..=MAX_EXTENT_SAMPLES)
+            .map(|id| {
+                ExtentSample::new(ExtentSampleId(id as u64), crate::math::Vec3::ZERO, 1.0).unwrap()
+            })
+            .collect();
+        assert!(SourceExtent::weighted_samples(too_many).is_err());
+
+        assert!(
+            ExtentSample::new(
+                ExtentSampleId(1),
+                crate::math::Vec3::X * (MAX_EXTENT_RADIUS_WORLD_UNITS + 1.0),
+                1.0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn occlusion_profile_defaults_to_compatible_point_exact() {
+        assert_eq!(OcclusionProfile::default(), OcclusionProfile::PointExact);
+        assert_eq!(
+            EmitterDesc::spatial(Pose::identity()).occlusion_profile(),
+            OcclusionProfile::PointExact
+        );
+    }
+
+    #[test]
+    fn distributed_occlusion_profile_validates_all_stability_controls() {
+        let profile = DistributedOcclusionProfile::default()
+            .with_gain_floor([0.5, 0.25, 0.125])
+            .unwrap()
+            .with_response_times(0.2, 0.1)
+            .unwrap()
+            .with_classification(0.2, 0.6, 0.15)
+            .unwrap()
+            .with_max_response_age(0.4)
+            .unwrap()
+            .with_lobe_count(4)
+            .unwrap();
+
+        assert_eq!(profile.gain_floor(), [0.5, 0.25, 0.125]);
+        assert_eq!(profile.response_times_seconds(), (0.2, 0.1));
+        assert_eq!(profile.classification(), (0.2, 0.6, 0.15));
+        assert_eq!(profile.max_response_age_seconds(), 0.4);
+        assert_eq!(profile.lobe_count(), 4);
+
+        assert!(
+            DistributedOcclusionProfile::default()
+                .with_gain_floor([0.0, 1.0, 1.0])
+                .is_err()
+        );
+        assert!(
+            DistributedOcclusionProfile::default()
+                .with_gain_floor([1.1, 1.0, 1.0])
+                .is_err()
+        );
+        assert!(
+            DistributedOcclusionProfile::default()
+                .with_response_times(f32::NAN, 0.1)
+                .is_err()
+        );
+        assert!(
+            DistributedOcclusionProfile::default()
+                .with_classification(0.6, 0.2, 0.1)
+                .is_err()
+        );
+        assert!(
+            DistributedOcclusionProfile::default()
+                .with_max_response_age(0.0)
+                .is_err()
+        );
+        assert!(
+            DistributedOcclusionProfile::default()
+                .with_lobe_count(0)
+                .is_err()
+        );
+        assert!(
+            DistributedOcclusionProfile::default()
+                .with_lobe_count((MAX_DIRECT_LOBES + 1) as u8)
+                .is_err()
+        );
     }
 }
 
@@ -405,11 +531,13 @@ impl Default for BusParams {
 }
 
 /// Initial, low-frequency properties of an emitter.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EmitterDesc {
     placement: EmitterPlacement,
     gain_db: f32,
     bus: Option<Bus>,
+    extent: SourceExtent,
+    occlusion_profile: OcclusionProfile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -424,6 +552,8 @@ impl EmitterDesc {
             placement: EmitterPlacement::NonSpatial,
             gain_db: 0.0,
             bus: None,
+            extent: SourceExtent::Point,
+            occlusion_profile: OcclusionProfile::PointExact,
         }
     }
 
@@ -432,6 +562,8 @@ impl EmitterDesc {
             placement: EmitterPlacement::Spatial(pose),
             gain_db: 0.0,
             bus: None,
+            extent: SourceExtent::Point,
+            occlusion_profile: OcclusionProfile::PointExact,
         }
     }
 
@@ -442,6 +574,27 @@ impl EmitterDesc {
 
     pub fn gain_db(&self) -> f32 {
         self.gain_db
+    }
+
+    /// Sets the initial local source extent. Later extent changes must arrive in a complete
+    /// [`SpatialFrame`] and are captured only by subsequently accepted Voices.
+    pub fn with_extent(mut self, extent: SourceExtent) -> Self {
+        self.extent = extent;
+        self
+    }
+
+    pub fn extent(&self) -> &SourceExtent {
+        &self.extent
+    }
+
+    /// Sets the default occlusion policy captured by subsequently accepted Voices.
+    pub fn with_occlusion_profile(mut self, profile: OcclusionProfile) -> Self {
+        self.occlusion_profile = profile;
+        self
+    }
+
+    pub fn occlusion_profile(&self) -> OcclusionProfile {
+        self.occlusion_profile
     }
 
     /// Routes this emitter to a declared bus. Without this, it feeds Master directly.
@@ -461,7 +614,7 @@ impl EmitterDesc {
         }
     }
 
-    pub(crate) fn source_config(self, voice_gain_db: f32) -> SourceConfig {
+    pub(crate) fn source_config(&self, voice_gain_db: f32) -> SourceConfig {
         let gain_db = self.gain_db + voice_gain_db;
         match self.placement {
             EmitterPlacement::NonSpatial => SourceConfig::non_spatial_with_volume_db(gain_db),
@@ -481,6 +634,10 @@ impl EmitterDesc {
                 true
             }
         }
+    }
+
+    pub(crate) fn set_extent(&mut self, extent: SourceExtent) {
+        self.extent = extent;
     }
 }
 
@@ -502,6 +659,7 @@ pub struct PlayOptions {
     direct_path: Option<DirectPath>,
     environment_send: Option<EnvironmentSend>,
     play_command_id: Option<PlayCommandId>,
+    occlusion_profile: Option<OcclusionProfile>,
 }
 
 impl PlayOptions {
@@ -557,6 +715,12 @@ impl PlayOptions {
         self
     }
 
+    /// Overrides the Emitter's occlusion policy for this Voice without changing its extent.
+    pub fn with_occlusion_profile(mut self, profile: OcclusionProfile) -> Self {
+        self.occlusion_profile = Some(profile);
+        self
+    }
+
     pub(crate) fn bus(self) -> Option<Bus> {
         self.bus
     }
@@ -574,11 +738,17 @@ impl PlayOptions {
     }
 
     pub(crate) fn has_spatial_routing_override(self) -> bool {
-        self.direct_path.is_some() || self.environment_send.is_some()
+        self.direct_path.is_some()
+            || self.environment_send.is_some()
+            || self.occlusion_profile.is_some()
     }
 
     pub(crate) fn play_command_id(self) -> Option<PlayCommandId> {
         self.play_command_id
+    }
+
+    pub(crate) fn occlusion_profile(self, emitter_default: OcclusionProfile) -> OcclusionProfile {
+        self.occlusion_profile.unwrap_or(emitter_default)
     }
 }
 
@@ -593,16 +763,18 @@ impl Default for PlayOptions {
             direct_path: None,
             environment_send: None,
             play_command_id: None,
+            occlusion_profile: None,
         }
     }
 }
 
 /// One spatial emitter transform in a complete game-frame snapshot.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EmitterSpatialState {
     pub emitter: Emitter,
     pub pose: Pose,
     acoustic_priority: f32,
+    extent: SourceExtent,
 }
 
 impl EmitterSpatialState {
@@ -611,6 +783,7 @@ impl EmitterSpatialState {
             emitter,
             pose,
             acoustic_priority: 1.0,
+            extent: SourceExtent::Point,
         }
     }
 
@@ -623,6 +796,16 @@ impl EmitterSpatialState {
 
     pub fn acoustic_priority(&self) -> f32 {
         self.acoustic_priority
+    }
+
+    /// Publishes the emitter's latest local extent in this complete spatial generation.
+    pub fn with_extent(mut self, extent: SourceExtent) -> Self {
+        self.extent = extent;
+        self
+    }
+
+    pub fn extent(&self) -> &SourceExtent {
+        &self.extent
     }
 }
 

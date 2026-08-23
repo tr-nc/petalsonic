@@ -32,6 +32,27 @@ pub enum OutputDevicePolicy {
     PinnedNameContains(String),
 }
 
+/// Hard upper bounds for each asynchronous direct-acoustics solve.
+///
+/// Spatial quality may choose lower limits, but never exceeds these values. One direct or
+/// environment route through one extent sample consumes one direct ray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvironmentalAcousticsBudget {
+    /// Maximum Point or extended sources selected for one solve.
+    pub max_processed_extents: usize,
+    /// Maximum direct/environment visibility rays across the selected extents.
+    pub max_direct_rays: usize,
+}
+
+impl Default for EnvironmentalAcousticsBudget {
+    fn default() -> Self {
+        Self {
+            max_processed_extents: 64,
+            max_direct_rays: 1_024,
+        }
+    }
+}
+
 /// Configuration descriptor for a PetalSonic world
 #[derive(Clone)]
 pub struct PetalSonicWorldDesc {
@@ -57,7 +78,7 @@ pub struct PetalSonicWorldDesc {
     /// This queue is independent from regular control traffic so overload cannot
     /// consume the capacity needed to retire voices and emitters.
     pub lifecycle_queue_capacity: usize,
-    /// Capacity of each bounded pull-event queue (lifecycle and opt-in Voice telemetry).
+    /// Capacity of each bounded pull-event queue (lifecycle, Voice, and acoustics telemetry).
     pub event_queue_capacity: usize,
     /// Capacity of the bounded timing/diagnostics queue.
     pub timing_queue_capacity: usize,
@@ -97,6 +118,8 @@ pub struct PetalSonicWorldDesc {
     /// bounded internal ray budget and can also be changed while the world is running without
     /// rebuilding the output runtime.
     pub environmental_acoustics_quality: f32,
+    /// Hard caps applied after the normalized quality plan.
+    pub environmental_acoustics_budget: EnvironmentalAcousticsBudget,
     /// Optional immutable acoustic scene available when the runtime starts.
     pub acoustic_scene: Option<AcousticSceneSnapshot>,
 }
@@ -125,6 +148,7 @@ impl Default for PetalSonicWorldDesc {
             distance_scaler: 10.0,
             environmental_acoustics_enabled: true,
             environmental_acoustics_quality: 0.5,
+            environmental_acoustics_budget: EnvironmentalAcousticsBudget::default(),
             acoustic_scene: None,
         }
     }
@@ -156,6 +180,10 @@ impl std::fmt::Debug for PetalSonicWorldDesc {
             .field(
                 "environmental_acoustics_quality",
                 &self.environmental_acoustics_quality,
+            )
+            .field(
+                "environmental_acoustics_budget",
+                &self.environmental_acoustics_budget,
             )
             .field("acoustic_scene", &self.acoustic_scene)
             .finish()

@@ -1,13 +1,20 @@
 use crate::acoustics::{AcousticMaterial, AcousticRay, AcousticSceneSnapshot};
+use crate::config::EnvironmentalAcousticsBudget;
 use crate::domain::{
     DirectGeometry, DirectPath, DirectPlacement, Emitter, EnvironmentOrigin, EnvironmentSend,
-    SpatialFrame,
+    MAX_DIRECT_LOBES, MAX_EXTENT_SAMPLES, OcclusionProfile, SourceExtent, SpatialFrame,
 };
-use crate::events::EnvironmentResponse as EnvironmentResponseTelemetry;
+use crate::events::{
+    AcousticDiscardReason, AcousticExtentTelemetry, AcousticLobeTelemetry, AcousticOcclusionState,
+    AcousticRouteTelemetry, AcousticSolveStatus, AcousticTelemetryEvent,
+    EnvironmentResponse as EnvironmentResponseTelemetry,
+};
 use crate::math::{Pose, Vec3};
 use crate::spatial::LateReverbParameters;
 use crate::world::SourceId;
+use crossbeam_channel::{Receiver, Sender};
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -24,6 +31,7 @@ const RAY_EPSILON_METERS: f32 = 0.05;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AcousticSolvePlan {
     max_direct_sources: usize,
+    max_direct_rays: usize,
     max_early_reflection_sources: usize,
     early_reflection_taps: usize,
     early_reflection_ray_count: usize,
@@ -36,6 +44,7 @@ impl AcousticSolvePlan {
         let quality = quality.clamp(0.0, 1.0);
         Self {
             max_direct_sources: quality_count(32, 32, 64, quality),
+            max_direct_rays: quality_count(128, 256, 1_024, quality),
             // Keep the existing bounded crossfade pool; higher quality improves path sampling
             // without imposing more persistent render-thread state on lower settings.
             max_early_reflection_sources: quality_count(4, 8, 8, quality),
@@ -44,6 +53,12 @@ impl AcousticSolvePlan {
             late_ray_count: quality_count(128, 256, 1_024, quality),
             late_bounce_count: quality_count(4, 8, 12, quality),
         }
+    }
+
+    fn bounded_by(mut self, budget: EnvironmentalAcousticsBudget) -> Self {
+        self.max_direct_sources = self.max_direct_sources.min(budget.max_processed_extents);
+        self.max_direct_rays = self.max_direct_rays.min(budget.max_direct_rays);
+        self
     }
 }
 
@@ -69,7 +84,18 @@ pub(crate) struct DirectAcousticResponse {
     pub voice_id: SourceId,
     pub gain: [f32; 3],
     pub environment_gain: [f32; 3],
+    pub direct_lobes: Vec<DirectLobeTarget>,
+    pub(crate) environment_representatives: Vec<EnvironmentRepresentative>,
     pub early_reflections: Vec<EarlyReflectionTap>,
+    pub solve_status: DirectSolveStatus,
+    pub cache_age_seconds: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectSolveStatus {
+    Solved,
+    Retained,
+    Deferred,
 }
 
 #[derive(Debug)]
@@ -83,6 +109,7 @@ pub(crate) struct AcousticResponse {
 }
 
 impl AcousticResponse {
+    #[cfg(test)]
     pub(crate) fn direct_gain(&self, voice_id: SourceId) -> [f32; 3] {
         self.direct
             .iter()
@@ -91,6 +118,16 @@ impl AcousticResponse {
             .unwrap_or([1.0; 3])
     }
 
+    pub(crate) fn direct_gain_target(&self, voice_id: SourceId) -> Option<[f32; 3]> {
+        self.direct
+            .iter()
+            .find(|response| response.voice_id == voice_id)
+            .and_then(|response| {
+                (response.solve_status != DirectSolveStatus::Deferred).then_some(response.gain)
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn environment_gain(&self, voice_id: SourceId) -> [f32; 3] {
         self.direct
             .iter()
@@ -99,12 +136,32 @@ impl AcousticResponse {
             .unwrap_or([1.0; 3])
     }
 
+    pub(crate) fn environment_gain_target(&self, voice_id: SourceId) -> Option<[f32; 3]> {
+        self.direct
+            .iter()
+            .find(|response| response.voice_id == voice_id)
+            .and_then(|response| {
+                (response.solve_status != DirectSolveStatus::Deferred)
+                    .then_some(response.environment_gain)
+            })
+    }
+
     pub(crate) fn early_reflections(&self, voice_id: SourceId) -> &[EarlyReflectionTap] {
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
             .map(|response| response.early_reflections.as_slice())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn direct_lobes_target(&self, voice_id: SourceId) -> Option<&[DirectLobeTarget]> {
+        self.direct
+            .iter()
+            .find(|response| response.voice_id == voice_id)
+            .and_then(|response| {
+                (response.solve_status != DirectSolveStatus::Deferred)
+                    .then_some(response.direct_lobes.as_slice())
+            })
     }
 
     pub(crate) fn telemetry(&self, voice_id: SourceId) -> Option<EnvironmentResponseTelemetry> {
@@ -120,15 +177,18 @@ impl AcousticResponse {
 }
 
 /// Immutable routing and the latest compatible emitter state for one active Voice.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AcousticVoice {
     pub voice_id: SourceId,
     pub emitter: Emitter,
     pub emitter_world_pose: Pose,
     pub acoustic_priority: f32,
+    pub audibility: f32,
     pub detached: bool,
     pub direct_path: DirectPath,
     pub environment_send: EnvironmentSend,
+    pub source_extent: SourceExtent,
+    pub occlusion_profile: OcclusionProfile,
 }
 
 #[derive(Clone)]
@@ -237,6 +297,25 @@ impl AcousticVoiceInput {
         drop(state);
         self.input.changed.notify_one();
     }
+
+    pub(crate) fn update_emitter_audibility(&self, emitter: Emitter, audibility: f32) {
+        let Ok(mut state) = self.input.state.lock() else {
+            return;
+        };
+        let mut changed = false;
+        for voice in &mut state.voices {
+            if voice.emitter == emitter && !voice.detached {
+                voice.audibility = audibility.max(0.0);
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        state.generation = state.generation.wrapping_add(1).max(1);
+        drop(state);
+        self.input.changed.notify_one();
+    }
 }
 
 pub(crate) struct AcousticPropagationCounters {
@@ -249,6 +328,14 @@ pub(crate) struct AcousticPropagationCounters {
     solve_time_max_us: AtomicU64,
     solve_time_histogram: [AtomicU64; 64],
     last_publication: Mutex<Option<Instant>>,
+    telemetry_queue_high_water: std::sync::atomic::AtomicUsize,
+    dropped_telemetry_events: AtomicU64,
+    direct_ray_count: AtomicU64,
+    cache_hit_count: AtomicU64,
+    processed_extent_count: AtomicU64,
+    lobe_count: AtomicU64,
+    retained_response_count: AtomicU64,
+    deferred_response_count: AtomicU64,
 }
 
 impl Default for AcousticPropagationCounters {
@@ -263,6 +350,14 @@ impl Default for AcousticPropagationCounters {
             solve_time_max_us: AtomicU64::new(0),
             solve_time_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
             last_publication: Mutex::new(None),
+            telemetry_queue_high_water: std::sync::atomic::AtomicUsize::new(0),
+            dropped_telemetry_events: AtomicU64::new(0),
+            direct_ray_count: AtomicU64::new(0),
+            cache_hit_count: AtomicU64::new(0),
+            processed_extent_count: AtomicU64::new(0),
+            lobe_count: AtomicU64::new(0),
+            retained_response_count: AtomicU64::new(0),
+            deferred_response_count: AtomicU64::new(0),
         }
     }
 }
@@ -280,6 +375,12 @@ pub(crate) struct AcousticPropagationDiagnostics {
     pub solve_time_p99_us: u64,
     pub solve_time_max_us: u64,
     pub response_age_ms: u64,
+    pub direct_ray_count: u64,
+    pub cache_hit_count: u64,
+    pub processed_extent_count: u64,
+    pub lobe_count: u64,
+    pub retained_response_count: u64,
+    pub deferred_response_count: u64,
 }
 
 impl AcousticPropagationCounters {
@@ -316,6 +417,12 @@ impl AcousticPropagationCounters {
             solve_time_p99_us: histogram_percentile(&self.solve_time_histogram, total, 99),
             solve_time_max_us: self.solve_time_max_us.load(Ordering::Relaxed),
             response_age_ms,
+            direct_ray_count: self.direct_ray_count.load(Ordering::Relaxed),
+            cache_hit_count: self.cache_hit_count.load(Ordering::Relaxed),
+            processed_extent_count: self.processed_extent_count.load(Ordering::Relaxed),
+            lobe_count: self.lobe_count.load(Ordering::Relaxed),
+            retained_response_count: self.retained_response_count.load(Ordering::Relaxed),
+            deferred_response_count: self.deferred_response_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -328,6 +435,7 @@ pub(crate) struct AcousticPropagation {
     quality_bits: AtomicU32,
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    telemetry_receiver: Receiver<AcousticTelemetryEvent>,
 }
 
 impl AcousticPropagation {
@@ -335,7 +443,9 @@ impl AcousticPropagation {
         distance_scaler: f32,
         enabled: Arc<AtomicBool>,
         environmental_acoustics_quality: f32,
+        environmental_acoustics_budget: EnvironmentalAcousticsBudget,
         max_voices: usize,
+        telemetry_capacity: usize,
     ) -> std::io::Result<Self> {
         let input = Arc::new(SharedInput {
             state: Mutex::new(InputState::new(environmental_acoustics_quality, max_voices)),
@@ -344,23 +454,27 @@ impl AcousticPropagation {
         let latest_response = Arc::new(Mutex::new(None));
         let counters = Arc::new(AcousticPropagationCounters::default());
         let stop = Arc::new(AtomicBool::new(false));
+        let (telemetry_sender, telemetry_receiver) = crossbeam_channel::bounded(telemetry_capacity);
         let worker = {
             let input = input.clone();
             let latest_response = latest_response.clone();
             let counters = counters.clone();
             let enabled = enabled.clone();
             let stop = stop.clone();
+            let telemetry_sender = telemetry_sender.clone();
             std::thread::Builder::new()
                 .name("petalsonic-acoustics".into())
                 .spawn(move || {
-                    propagation_loop(
-                        &input,
-                        &latest_response,
-                        &counters,
-                        &enabled,
-                        &stop,
+                    propagation_loop(PropagationWorkerContext {
+                        input,
+                        latest_response,
+                        counters,
+                        enabled,
+                        stop,
                         distance_scaler,
-                    )
+                        environmental_acoustics_budget,
+                        telemetry_sender,
+                    })
                 })?
         };
         Ok(Self {
@@ -371,6 +485,7 @@ impl AcousticPropagation {
             quality_bits: AtomicU32::new(environmental_acoustics_quality.to_bits()),
             stop,
             worker: Mutex::new(Some(worker)),
+            telemetry_receiver,
         })
     }
 
@@ -427,6 +542,21 @@ impl AcousticPropagation {
 
     pub(crate) fn diagnostics(&self) -> AcousticPropagationDiagnostics {
         self.counters.snapshot()
+    }
+
+    pub(crate) fn telemetry_receiver(&self) -> Receiver<AcousticTelemetryEvent> {
+        self.telemetry_receiver.clone()
+    }
+
+    pub(crate) fn telemetry_pressure(&self) -> (usize, u64) {
+        (
+            self.counters
+                .telemetry_queue_high_water
+                .load(Ordering::Relaxed),
+            self.counters
+                .dropped_telemetry_events
+                .load(Ordering::Relaxed),
+        )
     }
 
     pub(crate) fn set_enabled(&self, enabled: bool) {
@@ -486,16 +616,31 @@ impl Drop for AcousticPropagation {
     }
 }
 
-fn propagation_loop(
-    input: &SharedInput,
-    latest_response: &Mutex<Option<Arc<AcousticResponse>>>,
-    counters: &AcousticPropagationCounters,
-    enabled: &AtomicBool,
-    stop: &AtomicBool,
+struct PropagationWorkerContext {
+    input: Arc<SharedInput>,
+    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    counters: Arc<AcousticPropagationCounters>,
+    enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     distance_scaler: f32,
-) {
+    environmental_acoustics_budget: EnvironmentalAcousticsBudget,
+    telemetry_sender: Sender<AcousticTelemetryEvent>,
+}
+
+fn propagation_loop(context: PropagationWorkerContext) {
+    let PropagationWorkerContext {
+        input,
+        latest_response,
+        counters,
+        enabled,
+        stop,
+        distance_scaler,
+        environmental_acoustics_budget,
+        telemetry_sender,
+    } = context;
     let mut consumed_generation = 0;
     let mut next_solve = Instant::now();
+    let mut solver = AcousticSolver::new(0);
     while !stop.load(Ordering::Acquire) {
         let captured = {
             let Ok(mut state) = input.state.lock() else {
@@ -540,79 +685,358 @@ fn propagation_loop(
         next_solve = Instant::now() + SOLVE_INTERVAL;
 
         let started = Instant::now();
-        let mut response = solve_response(&captured, distance_scaler);
+        let plan = AcousticSolvePlan::for_quality(captured.environmental_acoustics_quality)
+            .bounded_by(environmental_acoustics_budget);
+        let mut output = solver.solve_with_telemetry(&captured, distance_scaler, plan);
         let elapsed_us = started.elapsed().as_micros() as u64;
-        response.solve_time_us = elapsed_us;
+        output.response.solve_time_us = elapsed_us;
         counters.record_solve(elapsed_us);
 
-        let superseded = input
-            .state
-            .lock()
-            .map(|state| state.generation != captured.generation)
-            .unwrap_or(true);
-        if superseded {
+        let Ok(publication_guard) = input.state.lock() else {
+            return;
+        };
+        if publication_guard.generation != captured.generation {
+            drop(publication_guard);
             counters
                 .superseded_solve_count
                 .fetch_add(1, Ordering::Relaxed);
+            try_send_acoustic_telemetry(
+                &telemetry_sender,
+                &counters,
+                AcousticTelemetryEvent::SolveDiscarded {
+                    spatial_revision: output.response.spatial_revision,
+                    geometry_version: output.response.geometry_version,
+                    reason: AcousticDiscardReason::Superseded,
+                },
+            );
             continue;
         }
 
+        let mut response = output.response;
         response.published_at = Instant::now();
+        let response_spatial_revision = response.spatial_revision;
+        let response_geometry_version = response.geometry_version;
+        let response_published_at = response.published_at;
+        let Ok(mut latest) = latest_response.lock() else {
+            return;
+        };
+        *latest = Some(Arc::new(response));
+        drop(latest);
+        drop(publication_guard);
         counters
             .latest_spatial_revision
-            .store(response.spatial_revision, Ordering::Release);
+            .store(response_spatial_revision, Ordering::Release);
         counters
             .latest_geometry_version
-            .store(response.geometry_version, Ordering::Release);
+            .store(response_geometry_version, Ordering::Release);
         counters
             .published_response_count
             .fetch_add(1, Ordering::Relaxed);
         if let Ok(mut publication) = counters.last_publication.lock() {
-            *publication = Some(response.published_at);
+            *publication = Some(response_published_at);
         }
-        if let Ok(mut latest) = latest_response.lock() {
-            *latest = Some(Arc::new(response));
+        for telemetry in output.telemetry {
+            counters.direct_ray_count.fetch_add(
+                (telemetry.direct.ray_count + telemetry.environment.ray_count) as u64,
+                Ordering::Relaxed,
+            );
+            counters.cache_hit_count.fetch_add(
+                (telemetry.direct.cache_hit_count + telemetry.environment.cache_hit_count) as u64,
+                Ordering::Relaxed,
+            );
+            counters
+                .processed_extent_count
+                .fetch_add(u64::from(telemetry.budget_member), Ordering::Relaxed);
+            counters
+                .lobe_count
+                .fetch_add(telemetry.lobes.len() as u64, Ordering::Relaxed);
+            match telemetry.solve_status {
+                AcousticSolveStatus::Solved => {}
+                AcousticSolveStatus::Retained => {
+                    counters
+                        .retained_response_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                AcousticSolveStatus::Deferred => {
+                    counters
+                        .deferred_response_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            try_send_acoustic_telemetry(
+                &telemetry_sender,
+                &counters,
+                AcousticTelemetryEvent::ExtentResponse(Box::new(telemetry)),
+            );
         }
     }
 }
 
+fn try_send_acoustic_telemetry(
+    sender: &Sender<AcousticTelemetryEvent>,
+    counters: &AcousticPropagationCounters,
+    event: AcousticTelemetryEvent,
+) {
+    if sender.try_send(event).is_err() {
+        counters
+            .dropped_telemetry_events
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let depth = sender.len();
+    let mut current = counters.telemetry_queue_high_water.load(Ordering::Relaxed);
+    while depth > current {
+        match counters.telemetry_queue_high_water.compare_exchange_weak(
+            current,
+            depth,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[cfg(test)]
 fn solve_response(input: &SolveInput, distance_scaler: f32) -> AcousticResponse {
     let plan = AcousticSolvePlan::for_quality(input.environmental_acoustics_quality);
-    let candidates = ranked_voices(input, plan);
-    let mut direct = solve_direct(input, &candidates, distance_scaler);
-    solve_early_reflections(input, &candidates, distance_scaler, plan, &mut direct);
-    AcousticResponse {
-        spatial_revision: input.spatial.revision(),
-        geometry_version: input.scene.version(),
-        direct,
-        late_reverb: solve_late_reverb(input, distance_scaler, plan),
-        published_at: Instant::now(),
-        solve_time_us: 0,
+    AcousticSolver::new(input.voices.len()).solve_with_plan(input, distance_scaler, plan)
+}
+
+struct AcousticSolveOutput {
+    response: AcousticResponse,
+    telemetry: Vec<AcousticExtentTelemetry>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedDirectResponse {
+    response: DirectAcousticResponse,
+    telemetry: AcousticExtentTelemetry,
+    solved_at_sim_time_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RouteKind {
+    Direct,
+    Environment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SampleCacheKey {
+    voice_id: SourceId,
+    emitter: Emitter,
+    spatial_revision: u64,
+    geometry_version: u64,
+    sample_id: crate::domain::ExtentSampleId,
+    route: RouteKind,
+}
+
+struct AcousticSolver {
+    previous_budget_membership: HashSet<SourceId>,
+    last_solved_response: HashMap<SourceId, CachedDirectResponse>,
+    temporal_occlusion: HashMap<(SourceId, RouteKind), TemporalOcclusionState>,
+    sample_cache: HashMap<SampleCacheKey, ExtentSampleResponse>,
+}
+
+impl AcousticSolver {
+    fn new(max_voices: usize) -> Self {
+        Self {
+            previous_budget_membership: HashSet::with_capacity(max_voices),
+            last_solved_response: HashMap::with_capacity(max_voices),
+            temporal_occlusion: HashMap::with_capacity(max_voices.saturating_mul(2)),
+            sample_cache: HashMap::with_capacity(
+                max_voices
+                    .saturating_mul(MAX_EXTENT_SAMPLES)
+                    .saturating_mul(2),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn solve_with_plan(
+        &mut self,
+        input: &SolveInput,
+        distance_scaler: f32,
+        plan: AcousticSolvePlan,
+    ) -> AcousticResponse {
+        self.solve_with_telemetry(input, distance_scaler, plan)
+            .response
+    }
+
+    fn solve_with_telemetry(
+        &mut self,
+        input: &SolveInput,
+        distance_scaler: f32,
+        plan: AcousticSolvePlan,
+    ) -> AcousticSolveOutput {
+        let candidates = ranked_voices(input, &self.previous_budget_membership);
+        let (selected, skipped) = select_budgeted_candidates(&candidates, plan);
+        let (mut direct, mut telemetry) = solve_direct(
+            input,
+            &selected,
+            distance_scaler,
+            &mut self.temporal_occlusion,
+            &mut self.sample_cache,
+        );
+        solve_early_reflections(input, &selected, distance_scaler, plan, &mut direct);
+
+        let sim_time = input.spatial.sim_time_seconds();
+        for (response, telemetry) in direct.iter().zip(&telemetry) {
+            self.last_solved_response.insert(
+                response.voice_id,
+                CachedDirectResponse {
+                    response: response.clone(),
+                    telemetry: telemetry.clone(),
+                    solved_at_sim_time_seconds: sim_time,
+                },
+            );
+        }
+        for candidate in skipped {
+            let max_age = max_response_age_seconds(candidate.voice.occlusion_profile);
+            let retained = self
+                .last_solved_response
+                .get(&candidate.voice.voice_id)
+                .and_then(|cached| {
+                    let age = (sim_time - cached.solved_at_sim_time_seconds).max(0.0) as f32;
+                    (age <= max_age).then(|| {
+                        let mut response = cached.response.clone();
+                        response.solve_status = DirectSolveStatus::Retained;
+                        response.cache_age_seconds = age;
+                        let mut telemetry = cached.telemetry.clone();
+                        telemetry.spatial_revision = input.spatial.revision();
+                        telemetry.geometry_version = input.scene.version();
+                        telemetry.solve_status = AcousticSolveStatus::Retained;
+                        telemetry.cache_age_seconds = age;
+                        telemetry.budget_member = false;
+                        telemetry.direct.ray_count = 0;
+                        telemetry.direct.cache_hit_count = 0;
+                        telemetry.environment.ray_count = 0;
+                        telemetry.environment.cache_hit_count = 0;
+                        (response, telemetry)
+                    })
+                });
+            let (response, event) = retained.unwrap_or_else(|| {
+                (
+                    deferred_response(&candidate.voice),
+                    deferred_telemetry(input, &candidate.voice),
+                )
+            });
+            direct.push(response);
+            telemetry.push(event);
+        }
+        direct.sort_by_key(|response| response.voice_id.value());
+        telemetry.sort_by_key(|event| event.voice_id);
+
+        self.previous_budget_membership.clear();
+        self.previous_budget_membership
+            .extend(selected.iter().map(|candidate| candidate.voice.voice_id));
+        let active_voice_ids = input
+            .voices
+            .iter()
+            .map(|voice| voice.voice_id)
+            .collect::<HashSet<_>>();
+        self.last_solved_response
+            .retain(|voice_id, _| active_voice_ids.contains(voice_id));
+        self.temporal_occlusion
+            .retain(|(voice_id, _), _| active_voice_ids.contains(voice_id));
+        self.sample_cache.retain(|key, _| {
+            active_voice_ids.contains(&key.voice_id)
+                && key.spatial_revision == input.spatial.revision()
+                && key.geometry_version == input.scene.version()
+        });
+
+        AcousticSolveOutput {
+            response: AcousticResponse {
+                spatial_revision: input.spatial.revision(),
+                geometry_version: input.scene.version(),
+                direct,
+                late_reverb: solve_late_reverb(input, distance_scaler, plan),
+                published_at: Instant::now(),
+                solve_time_us: 0,
+            },
+            telemetry,
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RankedVoice {
-    voice: AcousticVoice,
-    direct_origin: Option<Vec3>,
-    environment_origin: Option<Vec3>,
+fn deferred_response(voice: &AcousticVoice) -> DirectAcousticResponse {
+    DirectAcousticResponse {
+        voice_id: voice.voice_id,
+        gain: [1.0; 3],
+        environment_gain: [1.0; 3],
+        direct_lobes: Vec::new(),
+        environment_representatives: Vec::new(),
+        early_reflections: Vec::new(),
+        solve_status: DirectSolveStatus::Deferred,
+        cache_age_seconds: 0.0,
+    }
 }
 
-fn ranked_voices(input: &SolveInput, plan: AcousticSolvePlan) -> Vec<RankedVoice> {
+fn inactive_route_telemetry() -> AcousticRouteTelemetry {
+    AcousticRouteTelemetry {
+        sample_count: 0,
+        ray_count: 0,
+        cache_hit_count: 0,
+        hit_count: 0,
+        visible_fraction: 1.0,
+        raw_gain: [1.0; 3],
+        filtered_gain: [1.0; 3],
+        classified_state: AcousticOcclusionState::Visible,
+        dwell_seconds: 0.0,
+    }
+}
+
+fn deferred_telemetry(input: &SolveInput, voice: &AcousticVoice) -> AcousticExtentTelemetry {
+    AcousticExtentTelemetry {
+        voice_id: voice.voice_id.value(),
+        emitter: voice.emitter,
+        spatial_revision: input.spatial.revision(),
+        geometry_version: input.scene.version(),
+        response_spatial_revision: input.spatial.revision(),
+        response_geometry_version: input.scene.version(),
+        extent_sample_count: voice.source_extent.sample_count(),
+        direct: inactive_route_telemetry(),
+        environment: inactive_route_telemetry(),
+        lobes: Vec::new(),
+        solve_status: AcousticSolveStatus::Deferred,
+        cache_age_seconds: 0.0,
+        budget_member: false,
+    }
+}
+
+fn max_response_age_seconds(profile: OcclusionProfile) -> f32 {
+    match profile {
+        OcclusionProfile::PointExact => 0.25,
+        OcclusionProfile::AmbientDistributed(profile) => profile.max_response_age_seconds(),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RankedVoice {
+    voice: AcousticVoice,
+    direct_pose: Option<Pose>,
+    environment_pose: Option<Pose>,
+}
+
+fn ranked_voices(
+    input: &SolveInput,
+    previous_budget_membership: &HashSet<SourceId>,
+) -> Vec<RankedVoice> {
     let listener_pose = input.spatial.listener();
     let listener = listener_pose.position;
     let mut candidates: Vec<(f32, RankedVoice)> = input
         .voices
         .iter()
         .filter_map(|voice| {
-            let direct_origin = match voice.direct_path.placement() {
+            let direct_pose = match voice.direct_path.placement() {
                 DirectPlacement::World
                     if matches!(
                         voice.direct_path.geometry(),
                         DirectGeometry::SimulatedTransmission
                     ) =>
                 {
-                    Some(voice.emitter_world_pose.position)
+                    Some(voice.emitter_world_pose)
                 }
                 DirectPlacement::ListenerRelative(local_pose)
                     if matches!(
@@ -620,117 +1044,722 @@ fn ranked_voices(input: &SolveInput, plan: AcousticSolvePlan) -> Vec<RankedVoice
                         DirectGeometry::SimulatedTransmission
                     ) =>
                 {
-                    Some(listener_to_world_position(
-                        listener_pose,
-                        local_pose.position,
-                    ))
+                    Some(listener_to_world_pose(listener_pose, local_pose))
                 }
                 _ => None,
             };
-            let environment_origin = match voice.environment_send.origin() {
-                EnvironmentOrigin::FollowEmitter => Some(voice.emitter_world_pose.position),
-                EnvironmentOrigin::World(origin) => Some(origin.position),
+            let environment_pose = match voice.environment_send.origin() {
+                EnvironmentOrigin::FollowEmitter => Some(voice.emitter_world_pose),
+                EnvironmentOrigin::World(origin) => Some(origin),
                 EnvironmentOrigin::Disabled => None,
             };
-            let origin = environment_origin.or(direct_origin)?;
+            if direct_pose
+                .is_some_and(|pose| !extent_transform_is_finite(&voice.source_extent, pose))
+                || environment_pose
+                    .is_some_and(|pose| !extent_transform_is_finite(&voice.source_extent, pose))
+            {
+                return None;
+            }
+            let origin = environment_pose.or(direct_pose)?.position;
             let distance = origin.distance(listener);
             let priority = voice.acoustic_priority;
+            let membership_bias = if previous_budget_membership.contains(&voice.voice_id) {
+                1.1
+            } else {
+                1.0
+            };
             (distance.is_finite() && priority.is_finite() && priority > 0.0).then_some((
-                priority / (1.0 + distance),
+                priority * voice.audibility.max(0.0) * membership_bias / (1.0 + distance),
                 RankedVoice {
-                    voice: *voice,
-                    direct_origin,
-                    environment_origin,
+                    voice: voice.clone(),
+                    direct_pose,
+                    environment_pose,
                 },
             ))
         })
         .collect();
-    candidates.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(CmpOrdering::Equal));
-    candidates.truncate(plan.max_direct_sources);
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(CmpOrdering::Equal)
+            .then_with(|| {
+                left.1
+                    .voice
+                    .voice_id
+                    .value()
+                    .cmp(&right.1.voice.voice_id.value())
+            })
+    });
     candidates.into_iter().map(|(_, voice)| voice).collect()
+}
+
+fn extent_transform_is_finite(extent: &SourceExtent, pose: Pose) -> bool {
+    extent.weighted().is_none_or(|weighted| {
+        weighted
+            .samples()
+            .iter()
+            .all(|sample| (pose.position + pose.rotation * sample.local_position()).is_finite())
+    })
+}
+
+fn select_budgeted_candidates(
+    candidates: &[RankedVoice],
+    plan: AcousticSolvePlan,
+) -> (Vec<RankedVoice>, Vec<RankedVoice>) {
+    let mut selected = Vec::with_capacity(plan.max_direct_sources.min(candidates.len()));
+    let mut skipped = Vec::new();
+    let mut rays = 0usize;
+    for candidate in candidates {
+        let route_count = usize::from(candidate.direct_pose.is_some())
+            + usize::from(candidate.environment_pose.is_some());
+        let cost = candidate
+            .voice
+            .source_extent
+            .sample_count()
+            .saturating_mul(route_count);
+        if selected.len() < plan.max_direct_sources
+            && rays.saturating_add(cost) <= plan.max_direct_rays
+        {
+            rays += cost;
+            selected.push(candidate.clone());
+        } else {
+            skipped.push(candidate.clone());
+        }
+    }
+    (selected, skipped)
 }
 
 fn solve_direct(
     input: &SolveInput,
     candidates: &[RankedVoice],
     distance_scaler: f32,
-) -> Vec<DirectAcousticResponse> {
+    temporal_occlusion: &mut HashMap<(SourceId, RouteKind), TemporalOcclusionState>,
+    sample_cache: &mut HashMap<SampleCacheKey, ExtentSampleResponse>,
+) -> (Vec<DirectAcousticResponse>, Vec<AcousticExtentTelemetry>) {
     let listener = input.spatial.listener().position;
     let ray_epsilon_world = RAY_EPSILON_METERS / distance_scaler.max(0.001);
 
-    let direct_gain = trace_transmission(
-        input,
-        listener,
-        ray_epsilon_world,
-        candidates.iter().map(|voice| voice.direct_origin),
-    );
-    let environment_gain = trace_transmission(
-        input,
-        listener,
-        ray_epsilon_world,
-        candidates.iter().map(|voice| voice.environment_origin),
-    );
-
     candidates
         .iter()
-        .zip(direct_gain)
-        .zip(environment_gain)
-        .map(
-            |((candidate, gain), environment_gain)| DirectAcousticResponse {
-                voice_id: candidate.voice.voice_id,
-                gain,
-                environment_gain,
-                early_reflections: Vec::with_capacity(MAX_EARLY_REFLECTION_TAPS),
-            },
-        )
-        .collect()
+        .map(|candidate| {
+            let direct_samples = candidate.direct_pose.map(|pose| {
+                trace_extent_transmission(
+                    input,
+                    RouteTraceContext {
+                        listener,
+                        ray_epsilon_world,
+                        voice_id: candidate.voice.voice_id,
+                        emitter: candidate.voice.emitter,
+                        route: RouteKind::Direct,
+                    },
+                    resolve_extent_samples(&candidate.voice.source_extent, pose),
+                    sample_cache,
+                )
+            });
+            let environment_samples = candidate.environment_pose.map(|pose| {
+                trace_extent_transmission(
+                    input,
+                    RouteTraceContext {
+                        listener,
+                        ray_epsilon_world,
+                        voice_id: candidate.voice.voice_id,
+                        emitter: candidate.voice.emitter,
+                        route: RouteKind::Environment,
+                    },
+                    resolve_extent_samples(&candidate.voice.source_extent, pose),
+                    sample_cache,
+                )
+            });
+            let direct_aggregate = direct_samples
+                .as_ref()
+                .map(|trace| trace.samples.as_slice())
+                .map(aggregate_extent_energy);
+            let environment_aggregate = environment_samples
+                .as_ref()
+                .map(|trace| trace.samples.as_slice())
+                .map(aggregate_extent_energy);
+            let raw_direct = direct_aggregate.map_or([1.0; 3], |aggregate| aggregate.gain);
+            let raw_environment =
+                environment_aggregate.map_or([1.0; 3], |aggregate| aggregate.gain);
+            let direct_update = filter_profile_gain(
+                candidate.voice.voice_id,
+                RouteKind::Direct,
+                raw_direct,
+                direct_aggregate.map_or(1.0, |aggregate| aggregate.visible_fraction),
+                input.spatial.sim_time_seconds(),
+                candidate.voice.occlusion_profile,
+                temporal_occlusion,
+            );
+            let environment_update = filter_profile_gain(
+                candidate.voice.voice_id,
+                RouteKind::Environment,
+                raw_environment,
+                environment_aggregate.map_or(1.0, |aggregate| aggregate.visible_fraction),
+                input.spatial.sim_time_seconds(),
+                candidate.voice.occlusion_profile,
+                temporal_occlusion,
+            );
+            let gain = direct_update.filtered_gain;
+            let environment_gain = environment_update.filtered_gain;
+            let direct_lobes =
+                direct_samples.as_ref().map_or_else(Vec::new, |trace| {
+                    match candidate.voice.source_extent {
+                        SourceExtent::Point => Vec::new(),
+                        SourceExtent::WeightedSamples(_) => aggregate_directional_lobes(
+                            &trace.samples,
+                            listener,
+                            profile_lobe_count(candidate.voice.occlusion_profile),
+                            gain,
+                        ),
+                    }
+                });
+            let environment_representatives =
+                environment_samples.as_ref().map_or_else(Vec::new, |trace| {
+                    select_environment_representatives(&trace.samples, 2)
+                });
+            let direct_route = route_telemetry(
+                direct_samples.as_ref(),
+                direct_aggregate,
+                raw_direct,
+                direct_update,
+            );
+            let environment_route = route_telemetry(
+                environment_samples.as_ref(),
+                environment_aggregate,
+                raw_environment,
+                environment_update,
+            );
+            let lobe_telemetry = direct_lobes
+                .iter()
+                .map(|lobe| AcousticLobeTelemetry {
+                    lobe_id: lobe.lobe_id,
+                    direction: lobe.direction,
+                    gain: lobe.gain,
+                    power: lobe.power,
+                })
+                .collect();
+            (
+                DirectAcousticResponse {
+                    voice_id: candidate.voice.voice_id,
+                    gain,
+                    environment_gain,
+                    direct_lobes,
+                    environment_representatives,
+                    early_reflections: Vec::with_capacity(MAX_EARLY_REFLECTION_TAPS),
+                    solve_status: DirectSolveStatus::Solved,
+                    cache_age_seconds: 0.0,
+                },
+                AcousticExtentTelemetry {
+                    voice_id: candidate.voice.voice_id.value(),
+                    emitter: candidate.voice.emitter,
+                    spatial_revision: input.spatial.revision(),
+                    geometry_version: input.scene.version(),
+                    response_spatial_revision: input.spatial.revision(),
+                    response_geometry_version: input.scene.version(),
+                    extent_sample_count: candidate.voice.source_extent.sample_count(),
+                    direct: direct_route,
+                    environment: environment_route,
+                    lobes: lobe_telemetry,
+                    solve_status: AcousticSolveStatus::Solved,
+                    cache_age_seconds: 0.0,
+                    budget_member: true,
+                },
+            )
+        })
+        .unzip()
 }
 
-fn trace_transmission(
-    input: &SolveInput,
+fn route_telemetry(
+    trace: Option<&ExtentTrace>,
+    aggregate: Option<ExtentEnergyAggregate>,
+    raw_gain: [f32; 3],
+    update: TemporalOcclusionUpdate,
+) -> AcousticRouteTelemetry {
+    let Some(trace) = trace else {
+        return inactive_route_telemetry();
+    };
+    let aggregate = aggregate.expect("a traced extent always has an energy aggregate");
+    AcousticRouteTelemetry {
+        sample_count: trace.samples.len(),
+        ray_count: trace.ray_count,
+        cache_hit_count: trace.cache_hit_count,
+        hit_count: aggregate.hit_count,
+        visible_fraction: aggregate.visible_fraction,
+        raw_gain,
+        filtered_gain: update.filtered_gain,
+        classified_state: match update.classification {
+            OcclusionClassification::Visible => AcousticOcclusionState::Visible,
+            OcclusionClassification::Occluded => AcousticOcclusionState::Occluded,
+        },
+        dwell_seconds: update.dwell_seconds,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedExtentSample {
+    sample_id: crate::domain::ExtentSampleId,
+    power_weight: f32,
+    world_position: Vec3,
+}
+
+struct ExtentTrace {
+    samples: Vec<ExtentSampleResponse>,
+    ray_count: usize,
+    cache_hit_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RouteTraceContext {
     listener: Vec3,
     ray_epsilon_world: f32,
-    origins: impl Iterator<Item = Option<Vec3>>,
-) -> Vec<[f32; 3]> {
-    let origins: Vec<_> = origins.collect();
-    let mut rays = Vec::with_capacity(origins.len());
-    let mut min_distances = Vec::with_capacity(origins.len());
-    let mut max_distances = Vec::with_capacity(origins.len());
-    for origin in &origins {
-        let delta = origin.unwrap_or(listener) - listener;
+    voice_id: SourceId,
+    emitter: Emitter,
+    route: RouteKind,
+}
+
+fn resolve_extent_samples(extent: &SourceExtent, pose: Pose) -> Vec<ResolvedExtentSample> {
+    match extent {
+        SourceExtent::Point => vec![ResolvedExtentSample {
+            sample_id: crate::domain::ExtentSampleId(u64::MAX),
+            power_weight: 1.0,
+            world_position: pose.position,
+        }],
+        SourceExtent::WeightedSamples(weighted) => weighted
+            .samples()
+            .iter()
+            .map(|sample| ResolvedExtentSample {
+                sample_id: sample.id(),
+                power_weight: sample.power_weight(),
+                world_position: pose.position + pose.rotation * sample.local_position(),
+            })
+            .collect(),
+    }
+}
+
+fn trace_extent_transmission(
+    input: &SolveInput,
+    context: RouteTraceContext,
+    samples: Vec<ResolvedExtentSample>,
+    sample_cache: &mut HashMap<SampleCacheKey, ExtentSampleResponse>,
+) -> ExtentTrace {
+    let mut responses = vec![None; samples.len()];
+    let mut miss_indices = Vec::with_capacity(samples.len());
+    let mut miss_keys = Vec::with_capacity(samples.len());
+    let mut rays = Vec::with_capacity(samples.len());
+    let mut min_distances = Vec::with_capacity(samples.len());
+    let mut max_distances = Vec::with_capacity(samples.len());
+    for (index, sample) in samples.iter().enumerate() {
+        let key = SampleCacheKey {
+            voice_id: context.voice_id,
+            emitter: context.emitter,
+            spatial_revision: input.spatial.revision(),
+            geometry_version: input.scene.version(),
+            sample_id: sample.sample_id,
+            route: context.route,
+        };
+        if let Some(cached) = sample_cache.get(&key).copied() {
+            responses[index] = Some(cached);
+            continue;
+        }
+        let delta = sample.world_position - context.listener;
         let distance = delta.length();
+        miss_indices.push(index);
+        miss_keys.push(key);
         rays.push(AcousticRay {
-            origin: listener,
+            origin: context.listener,
             direction: normalize_or(delta, Vec3::Z),
         });
-        let max_distance = (distance - ray_epsilon_world).max(0.0);
-        min_distances.push(ray_epsilon_world.min(max_distance));
+        let max_distance = (distance - context.ray_epsilon_world).max(0.0);
+        min_distances.push(context.ray_epsilon_world.min(max_distance));
         max_distances.push(max_distance);
     }
-    let mut hits = vec![None; rays.len()];
-    input
-        .scene
-        .query()
-        .trace_closest_hit_batch(&rays, &min_distances, &max_distances, &mut hits);
+    if !rays.is_empty() {
+        let mut hits = vec![None; rays.len()];
+        input.scene.query().trace_closest_hit_batch(
+            &rays,
+            &min_distances,
+            &max_distances,
+            &mut hits,
+        );
+        for ((((index, key), hit), min_distance), max_distance) in miss_indices
+            .into_iter()
+            .zip(miss_keys)
+            .zip(hits)
+            .zip(min_distances)
+            .zip(max_distances)
+        {
+            let sample = samples[index];
+            let hit =
+                hit.filter(|hit| valid_hit_distance(hit.distance, min_distance, max_distance));
+            let response = ExtentSampleResponse {
+                sample_id: sample.sample_id,
+                power_weight: sample.power_weight,
+                world_position: sample.world_position,
+                transmission: hit
+                    .map(|hit| {
+                        hit.material
+                            .transmission
+                            .map(|gain| sanitize_unit(gain, 1.0))
+                    })
+                    .unwrap_or([1.0; 3]),
+                hit: hit.is_some(),
+            };
+            sample_cache.insert(key, response);
+            responses[index] = Some(response);
+        }
+    }
+    ExtentTrace {
+        samples: responses
+            .into_iter()
+            .map(|response| response.expect("every extent sample must resolve or hit the cache"))
+            .collect(),
+        ray_count: rays.len(),
+        cache_hit_count: samples.len().saturating_sub(rays.len()),
+    }
+}
 
-    origins
-        .into_iter()
-        .zip(hits)
-        .zip(min_distances.into_iter().zip(max_distances))
-        .map(|((origin, hit), (min_distance, max_distance))| {
-            origin
-                .map(|_| {
-                    hit.filter(|hit| valid_hit_distance(hit.distance, min_distance, max_distance))
-                        .map(|hit| {
-                            hit.material
-                                .transmission
-                                .map(|gain| sanitize_unit(gain, 1.0))
-                        })
-                        .unwrap_or([1.0; 3])
-                })
-                .unwrap_or([1.0; 3])
+fn apply_profile_floor(gain: [f32; 3], profile: OcclusionProfile) -> [f32; 3] {
+    match profile {
+        OcclusionProfile::PointExact => gain,
+        OcclusionProfile::AmbientDistributed(profile) => {
+            let floor = profile.gain_floor();
+            std::array::from_fn(|band| gain[band].max(floor[band]))
+        }
+    }
+}
+
+fn filter_profile_gain(
+    voice_id: SourceId,
+    route: RouteKind,
+    raw_gain: [f32; 3],
+    visible_fraction: f32,
+    sim_time_seconds: f64,
+    profile: OcclusionProfile,
+    temporal_occlusion: &mut HashMap<(SourceId, RouteKind), TemporalOcclusionState>,
+) -> TemporalOcclusionUpdate {
+    match profile {
+        OcclusionProfile::PointExact => TemporalOcclusionUpdate {
+            filtered_gain: raw_gain,
+            classification: if visible_fraction < 1.0 - f32::EPSILON {
+                OcclusionClassification::Occluded
+            } else {
+                OcclusionClassification::Visible
+            },
+            dwell_seconds: 0.0,
+        },
+        OcclusionProfile::AmbientDistributed(profile) => {
+            let bounded =
+                apply_profile_floor(raw_gain, OcclusionProfile::AmbientDistributed(profile));
+            temporal_occlusion
+                .entry((voice_id, route))
+                .or_default()
+                .update(bounded, visible_fraction, sim_time_seconds, profile)
+        }
+    }
+}
+
+fn profile_lobe_count(profile: OcclusionProfile) -> u8 {
+    match profile {
+        OcclusionProfile::PointExact => MAX_DIRECT_LOBES as u8,
+        OcclusionProfile::AmbientDistributed(profile) => profile.lobe_count(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum OcclusionClassification {
+    #[default]
+    Visible,
+    Occluded,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TemporalOcclusionUpdate {
+    filtered_gain: [f32; 3],
+    classification: OcclusionClassification,
+    dwell_seconds: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TemporalOcclusionState {
+    initialized: bool,
+    filtered_gain: [f32; 3],
+    classification: OcclusionClassification,
+    classification_since: f64,
+    pending_classification: Option<OcclusionClassification>,
+    pending_since: f64,
+    last_time: f64,
+}
+
+impl Default for TemporalOcclusionState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            filtered_gain: [1.0; 3],
+            classification: OcclusionClassification::Visible,
+            classification_since: 0.0,
+            pending_classification: None,
+            pending_since: 0.0,
+            last_time: 0.0,
+        }
+    }
+}
+
+impl TemporalOcclusionState {
+    fn update(
+        &mut self,
+        raw_gain: [f32; 3],
+        visible_fraction: f32,
+        sim_time_seconds: f64,
+        profile: crate::domain::DistributedOcclusionProfile,
+    ) -> TemporalOcclusionUpdate {
+        let sim_time_seconds = if sim_time_seconds.is_finite() {
+            sim_time_seconds.max(self.last_time)
+        } else {
+            self.last_time
+        };
+        if !self.initialized {
+            self.initialized = true;
+            self.filtered_gain = raw_gain;
+            self.classification = if visible_fraction <= profile.classification().0 {
+                OcclusionClassification::Occluded
+            } else {
+                OcclusionClassification::Visible
+            };
+            self.classification_since = sim_time_seconds;
+            self.last_time = sim_time_seconds;
+            return self.snapshot(sim_time_seconds);
+        }
+
+        let elapsed = (sim_time_seconds - self.last_time).max(0.0) as f32;
+        let (attack_seconds, release_seconds) = profile.response_times_seconds();
+        for (filtered, raw) in self.filtered_gain.iter_mut().zip(raw_gain) {
+            let response_seconds = if raw < *filtered {
+                attack_seconds
+            } else {
+                release_seconds
+            };
+            let alpha = 1.0 - (-elapsed / response_seconds).exp();
+            *filtered += alpha * (raw - *filtered);
+        }
+        self.last_time = sim_time_seconds;
+
+        let (enter_threshold, exit_threshold, minimum_dwell_seconds) = profile.classification();
+        let requested = match self.classification {
+            OcclusionClassification::Visible if visible_fraction < enter_threshold => {
+                Some(OcclusionClassification::Occluded)
+            }
+            OcclusionClassification::Occluded if visible_fraction > exit_threshold => {
+                Some(OcclusionClassification::Visible)
+            }
+            _ => None,
+        };
+        match requested {
+            Some(requested) if self.pending_classification == Some(requested) => {
+                if sim_time_seconds - self.pending_since + 1.0e-6
+                    >= f64::from(minimum_dwell_seconds)
+                {
+                    self.classification = requested;
+                    self.classification_since = sim_time_seconds;
+                    self.pending_classification = None;
+                }
+            }
+            Some(requested) => {
+                self.pending_classification = Some(requested);
+                self.pending_since = sim_time_seconds;
+            }
+            None => self.pending_classification = None,
+        }
+        self.snapshot(sim_time_seconds)
+    }
+
+    fn snapshot(self, sim_time_seconds: f64) -> TemporalOcclusionUpdate {
+        TemporalOcclusionUpdate {
+            filtered_gain: self.filtered_gain,
+            classification: self.classification,
+            dwell_seconds: (sim_time_seconds - self.classification_since).max(0.0) as f32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExtentSampleResponse {
+    sample_id: crate::domain::ExtentSampleId,
+    power_weight: f32,
+    world_position: Vec3,
+    transmission: [f32; 3],
+    hit: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExtentEnergyAggregate {
+    gain: [f32; 3],
+    hit_count: usize,
+    visible_fraction: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DirectLobeTarget {
+    pub lobe_id: u8,
+    pub direction: Vec3,
+    pub gain: [f32; 3],
+    pub power: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EnvironmentRepresentative {
+    sample_id: crate::domain::ExtentSampleId,
+    world_position: Vec3,
+    power: f32,
+}
+
+fn aggregate_extent_energy(samples: &[ExtentSampleResponse]) -> ExtentEnergyAggregate {
+    let mut ordered = samples.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|sample| sample.sample_id);
+    let mut energy = [0.0_f64; 3];
+    let mut visible_power = 0.0_f64;
+    let mut hit_count = 0;
+    for sample in ordered {
+        let weight = f64::from(sample.power_weight);
+        if sample.hit {
+            hit_count += 1;
+        } else {
+            visible_power += weight;
+        }
+        for (band_energy, transmission) in energy.iter_mut().zip(sample.transmission) {
+            let transmission = f64::from(sanitize_unit(transmission, 1.0));
+            *band_energy += weight * transmission * transmission;
+        }
+    }
+    ExtentEnergyAggregate {
+        gain: energy.map(|energy| energy.max(0.0).sqrt() as f32),
+        hit_count,
+        visible_fraction: visible_power.clamp(0.0, 1.0) as f32,
+    }
+}
+
+fn aggregate_directional_lobes(
+    samples: &[ExtentSampleResponse],
+    listener: Vec3,
+    requested_lobes: u8,
+    target_gain: [f32; 3],
+) -> Vec<DirectLobeTarget> {
+    let lobe_count = usize::from(requested_lobes).clamp(1, MAX_DIRECT_LOBES);
+    let mut ordered = samples.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|sample| sample.sample_id);
+    let mut band_energy = [[0.0_f64; 3]; MAX_DIRECT_LOBES];
+    let mut power_basis = [0.0_f64; MAX_DIRECT_LOBES];
+    let mut fallback_power = [0.0_f64; MAX_DIRECT_LOBES];
+    let mut direction_sum = [Vec3::ZERO; MAX_DIRECT_LOBES];
+    let mut fallback: [Option<(f32, crate::domain::ExtentSampleId, Vec3)>; MAX_DIRECT_LOBES] =
+        [None; MAX_DIRECT_LOBES];
+
+    for sample in ordered {
+        let lobe = sample.sample_id.0 as usize % lobe_count;
+        fallback_power[lobe] += f64::from(sample.power_weight);
+        let direction = normalize_or(sample.world_position - listener, Vec3::Z);
+        let mut broadband_energy = 0.0_f64;
+        for (energy, transmission) in band_energy[lobe].iter_mut().zip(sample.transmission) {
+            let transmission = f64::from(sanitize_unit(transmission, 1.0));
+            let sample_energy = f64::from(sample.power_weight) * transmission * transmission;
+            *energy += sample_energy;
+            broadband_energy += sample_energy / 3.0;
+        }
+        let directional_weight = broadband_energy.max(f64::from(sample.power_weight) * 1.0e-6);
+        power_basis[lobe] += broadband_energy;
+        direction_sum[lobe] += direction * directional_weight as f32;
+        let candidate = (directional_weight as f32, sample.sample_id, direction);
+        if fallback[lobe].is_none_or(|current| {
+            candidate.0 > current.0 || (candidate.0 == current.0 && candidate.1 < current.1)
+        }) {
+            fallback[lobe] = Some(candidate);
+        }
+    }
+
+    let measured_total_power = power_basis.iter().sum::<f64>();
+    let total_fallback_power = fallback_power.iter().sum::<f64>();
+    let total_band_energy = std::array::from_fn::<_, 3, _>(|band| {
+        band_energy
+            .iter()
+            .map(|lobe_energy| lobe_energy[band])
+            .sum::<f64>()
+    });
+    let active_lobes = (0..lobe_count)
+        .filter(|index| fallback[*index].is_some())
+        .count()
+        .max(1);
+    let mut lobes = Vec::with_capacity(active_lobes);
+    for lobe in 0..lobe_count {
+        let Some((_, _, fallback_direction)) = fallback[lobe] else {
+            continue;
+        };
+        let power = if measured_total_power > f64::EPSILON {
+            (power_basis[lobe] / measured_total_power) as f32
+        } else if total_fallback_power > f64::EPSILON {
+            (fallback_power[lobe] / total_fallback_power) as f32
+        } else {
+            1.0 / active_lobes as f32
+        };
+        lobes.push(DirectLobeTarget {
+            lobe_id: lobe as u8,
+            direction: normalize_or(direction_sum[lobe], fallback_direction),
+            gain: std::array::from_fn(|band| {
+                let energy_fraction = if total_band_energy[band] > f64::EPSILON {
+                    band_energy[lobe][band] / total_band_energy[band]
+                } else {
+                    f64::from(power)
+                };
+                energy_fraction.max(0.0).sqrt() as f32 * target_gain[band]
+            }),
+            power,
+        });
+    }
+    lobes
+}
+
+fn select_environment_representatives(
+    samples: &[ExtentSampleResponse],
+    limit: usize,
+) -> Vec<EnvironmentRepresentative> {
+    let mut representatives = samples
+        .iter()
+        .map(|sample| {
+            let transmission_energy = sample
+                .transmission
+                .iter()
+                .map(|transmission| transmission * transmission)
+                .sum::<f32>()
+                / 3.0;
+            EnvironmentRepresentative {
+                sample_id: sample.sample_id,
+                world_position: sample.world_position,
+                power: sample.power_weight * transmission_energy,
+            }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    representatives.sort_by(|left, right| {
+        right
+            .power
+            .total_cmp(&left.power)
+            .then_with(|| left.sample_id.cmp(&right.sample_id))
+    });
+    representatives.truncate(limit.min(representatives.len()));
+    let selected_power = representatives
+        .iter()
+        .map(|representative| representative.power)
+        .sum::<f32>();
+    if selected_power > f32::EPSILON {
+        for representative in &mut representatives {
+            representative.power /= selected_power;
+        }
+    } else if !representatives.is_empty() {
+        let equal_power = 1.0 / representatives.len() as f32;
+        for representative in &mut representatives {
+            representative.power = equal_power;
+        }
+    }
+    representatives.sort_by_key(|representative| representative.sample_id);
+    representatives
 }
 
 fn solve_early_reflections(
@@ -760,11 +1789,19 @@ fn solve_early_reflections(
     );
 
     for candidate in candidates.iter().take(plan.max_early_reflection_sources) {
-        let Some(source_position) = candidate.environment_origin else {
+        let Some((representatives, aggregate_environment_gain)) = responses
+            .iter()
+            .find(|response| response.voice_id == candidate.voice.voice_id)
+            .map(|response| {
+                (
+                    response.environment_representatives.clone(),
+                    response.environment_gain,
+                )
+            })
+        else {
             continue;
         };
-        let direct_distance_world = source_position.distance(listener);
-        if !direct_distance_world.is_finite() {
+        if representatives.is_empty() {
             continue;
         }
         let mut visibility_rays = Vec::with_capacity(plan.early_reflection_ray_count);
@@ -778,6 +1815,12 @@ fn solve_early_reflections(
             }) else {
                 continue;
             };
+            let representative = representatives[path_id % representatives.len()];
+            let source_position = representative.world_position;
+            let direct_distance_world = source_position.distance(listener);
+            if !direct_distance_world.is_finite() {
+                continue;
+            }
             let hit_position = listener + probe_ray.direction * hit.distance;
             let hit_to_source = source_position - hit_position;
             let hit_to_source_distance = hit_to_source.length();
@@ -820,10 +1863,12 @@ fn solve_early_reflections(
             let total_distance_meters = total_distance_world * distance_scaler;
             let propagation_gain = EARLY_REFLECTION_GAIN
                 * path_weight
+                * representative.power.sqrt()
                 * propagation_air_absorption(total_distance_meters)
                 * propagation_distance_attenuation(total_distance_meters);
             let gain = std::array::from_fn(|band| {
                 propagation_gain
+                    * aggregate_environment_gain[band]
                     * (1.0
                         - sanitize_unit(
                             hit.material.absorption[band],
@@ -841,7 +1886,8 @@ fn solve_early_reflections(
             visibility_min.push(0.0);
             visibility_max.push((hit_to_source_distance - ray_epsilon_world * 2.0).max(0.0));
             candidates_for_visibility.push(EarlyReflectionTap {
-                path_id: path_id as u16,
+                path_id: ((path_id as u64 ^ representative.sample_id.0.rotate_left(17))
+                    & u64::from(u16::MAX)) as u16,
                 arrival_direction: probe_ray.direction,
                 delay_seconds,
                 gain,
@@ -879,11 +1925,14 @@ fn solve_early_reflections(
     }
 }
 
-fn listener_to_world_position(listener: Pose, local_position: Vec3) -> Vec3 {
-    listener.position
-        + listener.right() * local_position.x
-        + listener.up() * local_position.y
-        + listener.forward() * local_position.z
+fn listener_to_world_pose(listener: Pose, local: Pose) -> Pose {
+    Pose::new(
+        listener.position
+            + listener.right() * local.position.x
+            + listener.up() * local.position.y
+            + listener.forward() * local.position.z,
+        listener.rotation * local.rotation,
+    )
 }
 
 fn reflection_strength(tap: &EarlyReflectionTap) -> f32 {
@@ -1102,6 +2151,7 @@ mod tests {
     use crate::acoustics::{AcousticHit, AcousticMaterial, AcousticRayQuerySnapshot};
     use crate::domain::EmitterSpatialState;
     use crate::math::Pose;
+    use std::sync::atomic::AtomicUsize;
 
     struct NoGeometry;
 
@@ -1123,6 +2173,104 @@ mod tests {
             _max_distances: &[f32],
             hits: &mut [Option<AcousticHit>],
         ) {
+            hits.fill(None);
+        }
+    }
+
+    struct BlockingOpenGeometry {
+        first_call: AtomicBool,
+        entered: Mutex<bool>,
+        entered_changed: Condvar,
+        released: Mutex<bool>,
+        released_changed: Condvar,
+    }
+
+    impl BlockingOpenGeometry {
+        fn new() -> Self {
+            Self {
+                first_call: AtomicBool::new(true),
+                entered: Mutex::new(false),
+                entered_changed: Condvar::new(),
+                released: Mutex::new(false),
+                released_changed: Condvar::new(),
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let entered = self.entered.lock().unwrap();
+            let (_entered, timeout) = self
+                .entered_changed
+                .wait_timeout_while(entered, Duration::from_secs(1), |entered| !*entered)
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "worker never entered the controlled solve"
+            );
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.released_changed.notify_all();
+        }
+    }
+
+    impl AcousticRayQuerySnapshot for BlockingOpenGeometry {
+        fn trace_any_hit_batch(
+            &self,
+            _rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            hits.fill(false);
+        }
+
+        fn trace_closest_hit_batch(
+            &self,
+            _rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [Option<AcousticHit>],
+        ) {
+            if self.first_call.swap(false, Ordering::AcqRel) {
+                *self.entered.lock().unwrap() = true;
+                self.entered_changed.notify_all();
+                let released = self.released.lock().unwrap();
+                drop(
+                    self.released_changed
+                        .wait_while(released, |released| !*released)
+                        .unwrap(),
+                );
+            }
+            hits.fill(None);
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingOpenGeometry {
+        traced_closest_rays: AtomicUsize,
+    }
+
+    impl AcousticRayQuerySnapshot for CountingOpenGeometry {
+        fn trace_any_hit_batch(
+            &self,
+            _rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            hits.fill(false);
+        }
+
+        fn trace_closest_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [Option<AcousticHit>],
+        ) {
+            self.traced_closest_rays
+                .fetch_add(rays.len(), Ordering::Relaxed);
             hits.fill(None);
         }
     }
@@ -1247,6 +2395,44 @@ mod tests {
         }
     }
 
+    struct NegativeXWood;
+
+    impl AcousticRayQuerySnapshot for NegativeXWood {
+        fn trace_any_hit_batch(
+            &self,
+            _rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            hits.fill(false);
+        }
+
+        fn trace_closest_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            min_distances: &[f32],
+            max_distances: &[f32],
+            hits: &mut [Option<AcousticHit>],
+        ) {
+            for (((ray, min_distance), max_distance), hit) in rays
+                .iter()
+                .zip(min_distances.iter().copied())
+                .zip(max_distances.iter().copied())
+                .zip(hits.iter_mut())
+            {
+                *hit = (ray.direction.x < 0.0).then_some(AcousticHit {
+                    distance: (min_distance + max_distance) * 0.5,
+                    normal: -ray.direction,
+                    material: AcousticMaterial {
+                        transmission: [0.1; 3],
+                        ..AcousticMaterial::default()
+                    },
+                });
+            }
+        }
+    }
+
     struct ReflectiveFloor {
         blocks_visibility: bool,
     }
@@ -1314,12 +2500,202 @@ mod tests {
                 emitter,
                 emitter_world_pose: Pose::from_position(Vec3::Z),
                 acoustic_priority: 1.0,
+                audibility: 1.0,
                 detached: false,
                 direct_path: DirectPath::default(),
                 environment_send: EnvironmentSend::default(),
+                source_extent: SourceExtent::Point,
+                occlusion_profile: OcclusionProfile::PointExact,
             }],
             environmental_acoustics_quality: 0.5,
         }
+    }
+
+    fn eight_sample_extent() -> SourceExtent {
+        use crate::domain::{ExtentSample, ExtentSampleId};
+
+        SourceExtent::weighted_samples(
+            [-1.75_f32, -1.25, -0.75, -0.25, 0.25, 0.75, 1.25, 1.75]
+                .into_iter()
+                .enumerate()
+                .map(|(id, x)| {
+                    ExtentSample::new(ExtentSampleId(id as u64), Vec3::new(x, 0.0, 2.0), 1.0)
+                        .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn fixture_gain_at_listener(listener_x: f32, revision: u64) -> f32 {
+        let mut fixture = input(Arc::new(NegativeXWood));
+        fixture.spatial = Arc::new(SpatialFrame::new(
+            revision,
+            revision as f64 * 0.1,
+            Pose::from_position(Vec3::new(listener_x, 0.0, 0.0)),
+            vec![EmitterSpatialState::new(
+                fixture.voices[0].emitter,
+                Pose::identity(),
+            )],
+        ));
+        fixture.voices[0].emitter_world_pose = Pose::identity();
+        fixture.voices[0].source_extent = eight_sample_extent();
+        fixture.voices[0].environment_send = EnvironmentSend::disabled();
+        let plan = AcousticSolvePlan {
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+            ..AcousticSolvePlan::for_quality(0.5)
+        };
+        AcousticSolver::new(1)
+            .solve_with_plan(&fixture, 1.0, plan)
+            .direct[0]
+            .gain[0]
+    }
+
+    #[test]
+    fn fixed_extended_source_trajectory_and_budget_fixture_is_deterministic() {
+        let listener_path = [-2.0_f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let forward = listener_path
+            .into_iter()
+            .enumerate()
+            .map(|(index, x)| fixture_gain_at_listener(x, index as u64 + 1))
+            .collect::<Vec<_>>();
+        let reverse = listener_path
+            .into_iter()
+            .rev()
+            .enumerate()
+            .map(|(index, x)| fixture_gain_at_listener(x, index as u64 + 20))
+            .collect::<Vec<_>>();
+        for (forward_gain, reverse_gain) in forward.iter().zip(reverse.iter().rev()) {
+            assert!((forward_gain - reverse_gain).abs() < 1.0e-6);
+        }
+        assert!(forward.windows(2).all(|pair| pair[1] <= pair[0] + 1.0e-6));
+
+        let static_left = fixture_gain_at_listener(-1.0e-4, 40);
+        let static_right = fixture_gain_at_listener(1.0e-4, 41);
+        assert!((static_left - static_right).abs() < 1.0e-6);
+        let coarse_half_gain = fixture_gain_at_listener(0.0, 42);
+        assert!((coarse_half_gain - 0.710_633_5).abs() < 1.0e-6);
+
+        let mut budget_input = input(Arc::new(NoGeometry));
+        budget_input.voices[0].source_extent = eight_sample_extent();
+        budget_input.voices[0].environment_send = EnvironmentSend::disabled();
+        budget_input.voices = (0..10)
+            .map(|index| {
+                let mut voice = budget_input.voices[0].clone();
+                voice.voice_id = SourceId::from(index as u64);
+                voice.emitter = Emitter {
+                    world_id: 1,
+                    index,
+                    generation: 1,
+                };
+                voice
+            })
+            .collect();
+        let output = AcousticSolver::new(10).solve_with_telemetry(
+            &budget_input,
+            1.0,
+            AcousticSolvePlan {
+                max_direct_sources: 8,
+                max_direct_rays: 64,
+                max_early_reflection_sources: 0,
+                early_reflection_taps: 0,
+                early_reflection_ray_count: 0,
+                late_ray_count: 0,
+                late_bounce_count: 0,
+            },
+        );
+        let solved = output
+            .telemetry
+            .iter()
+            .filter(|event| event.solve_status == AcousticSolveStatus::Solved)
+            .count();
+        let deferred = output
+            .telemetry
+            .iter()
+            .filter(|event| event.solve_status == AcousticSolveStatus::Deferred)
+            .count();
+        assert_eq!((solved, deferred), (8, 2));
+
+        println!(
+            "PETALSONIC_EXTENDED_FIXTURE_METRICS {{\"forward_gain\":{forward:?},\"reverse_gain\":{reverse:?},\"static_span\":{},\"coarse_half_gain\":{coarse_half_gain},\"budget_solved\":{solved},\"budget_deferred\":{deferred}}}",
+            (static_left - static_right).abs(),
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode extended-source worker performance probe"]
+    fn extended_source_worker_release_budget() {
+        use std::hint::black_box;
+
+        const EXTENTS: usize = 8;
+        const SAMPLES: usize = 8;
+        const ITERATIONS: usize = 512;
+        let query = Arc::new(CountingOpenGeometry::default());
+        let mut workload = input(query.clone());
+        workload.voices = (0..EXTENTS)
+            .map(|index| {
+                let mut voice = workload.voices[0].clone();
+                voice.voice_id = SourceId::from(index as u64);
+                voice.emitter = Emitter {
+                    world_id: 1,
+                    index: index as u32,
+                    generation: 1,
+                };
+                voice.emitter_world_pose =
+                    Pose::from_position(Vec3::new(index as f32 * 0.5 - 1.75, 0.0, 4.0));
+                voice.source_extent = eight_sample_extent();
+                voice.occlusion_profile = OcclusionProfile::AmbientDistributed(
+                    crate::domain::DistributedOcclusionProfile::default(),
+                );
+                voice
+            })
+            .collect();
+        let plan = AcousticSolvePlan {
+            max_direct_sources: EXTENTS,
+            max_direct_rays: EXTENTS * SAMPLES * 2,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let mut solver = AcousticSolver::new(EXTENTS);
+        let mut elapsed_us = Vec::with_capacity(ITERATIONS);
+        let mut observed_rays = 0usize;
+        for iteration in 0..ITERATIONS {
+            workload.spatial = Arc::new(SpatialFrame::new(
+                iteration as u64 + 100,
+                iteration as f64 / 60.0,
+                Pose::from_position(Vec3::new((iteration as f32 * 0.01).sin(), 0.0, 0.0)),
+                Vec::new(),
+            ));
+            let started = Instant::now();
+            let output = solver.solve_with_telemetry(black_box(&workload), 1.0, plan);
+            elapsed_us.push(started.elapsed().as_micros() as u64);
+            observed_rays = output
+                .telemetry
+                .iter()
+                .map(|event| event.direct.ray_count + event.environment.ray_count)
+                .sum();
+            black_box(output);
+        }
+        elapsed_us.sort_unstable();
+        assert_eq!(observed_rays, EXTENTS * SAMPLES * 2);
+        assert_eq!(
+            query.traced_closest_rays.load(Ordering::Relaxed),
+            ITERATIONS * observed_rays,
+        );
+        println!(
+            "PETALSONIC_EXTENDED_WORKER_METRICS {{\"extents\":{EXTENTS},\"samples_per_extent\":{SAMPLES},\"rays_per_solve\":{observed_rays},\"iterations\":{ITERATIONS},\"p50_us\":{},\"p95_us\":{},\"p99_us\":{},\"max_us\":{}}}",
+            elapsed_us[ITERATIONS / 2],
+            elapsed_us[ITERATIONS * 95 / 100],
+            elapsed_us[ITERATIONS * 99 / 100],
+            elapsed_us[ITERATIONS - 1],
+        );
     }
 
     #[test]
@@ -1328,6 +2704,7 @@ mod tests {
             AcousticSolvePlan::for_quality(0.0),
             AcousticSolvePlan {
                 max_direct_sources: 32,
+                max_direct_rays: 128,
                 max_early_reflection_sources: 4,
                 early_reflection_taps: 1,
                 early_reflection_ray_count: 32,
@@ -1339,6 +2716,7 @@ mod tests {
             AcousticSolvePlan::for_quality(0.5),
             AcousticSolvePlan {
                 max_direct_sources: 32,
+                max_direct_rays: 256,
                 max_early_reflection_sources: 8,
                 early_reflection_taps: 2,
                 early_reflection_ray_count: 64,
@@ -1350,6 +2728,7 @@ mod tests {
             AcousticSolvePlan::for_quality(1.0),
             AcousticSolvePlan {
                 max_direct_sources: 64,
+                max_direct_rays: 1_024,
                 max_early_reflection_sources: 8,
                 early_reflection_taps: 2,
                 early_reflection_ray_count: 256,
@@ -1357,6 +2736,14 @@ mod tests {
                 late_bounce_count: 12,
             }
         );
+        let bounded =
+            AcousticSolvePlan::for_quality(1.0).bounded_by(EnvironmentalAcousticsBudget {
+                max_processed_extents: 7,
+                max_direct_rays: 80,
+            });
+        assert_eq!(bounded.max_direct_sources, 7);
+        assert_eq!(bounded.max_direct_rays, 80);
+        assert_eq!(bounded.max_early_reflection_sources, 8);
 
         let mut previous = AcousticSolvePlan::for_quality(0.0);
         for step in 1..=100 {
@@ -1372,12 +2759,405 @@ mod tests {
     }
 
     #[test]
+    fn acoustic_telemetry_queue_is_bounded_and_counts_pressure() {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let counters = AcousticPropagationCounters::default();
+        let event = AcousticTelemetryEvent::SolveDiscarded {
+            spatial_revision: 1,
+            geometry_version: 2,
+            reason: AcousticDiscardReason::Superseded,
+        };
+
+        try_send_acoustic_telemetry(&sender, &counters, event.clone());
+        try_send_acoustic_telemetry(&sender, &counters, event);
+
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(
+            counters.telemetry_queue_high_water.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(counters.dropped_telemetry_events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn distributed_transmission_aggregates_normalized_power_not_binary_hits() {
+        let mut samples = (0..8)
+            .map(|id| ExtentSampleResponse {
+                sample_id: crate::domain::ExtentSampleId(id),
+                power_weight: 0.125,
+                world_position: Vec3::new(id as f32 - 3.5, 0.0, 4.0),
+                transmission: if id == 0 { [0.1; 3] } else { [1.0; 3] },
+                hit: id == 0,
+            })
+            .collect::<Vec<_>>();
+
+        let first = aggregate_extent_energy(&samples);
+        samples.reverse();
+        let reversed = aggregate_extent_energy(&samples);
+
+        assert_eq!(
+            first, reversed,
+            "sample traversal order changed the response"
+        );
+        assert_eq!(first.hit_count, 1);
+        assert!((first.visible_fraction - 0.875).abs() < 1.0e-6);
+        for gain in first.gain {
+            assert!((gain - 0.936_082_3).abs() < 1.0e-6);
+            assert!((20.0 * gain.log10() - -0.573_72).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn half_occlusion_changes_only_the_occluded_sample_energy() {
+        let samples = [
+            ExtentSampleResponse {
+                sample_id: crate::domain::ExtentSampleId(1),
+                power_weight: 0.5,
+                world_position: Vec3::X,
+                transmission: [1.0; 3],
+                hit: false,
+            },
+            ExtentSampleResponse {
+                sample_id: crate::domain::ExtentSampleId(2),
+                power_weight: 0.5,
+                world_position: -Vec3::X,
+                transmission: [0.0; 3],
+                hit: true,
+            },
+        ];
+
+        let aggregate = aggregate_extent_energy(&samples);
+        assert_eq!(aggregate.gain, [std::f32::consts::FRAC_1_SQRT_2; 3]);
+        assert_eq!(aggregate.visible_fraction, 0.5);
+    }
+
+    #[test]
+    fn directional_lobes_are_stable_order_independent_and_power_normalized() {
+        let mut samples = [
+            (11, Vec3::X, 1.0),
+            (12, Vec3::Y, 0.8),
+            (13, Vec3::Z, 0.6),
+            (14, -Vec3::X, 0.4),
+        ]
+        .map(|(id, world_position, transmission)| ExtentSampleResponse {
+            sample_id: crate::domain::ExtentSampleId(id),
+            power_weight: 0.25,
+            world_position,
+            transmission: [transmission; 3],
+            hit: transmission < 1.0,
+        });
+
+        let first = aggregate_directional_lobes(&samples, Vec3::ZERO, 4, [1.0; 3]);
+        samples.reverse();
+        let reversed = aggregate_directional_lobes(&samples, Vec3::ZERO, 4, [1.0; 3]);
+
+        assert_eq!(first, reversed);
+        assert_eq!(first.len(), 4);
+        assert!((first.iter().map(|lobe| lobe.power).sum::<f32>() - 1.0).abs() < 1.0e-6);
+        assert!(first.iter().all(|lobe| lobe.direction.is_normalized()));
+        assert_eq!(
+            first.iter().map(|lobe| lobe.lobe_id).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn distributed_profile_applies_attack_release_schmitt_thresholds_and_dwell() {
+        let profile = crate::domain::DistributedOcclusionProfile::default()
+            .with_gain_floor([0.1; 3])
+            .unwrap()
+            .with_response_times(0.2, 0.1)
+            .unwrap()
+            .with_classification(0.25, 0.55, 0.1)
+            .unwrap();
+        let mut state = TemporalOcclusionState::default();
+
+        let initial = state.update([1.0; 3], 1.0, 0.0, profile);
+        assert_eq!(initial.classification, OcclusionClassification::Visible);
+        assert_eq!(initial.filtered_gain, [1.0; 3]);
+
+        let entering = state.update([0.5; 3], 0.1, 0.05, profile);
+        assert_eq!(entering.classification, OcclusionClassification::Visible);
+        assert!((entering.filtered_gain[0] - 0.889_400_4).abs() < 1.0e-6);
+
+        let entered = state.update([0.5; 3], 0.1, 0.15, profile);
+        assert_eq!(entered.classification, OcclusionClassification::Occluded);
+        assert!((entered.dwell_seconds - 0.0).abs() < 1.0e-6);
+
+        let exiting = state.update([1.0; 3], 0.9, 0.2, profile);
+        assert_eq!(exiting.classification, OcclusionClassification::Occluded);
+        assert!(exiting.filtered_gain[0] > entered.filtered_gain[0]);
+
+        let exited = state.update([1.0; 3], 0.9, 0.3, profile);
+        assert_eq!(exited.classification, OcclusionClassification::Visible);
+    }
+
+    #[test]
     fn response_pairs_complete_spatial_and_geometry_generations() {
         let response = solve_response(&input(Arc::new(UnitRoom)), 1.0);
         assert_eq!(response.spatial_revision, 11);
         assert_eq!(response.geometry_version, 17);
         assert_eq!(response.direct.len(), 1);
         assert_eq!(response.direct[0].gain, [0.1, 0.05, 0.02]);
+    }
+
+    #[test]
+    fn weighted_extent_solve_uses_all_stable_samples_without_extra_voices() {
+        use crate::domain::{DistributedOcclusionProfile, ExtentSample, ExtentSampleId};
+
+        let mut input = input(Arc::new(NegativeXWood));
+        let samples = (0..8)
+            .map(|id| {
+                let x = if id == 0 { -1.0 } else { 1.0 + id as f32 * 0.1 };
+                ExtentSample::new(ExtentSampleId(id), Vec3::new(x, id as f32 * 0.1, 2.0), 1.0)
+                    .unwrap()
+            })
+            .collect();
+        input.voices[0].emitter_world_pose = Pose::identity();
+        input.voices[0].source_extent = SourceExtent::weighted_samples(samples).unwrap();
+        input.voices[0].occlusion_profile = OcclusionProfile::AmbientDistributed(
+            DistributedOcclusionProfile::default()
+                .with_lobe_count(4)
+                .unwrap(),
+        );
+
+        let response = solve_response(&input, 1.0);
+        assert_eq!(
+            response.direct.len(),
+            1,
+            "one Voice must remain one cursor/response"
+        );
+        assert!((response.direct[0].gain[0] - 0.936_082_3).abs() < 1.0e-6);
+        assert_eq!(response.direct[0].direct_lobes.len(), 4);
+        for band in 0..3 {
+            let lobe_energy = response.direct[0]
+                .direct_lobes
+                .iter()
+                .map(|lobe| lobe.gain[band] * lobe.gain[band])
+                .sum::<f32>();
+            assert!((lobe_energy - response.direct[0].gain[band].powi(2)).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn extent_telemetry_reports_rays_hits_cache_filter_and_lobes() {
+        use crate::domain::{DistributedOcclusionProfile, ExtentSample, ExtentSampleId};
+
+        let mut input = input(Arc::new(NegativeXWood));
+        input.voices[0].emitter_world_pose = Pose::identity();
+        input.voices[0].source_extent = SourceExtent::weighted_samples(
+            (0..8)
+                .map(|id| {
+                    ExtentSample::new(
+                        ExtentSampleId(id),
+                        Vec3::new(if id == 0 { -1.0 } else { 1.0 }, id as f32 * 0.1, 2.0),
+                        1.0,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        input.voices[0].occlusion_profile = OcclusionProfile::AmbientDistributed(
+            DistributedOcclusionProfile::default()
+                .with_lobe_count(4)
+                .unwrap(),
+        );
+        let plan = AcousticSolvePlan {
+            max_early_reflection_sources: 0,
+            late_ray_count: 0,
+            ..AcousticSolvePlan::for_quality(0.5)
+        };
+        let mut solver = AcousticSolver::new(1);
+
+        let first = solver.solve_with_telemetry(&input, 1.0, plan);
+        let event = &first.telemetry[0];
+        assert_eq!(event.extent_sample_count, 8);
+        assert_eq!(event.direct.sample_count, 8);
+        assert_eq!(event.direct.ray_count, 8);
+        assert_eq!(event.direct.cache_hit_count, 0);
+        assert_eq!(event.direct.hit_count, 1);
+        assert!((event.direct.visible_fraction - 0.875).abs() < 1.0e-6);
+        assert!((event.direct.raw_gain[0] - 0.936_082_3).abs() < 1.0e-6);
+        assert_eq!(event.direct.raw_gain, event.direct.filtered_gain);
+        assert_eq!(event.lobes.len(), 4);
+        assert_eq!(event.solve_status, AcousticSolveStatus::Solved);
+        assert!(event.budget_member);
+        assert_eq!(
+            first.response.direct[0].environment_representatives.len(),
+            2,
+            "early reflections must have bounded distributed representatives",
+        );
+        assert!(
+            first.response.direct[0]
+                .environment_representatives
+                .iter()
+                .all(|representative| representative.world_position != Vec3::ZERO)
+        );
+
+        let cached = solver.solve_with_telemetry(&input, 1.0, plan);
+        assert_eq!(cached.telemetry[0].direct.ray_count, 0);
+        assert_eq!(cached.telemetry[0].direct.cache_hit_count, 8);
+        assert_eq!(cached.telemetry[0].environment.ray_count, 0);
+        assert_eq!(cached.telemetry[0].environment.cache_hit_count, 8);
+    }
+
+    #[test]
+    fn budget_skip_retains_bounded_history_then_defers_without_unity_fallback() {
+        let mut input = input(Arc::new(DirectionalTransmission));
+        let emitter_b = Emitter {
+            world_id: 1,
+            index: 1,
+            generation: 1,
+        };
+        input.voices[0].emitter_world_pose = Pose::from_position(Vec3::X);
+        input.voices[0].acoustic_priority = 2.0;
+        let mut voice_b = input.voices[0].clone();
+        voice_b.voice_id = SourceId::from(2);
+        voice_b.emitter = emitter_b;
+        voice_b.emitter_world_pose = Pose::from_position(-Vec3::X);
+        voice_b.acoustic_priority = 1.0;
+        input.voices.push(voice_b);
+        input.spatial = Arc::new(SpatialFrame::new(
+            20,
+            0.0,
+            Pose::identity(),
+            vec![
+                EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
+                EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
+            ],
+        ));
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 1,
+            max_direct_rays: 4,
+            ..AcousticSolvePlan::for_quality(0.5)
+        };
+        let mut solver = AcousticSolver::new(2);
+
+        let first = solver.solve_with_plan(&input, 1.0, plan);
+        let voice_a = first
+            .direct
+            .iter()
+            .find(|response| response.voice_id == SourceId::from(1))
+            .unwrap();
+        assert_eq!(voice_a.solve_status, DirectSolveStatus::Solved);
+        assert_eq!(voice_a.gain, [0.2; 3]);
+
+        input.voices[0].acoustic_priority = 1.0;
+        input.voices[1].acoustic_priority = 3.0;
+        input.spatial = Arc::new(SpatialFrame::new(
+            21,
+            0.1,
+            Pose::identity(),
+            vec![
+                EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
+                EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
+            ],
+        ));
+        let retained = solver.solve_with_plan(&input, 1.0, plan);
+        let voice_a = retained
+            .direct
+            .iter()
+            .find(|response| response.voice_id == SourceId::from(1))
+            .unwrap();
+        assert_eq!(voice_a.solve_status, DirectSolveStatus::Retained);
+        assert_eq!(voice_a.gain, [0.2; 3]);
+
+        input.spatial = Arc::new(SpatialFrame::new(
+            22,
+            0.4,
+            Pose::identity(),
+            vec![
+                EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
+                EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
+            ],
+        ));
+        let deferred = solver.solve_with_plan(&input, 1.0, plan);
+        let voice_a = deferred
+            .direct
+            .iter()
+            .find(|response| response.voice_id == SourceId::from(1))
+            .unwrap();
+        assert_eq!(voice_a.solve_status, DirectSolveStatus::Deferred);
+        assert_eq!(deferred.direct_gain_target(SourceId::from(1)), None);
+    }
+
+    #[test]
+    fn sample_cache_key_includes_voice_emitter_revisions_geometry_and_stable_sample_id() {
+        let query = Arc::new(CountingOpenGeometry::default());
+        let mut input = input(query.clone());
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 1,
+            max_direct_rays: 2,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let mut solver = AcousticSolver::new(1);
+
+        solver.solve_with_plan(&input, 1.0, plan);
+        assert_eq!(query.traced_closest_rays.load(Ordering::Relaxed), 2);
+        solver.solve_with_plan(&input, 1.0, plan);
+        assert_eq!(
+            query.traced_closest_rays.load(Ordering::Relaxed),
+            2,
+            "identical immutable solve input should reuse per-route sample results"
+        );
+
+        input.spatial = Arc::new(SpatialFrame::new(
+            12,
+            1.6,
+            Pose::identity(),
+            vec![EmitterSpatialState::new(
+                input.voices[0].emitter,
+                Pose::from_position(Vec3::Z),
+            )],
+        ));
+        solver.solve_with_plan(&input, 1.0, plan);
+        assert_eq!(query.traced_closest_rays.load(Ordering::Relaxed), 4);
+
+        input.scene = Arc::new(AcousticSceneSnapshot::new(18, query.clone()));
+        solver.solve_with_plan(&input, 1.0, plan);
+        assert_eq!(query.traced_closest_rays.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn budget_ranking_prefers_audible_priority_and_resists_small_rank_churn() {
+        let mut input = input(Arc::new(NoGeometry));
+        let mut quiet = input.voices[0].clone();
+        quiet.voice_id = SourceId::from(2);
+        quiet.audibility = 0.1;
+        quiet.acoustic_priority = 1.0;
+        input.voices[0].audibility = 1.0;
+        input.voices[0].acoustic_priority = 1.0;
+        input.voices.push(quiet);
+
+        let first = ranked_voices(&input, &HashSet::new());
+        assert_eq!(first[0].voice.voice_id, SourceId::from(1));
+
+        let previous = [SourceId::from(1)].into_iter().collect();
+        input.voices[1].audibility = 0.95;
+        let stable = ranked_voices(&input, &previous);
+        assert_eq!(stable[0].voice.voice_id, SourceId::from(1));
+    }
+
+    #[test]
+    fn emitter_audibility_updates_attached_acoustic_voices_only() {
+        let input_port = AcousticVoiceInput::isolated(2);
+        let attached = input(Arc::new(NoGeometry)).voices.remove(0);
+        let mut detached = attached.clone();
+        detached.voice_id = SourceId::from(2);
+        detached.detached = true;
+        input_port.activate(attached.clone());
+        input_port.activate(detached);
+
+        input_port.update_emitter_audibility(attached.emitter, 0.25);
+
+        let state = input_port.input.state.lock().unwrap();
+        assert_eq!(state.voices[0].audibility, 0.25);
+        assert_eq!(state.voices[1].audibility, 1.0);
     }
 
     #[test]
@@ -1390,20 +3170,26 @@ mod tests {
                 emitter,
                 emitter_world_pose: Pose::from_position(Vec3::Z),
                 acoustic_priority: 1.0,
+                audibility: 1.0,
                 detached: false,
                 direct_path: DirectPath::listener_relative(Pose::from_position(-Vec3::Y))
                     .with_geometry(DirectGeometry::BypassTransmission),
                 environment_send: EnvironmentSend::from_world_pose(Pose::from_position(Vec3::X)),
+                source_extent: SourceExtent::Point,
+                occlusion_profile: OcclusionProfile::PointExact,
             },
             AcousticVoice {
                 voice_id: SourceId::from(42),
                 emitter,
                 emitter_world_pose: Pose::from_position(Vec3::Z),
                 acoustic_priority: 1.0,
+                audibility: 1.0,
                 detached: false,
                 direct_path: DirectPath::listener_relative(Pose::from_position(-Vec3::Y))
                     .with_geometry(DirectGeometry::BypassTransmission),
                 environment_send: EnvironmentSend::from_world_pose(Pose::from_position(-Vec3::X)),
+                source_extent: SourceExtent::Point,
+                occlusion_profile: OcclusionProfile::PointExact,
             },
         ];
 
@@ -1481,9 +3267,107 @@ mod tests {
     }
 
     #[test]
+    fn completed_superseded_solve_is_discarded_before_publication() {
+        let query = Arc::new(BlockingOpenGeometry::new());
+        let propagation = AcousticPropagation::new(
+            1.0,
+            Arc::new(AtomicBool::new(true)),
+            0.0,
+            EnvironmentalAcousticsBudget::default(),
+            1,
+            16,
+        )
+        .unwrap();
+        let emitter = Emitter {
+            world_id: 1,
+            index: 0,
+            generation: 1,
+        };
+        propagation.voice_input().activate(AcousticVoice {
+            voice_id: SourceId::from(1),
+            emitter,
+            emitter_world_pose: Pose::from_position(Vec3::Z),
+            acoustic_priority: 1.0,
+            audibility: 1.0,
+            detached: false,
+            direct_path: DirectPath::default(),
+            environment_send: EnvironmentSend::default(),
+            source_extent: SourceExtent::Point,
+            occlusion_profile: OcclusionProfile::PointExact,
+        });
+        propagation
+            .publish_scene(Arc::new(AcousticSceneSnapshot::new(7, query.clone())))
+            .unwrap();
+        propagation
+            .publish_spatial_frame(Arc::new(SpatialFrame::new(
+                1,
+                0.0,
+                Pose::identity(),
+                vec![EmitterSpatialState::new(
+                    emitter,
+                    Pose::from_position(Vec3::Z),
+                )],
+            )))
+            .unwrap();
+        query.wait_until_entered();
+
+        propagation
+            .publish_spatial_frame(Arc::new(SpatialFrame::new(
+                2,
+                0.1,
+                Pose::identity(),
+                vec![EmitterSpatialState::new(
+                    emitter,
+                    Pose::from_position(Vec3::new(0.0, 0.0, 2.0)),
+                )],
+            )))
+            .unwrap();
+        assert!(propagation.latest_response.lock().unwrap().is_none());
+        query.release();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let revision = propagation
+                .latest_response
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|response| response.spatial_revision);
+            if revision == Some(2) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "latest revision was not published"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(propagation.diagnostics().superseded_solve_count, 1);
+        assert!(propagation.telemetry_receiver().try_iter().any(|event| {
+            matches!(
+                event,
+                AcousticTelemetryEvent::SolveDiscarded {
+                    spatial_revision: 1,
+                    geometry_version: 7,
+                    reason: AcousticDiscardReason::Superseded,
+                }
+            )
+        }));
+        propagation.close();
+    }
+
+    #[test]
     fn worker_keeps_only_latest_complete_input_and_closes_cleanly() {
-        let propagation =
-            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5, 8).unwrap();
+        let propagation = AcousticPropagation::new(
+            1.0,
+            Arc::new(AtomicBool::new(true)),
+            0.5,
+            EnvironmentalAcousticsBudget::default(),
+            8,
+            8,
+        )
+        .unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(17, Arc::new(UnitRoom))))
             .unwrap();
@@ -1536,8 +3420,15 @@ mod tests {
 
     #[test]
     fn disabled_worker_waits_for_reenable_before_solving() {
-        let propagation =
-            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(false)), 0.5, 8).unwrap();
+        let propagation = AcousticPropagation::new(
+            1.0,
+            Arc::new(AtomicBool::new(false)),
+            0.5,
+            EnvironmentalAcousticsBudget::default(),
+            8,
+            8,
+        )
+        .unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();
@@ -1567,8 +3458,15 @@ mod tests {
 
     #[test]
     fn quality_change_wakes_the_existing_worker_without_new_scene_input() {
-        let propagation =
-            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5, 8).unwrap();
+        let propagation = AcousticPropagation::new(
+            1.0,
+            Arc::new(AtomicBool::new(true)),
+            0.5,
+            EnvironmentalAcousticsBudget::default(),
+            8,
+            8,
+        )
+        .unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();

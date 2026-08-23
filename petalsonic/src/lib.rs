@@ -82,24 +82,34 @@ mod events;
 mod gain;
 mod math;
 mod mixer;
+mod occlusion;
 mod platform;
 mod playback;
+mod source_extent;
 mod spatial;
 mod world;
 
 pub use acoustics::{
     AcousticHit, AcousticMaterial, AcousticRay, AcousticRayQuerySnapshot, AcousticSceneSnapshot,
 };
-pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
+pub use config::{
+    EnvironmentalAcousticsBudget, LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc,
+    SpatialQuality,
+};
 pub use domain::{
     Bus, BusDesc, BusParams, DirectGeometry, DirectPath, DirectPlacement, DirectPropagation,
-    Emitter, EmitterDesc, EmitterSpatialState, EnvironmentOrigin, EnvironmentSend, PlayCommandId,
-    PlayOptions, PlaybackControl, PlaybackTag, ResidentClip, SpatialFrame,
+    DistributedOcclusionProfile, Emitter, EmitterDesc, EmitterSpatialState, EnvironmentOrigin,
+    EnvironmentSend, ExtentSample, ExtentSampleId, MAX_DIRECT_LOBES, MAX_EXTENT_RADIUS_WORLD_UNITS,
+    MAX_EXTENT_SAMPLES, OcclusionProfile, PlayCommandId, PlayOptions, PlaybackControl, PlaybackTag,
+    ResidentClip, SourceExtent, SpatialFrame, WeightedSamples,
 };
 pub use error::PetalSonicError;
 pub use events::{
-    EnvironmentResponse, PetalSonicEvent, RenderTimingEvent, RuntimeDiagnostics, RuntimeState,
-    RuntimeStatus, VoiceFirstRenderTelemetry, VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
+    AcousticDiscardReason, AcousticExtentTelemetry, AcousticLobeTelemetry, AcousticOcclusionState,
+    AcousticRouteTelemetry, AcousticSolveStatus, AcousticTelemetryDiagnostics,
+    AcousticTelemetryEvent, EnvironmentResponse, PetalSonicEvent, RenderTimingEvent,
+    RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceFirstRenderTelemetry,
+    VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
 };
 pub use math::{Pose, Quat, Vec3};
 pub use world::PetalSonicWorld;

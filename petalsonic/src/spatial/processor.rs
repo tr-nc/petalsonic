@@ -6,9 +6,12 @@ use super::native_ambisonics::{
 use super::native_hrtf::{
     NativeHrtfRenderMetrics, NativeHrtfRenderer, NativeHrtfSourceState, NativeHrtfTable,
 };
-use crate::acoustic_propagation::{AcousticResponse, MAX_EARLY_REFLECTION_TAPS};
+use crate::acoustic_propagation::{AcousticResponse, DirectLobeTarget, MAX_EARLY_REFLECTION_TAPS};
 use crate::config::SourceConfig;
-use crate::domain::{DirectGeometry, DirectPlacement, EnvironmentOrigin};
+use crate::domain::{
+    DirectGeometry, DirectPlacement, EnvironmentOrigin, MAX_DIRECT_LOBES, OcclusionProfile,
+    SourceExtent,
+};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{VoiceFirstRenderTelemetry, VoiceTelemetryEvent};
 use crate::gain;
@@ -29,6 +32,7 @@ const EARLY_REFLECTION_SMOOTHING_SECONDS: f32 = 0.05;
 const EARLY_REFLECTION_SLOT_RELEASE_GAIN: f32 = 1.0e-3;
 // Keep one active set plus one fading set so a priority change can crossfade without allocating.
 const EARLY_REFLECTION_SOURCE_STATE_CAPACITY: usize = 16;
+const MAX_LOBE_DECORRELATION_DELAY: usize = 17;
 
 #[derive(Debug, Clone)]
 struct NativeDirectSourceState {
@@ -50,6 +54,92 @@ impl NativeDirectSourceState {
             low_state: 0.0,
             low_mid_state: 0.0,
             current_gain: [1.0; 3],
+        }
+    }
+
+    fn new_silent() -> Self {
+        Self {
+            low_state: 0.0,
+            low_mid_state: 0.0,
+            current_gain: [0.0; 3],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LobeDecorrelator {
+    delay_samples: usize,
+    coefficient: f32,
+    input_delay: [f32; MAX_LOBE_DECORRELATION_DELAY],
+    output_delay: [f32; MAX_LOBE_DECORRELATION_DELAY],
+    index: usize,
+}
+
+impl LobeDecorrelator {
+    fn new(lobe_id: u8) -> Self {
+        let (delay_samples, coefficient) = match lobe_id {
+            0 => (0, 0.0),
+            1 => (5, 0.37),
+            2 => (11, -0.51),
+            _ => (17, 0.63),
+        };
+        Self {
+            delay_samples,
+            coefficient,
+            input_delay: [0.0; MAX_LOBE_DECORRELATION_DELAY],
+            output_delay: [0.0; MAX_LOBE_DECORRELATION_DELAY],
+            index: 0,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        if self.delay_samples == 0 {
+            return input;
+        }
+        let delayed_input = self.input_delay[self.index];
+        let delayed_output = self.output_delay[self.index];
+        let output = self.coefficient * input + delayed_input - self.coefficient * delayed_output;
+        self.input_delay[self.index] = input;
+        self.output_delay[self.index] = output;
+        self.index = (self.index + 1) % self.delay_samples;
+        output
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalDirectLobeTarget {
+    direction: Vec3,
+    gain: [f32; 3],
+}
+
+#[derive(Debug, Clone)]
+struct NativeDirectLobeSlotState {
+    current_direction: Vec3,
+    filter: NativeDirectSourceState,
+    decorrelator: LobeDecorrelator,
+}
+
+impl NativeDirectLobeSlotState {
+    fn new(lobe_id: u8) -> Self {
+        Self {
+            current_direction: Vec3::Z,
+            filter: NativeDirectSourceState::new_silent(),
+            decorrelator: LobeDecorrelator::new(lobe_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeDirectLobeSourceState {
+    slots: [NativeDirectLobeSlotState; MAX_DIRECT_LOBES],
+    held_targets: [Option<LocalDirectLobeTarget>; MAX_DIRECT_LOBES],
+}
+
+impl NativeDirectLobeSourceState {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|index| NativeDirectLobeSlotState::new(index as u8)),
+            held_targets: [None; MAX_DIRECT_LOBES],
         }
     }
 }
@@ -150,6 +240,7 @@ impl NativeEarlyReflectionSourceState {
 pub(crate) struct RetiredSpatialSource {
     _native_hrtf: Option<NativeHrtfSourceState>,
     _native_direct: Option<NativeDirectSourceState>,
+    _native_direct_lobes: Option<NativeDirectLobeSourceState>,
 }
 
 pub(crate) struct SpatialProcessorConfig {
@@ -163,6 +254,11 @@ pub(crate) struct SpatialProcessorConfig {
     pub environmental_acoustics_enabled: Arc<AtomicBool>,
 }
 
+pub(crate) enum AcousticResponseReplacement {
+    Accepted(Option<Arc<AcousticResponse>>),
+    Rejected(Arc<AcousticResponse>),
+}
+
 /// PetalSonic's native HRTF, Ambisonics, and geometry-acoustics renderer.
 pub struct SpatialProcessor {
     // Native HRTF/Ambisonics renderer and delay state
@@ -172,6 +268,7 @@ pub struct SpatialProcessor {
     native_ambisonics_decoder: Option<NativeAmbisonicsBinauralDecoder>,
     native_ambisonics_state: Option<NativeAmbisonicsBinauralState>,
     native_direct_source_states: HashMap<SourceId, NativeDirectSourceState>,
+    native_direct_lobe_source_states: HashMap<SourceId, NativeDirectLobeSourceState>,
     native_environment_source_states: HashMap<SourceId, NativeDirectSourceState>,
     native_early_reflection_source_states: HashMap<SourceId, NativeEarlyReflectionSourceState>,
     free_native_early_reflection_source_states: Vec<NativeEarlyReflectionSourceState>,
@@ -196,6 +293,7 @@ pub struct SpatialProcessor {
     // Cached buffers to avoid allocations
     cached_input_buf: Vec<f32>,             // Input mono samples
     cached_direct_buf: Vec<f32>,            // After DirectEffect
+    cached_direct_lobe_buf: Vec<f32>,       // One reusable decorrelated direct lobe
     cached_environment_send_buf: Vec<f32>,  // Voice block routed to the shared environment
     cached_summed_encoded_buf: Vec<f32>,    // Accumulated native Ambisonics field
     cached_binaural_processed: Vec<f32>,    // Final binaural output (interleaved stereo)
@@ -207,6 +305,7 @@ pub struct SpatialProcessor {
     listener_up: Vec3,
     listener_front: Vec3,
     listener_right: Vec3,
+    direction_field_active: bool,
 }
 
 /// Detailed timing metrics captured for a single spatial processing pass.
@@ -272,17 +371,15 @@ impl SpatialProcessor {
         } = config;
         let table = load_native_hrtf_table(sample_rate, native_hrtf_path.as_deref())?;
         let native_hrtf_renderer = NativeHrtfRenderer::with_frame_size(table.clone(), frame_size)?;
-        let mut native_ambisonics_decoder = None;
-        let mut native_ambisonics_state = None;
-        if use_ambisonics {
-            let decoder = NativeAmbisonicsBinauralDecoder::with_frame_size(
-                table.clone(),
-                DEFAULT_NATIVE_AMBISONICS_ORDER,
-                frame_size,
-            )?;
-            native_ambisonics_state = Some(decoder.create_state());
-            native_ambisonics_decoder = Some(decoder);
-        }
+        // The shared decoder is also the bounded direction-distribution renderer for extended
+        // sources, even when ordinary point Voices use direct native HRTF.
+        let decoder = NativeAmbisonicsBinauralDecoder::with_frame_size(
+            table.clone(),
+            DEFAULT_NATIVE_AMBISONICS_ORDER,
+            frame_size,
+        )?;
+        let native_ambisonics_state = Some(decoder.create_state());
+        let native_ambisonics_decoder = Some(decoder);
 
         let native_ambisonics_encoder =
             NativeAmbisonicsEncoder::new(DEFAULT_NATIVE_AMBISONICS_ORDER)?;
@@ -290,6 +387,7 @@ impl SpatialProcessor {
         // Pre-allocate buffers
         let cached_input_buf = vec![0.0; frame_size];
         let cached_direct_buf = vec![0.0; frame_size];
+        let cached_direct_lobe_buf = vec![0.0; frame_size];
         let cached_environment_send_buf = vec![0.0; frame_size];
         let ambisonics_channel_count =
             native_ambisonics_channel_count(DEFAULT_NATIVE_AMBISONICS_ORDER)?;
@@ -329,6 +427,7 @@ impl SpatialProcessor {
             native_ambisonics_decoder,
             native_ambisonics_state,
             native_direct_source_states: HashMap::with_capacity(max_voices),
+            native_direct_lobe_source_states: HashMap::with_capacity(max_voices),
             native_environment_source_states: HashMap::with_capacity(max_voices),
             native_early_reflection_source_states: HashMap::with_capacity(
                 early_reflection_pool_size,
@@ -356,6 +455,7 @@ impl SpatialProcessor {
             hrtf_gain_linear,
             cached_input_buf,
             cached_direct_buf,
+            cached_direct_lobe_buf,
             cached_environment_send_buf,
             cached_summed_encoded_buf,
             cached_binaural_processed,
@@ -365,6 +465,7 @@ impl SpatialProcessor {
             listener_up: Vec3::new(0.0, 1.0, 0.0),
             listener_front: Vec3::new(0.0, 0.0, -1.0),
             listener_right: Vec3::new(1.0, 0.0, 0.0),
+            direction_field_active: false,
         })
     }
 
@@ -381,17 +482,39 @@ impl SpatialProcessor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_acoustic_response(
         &mut self,
         response: Arc<AcousticResponse>,
-    ) -> Option<Arc<AcousticResponse>> {
+    ) -> AcousticResponseReplacement {
+        self.replace_acoustic_response_at_least(response, 0, 0)
+    }
+
+    pub(crate) fn replace_acoustic_response_at_least(
+        &mut self,
+        response: Arc<AcousticResponse>,
+        minimum_spatial_revision: u64,
+        minimum_geometry_version: u64,
+    ) -> AcousticResponseReplacement {
+        if response.spatial_revision < minimum_spatial_revision
+            || response.geometry_version < minimum_geometry_version
+        {
+            return AcousticResponseReplacement::Rejected(response);
+        }
+        if self.acoustic_response.as_ref().is_some_and(|current| {
+            response.spatial_revision < current.spatial_revision
+                || response.geometry_version < current.geometry_version
+        }) {
+            return AcousticResponseReplacement::Rejected(response);
+        }
         self.late_reverb.set_parameters(response.late_reverb);
-        self.acoustic_response.replace(response)
+        AcousticResponseReplacement::Accepted(self.acoustic_response.replace(response))
     }
 
     pub(crate) fn retire_source(&mut self, source_id: SourceId) -> Option<RetiredSpatialSource> {
         let native_hrtf = self.native_hrtf_source_states.remove(&source_id);
         let native_direct = self.native_direct_source_states.remove(&source_id);
+        let native_direct_lobes = self.native_direct_lobe_source_states.remove(&source_id);
         self.native_environment_source_states.remove(&source_id);
         let release_early_state = self
             .native_early_reflection_source_states
@@ -411,10 +534,12 @@ impl SpatialProcessor {
         {
             state.draining = true;
         }
-        (native_hrtf.is_some() || native_direct.is_some()).then_some(RetiredSpatialSource {
-            _native_hrtf: native_hrtf,
-            _native_direct: native_direct,
-        })
+        (native_hrtf.is_some() || native_direct.is_some() || native_direct_lobes.is_some())
+            .then_some(RetiredSpatialSource {
+                _native_hrtf: native_hrtf,
+                _native_direct: native_direct,
+                _native_direct_lobes: native_direct_lobes,
+            })
     }
 
     fn ensure_native_hrtf_state_for_source(&mut self, source_id: SourceId) -> Result<()> {
@@ -431,6 +556,12 @@ impl SpatialProcessor {
         self.native_direct_source_states
             .entry(source_id)
             .or_insert_with(NativeDirectSourceState::new);
+    }
+
+    fn ensure_native_direct_lobe_state_for_source(&mut self, source_id: SourceId) {
+        self.native_direct_lobe_source_states
+            .entry(source_id)
+            .or_insert_with(NativeDirectLobeSourceState::new);
     }
 
     fn ensure_native_environment_state_for_source(&mut self, source_id: SourceId) {
@@ -519,8 +650,15 @@ impl SpatialProcessor {
             }
 
             if !matches!(instance.direct_path.placement(), DirectPlacement::Disabled) {
-                self.ensure_native_hrtf_state_for_source(*source_id)?;
-                self.ensure_native_direct_state_for_source(*source_id);
+                match instance.source_extent {
+                    SourceExtent::Point => {
+                        self.ensure_native_hrtf_state_for_source(*source_id)?;
+                        self.ensure_native_direct_state_for_source(*source_id);
+                    }
+                    SourceExtent::WeightedSamples(_) => {
+                        self.ensure_native_direct_lobe_state_for_source(*source_id);
+                    }
+                }
             }
             if !matches!(
                 instance.environment_send.origin(),
@@ -535,6 +673,7 @@ impl SpatialProcessor {
         self.cached_summed_encoded_buf.fill(0.0);
         self.cached_binaural_processed.fill(0.0);
         self.cached_late_reverb_input.fill(0.0);
+        self.direction_field_active = false;
 
         // Process each spatial source and accumulate detailed timing.
         for source_id in spatial_ids {
@@ -560,7 +699,7 @@ impl SpatialProcessor {
         metrics.native_hrtf_direction_lookup_time_us += draining_metrics.direction_lookup_time_us;
         metrics.native_hrtf_convolution_time_us += draining_metrics.convolution_time_us;
 
-        if self.use_ambisonics {
+        if self.use_ambisonics || self.direction_field_active {
             let decoding_start = Instant::now();
             let native_metrics = self.apply_native_ambisonics_decode_effect()?;
             metrics.native_hrtf_direction_lookup_time_us += native_metrics.direction_lookup_time_us;
@@ -662,13 +801,23 @@ impl SpatialProcessor {
         let direct_start = Instant::now();
         let direct_local_position =
             self.resolve_direct_local_position(instance.direct_path.placement(), emitter_position);
+        let distributed_direct = matches!(instance.source_extent, SourceExtent::WeightedSamples(_));
         self.cached_direct_buf.fill(0.0);
         if let Some(direct_local_position) = direct_local_position {
-            self.apply_native_direct_effect(
-                source_id,
-                direct_local_position,
-                instance.direct_path.geometry(),
-            )?;
+            if distributed_direct {
+                self.apply_native_distributed_direct_effect(
+                    source_id,
+                    instance,
+                    direct_local_position,
+                    instance.direct_path.geometry(),
+                )?;
+            } else {
+                self.apply_native_direct_effect(
+                    source_id,
+                    direct_local_position,
+                    instance.direct_path.geometry(),
+                )?;
+            }
         }
 
         let environment_local_position = match instance.environment_send.origin() {
@@ -683,16 +832,16 @@ impl SpatialProcessor {
         let environment_send_gain = gain::db_to_linear(instance.environment_send.gain_db());
         self.cached_environment_send_buf.fill(0.0);
         if let Some(environment_local_position) = environment_local_position {
-            let compatible_shared_path =
-                matches!(instance.direct_path.placement(), DirectPlacement::World)
-                    && matches!(
-                        instance.direct_path.geometry(),
-                        DirectGeometry::SimulatedTransmission
-                    )
-                    && matches!(
-                        instance.environment_send.origin(),
-                        EnvironmentOrigin::FollowEmitter
-                    );
+            let compatible_shared_path = !distributed_direct
+                && matches!(instance.direct_path.placement(), DirectPlacement::World)
+                && matches!(
+                    instance.direct_path.geometry(),
+                    DirectGeometry::SimulatedTransmission
+                )
+                && matches!(
+                    instance.environment_send.origin(),
+                    EnvironmentOrigin::FollowEmitter
+                );
             if compatible_shared_path {
                 for (send, direct) in self
                     .cached_environment_send_buf
@@ -728,7 +877,9 @@ impl SpatialProcessor {
         }
         metrics.direct_processing_time_us = direct_start.elapsed().as_micros() as u64;
 
-        if let Some(direct_local_position) = direct_local_position {
+        if let Some(direct_local_position) = direct_local_position
+            && !distributed_direct
+        {
             if self.use_ambisonics {
                 let encoding_start = Instant::now();
                 self.apply_native_ambisonics_encode_effect(direct_local_position)?;
@@ -813,6 +964,161 @@ impl SpatialProcessor {
     }
 
     /// Apply PetalSonic's native direct path to the input buffer.
+    fn apply_native_distributed_direct_effect(
+        &mut self,
+        source_id: SourceId,
+        instance: &PlaybackInstance,
+        direct_local_position: Vec3,
+        geometry: DirectGeometry,
+    ) -> Result<()> {
+        let use_solved_targets = self.environmental_acoustics_active
+            && matches!(geometry, DirectGeometry::SimulatedTransmission);
+        let solved_targets = use_solved_targets
+            .then(|| {
+                self.acoustic_response
+                    .as_ref()
+                    .and_then(|response| response.direct_lobes_target(source_id))
+            })
+            .flatten();
+        let has_held_targets = self
+            .native_direct_lobe_source_states
+            .get(&source_id)
+            .is_some_and(|state| state.held_targets.iter().any(Option::is_some));
+        let next_targets = if let Some(targets) = solved_targets {
+            Some(self.listener_local_lobe_targets(targets))
+        } else if use_solved_targets && has_held_targets {
+            None
+        } else {
+            Some(self.unoccluded_lobe_targets(instance))
+        };
+
+        let distance_meters = direct_local_position.length() * self.distance_scaler;
+        let distance_gain =
+            native_distance_attenuation(distance_meters) * native_air_absorption(distance_meters);
+        let direction_alpha =
+            1.0 - (-(self.frame_size as f32 / self.sample_rate.max(1) as f32) / 0.1).exp();
+        let coefficients = ThreeBandCoefficients {
+            low: self.direct_low_coefficient,
+            low_mid: self.direct_low_mid_coefficient,
+            smoothing: self.direct_gain_smoothing_coefficient,
+        };
+        let state = self
+            .native_direct_lobe_source_states
+            .get_mut(&source_id)
+            .ok_or_else(|| {
+                PetalSonicError::SpatialAudio(format!(
+                    "No native direct-lobe state found for source {source_id}"
+                ))
+            })?;
+        if let Some(next_targets) = next_targets {
+            state.held_targets = next_targets;
+        }
+
+        let mut field_active = false;
+        for (slot_index, slot) in state.slots.iter_mut().enumerate() {
+            let target = state.held_targets[slot_index];
+            let target_gain = target.map_or([0.0; 3], |target| target.gain);
+            if let Some(target) = target {
+                slot.current_direction = normalized_direction(
+                    slot.current_direction
+                        .lerp(target.direction, direction_alpha),
+                );
+            }
+            apply_three_band_gain(
+                &self.cached_input_buf,
+                &mut self.cached_direct_lobe_buf,
+                &mut slot.filter,
+                coefficients,
+                target_gain,
+                distance_gain,
+            );
+            for sample in &mut self.cached_direct_lobe_buf {
+                *sample = slot.decorrelator.process(*sample);
+            }
+            if target.is_some()
+                || slot
+                    .filter
+                    .current_gain
+                    .iter()
+                    .any(|gain| gain.abs() > 1.0e-5)
+            {
+                self.native_ambisonics_encoder.encode_source_accumulate(
+                    slot.current_direction,
+                    &self.cached_direct_lobe_buf,
+                    &mut self.cached_summed_encoded_buf,
+                )?;
+                field_active = true;
+            }
+        }
+        self.direction_field_active |= field_active;
+        Ok(())
+    }
+
+    fn listener_local_lobe_targets(
+        &self,
+        targets: &[DirectLobeTarget],
+    ) -> [Option<LocalDirectLobeTarget>; MAX_DIRECT_LOBES] {
+        let mut local = [None; MAX_DIRECT_LOBES];
+        for target in targets {
+            let index = usize::from(target.lobe_id);
+            if index >= MAX_DIRECT_LOBES {
+                continue;
+            }
+            local[index] = Some(LocalDirectLobeTarget {
+                direction: listener_local_direction(
+                    target.direction,
+                    self.listener_right,
+                    self.listener_up,
+                    self.listener_front,
+                ),
+                gain: target.gain,
+            });
+        }
+        local
+    }
+
+    fn unoccluded_lobe_targets(
+        &self,
+        instance: &PlaybackInstance,
+    ) -> [Option<LocalDirectLobeTarget>; MAX_DIRECT_LOBES] {
+        let mut power = [0.0_f32; MAX_DIRECT_LOBES];
+        let mut direction_sum = [Vec3::ZERO; MAX_DIRECT_LOBES];
+        let mut fallback = [None; MAX_DIRECT_LOBES];
+        let SourceExtent::WeightedSamples(weighted) = &instance.source_extent else {
+            return [None; MAX_DIRECT_LOBES];
+        };
+        let lobe_count = render_lobe_count(instance.occlusion_profile);
+        for sample in weighted.samples() {
+            let lobe = sample.id().0 as usize % lobe_count;
+            let local_position = match instance.direct_path.placement() {
+                DirectPlacement::World => match &instance.config {
+                    SourceConfig::Spatial { pose, .. } => self.world_to_listener_position(
+                        pose.position + pose.rotation * sample.local_position(),
+                    ),
+                    SourceConfig::NonSpatial { .. } => Vec3::Z,
+                },
+                DirectPlacement::ListenerRelative(pose) => {
+                    pose.position + pose.rotation * sample.local_position()
+                }
+                DirectPlacement::Disabled => continue,
+            };
+            let direction = normalized_direction(local_position);
+            power[lobe] += sample.power_weight();
+            direction_sum[lobe] += direction * sample.power_weight();
+            fallback[lobe].get_or_insert(direction);
+        }
+        std::array::from_fn(|lobe| {
+            fallback[lobe].map(|fallback_direction| LocalDirectLobeTarget {
+                direction: if direction_sum[lobe].length_squared() > f32::EPSILON {
+                    direction_sum[lobe].normalize()
+                } else {
+                    fallback_direction
+                },
+                gain: [power[lobe].sqrt(); 3],
+            })
+        })
+    }
+
     fn apply_native_direct_effect(
         &mut self,
         source_id: SourceId,
@@ -823,16 +1129,6 @@ impl SpatialProcessor {
         let distance_meters = distance_world * self.distance_scaler;
         let distance_attenuation = native_distance_attenuation(distance_meters);
         let air_absorption = native_air_absorption(distance_meters);
-        let target_gain = if self.environmental_acoustics_active
-            && matches!(geometry, DirectGeometry::SimulatedTransmission)
-        {
-            self.acoustic_response
-                .as_ref()
-                .map(|response| response.direct_gain(source_id))
-                .unwrap_or([1.0; 3])
-        } else {
-            [1.0; 3]
-        };
         let distance_gain = distance_attenuation * air_absorption;
         let state = self
             .native_direct_source_states
@@ -843,6 +1139,16 @@ impl SpatialProcessor {
                     source_id
                 ))
             })?;
+        let target_gain = if self.environmental_acoustics_active
+            && matches!(geometry, DirectGeometry::SimulatedTransmission)
+        {
+            self.acoustic_response
+                .as_ref()
+                .and_then(|response| response.direct_gain_target(source_id))
+                .unwrap_or(state.current_gain)
+        } else {
+            [1.0; 3]
+        };
 
         apply_three_band_gain(
             &self.cached_input_buf,
@@ -869,14 +1175,6 @@ impl SpatialProcessor {
         let distance_gain = native_distance_attenuation(distance_meters)
             * native_air_absorption(distance_meters)
             * send_gain;
-        let target_gain = if self.environmental_acoustics_active {
-            self.acoustic_response
-                .as_ref()
-                .map(|response| response.environment_gain(source_id))
-                .unwrap_or([1.0; 3])
-        } else {
-            [1.0; 3]
-        };
         let state = self
             .native_environment_source_states
             .get_mut(&source_id)
@@ -886,6 +1184,14 @@ impl SpatialProcessor {
                     source_id
                 ))
             })?;
+        let target_gain = if self.environmental_acoustics_active {
+            self.acoustic_response
+                .as_ref()
+                .and_then(|response| response.environment_gain_target(source_id))
+                .unwrap_or(state.current_gain)
+        } else {
+            [1.0; 3]
+        };
         apply_three_band_gain(
             &self.cached_input_buf,
             &mut self.cached_environment_send_buf,
@@ -1176,6 +1482,13 @@ fn normalized_direction(position: Vec3) -> Vec3 {
     }
 }
 
+fn render_lobe_count(profile: OcclusionProfile) -> usize {
+    match profile {
+        OcclusionProfile::PointExact => MAX_DIRECT_LOBES,
+        OcclusionProfile::AmbientDistributed(profile) => usize::from(profile.lobe_count()),
+    }
+}
+
 fn load_native_hrtf_table(
     sample_rate: u32,
     native_hrtf_path: Option<&str>,
@@ -1260,12 +1573,208 @@ mod tests {
     use crate::playback::{LoopMode, VoiceStart};
     use std::time::Duration;
 
+    fn empty_acoustic_response(
+        spatial_revision: u64,
+        geometry_version: u64,
+    ) -> Arc<AcousticResponse> {
+        Arc::new(AcousticResponse {
+            spatial_revision,
+            geometry_version,
+            direct: Vec::new(),
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 0,
+        })
+    }
+
+    #[test]
+    fn render_rejects_spatial_and_geometry_revision_rollbacks() {
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            processor.replace_acoustic_response(empty_acoustic_response(10, 20)),
+            AcousticResponseReplacement::Accepted(None)
+        ));
+        assert!(matches!(
+            processor.replace_acoustic_response(empty_acoustic_response(9, 21)),
+            AcousticResponseReplacement::Rejected(_)
+        ));
+        assert!(matches!(
+            processor.replace_acoustic_response(empty_acoustic_response(11, 19)),
+            AcousticResponseReplacement::Rejected(_)
+        ));
+        assert!(matches!(
+            processor.replace_acoustic_response_at_least(empty_acoustic_response(10, 20), 11, 20,),
+            AcousticResponseReplacement::Rejected(_)
+        ));
+        assert!(matches!(
+            processor.replace_acoustic_response_at_least(empty_acoustic_response(10, 20), 10, 21,),
+            AcousticResponseReplacement::Rejected(_)
+        ));
+
+        let current = processor.acoustic_response.as_ref().unwrap();
+        assert_eq!(current.spatial_revision, 10);
+        assert_eq!(current.geometry_version, 20);
+    }
+
     #[test]
     fn native_distance_attenuation_is_clamped_near_listener() {
         assert_eq!(native_distance_attenuation(0.0), 1.0);
         assert_eq!(native_distance_attenuation(0.5), 1.0);
         assert_eq!(native_distance_attenuation(1.0), 1.0);
         assert!((native_distance_attenuation(4.0) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bounded_lobe_decorrelation_preserves_normalized_impulse_power() {
+        let weights = [0.4_f32, 0.3, 0.2, 0.1];
+        let mut total_energy = 0.0_f32;
+        for (lobe_id, power) in weights.into_iter().enumerate() {
+            let mut decorrelator = LobeDecorrelator::new(lobe_id as u8);
+            let mut lobe_energy = 0.0;
+            for sample_index in 0..512 {
+                let input = if sample_index == 0 { power.sqrt() } else { 0.0 };
+                let output = decorrelator.process(input);
+                lobe_energy += output * output;
+            }
+            total_energy += lobe_energy;
+        }
+
+        assert!((total_energy - 1.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn distributed_direct_field_advances_one_cursor_once_and_stays_bounded() {
+        use crate::domain::{
+            DistributedOcclusionProfile, ExtentSample, ExtentSampleId, OcclusionProfile,
+            SourceExtent,
+        };
+
+        let source_id = SourceId::from(55);
+        let emitter = Emitter {
+            world_id: 1,
+            index: 0,
+            generation: 1,
+        };
+        let source_extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(1), Vec3::X, 0.5).unwrap(),
+            ExtentSample::new(ExtentSampleId(2), Vec3::Z, 0.5).unwrap(),
+        ])
+        .unwrap();
+        let profile = OcclusionProfile::AmbientDistributed(
+            DistributedOcclusionProfile::default()
+                .with_lobe_count(2)
+                .unwrap(),
+        );
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; 64],
+            48_000,
+            1,
+            Duration::from_secs_f64(64.0 / 48_000.0),
+        ));
+        let mut voice = PlaybackInstance::from_source(VoiceStart {
+            emitter,
+            audio_data: audio,
+            config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
+            loop_mode: LoopMode::Infinite,
+            bus_index: 0,
+            playback_rate: 1.0,
+            detached: false,
+            completion_tag: None,
+            direct_path: DirectPath::default(),
+            environment_send: EnvironmentSend::disabled(),
+            play_command_id: None,
+            source_extent,
+            occlusion_profile: profile,
+            mono_scratch: vec![0.0; 8],
+        });
+        voice.play_from_beginning();
+        voice.set_mix_parameters(crate::domain::BusParams::default());
+        let mut voices = [(source_id, voice)].into_iter().collect();
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
+        })
+        .unwrap();
+        processor.replace_acoustic_response(Arc::new(AcousticResponse {
+            spatial_revision: 1,
+            geometry_version: 1,
+            direct: vec![DirectAcousticResponse {
+                voice_id: source_id,
+                gain: [1.0; 3],
+                environment_gain: [1.0; 3],
+                direct_lobes: vec![
+                    crate::acoustic_propagation::DirectLobeTarget {
+                        lobe_id: 0,
+                        direction: Vec3::X,
+                        gain: [std::f32::consts::FRAC_1_SQRT_2; 3],
+                        power: 0.5,
+                    },
+                    crate::acoustic_propagation::DirectLobeTarget {
+                        lobe_id: 1,
+                        direction: Vec3::Z,
+                        gain: [std::f32::consts::FRAC_1_SQRT_2; 3],
+                        power: 0.5,
+                    },
+                ],
+                environment_representatives: Vec::new(),
+                early_reflections: Vec::new(),
+                solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                cache_age_seconds: 0.0,
+            }],
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 1,
+        }));
+        let mut output = [0.0; 16];
+        let mut events = Vec::new();
+
+        processor
+            .process_spatial_sources_with_metrics(
+                &[source_id],
+                &mut voices,
+                &mut output,
+                SpatialRenderContext::default(),
+                &mut events,
+            )
+            .unwrap();
+
+        let memory_activity = crate::engine::tests::callback_memory_activity(|| {
+            processor
+                .process_spatial_sources_with_metrics(
+                    &[source_id],
+                    &mut voices,
+                    &mut output,
+                    SpatialRenderContext::default(),
+                    &mut events,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            memory_activity, 0,
+            "steady distributed rendering allocated or freed"
+        );
+        assert_eq!(voices[&source_id].info.current_frame, 16);
+        assert_eq!(processor.native_direct_lobe_source_states.len(), 1);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().any(|sample| sample.abs() > 0.0));
     }
 
     #[test]
@@ -1332,6 +1841,8 @@ mod tests {
                     .with_geometry(DirectGeometry::BypassTransmission),
                 environment_send,
                 play_command_id: None,
+                source_extent: crate::domain::SourceExtent::Point,
+                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                 mono_scratch: vec![0.0; 8],
             });
             voice.play_from_beginning();
@@ -1402,6 +1913,8 @@ mod tests {
                 .with_geometry(DirectGeometry::BypassTransmission),
             environment_send: EnvironmentSend::from_world_pose(acoustic_origin),
             play_command_id: Some(play_command_id),
+            source_extent: crate::domain::SourceExtent::Point,
+            occlusion_profile: crate::domain::OcclusionProfile::PointExact,
             mono_scratch: vec![0.0; 8],
         });
         voice.play_from_beginning();
@@ -1453,6 +1966,10 @@ mod tests {
                 voice_id: source_id,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
+                direct_lobes: Vec::new(),
+                environment_representatives: Vec::new(),
+                solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                cache_age_seconds: 0.0,
                 early_reflections: Vec::new(),
             }],
             late_reverb: LateReverbParameters::SILENT,
@@ -1523,6 +2040,10 @@ mod tests {
                 voice_id: source_id,
                 gain: [0.0; 3],
                 environment_gain: [0.0; 3],
+                direct_lobes: Vec::new(),
+                environment_representatives: Vec::new(),
+                solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                cache_age_seconds: 0.0,
                 early_reflections: Vec::new(),
             }],
             late_reverb: LateReverbParameters::SILENT,
@@ -1589,6 +2110,10 @@ mod tests {
                 voice_id: source_id,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
+                direct_lobes: Vec::new(),
+                environment_representatives: Vec::new(),
+                solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                cache_age_seconds: 0.0,
                 early_reflections: vec![EarlyReflectionTap {
                     path_id: 7,
                     arrival_direction: Vec3::Z,
@@ -1660,6 +2185,10 @@ mod tests {
                 voice_id: source_id,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
+                direct_lobes: Vec::new(),
+                environment_representatives: Vec::new(),
+                solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                cache_age_seconds: 0.0,
                 early_reflections: vec![EarlyReflectionTap {
                     path_id: 4,
                     arrival_direction: Vec3::Z,
@@ -1733,6 +2262,10 @@ mod tests {
                     voice_id: SourceId::from(index as u64),
                     gain: [1.0; 3],
                     environment_gain: [1.0; 3],
+                    direct_lobes: Vec::new(),
+                    environment_representatives: Vec::new(),
+                    solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                    cache_age_seconds: 0.0,
                     early_reflections: vec![EarlyReflectionTap {
                         path_id: index as u16,
                         arrival_direction: Vec3::Z,
@@ -1798,6 +2331,10 @@ mod tests {
                 voice_id: *source_id,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
+                direct_lobes: Vec::new(),
+                environment_representatives: Vec::new(),
+                solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                cache_age_seconds: 0.0,
                 early_reflections: (0..MAX_EARLY_REFLECTION_TAPS)
                     .map(|path_id| EarlyReflectionTap {
                         path_id: path_id as u16,
@@ -1901,6 +2438,8 @@ mod tests {
                         Vec3::new(index as f32 - 3.5, 0.0, 4.0),
                     )),
                     play_command_id: None,
+                    source_extent: crate::domain::SourceExtent::Point,
+                    occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                     mono_scratch: vec![0.0; FRAMES],
                 });
                 voice.play_from_beginning();
@@ -1928,6 +2467,10 @@ mod tests {
                     voice_id: *source_id,
                     gain: [1.0; 3],
                     environment_gain: [1.0; 3],
+                    direct_lobes: Vec::new(),
+                    environment_representatives: Vec::new(),
+                    solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                    cache_age_seconds: 0.0,
                     early_reflections: vec![EarlyReflectionTap {
                         path_id: 1,
                         arrival_direction: Vec3::Z,
@@ -1979,6 +2522,178 @@ mod tests {
             elapsed.as_secs_f64() * 1_000.0,
             elapsed.as_secs_f64() * 1_000_000.0 / BLOCKS as f64,
             elapsed.as_secs_f64() / audio_seconds * 100.0,
+        );
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    #[ignore = "release-mode extended-source renderer performance probe"]
+    fn extended_source_direction_field_release_budget() {
+        use crate::domain::{
+            DistributedOcclusionProfile, ExtentSample, ExtentSampleId, SourceExtent,
+        };
+        use std::hint::black_box;
+
+        const SAMPLE_RATE: u32 = 48_000;
+        const FRAMES: usize = 1_024;
+        const VOICES: usize = 8;
+        const BLOCKS: usize = 1_000;
+        let source_ids = (1..=VOICES)
+            .map(|voice| SourceId::from(voice as u64))
+            .collect::<Vec<_>>();
+        let extent = SourceExtent::weighted_samples(
+            (0..8)
+                .map(|id| {
+                    let angle = id as f32 * std::f32::consts::TAU / 8.0;
+                    ExtentSample::new(
+                        ExtentSampleId(id),
+                        Vec3::new(angle.cos(), angle.sin() * 0.5, angle.sin()),
+                        1.0,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .unwrap();
+        let profile = OcclusionProfile::AmbientDistributed(
+            DistributedOcclusionProfile::default()
+                .with_lobe_count(3)
+                .unwrap(),
+        );
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.1 / VOICES as f32; FRAMES],
+            SAMPLE_RATE,
+            1,
+            Duration::from_secs_f64(FRAMES as f64 / SAMPLE_RATE as f64),
+        ));
+        let mut voices = source_ids
+            .iter()
+            .enumerate()
+            .map(|(index, source_id)| {
+                let mut voice = PlaybackInstance::from_source(VoiceStart {
+                    emitter: Emitter {
+                        world_id: 1,
+                        index: index as u32,
+                        generation: 1,
+                    },
+                    audio_data: audio.clone(),
+                    config: SourceConfig::spatial(Pose::from_position(Vec3::new(
+                        index as f32 - 3.5,
+                        0.0,
+                        4.0,
+                    ))),
+                    loop_mode: LoopMode::Infinite,
+                    bus_index: 0,
+                    playback_rate: 1.0,
+                    detached: false,
+                    completion_tag: None,
+                    direct_path: DirectPath::default(),
+                    environment_send: EnvironmentSend::default(),
+                    play_command_id: None,
+                    source_extent: extent.clone(),
+                    occlusion_profile: profile,
+                    mono_scratch: vec![0.0; FRAMES],
+                });
+                voice.play_from_beginning();
+                voice.set_mix_parameters(crate::domain::BusParams::default());
+                (*source_id, voice)
+            })
+            .collect::<HashMap<_, _>>();
+        let lobe_gain = (1.0_f32 / 3.0).sqrt();
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: SAMPLE_RATE,
+            frame_size: FRAMES,
+            max_voices: VOICES,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
+        })
+        .unwrap();
+        processor.replace_acoustic_response(Arc::new(AcousticResponse {
+            spatial_revision: 1,
+            geometry_version: 1,
+            direct: source_ids
+                .iter()
+                .map(|source_id| DirectAcousticResponse {
+                    voice_id: *source_id,
+                    gain: [1.0; 3],
+                    environment_gain: [0.8, 0.7, 0.6],
+                    direct_lobes: vec![
+                        DirectLobeTarget {
+                            lobe_id: 0,
+                            direction: Vec3::X,
+                            gain: [lobe_gain; 3],
+                            power: 1.0 / 3.0,
+                        },
+                        DirectLobeTarget {
+                            lobe_id: 1,
+                            direction: Vec3::Z,
+                            gain: [lobe_gain; 3],
+                            power: 1.0 / 3.0,
+                        },
+                        DirectLobeTarget {
+                            lobe_id: 2,
+                            direction: -Vec3::X,
+                            gain: [lobe_gain; 3],
+                            power: 1.0 / 3.0,
+                        },
+                    ],
+                    environment_representatives: Vec::new(),
+                    solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                    cache_age_seconds: 0.0,
+                    early_reflections: Vec::new(),
+                })
+                .collect(),
+            late_reverb: LateReverbParameters {
+                pre_delay_seconds: 0.02,
+                rt60_seconds: [0.8, 1.2, 0.9],
+                wet_gain: 0.2,
+            },
+            published_at: Instant::now(),
+            solve_time_us: 1,
+        }));
+        let mut output = vec![0.0; FRAMES * 2];
+        let mut events = Vec::with_capacity(VOICES * 2);
+        for _ in 0..32 {
+            output.fill(0.0);
+            processor
+                .process_spatial_sources_with_metrics(
+                    &source_ids,
+                    &mut voices,
+                    &mut output,
+                    SpatialRenderContext::default(),
+                    &mut events,
+                )
+                .unwrap();
+        }
+
+        let mut elapsed_us = Vec::with_capacity(BLOCKS);
+        for _ in 0..BLOCKS {
+            output.fill(0.0);
+            let started = Instant::now();
+            processor
+                .process_spatial_sources_with_metrics(
+                    black_box(&source_ids),
+                    black_box(&mut voices),
+                    black_box(&mut output),
+                    SpatialRenderContext::default(),
+                    black_box(&mut events),
+                )
+                .unwrap();
+            elapsed_us.push(started.elapsed().as_micros() as u64);
+        }
+        elapsed_us.sort_unstable();
+        let audio_seconds = FRAMES as f64 * BLOCKS as f64 / SAMPLE_RATE as f64;
+        let elapsed_seconds = elapsed_us.iter().sum::<u64>() as f64 / 1_000_000.0;
+        println!(
+            "PETALSONIC_EXTENDED_RENDER_METRICS {{\"voices\":{VOICES},\"samples_per_extent\":8,\"lobes_per_voice\":3,\"blocks\":{BLOCKS},\"frames\":{FRAMES},\"p50_us\":{},\"p95_us\":{},\"p99_us\":{},\"max_us\":{},\"realtime_cpu_percent\":{}}}",
+            elapsed_us[BLOCKS / 2],
+            elapsed_us[BLOCKS * 95 / 100],
+            elapsed_us[BLOCKS * 99 / 100],
+            elapsed_us[BLOCKS - 1],
+            elapsed_seconds / audio_seconds * 100.0,
         );
         assert!(output.iter().all(|sample| sample.is_finite()));
     }

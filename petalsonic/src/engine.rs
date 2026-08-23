@@ -13,7 +13,8 @@ use crate::math::Pose;
 use crate::mixer;
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, VoiceStart};
 use crate::spatial::{
-    RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig, SpatialRenderContext,
+    AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
+    SpatialRenderContext,
 };
 use crate::world::{OutputPreparation, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -148,6 +149,7 @@ struct PumpState {
     pending_acoustic_response_retirement: Option<Arc<AcousticResponse>>,
     acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
     acoustic_voice_input: AcousticVoiceInput,
+    acoustic_scene_version: Arc<std::sync::atomic::AtomicU64>,
     resampler: Arc<Mutex<StreamingResampler>>,
     /// Producer end of ring buffer - writes pre-rendered audio samples (lock-free)
     ring_buffer_producer: HeapProd<StereoFrame>,
@@ -238,6 +240,7 @@ pub(crate) struct EngineStartup {
     pub latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     pub acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
     pub acoustic_voice_input: AcousticVoiceInput,
+    pub acoustic_scene_version: Arc<std::sync::atomic::AtomicU64>,
     pub environmental_acoustics_enabled: Arc<AtomicBool>,
     pub ports: EngineRuntimePorts,
 }
@@ -260,6 +263,7 @@ pub(crate) struct PetalSonicEngine {
     latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
     acoustic_voice_input: AcousticVoiceInput,
+    acoustic_scene_version: Arc<std::sync::atomic::AtomicU64>,
     /// The actual sample rate used by the audio device (may differ from desc.sample_rate)
     device_sample_rate: u32,
     pump_state: Option<Arc<Mutex<PumpState>>>,
@@ -298,6 +302,7 @@ impl PetalSonicEngine {
             latest_acoustic_response,
             acoustic_response_retirement_sender,
             acoustic_voice_input,
+            acoustic_scene_version,
             environmental_acoustics_enabled,
             ports,
         } = startup;
@@ -345,6 +350,7 @@ impl PetalSonicEngine {
             latest_acoustic_response,
             acoustic_response_retirement_sender,
             acoustic_voice_input,
+            acoustic_scene_version,
             pump_state: None,
             render_thread: None,
             spatial_processor,
@@ -1281,6 +1287,7 @@ impl PetalSonicEngine {
             pending_acoustic_response_retirement: None,
             acoustic_response_retirement_sender: self.acoustic_response_retirement_sender.clone(),
             acoustic_voice_input: self.acoustic_voice_input.clone(),
+            acoustic_scene_version: self.acoustic_scene_version.clone(),
             resampler: resampler.clone(),
             ring_buffer_producer: producer,
             channels: config.channels,
@@ -1605,10 +1612,27 @@ impl PetalSonicEngine {
             }
             return;
         };
-        let replaced = processor.replace_acoustic_response(next);
+        let minimum_spatial_revision = ctx
+            .current_spatial_frame
+            .as_ref()
+            .map_or(0, |frame| frame.revision());
+        let minimum_geometry_version = ctx.acoustic_scene_version.load(Ordering::Acquire);
+        let retired = match processor.replace_acoustic_response_at_least(
+            next,
+            minimum_spatial_revision,
+            minimum_geometry_version,
+        ) {
+            AcousticResponseReplacement::Accepted(previous) => previous,
+            AcousticResponseReplacement::Rejected(rejected) => {
+                ctx.counters
+                    .acoustic_render_rejected_responses
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(rejected)
+            }
+        };
 
-        if let Some(previous) = replaced
-            && let Err(error) = ctx.acoustic_response_retirement_sender.try_send(previous)
+        if let Some(retired) = retired
+            && let Err(error) = ctx.acoustic_response_retirement_sender.try_send(retired)
         {
             ctx.pending_acoustic_response_retirement = Some(error.into_inner());
         }
@@ -1774,6 +1798,8 @@ impl PetalSonicEngine {
                 direct_path,
                 environment_send,
                 play_command_id,
+                source_extent,
+                occlusion_profile,
                 mono_scratch,
             } => {
                 let acoustic_voice = match &config {
@@ -1782,9 +1808,12 @@ impl PetalSonicEngine {
                         emitter,
                         emitter_world_pose: *pose,
                         acoustic_priority: 1.0,
+                        audibility: config.volume(),
                         detached,
                         direct_path,
                         environment_send,
+                        source_extent: source_extent.clone(),
+                        occlusion_profile,
                     }),
                     SourceConfig::NonSpatial { .. } => None,
                 };
@@ -1798,6 +1827,8 @@ impl PetalSonicEngine {
                     direct_path,
                     environment_send,
                     play_command_id,
+                    source_extent,
+                    occlusion_profile,
                     detached,
                     completion_tag,
                     mono_scratch,
@@ -1871,6 +1902,7 @@ impl PetalSonicEngine {
                 }
             }
             PlaybackCommand::UpdateEmitter(emitter, config, bus_index) => {
+                acoustic_voice_input.update_emitter_audibility(emitter, config.volume_linear());
                 for instance in active_playback.values_mut() {
                     if instance.emitter == emitter && !instance.detached {
                         instance.config = config.clone();
@@ -2087,7 +2119,7 @@ fn apply_master_gain_and_limit(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::SourceConfig;
@@ -2137,7 +2169,7 @@ mod tests {
         }
     }
 
-    fn callback_memory_activity(operation: impl FnOnce()) -> usize {
+    pub(crate) fn callback_memory_activity(operation: impl FnOnce()) -> usize {
         PROBE_ACTIVITY.with(|count| count.set(0));
         PROBE_ACTIVE.with(|active| active.set(true));
         operation();
@@ -2363,6 +2395,8 @@ mod tests {
                 direct_path: crate::domain::DirectPath::default(),
                 environment_send: crate::domain::EnvironmentSend::default(),
                 play_command_id: None,
+                source_extent: crate::domain::SourceExtent::Point,
+                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                 mono_scratch: vec![0.0; block_size],
             })
             .unwrap();
@@ -2386,6 +2420,7 @@ mod tests {
             pending_acoustic_response_retirement: None,
             acoustic_response_retirement_sender: crossbeam_channel::bounded(2).0,
             acoustic_voice_input: AcousticVoiceInput::isolated(8),
+            acoustic_scene_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Exercise the non-bypass path used when the physical device rate differs
             // from the world's logical 48 kHz rate.
             resampler: PetalSonicEngine::create_resampler(sample_rate, 44_100, 2, block_size)
@@ -2471,6 +2506,8 @@ mod tests {
                     direct_path: crate::domain::DirectPath::default(),
                     environment_send: crate::domain::EnvironmentSend::default(),
                     play_command_id: None,
+                    source_extent: crate::domain::SourceExtent::Point,
+                    occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                     mono_scratch: vec![0.0; block_size],
                 })
                 .unwrap();
@@ -2493,6 +2530,7 @@ mod tests {
             pending_acoustic_response_retirement: None,
             acoustic_response_retirement_sender: crossbeam_channel::bounded(2).0,
             acoustic_voice_input: AcousticVoiceInput::isolated(VOICES),
+            acoustic_scene_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resampler: PetalSonicEngine::create_resampler(
                 sample_rate,
                 device_sample_rate,
@@ -2633,6 +2671,8 @@ mod tests {
                     direct_path: crate::domain::DirectPath::default(),
                     environment_send: crate::domain::EnvironmentSend::default(),
                     play_command_id: None,
+                    source_extent: crate::domain::SourceExtent::Point,
+                    occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                     mono_scratch: vec![0.0; 32],
                 })
                 .unwrap();
@@ -2672,6 +2712,8 @@ mod tests {
 
     #[test]
     fn spatial_frame_updates_attached_voices_as_one_generation() {
+        use crate::domain::{ExtentSample, ExtentSampleId, SourceExtent};
+
         let emitter = crate::domain::Emitter {
             world_id: 1,
             index: 2,
@@ -2685,6 +2727,14 @@ mod tests {
         ));
         let old_pose = Pose::from_position(crate::math::Vec3::ZERO);
         let new_pose = Pose::from_position(crate::math::Vec3::new(4.0, 0.0, -2.0));
+        let captured_extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::X, 1.0).unwrap(),
+        ])
+        .unwrap();
+        let next_extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(2), crate::math::Vec3::Y, 1.0).unwrap(),
+        ])
+        .unwrap();
         let mut voices = HashMap::new();
         for (voice_id, detached) in [(SourceId::from(20), false), (SourceId::from(21), true)] {
             voices.insert(
@@ -2701,6 +2751,8 @@ mod tests {
                     direct_path: crate::domain::DirectPath::default(),
                     environment_send: crate::domain::EnvironmentSend::default(),
                     play_command_id: None,
+                    source_extent: captured_extent.clone(),
+                    occlusion_profile: crate::domain::OcclusionProfile::PointExact,
                     mono_scratch: vec![0.0; 32],
                 }),
             );
@@ -2709,12 +2761,16 @@ mod tests {
             1,
             0.0,
             Pose::default(),
-            vec![crate::domain::EmitterSpatialState::new(emitter, new_pose)],
+            vec![
+                crate::domain::EmitterSpatialState::new(emitter, new_pose).with_extent(next_extent),
+            ],
         );
 
         PetalSonicEngine::apply_spatial_frame_to_voices(&frame, &mut voices);
 
         assert_eq!(voices[&SourceId::from(20)].config.pose(), Some(new_pose));
         assert_eq!(voices[&SourceId::from(21)].config.pose(), Some(old_pose));
+        assert_eq!(voices[&SourceId::from(20)].source_extent, captured_extent);
+        assert_eq!(voices[&SourceId::from(21)].source_extent, captured_extent);
     }
 }

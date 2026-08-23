@@ -102,8 +102,10 @@ stable sample ID, and route. A skipped Voice yields `Retained` while its previou
 within `max_response_age_seconds`; after that it yields `Deferred`. Rendering holds its existing
 target for a deferred response instead of jumping to unity.
 
-A completed worker solve is discarded when any newer input generation exists. Rendering rejects
-spatial or geometry revision rollback even if a stale response reaches its boundary.
+A completed worker solve remains compatible across ordinary pose revisions. Scene replacement is
+a whole-solve barrier, while Voice retirement or rerouting filters only that Voice route. The
+renderer accepts a compatible response with a lagging spatial revision, rejects response rollback,
+and immediately follows it by solving the latest complete input.
 
 ## Environment Response
 
@@ -129,6 +131,13 @@ of 1..=`MAX_EXTENT_SAMPLES` `AcousticSampleObservation` values:
 - `hit`: whether the closest-hit query produced a valid material hit; and
 - `transmission`: the sanitized low/mid/high material transmission used by the solve, expressed as
   linear amplitude in the inclusive range 0..=1.
+
+Every captured Voice also emits `AcousticTelemetryEvent::VoiceConclusion`. It reports deterministic
+candidate rank and source-count limit, independent direct and Environment Send outcomes
+(`Applied`, `ExcludedByBudget`, or `Disabled`), filtered environment transmission, early tap count,
+and the existing `Solved`/`Retained`/`Deferred` status when a candidate response exists. This keeps
+budget admission explicit without changing `AcousticExtentTelemetry`'s public construction
+contract.
 
 PetalSonic does not invent a material name. `AcousticMaterial` has physical fields rather than a
 stable label, so telemetry exposes the exact three-band transmission snapshot required for the

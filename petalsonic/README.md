@@ -218,9 +218,10 @@ PetalSonic uses a three-layer audio-output path plus a world-owned propagation w
 - **`PetalSonicEvent`**: Events emitted by the engine
   - `PlaybackCompleted` for controlled one-shots
 - **`VoiceTelemetryEvent`**: Independently drained opt-in spatial telemetry
-  - `FirstRendered` and `EnvironmentResponse`, correlated by `PlayCommandId`
+  - `FirstRendered`, `EnvironmentResponse`, and final `EnergySummary`, correlated by
+    `PlayCommandId`
 - **`AcousticTelemetryEvent`**: Independently drained worker extent, route, lobe, budget, cache,
-  and discard telemetry
+  admission conclusion, and discard telemetry
 - **`RuntimeStatus` / `RuntimeDiagnostics`**: Current lifecycle state and cumulative bounded-runtime
   health counters
 

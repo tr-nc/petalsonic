@@ -9,11 +9,13 @@ use super::native_hrtf::{
 use crate::acoustic_propagation::{AcousticResponse, DirectLobeTarget, MAX_EARLY_REFLECTION_TAPS};
 use crate::config::SourceConfig;
 use crate::domain::{
-    DirectGeometry, DirectPlacement, EnvironmentOrigin, MAX_DIRECT_LOBES, OcclusionProfile,
-    SourceExtent,
+    DirectGeometry, DirectPlacement, Emitter, EnvironmentOrigin, MAX_DIRECT_LOBES,
+    OcclusionProfile, PlayCommandId, SourceExtent,
 };
 use crate::error::{PetalSonicError, Result};
-use crate::events::{VoiceFirstRenderTelemetry, VoiceTelemetryEvent};
+use crate::events::{
+    LateReverbTelemetry, VoiceEnergyTelemetry, VoiceFirstRenderTelemetry, VoiceTelemetryEvent,
+};
 use crate::gain;
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackInstance;
@@ -273,6 +275,8 @@ pub struct SpatialProcessor {
     native_early_reflection_source_states: HashMap<SourceId, NativeEarlyReflectionSourceState>,
     free_native_early_reflection_source_states: Vec<NativeEarlyReflectionSourceState>,
     draining_early_reflection_ids: Vec<SourceId>,
+    voice_energy_accumulators: HashMap<SourceId, VoiceEnergyAccumulator>,
+    pending_voice_energy_summaries: Vec<VoiceEnergyAccumulator>,
     acoustic_response: Option<Arc<AcousticResponse>>,
 
     // Configuration
@@ -347,6 +351,41 @@ struct SourceProcessingMetrics {
     hrtf_rendering_time_us: u64,
     native_hrtf_direction_lookup_time_us: u64,
     native_hrtf_convolution_time_us: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VoiceEnergyAccumulator {
+    play_command_id: PlayCommandId,
+    emitter: Emitter,
+    source_energy: f64,
+    direct_energy: f64,
+    environment_send_energy: f64,
+    early_reflection_energy: f64,
+}
+
+impl VoiceEnergyAccumulator {
+    fn new(play_command_id: PlayCommandId, emitter: Emitter) -> Self {
+        Self {
+            play_command_id,
+            emitter,
+            source_energy: 0.0,
+            direct_energy: 0.0,
+            environment_send_energy: 0.0,
+            early_reflection_energy: 0.0,
+        }
+    }
+
+    fn telemetry(self, late_reverb: LateReverbTelemetry) -> VoiceEnergyTelemetry {
+        VoiceEnergyTelemetry {
+            play_command_id: self.play_command_id,
+            emitter: self.emitter,
+            source_energy: self.source_energy,
+            direct_energy: self.direct_energy,
+            environment_send_energy: self.environment_send_energy,
+            early_reflection_energy: self.early_reflection_energy,
+            late_reverb,
+        }
+    }
 }
 
 impl SourceProcessingMetrics {
@@ -434,6 +473,12 @@ impl SpatialProcessor {
             ),
             free_native_early_reflection_source_states,
             draining_early_reflection_ids: Vec::with_capacity(early_reflection_pool_size),
+            voice_energy_accumulators: HashMap::with_capacity(
+                max_voices.saturating_add(early_reflection_pool_size),
+            ),
+            pending_voice_energy_summaries: Vec::with_capacity(
+                max_voices.saturating_add(early_reflection_pool_size),
+            ),
             acoustic_response: None,
             frame_size,
             sample_rate,
@@ -519,6 +564,7 @@ impl SpatialProcessor {
             .native_early_reflection_source_states
             .get(&source_id)
             .is_some_and(NativeEarlyReflectionSourceState::is_released);
+        let mut early_tail_draining = false;
         if release_early_state {
             if let Some(mut state) = self
                 .native_early_reflection_source_states
@@ -532,6 +578,10 @@ impl SpatialProcessor {
             .get_mut(&source_id)
         {
             state.draining = true;
+            early_tail_draining = true;
+        }
+        if !early_tail_draining {
+            self.finish_voice_energy(source_id);
         }
         (native_hrtf.is_some() || native_direct.is_some() || native_direct_lobes.is_some())
             .then_some(RetiredSpatialSource {
@@ -648,6 +698,14 @@ impl SpatialProcessor {
                 continue;
             }
 
+            if let Some(play_command_id) = instance.telemetry_command_id() {
+                self.voice_energy_accumulators
+                    .entry(*source_id)
+                    .or_insert_with(|| {
+                        VoiceEnergyAccumulator::new(play_command_id, instance.emitter)
+                    });
+            }
+
             if !matches!(instance.direct_path.placement(), DirectPlacement::Disabled) {
                 match instance.source_extent {
                     SourceExtent::Point => {
@@ -721,6 +779,7 @@ impl SpatialProcessor {
             self.environmental_acoustics_active,
         );
         metrics.late_reverb_time_us = late_reverb_start.elapsed().as_micros() as u64;
+        self.emit_pending_voice_energy(events);
 
         // Add to output buffer (don't overwrite - allow mixing with non-spatial sources)
         let frames_to_copy = (output_buffer.len() / 2).min(self.frame_size);
@@ -738,6 +797,10 @@ impl SpatialProcessor {
                 .native_early_reflection_source_states
                 .values()
                 .any(|state| state.draining)
+    }
+
+    pub(crate) fn has_pending_voice_telemetry(&self) -> bool {
+        !self.pending_voice_energy_summaries.is_empty()
     }
 
     fn process_draining_early_reflections(&mut self) -> Result<NativeHrtfRenderMetrics> {
@@ -768,9 +831,42 @@ impl SpatialProcessor {
             {
                 state.reset_for_voice(None);
                 self.free_native_early_reflection_source_states.push(state);
+                self.finish_voice_energy(source_id);
             }
         }
         Ok(metrics)
+    }
+
+    fn finish_voice_energy(&mut self, source_id: SourceId) {
+        let Some(energy) = self.voice_energy_accumulators.remove(&source_id) else {
+            return;
+        };
+        debug_assert!(
+            self.pending_voice_energy_summaries.len()
+                < self.pending_voice_energy_summaries.capacity()
+        );
+        if self.pending_voice_energy_summaries.len()
+            < self.pending_voice_energy_summaries.capacity()
+        {
+            self.pending_voice_energy_summaries.push(energy);
+        }
+    }
+
+    fn emit_pending_voice_energy(&mut self, events: &mut Vec<VoiceTelemetryEvent>) {
+        let (parameters, cumulative_input_energy, cumulative_output_energy) =
+            self.late_reverb.telemetry();
+        let late_reverb = LateReverbTelemetry {
+            pre_delay_seconds: parameters.pre_delay_seconds,
+            rt60_seconds: parameters.rt60_seconds,
+            wet_gain: parameters.wet_gain,
+            cumulative_input_energy,
+            cumulative_output_energy,
+        };
+        events.extend(
+            self.pending_voice_energy_summaries
+                .drain(..)
+                .map(|energy| VoiceTelemetryEvent::EnergySummary(energy.telemetry(late_reverb))),
+        );
     }
 
     /// Process a single spatial source
@@ -792,6 +888,9 @@ impl SpatialProcessor {
 
         // Fill input buffer with audio samples
         let frames_filled = self.fill_input_buffer(instance, volume);
+        if let Some(energy) = self.voice_energy_accumulators.get_mut(&source_id) {
+            energy.source_energy += block_energy(&self.cached_input_buf);
+        }
 
         let mut metrics = SourceProcessingMetrics::default();
 
@@ -802,9 +901,10 @@ impl SpatialProcessor {
             self.resolve_direct_local_position(instance.direct_path.placement(), emitter_position);
         let distributed_direct = matches!(instance.source_extent, SourceExtent::WeightedSamples(_));
         self.cached_direct_buf.fill(0.0);
+        let mut direct_energy = 0.0;
         if let Some(direct_local_position) = direct_local_position {
             if distributed_direct {
-                self.apply_native_distributed_direct_effect(
+                direct_energy = self.apply_native_distributed_direct_effect(
                     source_id,
                     instance,
                     direct_local_position,
@@ -816,7 +916,11 @@ impl SpatialProcessor {
                     direct_local_position,
                     instance.direct_path.geometry(),
                 )?;
+                direct_energy = block_energy(&self.cached_direct_buf);
             }
+        }
+        if let Some(energy) = self.voice_energy_accumulators.get_mut(&source_id) {
+            energy.direct_energy += direct_energy;
         }
 
         let environment_local_position = match instance.environment_send.origin() {
@@ -863,6 +967,9 @@ impl SpatialProcessor {
             {
                 *sum += *send;
             }
+        }
+        if let Some(energy) = self.voice_energy_accumulators.get_mut(&source_id) {
+            energy.environment_send_energy += block_energy(&self.cached_environment_send_buf);
         }
         if frames_filled > 0 {
             self.observe_voice_render(
@@ -969,7 +1076,7 @@ impl SpatialProcessor {
         instance: &PlaybackInstance,
         direct_local_position: Vec3,
         geometry: DirectGeometry,
-    ) -> Result<()> {
+    ) -> Result<f64> {
         let use_solved_targets = self.environmental_acoustics_active
             && matches!(geometry, DirectGeometry::SimulatedTransmission);
         let solved_targets = use_solved_targets
@@ -1014,6 +1121,7 @@ impl SpatialProcessor {
         }
 
         let mut field_active = false;
+        let mut direct_energy = 0.0;
         for (slot_index, slot) in state.slots.iter_mut().enumerate() {
             let target = state.held_targets[slot_index];
             let target_gain = target.map_or([0.0; 3], |target| target.gain);
@@ -1034,6 +1142,7 @@ impl SpatialProcessor {
             for sample in &mut self.cached_direct_lobe_buf {
                 *sample = slot.decorrelator.process(*sample);
             }
+            direct_energy += block_energy(&self.cached_direct_lobe_buf);
             if target.is_some()
                 || slot
                     .filter
@@ -1050,7 +1159,7 @@ impl SpatialProcessor {
             }
         }
         self.direction_field_active |= field_active;
-        Ok(())
+        Ok(direct_energy)
     }
 
     fn listener_local_lobe_targets(
@@ -1379,6 +1488,9 @@ impl SpatialProcessor {
                 metrics.convolution_time_us += tap_metrics.convolution_time_us;
             }
         }
+        if let Some(energy) = self.voice_energy_accumulators.get_mut(&source_id) {
+            energy.early_reflection_energy += block_energy(&self.cached_early_reflection_bufs);
+        }
         Ok(metrics)
     }
 
@@ -1479,6 +1591,13 @@ fn normalized_direction(position: Vec3) -> Vec3 {
     } else {
         Vec3::Z
     }
+}
+
+fn block_energy(samples: &[f32]) -> f64 {
+    samples
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum()
 }
 
 fn render_lobe_count(profile: OcclusionProfile) -> usize {
@@ -1928,7 +2047,7 @@ mod tests {
             native_hrtf_path: None,
             hrtf_gain: 0.0,
             use_ambisonics: false,
-            environmental_acoustics_enabled: Arc::new(AtomicBool::new(false)),
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
         })
         .unwrap();
         let mut output = [0.0; 16];
@@ -1973,7 +2092,11 @@ mod tests {
                 cache_age_seconds: 0.0,
                 early_reflections: Vec::new(),
             }],
-            late_reverb: LateReverbParameters::SILENT,
+            late_reverb: LateReverbParameters {
+                pre_delay_seconds: 0.02,
+                rt60_seconds: [0.7, 0.9, 1.1],
+                wet_gain: 0.4,
+            },
             published_at: Instant::now() - Duration::from_millis(7),
             solve_time_us: 1,
         }));
@@ -2016,6 +2139,38 @@ mod tests {
             )
             .unwrap();
         assert!(events.is_empty(), "voice telemetry must be one-shot");
+
+        let _ = processor.retire_source(source_id);
+        assert!(processor.has_pending_voice_telemetry());
+        events.clear();
+        processor
+            .process_spatial_sources_with_metrics(
+                &[],
+                &mut voices,
+                &mut output,
+                SpatialRenderContext {
+                    render_block_index: 20,
+                    spatial_revision: 24,
+                },
+                &mut events,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let VoiceTelemetryEvent::EnergySummary(energy) = events[0] else {
+            panic!("expected final Voice energy telemetry");
+        };
+        assert_eq!(energy.play_command_id, play_command_id);
+        assert_eq!(energy.emitter, emitter);
+        assert!(energy.source_energy > 0.0);
+        assert!(energy.direct_energy > 0.0);
+        assert!(energy.environment_send_energy > 0.0);
+        assert_eq!(energy.early_reflection_energy, 0.0);
+        assert_eq!(energy.late_reverb.pre_delay_seconds, 0.02);
+        assert_eq!(energy.late_reverb.rt60_seconds, [0.7, 0.9, 1.1]);
+        assert_eq!(energy.late_reverb.wet_gain, 0.4);
+        assert!(energy.late_reverb.cumulative_input_energy > 0.0);
+        assert!(energy.late_reverb.cumulative_output_energy >= 0.0);
+        assert!(!processor.has_pending_voice_telemetry());
     }
 
     #[test]
@@ -2209,6 +2364,18 @@ mod tests {
             solve_time_us: 1,
         }));
         processor.ensure_native_early_reflection_state_for_source(source_id);
+        let play_command_id = PlayCommandId(88);
+        processor.voice_energy_accumulators.insert(
+            source_id,
+            VoiceEnergyAccumulator::new(
+                play_command_id,
+                Emitter {
+                    world_id: 1,
+                    index: 7,
+                    generation: 1,
+                },
+            ),
+        );
         processor.cached_input_buf.fill(0.0);
         processor.cached_input_buf[0] = 1.0;
         processor.cached_binaural_processed.fill(0.0);
@@ -2278,6 +2445,15 @@ mod tests {
             !processor.has_environment_tail(),
             "late tail did not finish in bound"
         );
+        let mut events = Vec::with_capacity(1);
+        processor.emit_pending_voice_energy(&mut events);
+        let VoiceTelemetryEvent::EnergySummary(energy) = events[0] else {
+            panic!("expected energy summary after early tail release");
+        };
+        assert_eq!(energy.play_command_id, play_command_id);
+        assert!(energy.early_reflection_energy > 0.0);
+        assert!(energy.late_reverb.cumulative_input_energy > 0.0);
+        assert!(energy.late_reverb.cumulative_output_energy > 0.0);
     }
 
     #[test]

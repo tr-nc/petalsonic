@@ -59,6 +59,7 @@ pub(crate) struct ThreeBandFdn {
     target_pre_delay_samples: f32,
     current_feedback_gains: [[f32; 3]; FDN_LINE_COUNT],
     target_feedback_gains: [[f32; 3]; FDN_LINE_COUNT],
+    configured_parameters: LateReverbParameters,
     configured_wet_gain: f32,
     current_wet_gain: f32,
     target_wet_gain: f32,
@@ -66,6 +67,8 @@ pub(crate) struct ThreeBandFdn {
     enabled: bool,
     has_energy: bool,
     quiet_blocks: u8,
+    cumulative_input_energy: f64,
+    cumulative_output_energy: f64,
 }
 
 impl ThreeBandFdn {
@@ -91,6 +94,7 @@ impl ThreeBandFdn {
             target_pre_delay_samples: 0.0,
             current_feedback_gains: initial_feedback,
             target_feedback_gains: initial_feedback,
+            configured_parameters: initial,
             configured_wet_gain: 0.0,
             current_wet_gain: 0.0,
             target_wet_gain: 0.0,
@@ -98,11 +102,14 @@ impl ThreeBandFdn {
             enabled: true,
             has_energy: false,
             quiet_blocks: 0,
+            cumulative_input_energy: 0.0,
+            cumulative_output_energy: 0.0,
         }
     }
 
     pub(crate) fn set_parameters(&mut self, parameters: LateReverbParameters) {
         let parameters = parameters.sanitized();
+        self.configured_parameters = parameters;
         self.target_pre_delay_samples = parameters.pre_delay_seconds * self.sample_rate;
         self.target_feedback_gains = feedback_gains(self.sample_rate, parameters.rt60_seconds);
         self.configured_wet_gain = parameters.wet_gain;
@@ -116,6 +123,14 @@ impl ThreeBandFdn {
 
     pub(crate) fn needs_processing(&self) -> bool {
         self.has_energy || self.smoothing_remaining > 0
+    }
+
+    pub(crate) fn telemetry(&self) -> (LateReverbParameters, f64, f64) {
+        (
+            self.configured_parameters,
+            self.cumulative_input_energy,
+            self.cumulative_output_energy,
+        )
     }
 
     pub(crate) fn process_block(
@@ -151,6 +166,7 @@ impl ThreeBandFdn {
         for (frame, input_sample) in input.iter().copied().enumerate() {
             self.advance_smoothed_parameters();
             let injection = if enabled { input_sample } else { 0.0 };
+            self.cumulative_input_energy += f64::from(injection) * f64::from(injection);
             let delayed_input = self.process_pre_delay(injection);
 
             let outputs: [f32; FDN_LINE_COUNT] =
@@ -181,8 +197,12 @@ impl ThreeBandFdn {
 
             let normalization = 1.0 / (FDN_LINE_COUNT as f32).sqrt();
             let wet = self.current_wet_gain * normalization;
-            output_interleaved_stereo[frame * 2] += left * wet;
-            output_interleaved_stereo[frame * 2 + 1] += right * wet;
+            let wet_left = left * wet;
+            let wet_right = right * wet;
+            output_interleaved_stereo[frame * 2] += wet_left;
+            output_interleaved_stereo[frame * 2 + 1] += wet_right;
+            self.cumulative_output_energy += f64::from(wet_left) * f64::from(wet_left)
+                + f64::from(wet_right) * f64::from(wet_right);
             block_peak = block_peak.max(left.abs()).max(right.abs());
         }
 
@@ -337,6 +357,12 @@ mod tests {
         assert!(early_energy > 0.0);
         assert!(late_energy > 0.0);
         assert!(late_energy < early_energy);
+        let (parameters, cumulative_input_energy, cumulative_output_energy) = reverb.telemetry();
+        assert_eq!(parameters.pre_delay_seconds, 0.01);
+        assert_eq!(parameters.rt60_seconds, [0.3, 0.6, 1.2]);
+        assert_eq!(parameters.wet_gain, 0.5);
+        assert_eq!(cumulative_input_energy, 1.0);
+        assert!(cumulative_output_energy > 0.0);
     }
 
     #[test]

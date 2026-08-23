@@ -104,6 +104,10 @@ existing lifecycle events:
 - `VoiceTelemetryEvent::EnvironmentResponse` once if the first matching asynchronous response
   arrives later. It reports the response's spatial revision, geometry version, and age when
   observed by rendering.
+- `VoiceTelemetryEvent::EnergySummary` once after Voice completion and its bounded early tail have
+  drained. It reports cumulative source, direct, Environment Send, and early processing-stage
+  energy, plus a snapshot of global late pre-delay, RT60, wet gain, and cumulative input/output
+  energy.
 
 If a matching response exists on the first render block, it is embedded in `FirstRendered` and no
 second response event is emitted. Telemetry uses a separate queue bounded by

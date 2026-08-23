@@ -268,6 +268,35 @@ pub enum VoiceTelemetryEvent {
         play_command_id: PlayCommandId,
         response: EnvironmentResponse,
     },
+    /// Final processing-stage energy totals for one opted-in Voice, emitted after its bounded
+    /// per-Voice early-reflection tail has drained.
+    EnergySummary(VoiceEnergyTelemetry),
+}
+
+/// Sum-of-squares energy accumulated at the named stages of one immutable PCM Voice.
+///
+/// These values are diagnostic processing-stage energy, not loudness or independently mixable
+/// audio. Direct and early-reflection energy sum the bounded distributed route contributions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceEnergyTelemetry {
+    pub play_command_id: PlayCommandId,
+    pub emitter: Emitter,
+    pub source_energy: f64,
+    pub direct_energy: f64,
+    pub environment_send_energy: f64,
+    pub early_reflection_energy: f64,
+    /// Global shared late-reverb state observed when this Voice's summary was emitted.
+    pub late_reverb: LateReverbTelemetry,
+}
+
+/// Cumulative global late-reverb diagnostics captured without blocking the render thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LateReverbTelemetry {
+    pub pre_delay_seconds: f32,
+    pub rt60_seconds: [f32; 3],
+    pub wet_gain: f32,
+    pub cumulative_input_energy: f64,
+    pub cumulative_output_energy: f64,
 }
 
 /// Current pressure on the independently bounded per-Voice telemetry queue.
@@ -287,6 +316,17 @@ pub enum AcousticSolveStatus {
     Solved,
     Retained,
     Deferred,
+}
+
+/// Explicit worker conclusion for one direct or environment route in a solve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcousticRouteOutcome {
+    /// The route was admitted to this solve and its response was applied.
+    Applied,
+    /// The route was active but its Voice was outside the bounded solve budget.
+    ExcludedByBudget,
+    /// The immutable Voice routing disabled this worker route.
+    Disabled,
 }
 
 /// Stable Schmitt-classified state of one direct or environment route.
@@ -362,6 +402,30 @@ pub struct AcousticExtentTelemetry {
     pub budget_member: bool,
 }
 
+/// Bounded QoS and response summary for every immutable Voice route captured by one solve.
+///
+/// This is a separate event from [`AcousticExtentTelemetry`] so extending opt-in diagnostics does
+/// not change the construction contract of the existing public telemetry record.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcousticVoiceConclusionTelemetry {
+    pub voice_id: u64,
+    pub emitter: Emitter,
+    pub spatial_revision: u64,
+    pub geometry_version: u64,
+    /// One-based deterministic candidate rank, or `None` when neither route was a valid candidate.
+    pub candidate_rank: Option<usize>,
+    /// Maximum number of Voice candidates admitted by the source-count budget.
+    pub candidate_limit: usize,
+    pub direct: AcousticRouteOutcome,
+    pub environment: AcousticRouteOutcome,
+    /// Filtered low/mid/high transmission applied to the environment-send route.
+    pub environment_transmission_gain: [f32; 3],
+    /// Number of bounded early-reflection taps attached to the published Voice response.
+    pub early_tap_count: usize,
+    /// Existing retained/deferred semantics for an active candidate, or `None` if fully disabled.
+    pub solve_status: Option<AcousticSolveStatus>,
+}
+
 /// Why a completed worker result was deliberately not published.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +438,8 @@ pub enum AcousticDiscardReason {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AcousticTelemetryEvent {
     ExtentResponse(Box<AcousticExtentTelemetry>),
+    /// Explicit admission and route conclusion for one captured Voice.
+    VoiceConclusion(AcousticVoiceConclusionTelemetry),
     SolveDiscarded {
         spatial_revision: u64,
         geometry_version: u64,

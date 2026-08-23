@@ -56,6 +56,16 @@ The Direct Path's timing policy. `Immediate` is the currently supported model.
 **Play Command ID**:
 A caller-owned correlation value used only when per-Voice render telemetry is requested.
 
+**Voice Energy Summary**:
+One final opt-in diagnostic record emitted after PCM completion and bounded early-tail release.
+Its source, direct, Environment Send, and early values are cumulative processing-stage
+sum-of-squares energy; its late-reverb fields are a global cumulative snapshot, not per-Voice
+attribution.
+
+**Acoustic Voice Conclusion**:
+One worker QoS decision for every captured Voice, separating deterministic candidate rank and
+budget admission from route enablement and from the existing Solved/Retained/Deferred cache state.
+
 **Voice Route Generation**:
 A worker-owned generation assigned whenever a Voice identity is activated or its captured routing
 is replaced. It is independent of ordinary pose revisions and prevents completed work from being

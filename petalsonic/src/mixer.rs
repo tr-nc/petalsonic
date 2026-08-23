@@ -31,7 +31,7 @@ impl MixerScratch {
             spatial_ids: Vec::with_capacity(max_voices),
             muted_spatial_ids: Vec::with_capacity(max_voices),
             non_spatial_ids: Vec::with_capacity(max_voices),
-            voice_telemetry: Vec::with_capacity(max_voices.saturating_mul(2)),
+            voice_telemetry: Vec::with_capacity(max_voices.saturating_mul(4)),
         }
     }
 
@@ -115,7 +115,10 @@ pub fn mix_playback_instances_with_metrics(
         for source_id in &scratch.muted_spatial_ids {
             processor.silence_source_state(*source_id);
         }
-        if !scratch.spatial_ids.is_empty() || processor.has_environment_tail() {
+        if !scratch.spatial_ids.is_empty()
+            || processor.has_environment_tail()
+            || processor.has_pending_voice_telemetry()
+        {
             let spatial_start = Instant::now();
             if let Ok(metrics) = processor.process_spatial_sources_with_metrics(
                 &scratch.spatial_ids,

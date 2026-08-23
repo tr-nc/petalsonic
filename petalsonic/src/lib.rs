@@ -106,10 +106,11 @@ pub use domain::{
 pub use error::PetalSonicError;
 pub use events::{
     AcousticDiscardReason, AcousticExtentTelemetry, AcousticLobeTelemetry, AcousticOcclusionState,
-    AcousticRouteTelemetry, AcousticSampleObservation, AcousticSolveStatus,
-    AcousticTelemetryDiagnostics, AcousticTelemetryEvent, EnvironmentResponse, PetalSonicEvent,
-    RenderTimingEvent, RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceFirstRenderTelemetry,
-    VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
+    AcousticRouteOutcome, AcousticRouteTelemetry, AcousticSampleObservation, AcousticSolveStatus,
+    AcousticTelemetryDiagnostics, AcousticTelemetryEvent, AcousticVoiceConclusionTelemetry,
+    EnvironmentResponse, LateReverbTelemetry, PetalSonicEvent, RenderTimingEvent,
+    RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceEnergyTelemetry,
+    VoiceFirstRenderTelemetry, VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
 };
 pub use math::{Pose, Quat, Vec3};
 pub use world::PetalSonicWorld;

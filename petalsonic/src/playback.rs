@@ -463,6 +463,10 @@ impl PlaybackInstance {
         self.play_command_id
     }
 
+    pub(crate) fn telemetry_command_id(&self) -> Option<PlayCommandId> {
+        self.play_command_id
+    }
+
     pub(crate) fn pending_environment_response_id(&self) -> Option<PlayCommandId> {
         self.environment_response_pending
             .then_some(self.play_command_id)

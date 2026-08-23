@@ -59,6 +59,8 @@ fn main() -> Result<(), PetalSonicError> {
 - **Ray Tracing**: Optional ray tracing support for occlusion and reverb effects
 - **Runtime Acoustics Control**: Toggle geometry-driven occlusion, reflections, and reverb without
   rebuilding the world or disabling HRTF spatialization
+- **Per-Voice Spatial Routing**: Fan one PCM cursor into an independent Direct Path and Environment
+  Send, including invariant listener-local direct placement and a captured world acoustic origin
 - **Cross-Platform**: Works on Windows, macOS, Linux, and more via CPAL
 
 ## Project Structure
@@ -153,6 +155,8 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 - **Coexistence**: Spatial and non-spatial sources work together in the same world
 - **World-owned render thread**: Creating a world starts audio progress; callers never pump it
 - **Emitter/Voice split**: Callers manage stable Emitters; playback Voices are internal
+- **Single-cursor routing**: Direct Path and Environment Send derive from the same decoded Voice
+  block; fixed acoustic origins are captured per Voice
 - **World-level listener**: Single global listener pose for all spatial sources
 - **Lock-free ring buffer**: Bridges fixed-size render blocks to variable-size device callbacks
 - **Real-time safety**: No allocations or locks in the audio callback path
@@ -173,6 +177,8 @@ PetalSonic uses a three-layer architecture to provide real-time safe spatial aud
 
 - **API Documentation**: Run `cargo doc --open` to generate and view the full API documentation
 - **Core Library README**: See [petalsonic/README.md](./petalsonic/README.md) for detailed usage guide
+- **Direct/Environment Contract**: See
+  [docs/direct-environment-routing.md](./docs/direct-environment-routing.md)
 - **Examples**: Check the `petalsonic-demo` crate for working examples
 
 ## Development Commands

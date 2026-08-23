@@ -1,8 +1,9 @@
 // Mixer module - handles mixing of audio sources
 // This contains the mixing logic for both spatial and non-spatial sources
 
+use crate::events::VoiceTelemetryEvent;
 use crate::playback::{PlayState, PlaybackInstance};
-use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor};
+use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor, SpatialRenderContext};
 use crate::world::SourceId;
 use crate::{BusParams, gain};
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub struct MixerScratch {
     spatial_ids: Vec<SourceId>,
     muted_spatial_ids: Vec<SourceId>,
     non_spatial_ids: Vec<SourceId>,
+    voice_telemetry: Vec<VoiceTelemetryEvent>,
 }
 
 impl MixerScratch {
@@ -29,7 +31,14 @@ impl MixerScratch {
             spatial_ids: Vec::with_capacity(max_voices),
             muted_spatial_ids: Vec::with_capacity(max_voices),
             non_spatial_ids: Vec::with_capacity(max_voices),
+            voice_telemetry: Vec::with_capacity(max_voices.saturating_mul(2)),
         }
+    }
+
+    pub(crate) fn drain_voice_telemetry(
+        &mut self,
+    ) -> impl Iterator<Item = VoiceTelemetryEvent> + '_ {
+        self.voice_telemetry.drain(..)
     }
 }
 
@@ -42,12 +51,14 @@ pub struct MixProfilingSummary {
 }
 
 /// Mixes all active voices and returns completion plus bounded timing summaries.
+#[allow(clippy::too_many_arguments)] // Explicit borrowed render state keeps this hot path allocation-free.
 pub fn mix_playback_instances_with_metrics(
     world_buffer: &mut [f32],
     channels: u16,
     active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     spatial_processor: Option<&mut SpatialProcessor>,
     buses: &[BusParams],
+    render_context: SpatialRenderContext,
     scratch: &mut MixerScratch,
     completed_playbacks: &mut Vec<CompletedPlayback>,
 ) -> MixProfilingSummary {
@@ -58,6 +69,7 @@ pub fn mix_playback_instances_with_metrics(
     scratch.spatial_ids.clear();
     scratch.muted_spatial_ids.clear();
     scratch.non_spatial_ids.clear();
+    scratch.voice_telemetry.clear();
 
     let output_frames = world_buffer.len() / channels.max(1) as usize;
     for (source_id, instance) in active_playback.iter_mut() {
@@ -103,12 +115,14 @@ pub fn mix_playback_instances_with_metrics(
         for source_id in &scratch.muted_spatial_ids {
             processor.silence_source_state(*source_id);
         }
-        if !scratch.spatial_ids.is_empty() || processor.has_late_reverb_tail() {
+        if !scratch.spatial_ids.is_empty() || processor.has_environment_tail() {
             let spatial_start = Instant::now();
             if let Ok(metrics) = processor.process_spatial_sources_with_metrics(
                 &scratch.spatial_ids,
                 &mut active_playback,
                 world_buffer,
+                render_context,
+                &mut scratch.voice_telemetry,
             ) {
                 profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
                 profiling.spatial_metrics = Some(metrics);
@@ -209,6 +223,9 @@ mod tests {
                 playback_rate: 1.0,
                 detached: false,
                 completion_tag: None,
+                direct_path: crate::domain::DirectPath::default(),
+                environment_send: crate::domain::EnvironmentSend::default(),
+                play_command_id: None,
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
@@ -235,6 +252,7 @@ mod tests {
             &active,
             None,
             &buses,
+            SpatialRenderContext::default(),
             &mut scratch,
             &mut completed,
         );
@@ -268,6 +286,9 @@ mod tests {
                 playback_rate: 1.0,
                 detached: false,
                 completion_tag: None,
+                direct_path: crate::domain::DirectPath::default(),
+                environment_send: crate::domain::EnvironmentSend::default(),
+                play_command_id: None,
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
@@ -293,6 +314,7 @@ mod tests {
             &active,
             None,
             &buses,
+            SpatialRenderContext::default(),
             &mut scratch,
             &mut completed,
         );

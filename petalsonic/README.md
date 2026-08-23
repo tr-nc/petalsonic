@@ -14,6 +14,7 @@ A real-time safe native spatial audio library for Rust.
 - **Automatic Recovery**: Keeps logical audio state while output devices change or disappear
 - **Pull-Based Events**: Controlled completion and runtime state are observed on the caller thread
 - **Runtime Acoustics Control**: Toggle geometry-driven effects without rebuilding spatial audio
+- **Per-Voice Spatial Routing**: Give one cursor independent direct and environment semantics
 - **Multiple Audio Formats**: Support for WAV, MP3, FLAC, OGG, and more via Symphonia
 
 ## Quick Start
@@ -122,6 +123,18 @@ off smoothly bypasses direct transmission, early reflections, and late reverbera
 HRTF, distance attenuation, air absorption, playback position, and the worker lifecycle remain
 intact.
 
+### Direct Path and Environment Send
+
+Each spatial Voice has one PCM cursor and two independent routes. `DirectPath` selects world,
+listener-relative, or disabled placement, plus orthogonal geometry and propagation policies.
+`EnvironmentSend` selects a following, fixed world, or disabled acoustic origin. Both routes use
+the same decoded block; the send is not mixed as a second direct signal.
+
+See the workspace's
+[Direct Path and Environment Routing contract](../docs/direct-environment-routing.md) for the
+listener-local footstep integration, compatibility defaults, tail lifecycle, validation rules,
+and correlated telemetry.
+
 ## Architecture
 
 PetalSonic uses a three-layer audio-output path plus a world-owned propagation worker:
@@ -180,12 +193,16 @@ PetalSonic uses a three-layer audio-output path plus a world-owned propagation w
 ### Playback Control
 
 - **`PlayOptions`**: One-shot or looping intent plus bus, gain, and detachment
+- **`DirectPath`**: Per-Voice direct placement, geometry, and propagation policy
+- **`EnvironmentSend`**: Per-Voice environment origin and send gain
 - **`PlaybackControl`**: Optional handle for one explicitly controlled Voice
 
 ### Events
 
 - **`PetalSonicEvent`**: Events emitted by the engine
   - `PlaybackCompleted` for controlled one-shots
+- **`VoiceTelemetryEvent`**: Independently drained opt-in spatial telemetry
+  - `FirstRendered` and `EnvironmentResponse`, correlated by `PlayCommandId`
 - **`RuntimeStatus` / `RuntimeDiagnostics`**: Current lifecycle state and cumulative bounded-runtime
   health counters
 
@@ -207,7 +224,7 @@ let config = PetalSonicWorldDesc {
     max_voices: 128,              // Maximum simultaneous playback voices
     control_queue_capacity: 256,  // Bounded regular control queue
     lifecycle_queue_capacity: 32, // Reserved stop/destroy capacity
-    event_queue_capacity: 128,    // Bounded pull-event queue
+    event_queue_capacity: 128,    // Bound for each lifecycle/Voice-telemetry queue
     timing_queue_capacity: 128,   // Bounded diagnostics queue
     spatial_quality: SpatialQuality::Balanced,
     latency_profile: LatencyProfile::Balanced,

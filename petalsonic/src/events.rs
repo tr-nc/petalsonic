@@ -1,8 +1,10 @@
 //! Event types for PetalSonic
 
 use crate::config::{LatencyProfile, SpatialQuality};
-use crate::domain::{Emitter, PlaybackControl, PlaybackTag};
+use crate::domain::{Emitter, PlayCommandId, PlaybackControl, PlaybackTag};
+use crate::math::Pose;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// Observable state of the world-owned output runtime.
 #[repr(u8)]
@@ -69,9 +71,11 @@ pub(crate) struct RuntimeCounters {
     pub(crate) control_queue_high_water: AtomicUsize,
     pub(crate) lifecycle_queue_high_water: AtomicUsize,
     pub(crate) event_queue_high_water: AtomicUsize,
+    pub(crate) voice_telemetry_queue_high_water: AtomicUsize,
     pub(crate) timing_queue_high_water: AtomicUsize,
     pub(crate) rejected_commands: AtomicU64,
     pub(crate) dropped_events: AtomicU64,
+    pub(crate) dropped_voice_telemetry: AtomicU64,
     pub(crate) dropped_timing_events: AtomicU64,
     pub(crate) device_generation: AtomicU64,
     pub(crate) output_sample_rate: AtomicUsize,
@@ -86,9 +90,11 @@ impl Default for RuntimeCounters {
             control_queue_high_water: AtomicUsize::new(0),
             lifecycle_queue_high_water: AtomicUsize::new(0),
             event_queue_high_water: AtomicUsize::new(0),
+            voice_telemetry_queue_high_water: AtomicUsize::new(0),
             timing_queue_high_water: AtomicUsize::new(0),
             rejected_commands: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
+            dropped_voice_telemetry: AtomicU64::new(0),
             dropped_timing_events: AtomicU64::new(0),
             device_generation: AtomicU64::new(0),
             output_sample_rate: AtomicUsize::new(0),
@@ -198,6 +204,36 @@ pub struct RenderTimingEvent {
     pub total_time_us: u64,
 }
 
+/// The asynchronous environment response observed by a render block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvironmentResponse {
+    /// Complete spatial input generation used by the solver.
+    pub spatial_revision: u64,
+    /// Immutable acoustic geometry generation used by the solver.
+    pub geometry_version: u64,
+    /// Elapsed time between publication by the solver and observation by the render block.
+    pub age: Duration,
+}
+
+/// Opt-in telemetry for the first render block that advances one Voice's PCM cursor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceFirstRenderTelemetry {
+    /// Caller-supplied correlation value from [`crate::PlayOptions`].
+    pub play_command_id: PlayCommandId,
+    /// Reusable emitter whose immutable playback Voice produced this event.
+    pub emitter: Emitter,
+    /// Monotonic world render-block index, starting at zero for each output session.
+    pub render_block_index: u64,
+    /// Latest complete spatial frame observed at the render-quantum boundary.
+    pub spatial_revision: u64,
+    /// Direct placement in listener-local coordinates, or `None` when direct is disabled.
+    pub direct_local_pose: Option<Pose>,
+    /// World-space origin captured for this environment send, or `None` when disabled.
+    pub acoustic_origin: Option<Pose>,
+    /// Environment response already available for this Voice on its first render block.
+    pub environment_response: Option<EnvironmentResponse>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PetalSonicEvent {
     /// A controlled one-shot reached its natural end.
@@ -208,6 +244,31 @@ pub enum PetalSonicEvent {
     },
     /// The output runtime entered a different lifecycle state.
     RuntimeStateChanged(RuntimeState),
+}
+
+/// Opt-in per-Voice spatial telemetry, kept separate from lifecycle events for source
+/// compatibility and independent bounded consumption.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VoiceTelemetryEvent {
+    /// An opted-in spatial Voice advanced its PCM cursor for the first time.
+    FirstRendered(VoiceFirstRenderTelemetry),
+    /// The opted-in Voice first received an asynchronous environment response.
+    EnvironmentResponse {
+        play_command_id: PlayCommandId,
+        response: EnvironmentResponse,
+    },
+}
+
+/// Current pressure on the independently bounded per-Voice telemetry queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceTelemetryDiagnostics {
+    /// Events currently waiting for the caller.
+    pub queue_depth: usize,
+    /// Maximum observed queue depth since World creation.
+    pub queue_high_water: usize,
+    /// Events rejected because the queue was full or disconnected.
+    pub dropped_events: u64,
 }
 
 #[cfg(test)]

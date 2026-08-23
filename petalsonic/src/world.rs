@@ -11,7 +11,7 @@ use crate::engine::{
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
     PetalSonicEvent, RenderTimingEvent, RuntimeCounters, RuntimeDiagnostics, RuntimeState,
-    RuntimeStatus,
+    RuntimeStatus, VoiceTelemetryDiagnostics, VoiceTelemetryEvent,
 };
 use crate::math::Pose;
 use crate::playback::PlaybackCommand;
@@ -309,6 +309,7 @@ pub struct PetalSonicWorld {
     underrun_count: Arc<AtomicUsize>,
     active_output_device: Arc<Mutex<Option<String>>>,
     event_receiver: Receiver<PetalSonicEvent>,
+    voice_telemetry_receiver: Receiver<VoiceTelemetryEvent>,
     timing_receiver: Receiver<RenderTimingEvent>,
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
@@ -346,6 +347,7 @@ impl PetalSonicWorld {
             config.distance_scaler,
             environmental_acoustics_enabled.clone(),
             config.environmental_acoustics_quality,
+            config.max_voices,
         )
         .map_err(|error| {
             PetalSonicError::Engine(format!(
@@ -374,6 +376,7 @@ impl PetalSonicWorld {
             spatial_retirement_sender,
             latest_acoustic_response: acoustic_propagation.latest_response_slot(),
             acoustic_response_retirement_sender,
+            acoustic_voice_input: acoustic_propagation.voice_input(),
             environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
             ports,
         };
@@ -382,6 +385,7 @@ impl PetalSonicWorld {
             underrun_count,
             active_device_name,
             event_receiver,
+            voice_telemetry_receiver,
             timing_receiver,
             counters,
         } = observability;
@@ -421,6 +425,7 @@ impl PetalSonicWorld {
             underrun_count,
             active_output_device: active_device_name,
             event_receiver,
+            voice_telemetry_receiver,
             timing_receiver,
             runtime_state,
             recovery_attempts,
@@ -866,6 +871,7 @@ impl PetalSonicWorld {
         self.ensure_open()?;
         let state = self.emitter_state(emitter)?;
         Self::validate_playback_rate(options.playback_rate())?;
+        Self::validate_spatial_routing(state.desc.is_spatial(), options)?;
         let bus_index = self.resolve_bus(options.bus().or(state.desc.bus()))?;
         self.reserve_voice()?;
         let voice_id = SourceId(self.next_voice_id.fetch_add(1, Ordering::Relaxed));
@@ -897,6 +903,9 @@ impl PetalSonicWorld {
             completion_tag,
             bus_index,
             playback_rate: options.playback_rate(),
+            direct_path: options.direct_path(),
+            environment_send: options.environment_send(),
+            play_command_id: options.play_command_id(),
             mono_scratch: vec![0.0; self.desc.block_size],
         };
         if let Err(error) = self.try_send(command) {
@@ -1074,6 +1083,73 @@ impl PetalSonicWorld {
         }
     }
 
+    fn validate_spatial_routing(is_spatial: bool, options: PlayOptions) -> Result<()> {
+        if !is_spatial
+            && (options.has_spatial_routing_override() || options.play_command_id().is_some())
+        {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "play_options.spatial_routing",
+                reason: "DirectPath, EnvironmentSend, and spatial render telemetry require a spatial emitter"
+                    .into(),
+            });
+        }
+
+        let direct_path = options.direct_path();
+        if let crate::domain::DirectPlacement::ListenerRelative(pose) = direct_path.placement() {
+            Self::validate_route_pose("play_options.direct_path.listener_relative", pose)?;
+        }
+        if matches!(
+            direct_path.placement(),
+            crate::domain::DirectPlacement::Disabled
+        ) && !matches!(
+            direct_path.geometry(),
+            crate::domain::DirectGeometry::BypassTransmission
+        ) {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "play_options.direct_path.geometry",
+                reason: "a disabled DirectPath must bypass transmission".into(),
+            });
+        }
+
+        let environment_send = options.environment_send();
+        if !environment_send.gain_db().is_finite() {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "play_options.environment_send.gain_db",
+                reason: "must be finite".into(),
+            });
+        }
+        match environment_send.origin() {
+            crate::domain::EnvironmentOrigin::World(pose) => {
+                Self::validate_route_pose("play_options.environment_send.origin", pose)?;
+            }
+            crate::domain::EnvironmentOrigin::Disabled
+                if environment_send.gain_db().to_bits() != 0.0f32.to_bits() =>
+            {
+                return Err(PetalSonicError::InvalidConfiguration {
+                    field: "play_options.environment_send.gain_db",
+                    reason: "a disabled EnvironmentSend must use 0 dB".into(),
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_route_pose(field: &'static str, pose: Pose) -> Result<()> {
+        let rotation_length_squared = pose.rotation.length_squared();
+        if !pose.position.is_finite()
+            || !pose.rotation.is_finite()
+            || !rotation_length_squared.is_finite()
+            || rotation_length_squared <= f32::EPSILON
+        {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field,
+                reason: "position and rotation must be finite, with a non-zero rotation".into(),
+            });
+        }
+        Ok(())
+    }
+
     fn emitter_state(&self, emitter: Emitter) -> Result<EmitterState> {
         self.emitters
             .lock()
@@ -1245,6 +1321,26 @@ impl PetalSonicWorld {
         events
     }
 
+    /// Drains opt-in per-Voice render telemetry without consuming lifecycle events.
+    pub fn drain_voice_telemetry(&self) -> Vec<VoiceTelemetryEvent> {
+        self.voice_telemetry_receiver.try_iter().collect()
+    }
+
+    /// Reports pressure on the independently bounded Voice telemetry queue.
+    pub fn voice_telemetry_diagnostics(&self) -> VoiceTelemetryDiagnostics {
+        VoiceTelemetryDiagnostics {
+            queue_depth: self.voice_telemetry_receiver.len(),
+            queue_high_water: self
+                .counters
+                .voice_telemetry_queue_high_water
+                .load(Ordering::Relaxed),
+            dropped_events: self
+                .counters
+                .dropped_voice_telemetry
+                .load(Ordering::Relaxed),
+        }
+    }
+
     fn drain_retired_controls(&self) {
         if let Ok(mut controlled) = self.controlled_voices.lock() {
             while let Ok(voice_id) = self.retirement_receiver.try_recv() {
@@ -1317,7 +1413,32 @@ impl Drop for PetalSonicWorld {
 mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
+    use crate::domain::{DirectGeometry, DirectPath, EnvironmentSend, PlayCommandId};
     use std::cell::Cell;
+
+    #[test]
+    fn spatial_routing_rejects_invalid_or_inapplicable_policies() {
+        let local_nan = PlayOptions::once().with_direct_path(DirectPath::listener_relative(
+            Pose::from_position(crate::math::Vec3::splat(f32::NAN)),
+        ));
+        assert!(PetalSonicWorld::validate_spatial_routing(true, local_nan).is_err());
+
+        let disabled_with_geometry = PlayOptions::once().with_direct_path(
+            DirectPath::disabled().with_geometry(DirectGeometry::SimulatedTransmission),
+        );
+        assert!(PetalSonicWorld::validate_spatial_routing(true, disabled_with_geometry).is_err());
+
+        let non_spatial_override = PlayOptions::once()
+            .with_environment_send(EnvironmentSend::from_world_pose(Pose::identity()));
+        assert!(PetalSonicWorld::validate_spatial_routing(false, non_spatial_override).is_err());
+
+        let non_spatial_telemetry = PlayOptions::once().with_play_command_id(PlayCommandId(1));
+        assert!(PetalSonicWorld::validate_spatial_routing(false, non_spatial_telemetry).is_err());
+
+        let invalid_gain = PlayOptions::once()
+            .with_environment_send(EnvironmentSend::follow_emitter().with_gain_db(f32::NAN));
+        assert!(PetalSonicWorld::validate_spatial_routing(true, invalid_gain).is_err());
+    }
     use std::time::Duration;
 
     fn clip() -> ResidentClip {

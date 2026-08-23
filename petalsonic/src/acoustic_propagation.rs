@@ -1,7 +1,12 @@
 use crate::acoustics::{AcousticMaterial, AcousticRay, AcousticSceneSnapshot};
-use crate::domain::{Emitter, EmitterSpatialState, SpatialFrame};
-use crate::math::Vec3;
+use crate::domain::{
+    DirectGeometry, DirectPath, DirectPlacement, Emitter, EnvironmentOrigin, EnvironmentSend,
+    SpatialFrame,
+};
+use crate::events::EnvironmentResponse as EnvironmentResponseTelemetry;
+use crate::math::{Pose, Vec3};
 use crate::spatial::LateReverbParameters;
+use crate::world::SourceId;
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -61,8 +66,9 @@ pub(crate) struct EarlyReflectionTap {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DirectAcousticResponse {
-    pub emitter: Emitter,
+    pub voice_id: SourceId,
     pub gain: [f32; 3],
+    pub environment_gain: [f32; 3],
     pub early_reflections: Vec<EarlyReflectionTap>,
 }
 
@@ -77,21 +83,52 @@ pub(crate) struct AcousticResponse {
 }
 
 impl AcousticResponse {
-    pub(crate) fn direct_gain(&self, emitter: Emitter) -> [f32; 3] {
+    pub(crate) fn direct_gain(&self, voice_id: SourceId) -> [f32; 3] {
         self.direct
             .iter()
-            .find(|response| response.emitter == emitter)
+            .find(|response| response.voice_id == voice_id)
             .map(|response| response.gain)
             .unwrap_or([1.0; 3])
     }
 
-    pub(crate) fn early_reflections(&self, emitter: Emitter) -> &[EarlyReflectionTap] {
+    pub(crate) fn environment_gain(&self, voice_id: SourceId) -> [f32; 3] {
         self.direct
             .iter()
-            .find(|response| response.emitter == emitter)
+            .find(|response| response.voice_id == voice_id)
+            .map(|response| response.environment_gain)
+            .unwrap_or([1.0; 3])
+    }
+
+    pub(crate) fn early_reflections(&self, voice_id: SourceId) -> &[EarlyReflectionTap] {
+        self.direct
+            .iter()
+            .find(|response| response.voice_id == voice_id)
             .map(|response| response.early_reflections.as_slice())
             .unwrap_or_default()
     }
+
+    pub(crate) fn telemetry(&self, voice_id: SourceId) -> Option<EnvironmentResponseTelemetry> {
+        self.direct
+            .iter()
+            .any(|response| response.voice_id == voice_id)
+            .then(|| EnvironmentResponseTelemetry {
+                spatial_revision: self.spatial_revision,
+                geometry_version: self.geometry_version,
+                age: self.published_at.elapsed(),
+            })
+    }
+}
+
+/// Immutable routing and the latest compatible emitter state for one active Voice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AcousticVoice {
+    pub voice_id: SourceId,
+    pub emitter: Emitter,
+    pub emitter_world_pose: Pose,
+    pub acoustic_priority: f32,
+    pub detached: bool,
+    pub direct_path: DirectPath,
+    pub environment_send: EnvironmentSend,
 }
 
 #[derive(Clone)]
@@ -99,6 +136,7 @@ struct SolveInput {
     generation: u64,
     spatial: Arc<SpatialFrame>,
     scene: Arc<AcousticSceneSnapshot>,
+    voices: Vec<AcousticVoice>,
     environmental_acoustics_quality: f32,
 }
 
@@ -106,15 +144,17 @@ struct InputState {
     generation: u64,
     spatial: Option<Arc<SpatialFrame>>,
     scene: Option<Arc<AcousticSceneSnapshot>>,
+    voices: Vec<AcousticVoice>,
     environmental_acoustics_quality: f32,
 }
 
 impl InputState {
-    fn new(environmental_acoustics_quality: f32) -> Self {
+    fn new(environmental_acoustics_quality: f32, max_voices: usize) -> Self {
         Self {
             generation: 0,
             spatial: None,
             scene: None,
+            voices: Vec::with_capacity(max_voices),
             environmental_acoustics_quality,
         }
     }
@@ -124,6 +164,7 @@ impl InputState {
             generation: self.generation,
             spatial: self.spatial.clone()?,
             scene: self.scene.clone()?,
+            voices: self.voices.clone(),
             environmental_acoustics_quality: self.environmental_acoustics_quality,
         })
     }
@@ -132,6 +173,70 @@ impl InputState {
 struct SharedInput {
     state: Mutex<InputState>,
     changed: Condvar,
+}
+
+/// Bounded render-runtime port for active Voice acoustics state.
+#[derive(Clone)]
+pub(crate) struct AcousticVoiceInput {
+    input: Arc<SharedInput>,
+}
+
+impl AcousticVoiceInput {
+    #[cfg(test)]
+    pub(crate) fn isolated(max_voices: usize) -> Self {
+        Self {
+            input: Arc::new(SharedInput {
+                state: Mutex::new(InputState::new(0.5, max_voices)),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn activate(&self, mut voice: AcousticVoice) {
+        let Ok(mut state) = self.input.state.lock() else {
+            return;
+        };
+        if let Some(spatial) = &state.spatial
+            && let Some(emitter) = spatial
+                .emitters()
+                .iter()
+                .find(|candidate| candidate.emitter == voice.emitter)
+        {
+            voice.emitter_world_pose = emitter.pose;
+            voice.acoustic_priority = emitter.acoustic_priority();
+        }
+        if let Some(current) = state
+            .voices
+            .iter_mut()
+            .find(|current| current.voice_id == voice.voice_id)
+        {
+            *current = voice;
+        } else if state.voices.len() < state.voices.capacity() {
+            state.voices.push(voice);
+        } else {
+            return;
+        }
+        state.generation = state.generation.wrapping_add(1).max(1);
+        drop(state);
+        self.input.changed.notify_one();
+    }
+
+    pub(crate) fn retire(&self, voice_id: SourceId) {
+        let Ok(mut state) = self.input.state.lock() else {
+            return;
+        };
+        let Some(index) = state
+            .voices
+            .iter()
+            .position(|voice| voice.voice_id == voice_id)
+        else {
+            return;
+        };
+        state.voices.swap_remove(index);
+        state.generation = state.generation.wrapping_add(1).max(1);
+        drop(state);
+        self.input.changed.notify_one();
+    }
 }
 
 pub(crate) struct AcousticPropagationCounters {
@@ -230,9 +335,10 @@ impl AcousticPropagation {
         distance_scaler: f32,
         enabled: Arc<AtomicBool>,
         environmental_acoustics_quality: f32,
+        max_voices: usize,
     ) -> std::io::Result<Self> {
         let input = Arc::new(SharedInput {
-            state: Mutex::new(InputState::new(environmental_acoustics_quality)),
+            state: Mutex::new(InputState::new(environmental_acoustics_quality, max_voices)),
             changed: Condvar::new(),
         });
         let latest_response = Arc::new(Mutex::new(None));
@@ -276,6 +382,19 @@ impl AcousticPropagation {
             return Err(frame);
         };
         state.generation = state.generation.wrapping_add(1).max(1);
+        for voice in &mut state.voices {
+            if voice.detached {
+                continue;
+            }
+            if let Some(emitter) = frame
+                .emitters()
+                .iter()
+                .find(|candidate| candidate.emitter == voice.emitter)
+            {
+                voice.emitter_world_pose = emitter.pose;
+                voice.acoustic_priority = emitter.acoustic_priority();
+            }
+        }
         state.spatial = Some(frame);
         drop(state);
         self.input.changed.notify_one();
@@ -298,6 +417,12 @@ impl AcousticPropagation {
 
     pub(crate) fn latest_response_slot(&self) -> Arc<Mutex<Option<Arc<AcousticResponse>>>> {
         self.latest_response.clone()
+    }
+
+    pub(crate) fn voice_input(&self) -> AcousticVoiceInput {
+        AcousticVoiceInput {
+            input: self.input.clone(),
+        }
     }
 
     pub(crate) fn diagnostics(&self) -> AcousticPropagationDiagnostics {
@@ -429,6 +554,7 @@ fn propagation_loop(
             counters
                 .superseded_solve_count
                 .fetch_add(1, Ordering::Relaxed);
+            continue;
         }
 
         response.published_at = Instant::now();
@@ -452,7 +578,7 @@ fn propagation_loop(
 
 fn solve_response(input: &SolveInput, distance_scaler: f32) -> AcousticResponse {
     let plan = AcousticSolvePlan::for_quality(input.environmental_acoustics_quality);
-    let candidates = ranked_emitters(input, plan);
+    let candidates = ranked_voices(input, plan);
     let mut direct = solve_direct(input, &candidates, distance_scaler);
     solve_early_reflections(input, &candidates, distance_scaler, plan, &mut direct);
     AcousticResponse {
@@ -465,37 +591,113 @@ fn solve_response(input: &SolveInput, distance_scaler: f32) -> AcousticResponse 
     }
 }
 
-fn ranked_emitters(input: &SolveInput, plan: AcousticSolvePlan) -> Vec<&EmitterSpatialState> {
-    let listener = input.spatial.listener().position;
-    let mut candidates: Vec<(f32, &EmitterSpatialState)> = input
-        .spatial
-        .emitters()
+#[derive(Clone, Copy, Debug)]
+struct RankedVoice {
+    voice: AcousticVoice,
+    direct_origin: Option<Vec3>,
+    environment_origin: Option<Vec3>,
+}
+
+fn ranked_voices(input: &SolveInput, plan: AcousticSolvePlan) -> Vec<RankedVoice> {
+    let listener_pose = input.spatial.listener();
+    let listener = listener_pose.position;
+    let mut candidates: Vec<(f32, RankedVoice)> = input
+        .voices
         .iter()
-        .filter_map(|emitter| {
-            let distance = emitter.pose.position.distance(listener);
-            let priority = emitter.acoustic_priority();
-            (distance.is_finite() && priority.is_finite() && priority > 0.0)
-                .then_some((priority / (1.0 + distance), emitter))
+        .filter_map(|voice| {
+            let direct_origin = match voice.direct_path.placement() {
+                DirectPlacement::World
+                    if matches!(
+                        voice.direct_path.geometry(),
+                        DirectGeometry::SimulatedTransmission
+                    ) =>
+                {
+                    Some(voice.emitter_world_pose.position)
+                }
+                DirectPlacement::ListenerRelative(local_pose)
+                    if matches!(
+                        voice.direct_path.geometry(),
+                        DirectGeometry::SimulatedTransmission
+                    ) =>
+                {
+                    Some(listener_to_world_position(
+                        listener_pose,
+                        local_pose.position,
+                    ))
+                }
+                _ => None,
+            };
+            let environment_origin = match voice.environment_send.origin() {
+                EnvironmentOrigin::FollowEmitter => Some(voice.emitter_world_pose.position),
+                EnvironmentOrigin::World(origin) => Some(origin.position),
+                EnvironmentOrigin::Disabled => None,
+            };
+            let origin = environment_origin.or(direct_origin)?;
+            let distance = origin.distance(listener);
+            let priority = voice.acoustic_priority;
+            (distance.is_finite() && priority.is_finite() && priority > 0.0).then_some((
+                priority / (1.0 + distance),
+                RankedVoice {
+                    voice: *voice,
+                    direct_origin,
+                    environment_origin,
+                },
+            ))
         })
         .collect();
     candidates.sort_by(|left, right| right.0.partial_cmp(&left.0).unwrap_or(CmpOrdering::Equal));
     candidates.truncate(plan.max_direct_sources);
-    candidates.into_iter().map(|(_, emitter)| emitter).collect()
+    candidates.into_iter().map(|(_, voice)| voice).collect()
 }
 
 fn solve_direct(
     input: &SolveInput,
-    candidates: &[&EmitterSpatialState],
+    candidates: &[RankedVoice],
     distance_scaler: f32,
 ) -> Vec<DirectAcousticResponse> {
     let listener = input.spatial.listener().position;
     let ray_epsilon_world = RAY_EPSILON_METERS / distance_scaler.max(0.001);
 
-    let mut rays = Vec::with_capacity(candidates.len());
-    let mut min_distances = Vec::with_capacity(candidates.len());
-    let mut max_distances = Vec::with_capacity(candidates.len());
-    for emitter in candidates {
-        let delta = emitter.pose.position - listener;
+    let direct_gain = trace_transmission(
+        input,
+        listener,
+        ray_epsilon_world,
+        candidates.iter().map(|voice| voice.direct_origin),
+    );
+    let environment_gain = trace_transmission(
+        input,
+        listener,
+        ray_epsilon_world,
+        candidates.iter().map(|voice| voice.environment_origin),
+    );
+
+    candidates
+        .iter()
+        .zip(direct_gain)
+        .zip(environment_gain)
+        .map(
+            |((candidate, gain), environment_gain)| DirectAcousticResponse {
+                voice_id: candidate.voice.voice_id,
+                gain,
+                environment_gain,
+                early_reflections: Vec::with_capacity(MAX_EARLY_REFLECTION_TAPS),
+            },
+        )
+        .collect()
+}
+
+fn trace_transmission(
+    input: &SolveInput,
+    listener: Vec3,
+    ray_epsilon_world: f32,
+    origins: impl Iterator<Item = Option<Vec3>>,
+) -> Vec<[f32; 3]> {
+    let origins: Vec<_> = origins.collect();
+    let mut rays = Vec::with_capacity(origins.len());
+    let mut min_distances = Vec::with_capacity(origins.len());
+    let mut max_distances = Vec::with_capacity(origins.len());
+    for origin in &origins {
+        let delta = origin.unwrap_or(listener) - listener;
         let distance = delta.length();
         rays.push(AcousticRay {
             origin: listener,
@@ -511,30 +713,29 @@ fn solve_direct(
         .query()
         .trace_closest_hit_batch(&rays, &min_distances, &max_distances, &mut hits);
 
-    candidates
-        .iter()
+    origins
+        .into_iter()
         .zip(hits)
         .zip(min_distances.into_iter().zip(max_distances))
-        .map(
-            |((emitter, hit), (min_distance, max_distance))| DirectAcousticResponse {
-                emitter: emitter.emitter,
-                gain: hit
-                    .filter(|hit| valid_hit_distance(hit.distance, min_distance, max_distance))
-                    .map(|hit| {
-                        hit.material
-                            .transmission
-                            .map(|gain| sanitize_unit(gain, 1.0))
-                    })
-                    .unwrap_or([1.0; 3]),
-                early_reflections: Vec::with_capacity(MAX_EARLY_REFLECTION_TAPS),
-            },
-        )
+        .map(|((origin, hit), (min_distance, max_distance))| {
+            origin
+                .map(|_| {
+                    hit.filter(|hit| valid_hit_distance(hit.distance, min_distance, max_distance))
+                        .map(|hit| {
+                            hit.material
+                                .transmission
+                                .map(|gain| sanitize_unit(gain, 1.0))
+                        })
+                        .unwrap_or([1.0; 3])
+                })
+                .unwrap_or([1.0; 3])
+        })
         .collect()
 }
 
 fn solve_early_reflections(
     input: &SolveInput,
-    candidates: &[&EmitterSpatialState],
+    candidates: &[RankedVoice],
     distance_scaler: f32,
     plan: AcousticSolvePlan,
     responses: &mut [DirectAcousticResponse],
@@ -558,8 +759,10 @@ fn solve_early_reflections(
         &mut surface_hits,
     );
 
-    for emitter in candidates.iter().take(plan.max_early_reflection_sources) {
-        let source_position = emitter.pose.position;
+    for candidate in candidates.iter().take(plan.max_early_reflection_sources) {
+        let Some(source_position) = candidate.environment_origin else {
+            continue;
+        };
         let direct_distance_world = source_position.distance(listener);
         if !direct_distance_world.is_finite() {
             continue;
@@ -669,11 +872,18 @@ fn solve_early_reflections(
         taps.sort_by_key(|tap| tap.path_id);
         if let Some(response) = responses
             .iter_mut()
-            .find(|response| response.emitter == emitter.emitter)
+            .find(|response| response.voice_id == candidate.voice.voice_id)
         {
             response.early_reflections = taps;
         }
     }
+}
+
+fn listener_to_world_position(listener: Pose, local_position: Vec3) -> Vec3 {
+    listener.position
+        + listener.right() * local_position.x
+        + listener.up() * local_position.y
+        + listener.forward() * local_position.z
 }
 
 fn reflection_strength(tap: &EarlyReflectionTap) -> f32 {
@@ -890,6 +1100,7 @@ fn histogram_percentile(histogram: &[AtomicU64; 64], total: u64, percentile: u64
 mod tests {
     use super::*;
     use crate::acoustics::{AcousticHit, AcousticMaterial, AcousticRayQuerySnapshot};
+    use crate::domain::EmitterSpatialState;
     use crate::math::Pose;
 
     struct NoGeometry;
@@ -994,6 +1205,48 @@ mod tests {
         }
     }
 
+    struct DirectionalTransmission;
+
+    impl AcousticRayQuerySnapshot for DirectionalTransmission {
+        fn trace_any_hit_batch(
+            &self,
+            _rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            hits.fill(false);
+        }
+
+        fn trace_closest_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            min_distances: &[f32],
+            max_distances: &[f32],
+            hits: &mut [Option<AcousticHit>],
+        ) {
+            for (((ray, min_distance), max_distance), hit) in rays
+                .iter()
+                .zip(min_distances.iter().copied())
+                .zip(max_distances.iter().copied())
+                .zip(hits.iter_mut())
+            {
+                let distance = (min_distance + max_distance) * 0.5;
+                let transmission = if ray.direction.x >= 0.0 { 0.2 } else { 0.8 };
+                *hit = valid_hit_distance(distance, min_distance, max_distance).then_some(
+                    AcousticHit {
+                        distance,
+                        normal: -ray.direction,
+                        material: AcousticMaterial {
+                            transmission: [transmission; 3],
+                            ..AcousticMaterial::default()
+                        },
+                    },
+                );
+            }
+        }
+    }
+
     struct ReflectiveFloor {
         blocks_visibility: bool,
     }
@@ -1056,6 +1309,15 @@ mod tests {
                 )],
             )),
             scene: Arc::new(AcousticSceneSnapshot::new(17, query)),
+            voices: vec![AcousticVoice {
+                voice_id: SourceId::from(1),
+                emitter,
+                emitter_world_pose: Pose::from_position(Vec3::Z),
+                acoustic_priority: 1.0,
+                detached: false,
+                direct_path: DirectPath::default(),
+                environment_send: EnvironmentSend::default(),
+            }],
             environmental_acoustics_quality: 0.5,
         }
     }
@@ -1116,6 +1378,41 @@ mod tests {
         assert_eq!(response.geometry_version, 17);
         assert_eq!(response.direct.len(), 1);
         assert_eq!(response.direct[0].gain, [0.1, 0.05, 0.02]);
+    }
+
+    #[test]
+    fn overlapping_voices_keep_independent_fixed_acoustic_origins() {
+        let mut input = input(Arc::new(DirectionalTransmission));
+        let emitter = input.voices[0].emitter;
+        input.voices = vec![
+            AcousticVoice {
+                voice_id: SourceId::from(41),
+                emitter,
+                emitter_world_pose: Pose::from_position(Vec3::Z),
+                acoustic_priority: 1.0,
+                detached: false,
+                direct_path: DirectPath::listener_relative(Pose::from_position(-Vec3::Y))
+                    .with_geometry(DirectGeometry::BypassTransmission),
+                environment_send: EnvironmentSend::from_world_pose(Pose::from_position(Vec3::X)),
+            },
+            AcousticVoice {
+                voice_id: SourceId::from(42),
+                emitter,
+                emitter_world_pose: Pose::from_position(Vec3::Z),
+                acoustic_priority: 1.0,
+                detached: false,
+                direct_path: DirectPath::listener_relative(Pose::from_position(-Vec3::Y))
+                    .with_geometry(DirectGeometry::BypassTransmission),
+                environment_send: EnvironmentSend::from_world_pose(Pose::from_position(-Vec3::X)),
+            },
+        ];
+
+        let response = solve_response(&input, 1.0);
+        assert_eq!(response.direct.len(), 2);
+        assert_eq!(response.environment_gain(SourceId::from(41)), [0.2; 3]);
+        assert_eq!(response.environment_gain(SourceId::from(42)), [0.8; 3]);
+        assert_eq!(response.direct_gain(SourceId::from(41)), [1.0; 3]);
+        assert_eq!(response.direct_gain(SourceId::from(42)), [1.0; 3]);
     }
 
     #[test]
@@ -1186,7 +1483,7 @@ mod tests {
     #[test]
     fn worker_keeps_only_latest_complete_input_and_closes_cleanly() {
         let propagation =
-            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5).unwrap();
+            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5, 8).unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(17, Arc::new(UnitRoom))))
             .unwrap();
@@ -1240,7 +1537,7 @@ mod tests {
     #[test]
     fn disabled_worker_waits_for_reenable_before_solving() {
         let propagation =
-            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(false)), 0.5).unwrap();
+            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(false)), 0.5, 8).unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();
@@ -1271,7 +1568,7 @@ mod tests {
     #[test]
     fn quality_change_wakes_the_existing_worker_without_new_scene_input() {
         let propagation =
-            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5).unwrap();
+            AcousticPropagation::new(1.0, Arc::new(AtomicBool::new(true)), 0.5, 8).unwrap();
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();

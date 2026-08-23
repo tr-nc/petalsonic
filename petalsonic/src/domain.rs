@@ -152,6 +152,7 @@ mod tests {
     fn source_extent_defaults_to_a_compatible_point() {
         assert_eq!(SourceExtent::default(), SourceExtent::Point);
         assert_eq!(SourceExtent::Point.sample_count(), 1);
+        assert_eq!(ExtentSampleId::POINT, ExtentSampleId(u64::MAX));
         assert_eq!(
             EmitterDesc::spatial(Pose::identity()).extent(),
             &SourceExtent::Point

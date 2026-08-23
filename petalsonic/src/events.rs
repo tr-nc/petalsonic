@@ -1,7 +1,7 @@
 //! Event types for PetalSonic
 
 use crate::config::{LatencyProfile, SpatialQuality};
-use crate::domain::{Emitter, PlayCommandId, PlaybackControl, PlaybackTag};
+use crate::domain::{Emitter, ExtentSampleId, PlayCommandId, PlaybackControl, PlaybackTag};
 use crate::math::Pose;
 use crate::math::Vec3;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -297,9 +297,12 @@ pub enum AcousticOcclusionState {
 }
 
 /// Per-route measurements captured entirely on the acoustics worker.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AcousticRouteTelemetry {
+    /// Number of observations in `samples`; active routes contain 1..=8, inactive routes contain 0.
     pub sample_count: usize,
+    /// Stable-ID-ordered observations that produced `raw_gain`, `hit_count`, and `visible_fraction`.
+    pub samples: Vec<AcousticSampleObservation>,
     pub ray_count: usize,
     pub cache_hit_count: usize,
     pub hit_count: usize,
@@ -308,6 +311,26 @@ pub struct AcousticRouteTelemetry {
     pub filtered_gain: [f32; 3],
     pub classified_state: AcousticOcclusionState,
     pub dwell_seconds: f32,
+}
+
+/// One bounded physical observation used in a direct or environment route solve.
+///
+/// A valid closest hit reports `hit == true` and the sanitized low/mid/high linear-amplitude
+/// transmission copied from its [`crate::AcousticMaterial`]. A miss reports `hit == false` and
+/// unity transmission; there is no material to name or infer. Cache reuse republishes this exact
+/// observation even though it executes no new ray.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcousticSampleObservation {
+    /// Caller-stable weighted-sample identity, or [`ExtentSampleId::POINT`] for a Point extent.
+    pub sample_id: ExtentSampleId,
+    /// Normalized source-power fraction. Active route observations sum to one.
+    pub normalized_power_weight: f32,
+    /// World-space sample position used for this immutable route response.
+    pub world_position: Vec3,
+    /// Whether the route ray produced a valid closest material hit.
+    pub hit: bool,
+    /// Sanitized low/mid/high material transmission, as linear amplitude in `0..=1`.
+    pub transmission: [f32; 3],
 }
 
 /// One bounded renderer lobe derived deterministically from stable extent samples.

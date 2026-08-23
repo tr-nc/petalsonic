@@ -60,4 +60,7 @@ explicitly deferred; deferred does not mean unity.
 - The worker may allocate and query geometry. The render path only reads an immutable bounded
   target and uses preallocated state.
 - Acoustic telemetry is an independent bounded stream, so lifecycle-event compatibility is not
-  coupled to diagnostic volume.
+  coupled to diagnostic volume. Each active route publishes at most eight stable-ID sample
+  observations containing normalized power, world position, hit state, and the exact three-band
+  material transmission used by aggregation; cache reuse and retained responses preserve those
+  observations rather than fabricating misses.

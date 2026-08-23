@@ -34,8 +34,10 @@ the same physical meaning. Input order is irrelevant: construction sorts by ID a
 relative power. The current hard bounds are `MAX_EXTENT_SAMPLES == 8`,
 `MAX_DIRECT_LOBES == 4`, and `MAX_EXTENT_RADIUS_WORLD_UNITS` for local positions.
 
-`Point` remains the default for existing consumers. Non-spatial Emitters reject extent and
-occlusion semantics.
+`Point` remains the default for existing consumers. Its acoustic routes contain one unit-power
+observation with the synthetic stable ID `ExtentSampleId::POINT`; weighted IDs remain scoped to
+their route response, so the same numeric value is still accepted in a caller-supplied extent.
+Non-spatial Emitters reject extent and occlusion semantics.
 
 ## Ownership and updates
 
@@ -116,10 +118,45 @@ the PCM cursor alive.
 
 Drain `PetalSonicWorld::drain_acoustic_telemetry` independently from lifecycle and opt-in Voice
 render telemetry. `AcousticExtentTelemetry` reports publication and response revisions, Voice and
-Emitter identity, sample count, per-route rays/cache hits/hits/visible fraction/raw and filtered
-three-band gains/classification/dwell, lobe directions and energy, solve status, response age, and
-budget membership. `SolveDiscarded` reports superseded solves.
+Emitter identity, per-route observations and aggregates, lobe directions and energy, solve status,
+response age, and budget membership. `direct` and `environment` are independent
+`AcousticRouteTelemetry` values. Each active route contains a stable-ID-ordered `samples` vector
+of 1..=`MAX_EXTENT_SAMPLES` `AcousticSampleObservation` values:
+
+- `sample_id`: the caller's `ExtentSampleId`, or `ExtentSampleId::POINT` for Point compatibility;
+- `normalized_power_weight`: the normalized power used by this solve;
+- `world_position`: the world-space route position captured by the reported response revision;
+- `hit`: whether the closest-hit query produced a valid material hit; and
+- `transmission`: the sanitized low/mid/high material transmission used by the solve, expressed as
+  linear amplitude in the inclusive range 0..=1.
+
+PetalSonic does not invent a material name. `AcousticMaterial` has physical fields rather than a
+stable label, so telemetry exposes the exact three-band transmission snapshot required for the
+direct solve. `hit == false` means no valid material hit exists and `transmission == [1.0; 3]`; it
+does not mean a ray was skipped. On a sample-cache hit, `ray_count` decreases and
+`cache_hit_count` increases, but the cached `sample_id`, weight, world position, hit flag, and
+transmission are republished unchanged.
+
+For `Solved` and `Retained` routes, consumers can independently verify the aggregates:
+
+```text
+sample_count = samples.len()
+hit_count = count(samples where hit)
+visible_fraction = sum(normalized_power_weight where not hit)
+raw_gain[band] = sqrt(sum(normalized_power_weight * transmission[band]^2))
+```
+
+`filtered_gain` can differ from `raw_gain` because it includes the profile's floor and temporal
+attack/release. `Retained` republishes the previous observations unchanged, sets both route ray
+and cache-hit counts to zero, and identifies their age and original response revision. `Deferred`
+and disabled routes have no new physical observation: their `samples` are empty and their neutral
+aggregate fields are not a solve result. The enclosing `solve_status` distinguishes Deferred from
+a solved event with an intentionally disabled route. `SolveDiscarded` is the only telemetry for a
+superseded solve; no sample response from that solve is published.
 
 Use `acoustic_telemetry_diagnostics` for queue depth, high-water mark, and dropped events. Runtime
 diagnostics also expose cumulative direct rays, cache hits, processed extents, lobes, retained
-responses, deferred responses, and render-boundary revision rejections.
+responses, deferred responses, and render-boundary revision rejections. The worker may allocate
+the already boxed event and its bounded sample/lobe vectors. The audio callback never builds or
+locks telemetry. Queue capacity remains `event_queue_capacity`; a full queue drops the whole event
+and increments `dropped_events` rather than publishing a partial route.

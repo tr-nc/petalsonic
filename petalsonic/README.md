@@ -145,7 +145,9 @@ PCM or playback cursors. Extent, route placement, and `OcclusionProfile` remain 
 
 Dynamic extents are published with Emitter poses in complete `SpatialFrame` revisions. Every
 accepted play captures the current extent; later frame updates do not reshape an older Voice. See
-the [Extended Source contract](../docs/extended-source-routing.md).
+the [Extended Source contract](../docs/extended-source-routing.md). Its independent bounded
+acoustic telemetry includes per-route stable sample IDs, normalized power, world positions, hit
+state, and the exact three-band material transmission used to compute the aggregate response.
 
 ## Architecture
 

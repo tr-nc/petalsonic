@@ -17,6 +17,14 @@ pub const MAX_EXTENT_RADIUS_WORLD_UNITS: f32 = 1_000_000.0;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExtentSampleId(pub u64);
 
+impl ExtentSampleId {
+    /// Synthetic stable sample identity used by the compatibility [`SourceExtent::Point`] path.
+    ///
+    /// Sample IDs are scoped to one route observation. The same numeric value remains valid in a
+    /// caller-supplied [`SourceExtent::WeightedSamples`] extent for backward compatibility.
+    pub const POINT: Self = Self(u64::MAX);
+}
+
 /// One immutable local-space representative of source power.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtentSample {

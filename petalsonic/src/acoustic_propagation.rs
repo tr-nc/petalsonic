@@ -6,7 +6,7 @@ use crate::domain::{
 };
 use crate::events::{
     AcousticDiscardReason, AcousticExtentTelemetry, AcousticLobeTelemetry, AcousticOcclusionState,
-    AcousticRouteTelemetry, AcousticSolveStatus, AcousticTelemetryEvent,
+    AcousticRouteTelemetry, AcousticSampleObservation, AcousticSolveStatus, AcousticTelemetryEvent,
     EnvironmentResponse as EnvironmentResponseTelemetry,
 };
 use crate::math::{Pose, Vec3};
@@ -976,6 +976,7 @@ fn deferred_response(voice: &AcousticVoice) -> DirectAcousticResponse {
 fn inactive_route_telemetry() -> AcousticRouteTelemetry {
     AcousticRouteTelemetry {
         sample_count: 0,
+        samples: Vec::new(),
         ray_count: 0,
         cache_hit_count: 0,
         hit_count: 0,
@@ -1280,8 +1281,20 @@ fn route_telemetry(
         return inactive_route_telemetry();
     };
     let aggregate = aggregate.expect("a traced extent always has an energy aggregate");
+    debug_assert!(trace.samples.len() <= MAX_EXTENT_SAMPLES);
     AcousticRouteTelemetry {
         sample_count: trace.samples.len(),
+        samples: trace
+            .samples
+            .iter()
+            .map(|sample| AcousticSampleObservation {
+                sample_id: sample.sample_id,
+                normalized_power_weight: sample.power_weight,
+                world_position: sample.world_position,
+                hit: sample.hit,
+                transmission: sample.transmission,
+            })
+            .collect(),
         ray_count: trace.ray_count,
         cache_hit_count: trace.cache_hit_count,
         hit_count: aggregate.hit_count,
@@ -1321,7 +1334,7 @@ struct RouteTraceContext {
 fn resolve_extent_samples(extent: &SourceExtent, pose: Pose) -> Vec<ResolvedExtentSample> {
     match extent {
         SourceExtent::Point => vec![ResolvedExtentSample {
-            sample_id: crate::domain::ExtentSampleId(u64::MAX),
+            sample_id: crate::domain::ExtentSampleId::POINT,
             power_weight: 1.0,
             world_position: pose.position,
         }],
@@ -2780,6 +2793,51 @@ mod tests {
     }
 
     #[test]
+    fn max_sample_telemetry_queue_drops_whole_events_under_pressure() {
+        let mut input = input(Arc::new(NoGeometry));
+        input.voices[0].source_extent = eight_sample_extent();
+        let mut solver = AcousticSolver::new(1);
+        let output = solver.solve_with_telemetry(
+            &input,
+            1.0,
+            AcousticSolvePlan {
+                max_direct_sources: 1,
+                max_direct_rays: MAX_EXTENT_SAMPLES * 2,
+                max_early_reflection_sources: 0,
+                early_reflection_taps: 0,
+                early_reflection_ray_count: 0,
+                late_ray_count: 0,
+                late_bounce_count: 0,
+            },
+        );
+        assert_eq!(output.telemetry[0].direct.samples.len(), MAX_EXTENT_SAMPLES);
+        assert_eq!(
+            output.telemetry[0].environment.samples.len(),
+            MAX_EXTENT_SAMPLES
+        );
+        let event = AcousticTelemetryEvent::ExtentResponse(Box::new(output.telemetry[0].clone()));
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let counters = AcousticPropagationCounters::default();
+
+        try_send_acoustic_telemetry(&sender, &counters, event.clone());
+        try_send_acoustic_telemetry(&sender, &counters, event);
+
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(
+            counters.telemetry_queue_high_water.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(counters.dropped_telemetry_events.load(Ordering::Relaxed), 1);
+        let received = receiver.try_recv().unwrap();
+        assert!(matches!(
+            received,
+            AcousticTelemetryEvent::ExtentResponse(response)
+                if response.direct.samples.len() == MAX_EXTENT_SAMPLES
+                    && response.environment.samples.len() == MAX_EXTENT_SAMPLES
+        ));
+    }
+
+    #[test]
     fn distributed_transmission_aggregates_normalized_power_not_binary_hits() {
         let mut samples = (0..8)
             .map(|id| ExtentSampleResponse {
@@ -2979,6 +3037,52 @@ mod tests {
         assert_eq!(event.direct.hit_count, 1);
         assert!((event.direct.visible_fraction - 0.875).abs() < 1.0e-6);
         assert!((event.direct.raw_gain[0] - 0.936_082_3).abs() < 1.0e-6);
+        assert!((20.0 * event.direct.raw_gain[0].log10() - -0.573_72).abs() < 0.001);
+        assert_eq!(event.direct.samples.len(), 8);
+        assert_eq!(event.direct.samples[0].sample_id, ExtentSampleId(0));
+        assert_eq!(event.direct.samples[0].normalized_power_weight, 0.125);
+        assert_eq!(
+            event.direct.samples[0].world_position,
+            Vec3::new(-1.0, 0.0, 2.0)
+        );
+        assert!(event.direct.samples[0].hit);
+        assert_eq!(event.direct.samples[0].transmission, [0.1; 3]);
+        assert!(!event.direct.samples[1].hit);
+        assert_eq!(event.direct.samples[1].transmission, [1.0; 3]);
+        let reconstructed_energy = std::array::from_fn::<_, 3, _>(|band| {
+            event
+                .direct
+                .samples
+                .iter()
+                .map(|sample| sample.normalized_power_weight * sample.transmission[band].powi(2))
+                .sum::<f32>()
+        });
+        for (reconstructed, reported) in reconstructed_energy
+            .map(f32::sqrt)
+            .into_iter()
+            .zip(event.direct.raw_gain)
+        {
+            assert!((reconstructed - reported).abs() < 1.0e-6);
+        }
+        assert_eq!(
+            event
+                .direct
+                .samples
+                .iter()
+                .filter(|sample| sample.hit)
+                .count(),
+            event.direct.hit_count
+        );
+        assert_eq!(
+            event
+                .direct
+                .samples
+                .iter()
+                .filter(|sample| !sample.hit)
+                .map(|sample| sample.normalized_power_weight)
+                .sum::<f32>(),
+            event.direct.visible_fraction
+        );
         assert_eq!(event.direct.raw_gain, event.direct.filtered_gain);
         assert_eq!(event.lobes.len(), 4);
         assert_eq!(event.solve_status, AcousticSolveStatus::Solved);
@@ -2998,8 +3102,102 @@ mod tests {
         let cached = solver.solve_with_telemetry(&input, 1.0, plan);
         assert_eq!(cached.telemetry[0].direct.ray_count, 0);
         assert_eq!(cached.telemetry[0].direct.cache_hit_count, 8);
+        assert_eq!(cached.telemetry[0].direct.samples, event.direct.samples);
         assert_eq!(cached.telemetry[0].environment.ray_count, 0);
         assert_eq!(cached.telemetry[0].environment.cache_hit_count, 8);
+        assert_eq!(
+            cached.telemetry[0].environment.samples,
+            event.environment.samples
+        );
+    }
+
+    #[test]
+    fn public_sample_telemetry_reconstructs_half_wood_occlusion() {
+        let mut input = input(Arc::new(NegativeXWood));
+        input.voices[0].emitter_world_pose = Pose::identity();
+        input.voices[0].source_extent = eight_sample_extent();
+        input.voices[0].environment_send = EnvironmentSend::disabled();
+        let output = AcousticSolver::new(1).solve_with_telemetry(
+            &input,
+            1.0,
+            AcousticSolvePlan {
+                max_early_reflection_sources: 0,
+                late_ray_count: 0,
+                ..AcousticSolvePlan::for_quality(0.5)
+            },
+        );
+        let direct = &output.telemetry[0].direct;
+
+        assert_eq!(direct.samples.len(), 8);
+        assert_eq!(direct.hit_count, 4);
+        assert_eq!(direct.visible_fraction, 0.5);
+        assert!((direct.raw_gain[0] - 0.710_633_5).abs() < 1.0e-6);
+        assert!((20.0 * direct.raw_gain[0].log10() - -2.967_1).abs() < 0.001);
+        let reconstructed_gain = std::array::from_fn::<_, 3, _>(|band| {
+            direct
+                .samples
+                .iter()
+                .map(|sample| sample.normalized_power_weight * sample.transmission[band].powi(2))
+                .sum::<f32>()
+                .sqrt()
+        });
+        assert_eq!(reconstructed_gain, direct.raw_gain);
+    }
+
+    #[test]
+    fn point_sample_telemetry_keeps_direct_and_environment_routes_independent() {
+        use crate::domain::ExtentSampleId;
+
+        let mut input = input(Arc::new(DirectionalTransmission));
+        input.voices[0].emitter_world_pose = Pose::from_position(Vec3::X);
+        input.voices[0].environment_send =
+            EnvironmentSend::from_world_pose(Pose::from_position(-Vec3::X));
+        let mut solver = AcousticSolver::new(1);
+        let output = solver.solve_with_telemetry(
+            &input,
+            1.0,
+            AcousticSolvePlan {
+                max_early_reflection_sources: 0,
+                late_ray_count: 0,
+                ..AcousticSolvePlan::for_quality(0.5)
+            },
+        );
+        let event = &output.telemetry[0];
+
+        assert_eq!(event.direct.samples.len(), 1);
+        assert_eq!(event.environment.samples.len(), 1);
+        assert_eq!(event.direct.samples[0].sample_id, ExtentSampleId::POINT);
+        assert_eq!(
+            event.environment.samples[0].sample_id,
+            ExtentSampleId::POINT
+        );
+        assert_eq!(event.direct.samples[0].normalized_power_weight, 1.0);
+        assert_eq!(event.environment.samples[0].normalized_power_weight, 1.0);
+        assert_eq!(event.direct.samples[0].world_position, Vec3::X);
+        assert_eq!(event.environment.samples[0].world_position, -Vec3::X);
+        assert!(event.direct.samples[0].hit);
+        assert!(event.environment.samples[0].hit);
+        assert_eq!(event.direct.samples[0].transmission, [0.2; 3]);
+        assert_eq!(event.environment.samples[0].transmission, [0.8; 3]);
+
+        let cached = solver.solve_with_telemetry(
+            &input,
+            1.0,
+            AcousticSolvePlan {
+                max_early_reflection_sources: 0,
+                late_ray_count: 0,
+                ..AcousticSolvePlan::for_quality(0.5)
+            },
+        );
+        assert_eq!(cached.telemetry[0].direct.ray_count, 0);
+        assert_eq!(cached.telemetry[0].direct.cache_hit_count, 1);
+        assert_eq!(cached.telemetry[0].direct.samples[0].transmission, [0.2; 3]);
+        assert_eq!(cached.telemetry[0].environment.ray_count, 0);
+        assert_eq!(cached.telemetry[0].environment.cache_hit_count, 1);
+        assert_eq!(
+            cached.telemetry[0].environment.samples[0].transmission,
+            [0.8; 3]
+        );
     }
 
     #[test]
@@ -3034,14 +3232,22 @@ mod tests {
         };
         let mut solver = AcousticSolver::new(2);
 
-        let first = solver.solve_with_plan(&input, 1.0, plan);
+        let first = solver.solve_with_telemetry(&input, 1.0, plan);
         let voice_a = first
+            .response
             .direct
             .iter()
             .find(|response| response.voice_id == SourceId::from(1))
             .unwrap();
         assert_eq!(voice_a.solve_status, DirectSolveStatus::Solved);
         assert_eq!(voice_a.gain, [0.2; 3]);
+        let solved_telemetry = first
+            .telemetry
+            .iter()
+            .find(|event| event.voice_id == 1)
+            .unwrap()
+            .clone();
+        assert_eq!(solved_telemetry.direct.samples.len(), 1);
 
         input.voices[0].acoustic_priority = 1.0;
         input.voices[1].acoustic_priority = 3.0;
@@ -3054,14 +3260,32 @@ mod tests {
                 EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
             ],
         ));
-        let retained = solver.solve_with_plan(&input, 1.0, plan);
+        let retained = solver.solve_with_telemetry(&input, 1.0, plan);
         let voice_a = retained
+            .response
             .direct
             .iter()
             .find(|response| response.voice_id == SourceId::from(1))
             .unwrap();
         assert_eq!(voice_a.solve_status, DirectSolveStatus::Retained);
         assert_eq!(voice_a.gain, [0.2; 3]);
+        let retained_telemetry = retained
+            .telemetry
+            .iter()
+            .find(|event| event.voice_id == 1)
+            .unwrap();
+        assert_eq!(
+            retained_telemetry.solve_status,
+            AcousticSolveStatus::Retained
+        );
+        assert_eq!(retained_telemetry.response_spatial_revision, 20);
+        assert_eq!(retained_telemetry.spatial_revision, 21);
+        assert_eq!(retained_telemetry.direct.ray_count, 0);
+        assert_eq!(retained_telemetry.direct.cache_hit_count, 0);
+        assert_eq!(
+            retained_telemetry.direct.samples,
+            solved_telemetry.direct.samples
+        );
 
         input.spatial = Arc::new(SpatialFrame::new(
             22,
@@ -3072,14 +3296,29 @@ mod tests {
                 EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
             ],
         ));
-        let deferred = solver.solve_with_plan(&input, 1.0, plan);
+        let deferred = solver.solve_with_telemetry(&input, 1.0, plan);
         let voice_a = deferred
+            .response
             .direct
             .iter()
             .find(|response| response.voice_id == SourceId::from(1))
             .unwrap();
         assert_eq!(voice_a.solve_status, DirectSolveStatus::Deferred);
-        assert_eq!(deferred.direct_gain_target(SourceId::from(1)), None);
+        assert_eq!(
+            deferred.response.direct_gain_target(SourceId::from(1)),
+            None
+        );
+        let deferred_telemetry = deferred
+            .telemetry
+            .iter()
+            .find(|event| event.voice_id == 1)
+            .unwrap();
+        assert_eq!(
+            deferred_telemetry.solve_status,
+            AcousticSolveStatus::Deferred
+        );
+        assert!(deferred_telemetry.direct.samples.is_empty());
+        assert!(deferred_telemetry.environment.samples.is_empty());
     }
 
     #[test]
@@ -3344,7 +3583,11 @@ mod tests {
         }
 
         assert_eq!(propagation.diagnostics().superseded_solve_count, 1);
-        assert!(propagation.telemetry_receiver().try_iter().any(|event| {
+        let events = propagation
+            .telemetry_receiver()
+            .try_iter()
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
             matches!(
                 event,
                 AcousticTelemetryEvent::SolveDiscarded {
@@ -3352,6 +3595,22 @@ mod tests {
                     geometry_version: 7,
                     reason: AcousticDiscardReason::Superseded,
                 }
+            )
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AcousticTelemetryEvent::ExtentResponse(response)
+                    if response.response_spatial_revision == 1
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AcousticTelemetryEvent::ExtentResponse(response)
+                    if response.response_spatial_revision == 2
+                        && response.direct.samples.len() == 1
+                        && response.environment.samples.len() == 1
             )
         }));
         propagation.close();

@@ -1,8 +1,9 @@
 // Mixer module - handles mixing of audio sources
 // This contains the mixing logic for both spatial and non-spatial sources
 
+use crate::events::PetalSonicEvent;
 use crate::playback::{PlayState, PlaybackInstance};
-use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor};
+use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor, SpatialRenderContext};
 use crate::world::SourceId;
 use crate::{BusParams, gain};
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub struct MixerScratch {
     spatial_ids: Vec<SourceId>,
     muted_spatial_ids: Vec<SourceId>,
     non_spatial_ids: Vec<SourceId>,
+    voice_events: Vec<PetalSonicEvent>,
 }
 
 impl MixerScratch {
@@ -29,7 +31,12 @@ impl MixerScratch {
             spatial_ids: Vec::with_capacity(max_voices),
             muted_spatial_ids: Vec::with_capacity(max_voices),
             non_spatial_ids: Vec::with_capacity(max_voices),
+            voice_events: Vec::with_capacity(max_voices.saturating_mul(2)),
         }
+    }
+
+    pub(crate) fn drain_voice_events(&mut self) -> impl Iterator<Item = PetalSonicEvent> + '_ {
+        self.voice_events.drain(..)
     }
 }
 
@@ -42,12 +49,14 @@ pub struct MixProfilingSummary {
 }
 
 /// Mixes all active voices and returns completion plus bounded timing summaries.
+#[allow(clippy::too_many_arguments)] // Explicit borrowed render state keeps this hot path allocation-free.
 pub fn mix_playback_instances_with_metrics(
     world_buffer: &mut [f32],
     channels: u16,
     active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
     spatial_processor: Option<&mut SpatialProcessor>,
     buses: &[BusParams],
+    render_context: SpatialRenderContext,
     scratch: &mut MixerScratch,
     completed_playbacks: &mut Vec<CompletedPlayback>,
 ) -> MixProfilingSummary {
@@ -58,6 +67,7 @@ pub fn mix_playback_instances_with_metrics(
     scratch.spatial_ids.clear();
     scratch.muted_spatial_ids.clear();
     scratch.non_spatial_ids.clear();
+    scratch.voice_events.clear();
 
     let output_frames = world_buffer.len() / channels.max(1) as usize;
     for (source_id, instance) in active_playback.iter_mut() {
@@ -109,6 +119,8 @@ pub fn mix_playback_instances_with_metrics(
                 &scratch.spatial_ids,
                 &mut active_playback,
                 world_buffer,
+                render_context,
+                &mut scratch.voice_events,
             ) {
                 profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
                 profiling.spatial_metrics = Some(metrics);
@@ -211,6 +223,7 @@ mod tests {
                 completion_tag: None,
                 direct_path: crate::domain::DirectPath::default(),
                 environment_send: crate::domain::EnvironmentSend::default(),
+                play_command_id: None,
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
@@ -237,6 +250,7 @@ mod tests {
             &active,
             None,
             &buses,
+            SpatialRenderContext::default(),
             &mut scratch,
             &mut completed,
         );
@@ -272,6 +286,7 @@ mod tests {
                 completion_tag: None,
                 direct_path: crate::domain::DirectPath::default(),
                 environment_send: crate::domain::EnvironmentSend::default(),
+                play_command_id: None,
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
@@ -297,6 +312,7 @@ mod tests {
             &active,
             None,
             &buses,
+            SpatialRenderContext::default(),
             &mut scratch,
             &mut completed,
         );

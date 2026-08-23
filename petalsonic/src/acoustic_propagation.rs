@@ -3,6 +3,7 @@ use crate::domain::{
     DirectGeometry, DirectPath, DirectPlacement, Emitter, EnvironmentOrigin, EnvironmentSend,
     SpatialFrame,
 };
+use crate::events::EnvironmentResponse as EnvironmentResponseTelemetry;
 use crate::math::{Pose, Vec3};
 use crate::spatial::LateReverbParameters;
 use crate::world::SourceId;
@@ -104,6 +105,17 @@ impl AcousticResponse {
             .find(|response| response.voice_id == voice_id)
             .map(|response| response.early_reflections.as_slice())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn telemetry(&self, voice_id: SourceId) -> Option<EnvironmentResponseTelemetry> {
+        self.direct
+            .iter()
+            .any(|response| response.voice_id == voice_id)
+            .then(|| EnvironmentResponseTelemetry {
+                spatial_revision: self.spatial_revision,
+                geometry_version: self.geometry_version,
+                age: self.published_at.elapsed(),
+            })
     }
 }
 

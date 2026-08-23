@@ -10,6 +10,7 @@ use crate::acoustic_propagation::{AcousticResponse, MAX_EARLY_REFLECTION_TAPS};
 use crate::config::SourceConfig;
 use crate::domain::{DirectGeometry, DirectPlacement, EnvironmentOrigin};
 use crate::error::{PetalSonicError, Result};
+use crate::events::{PetalSonicEvent, VoiceFirstRenderTelemetry};
 use crate::gain;
 use crate::math::{Pose, Vec3};
 use crate::playback::PlaybackInstance;
@@ -231,6 +232,12 @@ pub struct SpatialProcessingMetrics {
     pub native_hrtf_direction_lookup_time_us: u64,
     /// Time spent in native HRTF FIR convolution.
     pub native_hrtf_convolution_time_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SpatialRenderContext {
+    pub render_block_index: u64,
+    pub spatial_revision: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -489,6 +496,8 @@ impl SpatialProcessor {
         spatial_ids: &[SourceId],
         instances: &mut HashMap<SourceId, PlaybackInstance>,
         output_buffer: &mut [f32],
+        render_context: SpatialRenderContext,
+        events: &mut Vec<PetalSonicEvent>,
     ) -> Result<SpatialProcessingMetrics> {
         self.capture_environmental_acoustics_state();
 
@@ -532,7 +541,8 @@ impl SpatialProcessor {
             let Some(instance) = instances.get_mut(source_id) else {
                 continue;
             };
-            let source_metrics = self.process_single_source(*source_id, instance)?;
+            let source_metrics =
+                self.process_single_source(*source_id, instance, render_context, events)?;
             metrics.direct_processing_time_us += source_metrics.direct_processing_time_us;
             metrics.early_reflection_time_us += source_metrics.early_reflection_time_us;
             metrics.ambisonics_encoding_time_us += source_metrics.ambisonics_encoding_time_us;
@@ -630,6 +640,8 @@ impl SpatialProcessor {
         &mut self,
         source_id: SourceId,
         instance: &mut PlaybackInstance,
+        render_context: SpatialRenderContext,
+        events: &mut Vec<PetalSonicEvent>,
     ) -> Result<SourceProcessingMetrics> {
         // Get spatial configuration (position + per-source volume)
         let emitter_position = match &instance.config {
@@ -641,7 +653,7 @@ impl SpatialProcessor {
         let volume = instance.config.volume();
 
         // Fill input buffer with audio samples
-        self.fill_input_buffer(instance, volume);
+        let frames_filled = self.fill_input_buffer(instance, volume);
 
         let mut metrics = SourceProcessingMetrics::default();
 
@@ -704,6 +716,16 @@ impl SpatialProcessor {
                 *sum += *send;
             }
         }
+        if frames_filled > 0 {
+            self.observe_voice_render(
+                source_id,
+                instance,
+                emitter_position,
+                direct_local_position,
+                render_context,
+                events,
+            );
+        }
         metrics.direct_processing_time_us = direct_start.elapsed().as_micros() as u64;
 
         if let Some(direct_local_position) = direct_local_position {
@@ -734,9 +756,60 @@ impl SpatialProcessor {
     }
 
     /// Fill input buffer from playback instance
-    fn fill_input_buffer(&mut self, instance: &mut PlaybackInstance, volume: f32) {
+    fn fill_input_buffer(&mut self, instance: &mut PlaybackInstance, volume: f32) -> usize {
         self.cached_input_buf.fill(0.0);
-        instance.fill_mono_buffer(&mut self.cached_input_buf[..self.frame_size], volume);
+        instance.fill_mono_buffer(&mut self.cached_input_buf[..self.frame_size], volume)
+    }
+
+    fn observe_voice_render(
+        &self,
+        source_id: SourceId,
+        instance: &mut PlaybackInstance,
+        emitter_position: Vec3,
+        direct_local_position: Option<Vec3>,
+        render_context: SpatialRenderContext,
+        events: &mut Vec<PetalSonicEvent>,
+    ) {
+        let environment_response = self
+            .acoustic_response
+            .as_ref()
+            .and_then(|response| response.telemetry(source_id));
+        if let Some(play_command_id) = instance.take_first_render_command_id() {
+            let direct_local_pose = match instance.direct_path.placement() {
+                DirectPlacement::ListenerRelative(local_pose) => Some(local_pose),
+                DirectPlacement::World => direct_local_position.map(Pose::from_position),
+                DirectPlacement::Disabled => None,
+            };
+            let acoustic_origin = match instance.environment_send.origin() {
+                EnvironmentOrigin::FollowEmitter => Some(Pose::from_position(emitter_position)),
+                EnvironmentOrigin::World(origin) => Some(origin),
+                EnvironmentOrigin::Disabled => None,
+            };
+            events.push(PetalSonicEvent::VoiceFirstRendered(
+                VoiceFirstRenderTelemetry {
+                    play_command_id,
+                    emitter: instance.emitter,
+                    render_block_index: render_context.render_block_index,
+                    spatial_revision: render_context.spatial_revision,
+                    direct_local_pose,
+                    acoustic_origin,
+                    environment_response,
+                },
+            ));
+            if environment_response.is_some() {
+                instance.mark_environment_response_reported();
+            }
+        }
+        if let (Some(play_command_id), Some(response)) = (
+            instance.pending_environment_response_id(),
+            environment_response,
+        ) {
+            events.push(PetalSonicEvent::VoiceEnvironmentResponse {
+                play_command_id,
+                response,
+            });
+            instance.mark_environment_response_reported();
+        }
     }
 
     /// Apply PetalSonic's native direct path to the input buffer.
@@ -1182,7 +1255,7 @@ mod tests {
     use super::*;
     use crate::acoustic_propagation::{DirectAcousticResponse, EarlyReflectionTap};
     use crate::audio_data::PetalSonicAudioData;
-    use crate::domain::{DirectPath, Emitter, EnvironmentSend};
+    use crate::domain::{DirectPath, Emitter, EnvironmentSend, PlayCommandId};
     use crate::math::Quat;
     use crate::playback::{LoopMode, VoiceStart};
     use std::time::Duration;
@@ -1258,6 +1331,7 @@ mod tests {
             direct_path: DirectPath::listener_relative(Pose::from_position(-Vec3::Y * 0.08))
                 .with_geometry(DirectGeometry::BypassTransmission),
             environment_send: EnvironmentSend::from_world_pose(Pose::from_position(Vec3::X)),
+            play_command_id: None,
             mono_scratch: vec![0.0; 8],
         });
         voice.play_from_beginning();
@@ -1276,11 +1350,145 @@ mod tests {
         .unwrap();
         let mut output = [0.0; 16];
         processor
-            .process_spatial_sources_with_metrics(&[source_id], &mut voices, &mut output)
+            .process_spatial_sources_with_metrics(
+                &[source_id],
+                &mut voices,
+                &mut output,
+                SpatialRenderContext::default(),
+                &mut Vec::new(),
+            )
             .unwrap();
 
         assert_eq!(voices[&source_id].info.current_frame, 8);
         assert!(output.iter().any(|sample| sample.abs() > 0.0));
+    }
+
+    #[test]
+    fn opted_in_voice_telemetry_correlates_first_render_and_late_environment_response() {
+        let source_id = SourceId::from(9);
+        let emitter = Emitter {
+            world_id: 1,
+            index: 4,
+            generation: 2,
+        };
+        let play_command_id = PlayCommandId(71);
+        let direct_local_pose = Pose::from_position(Vec3::new(0.02, -0.08, 0.0));
+        let acoustic_origin = Pose::from_position(Vec3::new(14.0, 0.0, -3.0));
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.5; 32],
+            48_000,
+            1,
+            Duration::from_secs_f64(32.0 / 48_000.0),
+        ));
+        let mut voice = PlaybackInstance::from_source(VoiceStart {
+            emitter,
+            audio_data: audio,
+            config: SourceConfig::spatial(Pose::from_position(Vec3::new(99.0, 2.0, 8.0))),
+            loop_mode: LoopMode::Once,
+            bus_index: 0,
+            playback_rate: 1.0,
+            detached: false,
+            completion_tag: None,
+            direct_path: DirectPath::listener_relative(direct_local_pose)
+                .with_geometry(DirectGeometry::BypassTransmission),
+            environment_send: EnvironmentSend::from_world_pose(acoustic_origin),
+            play_command_id: Some(play_command_id),
+            mono_scratch: vec![0.0; 8],
+        });
+        voice.play_from_beginning();
+        voice.set_mix_parameters(crate::domain::BusParams::default());
+        let mut voices = HashMap::from([(source_id, voice)]);
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let mut output = [0.0; 16];
+        let mut events = Vec::with_capacity(2);
+
+        processor
+            .process_spatial_sources_with_metrics(
+                &[source_id],
+                &mut voices,
+                &mut output,
+                SpatialRenderContext {
+                    render_block_index: 17,
+                    spatial_revision: 23,
+                },
+                &mut events,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let PetalSonicEvent::VoiceFirstRendered(first) = events[0] else {
+            panic!("expected first-render telemetry");
+        };
+        assert_eq!(first.play_command_id, play_command_id);
+        assert_eq!(first.emitter, emitter);
+        assert_eq!(first.render_block_index, 17);
+        assert_eq!(first.spatial_revision, 23);
+        assert_eq!(first.direct_local_pose, Some(direct_local_pose));
+        assert_eq!(first.acoustic_origin, Some(acoustic_origin));
+        assert_eq!(first.environment_response, None);
+
+        events.clear();
+        processor.replace_acoustic_response(Arc::new(AcousticResponse {
+            spatial_revision: 24,
+            geometry_version: 8,
+            direct: vec![DirectAcousticResponse {
+                voice_id: source_id,
+                gain: [1.0; 3],
+                environment_gain: [1.0; 3],
+                early_reflections: Vec::new(),
+            }],
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now() - Duration::from_millis(7),
+            solve_time_us: 1,
+        }));
+        processor
+            .process_spatial_sources_with_metrics(
+                &[source_id],
+                &mut voices,
+                &mut output,
+                SpatialRenderContext {
+                    render_block_index: 18,
+                    spatial_revision: 24,
+                },
+                &mut events,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let PetalSonicEvent::VoiceEnvironmentResponse {
+            play_command_id: response_id,
+            response,
+        } = events[0]
+        else {
+            panic!("expected environment-response telemetry");
+        };
+        assert_eq!(response_id, play_command_id);
+        assert_eq!(response.spatial_revision, 24);
+        assert_eq!(response.geometry_version, 8);
+        assert!(response.age >= Duration::from_millis(7));
+
+        events.clear();
+        processor
+            .process_spatial_sources_with_metrics(
+                &[source_id],
+                &mut voices,
+                &mut output,
+                SpatialRenderContext {
+                    render_block_index: 19,
+                    spatial_revision: 24,
+                },
+                &mut events,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "voice telemetry must be one-shot");
     }
 
     #[test]

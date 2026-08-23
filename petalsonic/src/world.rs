@@ -902,6 +902,7 @@ impl PetalSonicWorld {
             playback_rate: options.playback_rate(),
             direct_path: options.direct_path(),
             environment_send: options.environment_send(),
+            play_command_id: options.play_command_id(),
             mono_scratch: vec![0.0; self.desc.block_size],
         };
         if let Err(error) = self.try_send(command) {
@@ -1080,10 +1081,13 @@ impl PetalSonicWorld {
     }
 
     fn validate_spatial_routing(is_spatial: bool, options: PlayOptions) -> Result<()> {
-        if !is_spatial && options.has_spatial_routing_override() {
+        if !is_spatial
+            && (options.has_spatial_routing_override() || options.play_command_id().is_some())
+        {
             return Err(PetalSonicError::InvalidConfiguration {
                 field: "play_options.spatial_routing",
-                reason: "DirectPath and EnvironmentSend require a spatial emitter".into(),
+                reason: "DirectPath, EnvironmentSend, and spatial render telemetry require a spatial emitter"
+                    .into(),
             });
         }
 
@@ -1386,7 +1390,7 @@ impl Drop for PetalSonicWorld {
 mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
-    use crate::domain::{DirectGeometry, DirectPath, EnvironmentSend};
+    use crate::domain::{DirectGeometry, DirectPath, EnvironmentSend, PlayCommandId};
     use std::cell::Cell;
 
     #[test]
@@ -1404,6 +1408,9 @@ mod tests {
         let non_spatial_override = PlayOptions::once()
             .with_environment_send(EnvironmentSend::from_world_pose(Pose::identity()));
         assert!(PetalSonicWorld::validate_spatial_routing(false, non_spatial_override).is_err());
+
+        let non_spatial_telemetry = PlayOptions::once().with_play_command_id(PlayCommandId(1));
+        assert!(PetalSonicWorld::validate_spatial_routing(false, non_spatial_telemetry).is_err());
 
         let invalid_gain = PlayOptions::once()
             .with_environment_send(EnvironmentSend::follow_emitter().with_gain_db(f32::NAN));

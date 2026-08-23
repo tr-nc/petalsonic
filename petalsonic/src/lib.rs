@@ -93,12 +93,13 @@ pub use acoustics::{
 pub use config::{LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SpatialQuality};
 pub use domain::{
     Bus, BusDesc, BusParams, DirectGeometry, DirectPath, DirectPlacement, DirectPropagation,
-    Emitter, EmitterDesc, EmitterSpatialState, EnvironmentOrigin, EnvironmentSend, PlayOptions,
-    PlaybackControl, PlaybackTag, ResidentClip, SpatialFrame,
+    Emitter, EmitterDesc, EmitterSpatialState, EnvironmentOrigin, EnvironmentSend, PlayCommandId,
+    PlayOptions, PlaybackControl, PlaybackTag, ResidentClip, SpatialFrame,
 };
 pub use error::PetalSonicError;
 pub use events::{
-    PetalSonicEvent, RenderTimingEvent, RuntimeDiagnostics, RuntimeState, RuntimeStatus,
+    EnvironmentResponse, PetalSonicEvent, RenderTimingEvent, RuntimeDiagnostics, RuntimeState,
+    RuntimeStatus, VoiceFirstRenderTelemetry,
 };
 pub use math::{Pose, Quat, Vec3};
 pub use world::PetalSonicWorld;

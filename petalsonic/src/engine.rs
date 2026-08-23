@@ -10,7 +10,9 @@ use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeCounters, Runtime
 use crate::math::Pose;
 use crate::mixer;
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, VoiceStart};
-use crate::spatial::{RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig};
+use crate::spatial::{
+    RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig, SpatialRenderContext,
+};
 use crate::world::{OutputPreparation, SourceId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -168,6 +170,7 @@ struct PumpState {
     counters: Arc<RuntimeCounters>,
     backend_retirement_sender: Sender<RetiredSpatialSource>,
     pending_backend_retirements: Vec<(SourceId, RetiredSpatialSource)>,
+    render_block_index: u64,
 }
 
 /// Parameters for stream creation - groups related parameters to reduce argument count
@@ -1271,6 +1274,7 @@ impl PetalSonicEngine {
             counters: self.counters.clone(),
             backend_retirement_sender: self.backend_retirement_sender.clone(),
             pending_backend_retirements: Vec::with_capacity(self.desc.max_voices),
+            render_block_index: 0,
         }));
 
         // Create context for audio callback (simplified - just consumes from ring buffer)
@@ -1364,6 +1368,10 @@ impl PetalSonicEngine {
             return;
         }
 
+        let spatial_revision = ctx
+            .current_spatial_frame
+            .as_ref()
+            .map_or(0, |frame| frame.revision());
         let timing = Self::generate_samples(
             &mut ctx.ring_buffer_producer,
             samples_to_generate,
@@ -1378,6 +1386,10 @@ impl PetalSonicEngine {
             &mut ctx.completed_playbacks,
             &mut ctx.world_buffer,
             &mut ctx.resampled_buffer,
+            &mut ctx.render_block_index,
+            spatial_revision,
+            &ctx.event_sender,
+            &ctx.counters,
         );
 
         ctx.counters.record_render_time(timing.total_time_us);
@@ -1727,6 +1739,7 @@ impl PetalSonicEngine {
                 playback_rate,
                 direct_path,
                 environment_send,
+                play_command_id,
                 mono_scratch,
             } => {
                 let acoustic_voice = match &config {
@@ -1750,6 +1763,7 @@ impl PetalSonicEngine {
                     playback_rate,
                     direct_path,
                     environment_send,
+                    play_command_id,
                     detached,
                     completion_tag,
                     mono_scratch,
@@ -1860,6 +1874,10 @@ impl PetalSonicEngine {
         completed_playbacks: &mut Vec<mixer::CompletedPlayback>,
         world_buffer: &mut [f32],
         resampled_buffer: &mut [f32],
+        render_block_index: &mut u64,
+        spatial_revision: u64,
+        event_sender: &Sender<PetalSonicEvent>,
+        counters: &RuntimeCounters,
     ) -> RenderTimingEvent {
         let total_start = Instant::now();
         let mut total_mixing_time_us = 0u64;
@@ -1914,9 +1932,17 @@ impl PetalSonicEngine {
                 active_playback,
                 spatial_processor_guard.as_deref_mut(),
                 buses,
+                SpatialRenderContext {
+                    render_block_index: *render_block_index,
+                    spatial_revision,
+                },
                 mixer_scratch,
                 completed_playbacks,
             );
+            *render_block_index = render_block_index.wrapping_add(1);
+            for event in mixer_scratch.drain_voice_events() {
+                Self::try_send_event(event_sender, counters, event);
+            }
             total_mixing_time_us += mixing_start.elapsed().as_micros() as u64;
             total_direct_mixing_time_us += mix_profiling.direct_mix_time_us;
             total_spatial_time_us += mix_profiling.spatial_mix_time_us;
@@ -2269,6 +2295,7 @@ mod tests {
                 playback_rate: 1.0,
                 direct_path: crate::domain::DirectPath::default(),
                 environment_send: crate::domain::EnvironmentSend::default(),
+                play_command_id: None,
                 mono_scratch: vec![0.0; block_size],
             })
             .unwrap();
@@ -2314,6 +2341,7 @@ mod tests {
             counters: Arc::new(RuntimeCounters::default()),
             backend_retirement_sender,
             pending_backend_retirements: Vec::with_capacity(8),
+            render_block_index: 0,
         }));
         let is_running = Arc::new(AtomicBool::new(true));
         let render_thread = PetalSonicEngine::spawn_render_thread(
@@ -2374,6 +2402,7 @@ mod tests {
                     playback_rate: 1.0,
                     direct_path: crate::domain::DirectPath::default(),
                     environment_send: crate::domain::EnvironmentSend::default(),
+                    play_command_id: None,
                     mono_scratch: vec![0.0; block_size],
                 })
                 .unwrap();
@@ -2421,6 +2450,7 @@ mod tests {
             counters: Arc::new(RuntimeCounters::default()),
             backend_retirement_sender,
             pending_backend_retirements: Vec::with_capacity(VOICES),
+            render_block_index: 0,
         };
 
         PetalSonicEngine::pump_render_state(&mut pump);
@@ -2533,6 +2563,7 @@ mod tests {
                     playback_rate: 1.0,
                     direct_path: crate::domain::DirectPath::default(),
                     environment_send: crate::domain::EnvironmentSend::default(),
+                    play_command_id: None,
                     mono_scratch: vec![0.0; 32],
                 })
                 .unwrap();
@@ -2600,6 +2631,7 @@ mod tests {
                     completion_tag: None,
                     direct_path: crate::domain::DirectPath::default(),
                     environment_send: crate::domain::EnvironmentSend::default(),
+                    play_command_id: None,
                     mono_scratch: vec![0.0; 32],
                 }),
             );

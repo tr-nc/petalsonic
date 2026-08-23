@@ -179,6 +179,12 @@ impl std::fmt::Display for PlaybackControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackTag(pub u64);
 
+/// Caller-owned correlation value for opt-in per-Voice render telemetry.
+///
+/// PetalSonic preserves this value but does not assign or enforce uniqueness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlayCommandId(pub u64);
+
 /// Placement of the audible direct path for one playback Voice.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -495,6 +501,7 @@ pub struct PlayOptions {
     playback_rate: f32,
     direct_path: Option<DirectPath>,
     environment_send: Option<EnvironmentSend>,
+    play_command_id: Option<PlayCommandId>,
 }
 
 impl PlayOptions {
@@ -543,6 +550,13 @@ impl PlayOptions {
         self
     }
 
+    /// Requests one-shot spatial render and environment-response telemetry correlated by this
+    /// value. This option requires a spatial emitter.
+    pub fn with_play_command_id(mut self, play_command_id: PlayCommandId) -> Self {
+        self.play_command_id = Some(play_command_id);
+        self
+    }
+
     pub(crate) fn bus(self) -> Option<Bus> {
         self.bus
     }
@@ -562,6 +576,10 @@ impl PlayOptions {
     pub(crate) fn has_spatial_routing_override(self) -> bool {
         self.direct_path.is_some() || self.environment_send.is_some()
     }
+
+    pub(crate) fn play_command_id(self) -> Option<PlayCommandId> {
+        self.play_command_id
+    }
 }
 
 impl Default for PlayOptions {
@@ -574,6 +592,7 @@ impl Default for PlayOptions {
             playback_rate: 1.0,
             direct_path: None,
             environment_send: None,
+            play_command_id: None,
         }
     }
 }

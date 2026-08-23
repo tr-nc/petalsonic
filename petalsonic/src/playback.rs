@@ -12,7 +12,9 @@
 
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
-use crate::domain::{BusParams, DirectPath, Emitter, EnvironmentSend, PlaybackTag};
+use crate::domain::{
+    BusParams, DirectPath, Emitter, EnvironmentOrigin, EnvironmentSend, PlayCommandId, PlaybackTag,
+};
 use crate::world::SourceId;
 use std::fmt;
 use std::sync::Arc;
@@ -85,6 +87,7 @@ pub(crate) struct VoiceStart {
     pub completion_tag: Option<PlaybackTag>,
     pub direct_path: DirectPath,
     pub environment_send: EnvironmentSend,
+    pub play_command_id: Option<PlayCommandId>,
     pub mono_scratch: Vec<f32>,
 }
 
@@ -101,6 +104,9 @@ pub struct PlaybackInstance {
     pub direct_path: DirectPath,
     /// Immutable environment routing captured when this Voice was created.
     pub environment_send: EnvironmentSend,
+    play_command_id: Option<PlayCommandId>,
+    first_render_pending: bool,
+    environment_response_pending: bool,
     /// Immutable resident PCM shared by playback voices.
     pub audio_data: Arc<PetalSonicAudioData>,
     /// Current playback information
@@ -137,6 +143,7 @@ impl PlaybackInstance {
             completion_tag,
             direct_path,
             environment_send,
+            play_command_id,
             mono_scratch,
         } = start;
         let total_frames = audio_data.total_frames();
@@ -149,6 +156,10 @@ impl PlaybackInstance {
             completion_tag,
             direct_path,
             environment_send,
+            play_command_id,
+            first_render_pending: play_command_id.is_some(),
+            environment_response_pending: play_command_id.is_some()
+                && !matches!(environment_send.origin(), EnvironmentOrigin::Disabled),
             audio_data,
             info,
             config,
@@ -432,6 +443,24 @@ impl PlaybackInstance {
     pub(crate) fn should_reclaim(&self) -> bool {
         self.retired || matches!(self.loop_mode, LoopMode::Once) && self.info.is_finished()
     }
+
+    pub(crate) fn take_first_render_command_id(&mut self) -> Option<PlayCommandId> {
+        if !self.first_render_pending {
+            return None;
+        }
+        self.first_render_pending = false;
+        self.play_command_id
+    }
+
+    pub(crate) fn pending_environment_response_id(&self) -> Option<PlayCommandId> {
+        self.environment_response_pending
+            .then_some(self.play_command_id)
+            .flatten()
+    }
+
+    pub(crate) fn mark_environment_response_reported(&mut self) {
+        self.environment_response_pending = false;
+    }
 }
 
 /// Commands that can be sent to the audio engine for playback control.
@@ -448,6 +477,9 @@ impl PlaybackInstance {
 /// - `StopAll`: Stop all currently playing audio sources
 /// - `UpdateConfig`: Update the spatial configuration of a playing source
 /// - `Seek`: Seek to a specific position in the audio (0.0 = start, 1.0 = end)
+// Keeping Play inline lets the render thread move its owned buffers into a Voice without
+// allocating or freeing an extra command box at a render-quantum boundary.
+#[allow(clippy::large_enum_variant)]
 pub enum PlaybackCommand {
     Play {
         voice_id: SourceId,
@@ -461,6 +493,7 @@ pub enum PlaybackCommand {
         playback_rate: f32,
         direct_path: DirectPath,
         environment_send: EnvironmentSend,
+        play_command_id: Option<PlayCommandId>,
         mono_scratch: Vec<f32>,
     },
     PauseVoice(SourceId),
@@ -493,6 +526,7 @@ impl fmt::Debug for PlaybackCommand {
                 playback_rate,
                 direct_path,
                 environment_send,
+                play_command_id,
                 mono_scratch,
             } => f
                 .debug_struct("Play")
@@ -507,6 +541,7 @@ impl fmt::Debug for PlaybackCommand {
                 .field("playback_rate", playback_rate)
                 .field("direct_path", direct_path)
                 .field("environment_send", environment_send)
+                .field("play_command_id", play_command_id)
                 .field("mono_scratch_len", &mono_scratch.len())
                 .finish(),
             Self::PauseVoice(voice_id) => f.debug_tuple("PauseVoice").field(voice_id).finish(),
@@ -578,6 +613,7 @@ mod tests {
             completion_tag: None,
             direct_path: DirectPath::default(),
             environment_send: EnvironmentSend::default(),
+            play_command_id: None,
             mono_scratch: vec![0.0; 4],
         });
 
@@ -621,6 +657,7 @@ mod tests {
             completion_tag: None,
             direct_path: DirectPath::default(),
             environment_send: EnvironmentSend::default(),
+            play_command_id: None,
             mono_scratch: vec![0.0; 4],
         });
         instance.play_from_beginning();
@@ -665,6 +702,7 @@ mod tests {
             completion_tag: Some(PlaybackTag(9)),
             direct_path: DirectPath::default(),
             environment_send: EnvironmentSend::default(),
+            play_command_id: None,
             mono_scratch: vec![0.0; 256],
         });
         instance.play_from_beginning();

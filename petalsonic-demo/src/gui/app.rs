@@ -869,6 +869,7 @@ impl eframe::App for SpatialAudioDemo {
                 petalsonic::PetalSonicEvent::RuntimeStateChanged(state) => {
                     log::info!("GUI: Audio runtime is now {state:?}");
                 }
+                _ => {}
             }
         }
 

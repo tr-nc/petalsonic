@@ -1,8 +1,10 @@
 //! Event types for PetalSonic
 
 use crate::config::{LatencyProfile, SpatialQuality};
-use crate::domain::{Emitter, PlaybackControl, PlaybackTag};
+use crate::domain::{Emitter, PlayCommandId, PlaybackControl, PlaybackTag};
+use crate::math::Pose;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// Observable state of the world-owned output runtime.
 #[repr(u8)]
@@ -198,6 +200,37 @@ pub struct RenderTimingEvent {
     pub total_time_us: u64,
 }
 
+/// The asynchronous environment response observed by a render block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvironmentResponse {
+    /// Complete spatial input generation used by the solver.
+    pub spatial_revision: u64,
+    /// Immutable acoustic geometry generation used by the solver.
+    pub geometry_version: u64,
+    /// Elapsed time between publication by the solver and observation by the render block.
+    pub age: Duration,
+}
+
+/// Opt-in telemetry for the first render block that advances one Voice's PCM cursor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceFirstRenderTelemetry {
+    /// Caller-supplied correlation value from [`crate::PlayOptions`].
+    pub play_command_id: PlayCommandId,
+    /// Reusable emitter whose immutable playback Voice produced this event.
+    pub emitter: Emitter,
+    /// Monotonic world render-block index, starting at zero for each output session.
+    pub render_block_index: u64,
+    /// Latest complete spatial frame observed at the render-quantum boundary.
+    pub spatial_revision: u64,
+    /// Direct placement in listener-local coordinates, or `None` when direct is disabled.
+    pub direct_local_pose: Option<Pose>,
+    /// World-space origin captured for this environment send, or `None` when disabled.
+    pub acoustic_origin: Option<Pose>,
+    /// Environment response already available for this Voice on its first render block.
+    pub environment_response: Option<EnvironmentResponse>,
+}
+
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PetalSonicEvent {
     /// A controlled one-shot reached its natural end.
@@ -208,6 +241,13 @@ pub enum PetalSonicEvent {
     },
     /// The output runtime entered a different lifecycle state.
     RuntimeStateChanged(RuntimeState),
+    /// An opted-in spatial Voice advanced its PCM cursor for the first time.
+    VoiceFirstRendered(VoiceFirstRenderTelemetry),
+    /// The opted-in Voice first received an asynchronous environment response.
+    VoiceEnvironmentResponse {
+        play_command_id: PlayCommandId,
+        response: EnvironmentResponse,
+    },
 }
 
 #[cfg(test)]

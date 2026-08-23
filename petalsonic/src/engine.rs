@@ -1612,24 +1612,17 @@ impl PetalSonicEngine {
             }
             return;
         };
-        let minimum_spatial_revision = ctx
-            .current_spatial_frame
-            .as_ref()
-            .map_or(0, |frame| frame.revision());
-        let minimum_geometry_version = ctx.acoustic_scene_version.load(Ordering::Acquire);
-        let retired = match processor.replace_acoustic_response_at_least(
-            next,
-            minimum_spatial_revision,
-            minimum_geometry_version,
-        ) {
-            AcousticResponseReplacement::Accepted(previous) => previous,
-            AcousticResponseReplacement::Rejected(rejected) => {
-                ctx.counters
-                    .acoustic_render_rejected_responses
-                    .fetch_add(1, Ordering::Relaxed);
-                Some(rejected)
-            }
-        };
+        let required_geometry_version = ctx.acoustic_scene_version.load(Ordering::Acquire);
+        let retired =
+            match processor.replace_acoustic_response_for_scene(next, required_geometry_version) {
+                AcousticResponseReplacement::Accepted(previous) => previous,
+                AcousticResponseReplacement::Rejected(rejected) => {
+                    ctx.counters
+                        .acoustic_render_rejected_responses
+                        .fetch_add(1, Ordering::Relaxed);
+                    Some(rejected)
+                }
+            };
 
         if let Some(retired) = retired
             && let Err(error) = ctx.acoustic_response_retirement_sender.try_send(retired)
@@ -1814,6 +1807,7 @@ impl PetalSonicEngine {
                         environment_send,
                         source_extent: source_extent.clone(),
                         occlusion_profile,
+                        routing_generation: 0,
                     }),
                     SourceConfig::NonSpatial { .. } => None,
                 };

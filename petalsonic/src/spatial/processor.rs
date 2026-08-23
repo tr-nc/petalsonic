@@ -487,23 +487,22 @@ impl SpatialProcessor {
         &mut self,
         response: Arc<AcousticResponse>,
     ) -> AcousticResponseReplacement {
-        self.replace_acoustic_response_at_least(response, 0, 0)
+        self.replace_acoustic_response_for_scene(response, 0)
     }
 
-    pub(crate) fn replace_acoustic_response_at_least(
+    pub(crate) fn replace_acoustic_response_for_scene(
         &mut self,
         response: Arc<AcousticResponse>,
-        minimum_spatial_revision: u64,
-        minimum_geometry_version: u64,
+        required_geometry_version: u64,
     ) -> AcousticResponseReplacement {
-        if response.spatial_revision < minimum_spatial_revision
-            || response.geometry_version < minimum_geometry_version
+        if required_geometry_version != 0 && response.geometry_version != required_geometry_version
         {
             return AcousticResponseReplacement::Rejected(response);
         }
         if self.acoustic_response.as_ref().is_some_and(|current| {
-            response.spatial_revision < current.spatial_revision
-                || response.geometry_version < current.geometry_version
+            response.geometry_version < current.geometry_version
+                || response.geometry_version == current.geometry_version
+                    && response.spatial_revision < current.spatial_revision
         }) {
             return AcousticResponseReplacement::Rejected(response);
         }
@@ -1588,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn render_rejects_spatial_and_geometry_revision_rollbacks() {
+    fn render_accepts_lagging_pose_but_rejects_response_rollbacks_and_wrong_scene() {
         let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
             sample_rate: 48_000,
             frame_size: 8,
@@ -1606,7 +1605,7 @@ mod tests {
             AcousticResponseReplacement::Accepted(None)
         ));
         assert!(matches!(
-            processor.replace_acoustic_response(empty_acoustic_response(9, 21)),
+            processor.replace_acoustic_response(empty_acoustic_response(9, 20)),
             AcousticResponseReplacement::Rejected(_)
         ));
         assert!(matches!(
@@ -1614,11 +1613,11 @@ mod tests {
             AcousticResponseReplacement::Rejected(_)
         ));
         assert!(matches!(
-            processor.replace_acoustic_response_at_least(empty_acoustic_response(10, 20), 11, 20,),
-            AcousticResponseReplacement::Rejected(_)
+            processor.replace_acoustic_response_for_scene(empty_acoustic_response(10, 20), 20),
+            AcousticResponseReplacement::Accepted(_)
         ));
         assert!(matches!(
-            processor.replace_acoustic_response_at_least(empty_acoustic_response(10, 20), 10, 21,),
+            processor.replace_acoustic_response_for_scene(empty_acoustic_response(11, 20), 21),
             AcousticResponseReplacement::Rejected(_)
         ));
 
@@ -1717,6 +1716,7 @@ mod tests {
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
                 voice_id: source_id,
+                routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
                 direct_lobes: vec![
@@ -1964,6 +1964,7 @@ mod tests {
             geometry_version: 8,
             direct: vec![DirectAcousticResponse {
                 voice_id: source_id,
+                routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
                 direct_lobes: Vec::new(),
@@ -2038,6 +2039,7 @@ mod tests {
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
                 voice_id: source_id,
+                routing_generation: 0,
                 gain: [0.0; 3],
                 environment_gain: [0.0; 3],
                 direct_lobes: Vec::new(),
@@ -2108,6 +2110,7 @@ mod tests {
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
                 voice_id: source_id,
+                routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
                 direct_lobes: Vec::new(),
@@ -2165,7 +2168,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_direct_voice_drains_bounded_early_reflection_tail() {
+    fn completed_voice_drains_bounded_early_and_late_environment_tail() {
         let source_id = SourceId::from(7);
         let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
             sample_rate: 48_000,
@@ -2183,6 +2186,7 @@ mod tests {
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
                 voice_id: source_id,
+                routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
                 direct_lobes: Vec::new(),
@@ -2196,7 +2200,11 @@ mod tests {
                     gain: [0.8; 3],
                 }],
             }],
-            late_reverb: LateReverbParameters::SILENT,
+            late_reverb: LateReverbParameters {
+                pre_delay_seconds: 0.0,
+                rt60_seconds: [0.2; 3],
+                wet_gain: 0.5,
+            },
             published_at: Instant::now(),
             solve_time_us: 1,
         }));
@@ -2207,36 +2215,68 @@ mod tests {
         processor
             .apply_native_early_reflections(source_id, 1.0, true)
             .unwrap();
+        processor.cached_late_reverb_input.fill(0.0);
+        processor.cached_late_reverb_input[0] = 1.0;
+        processor.late_reverb.process_block(
+            &processor.cached_late_reverb_input,
+            &mut processor.cached_binaural_processed,
+            true,
+        );
 
         let _ = processor.retire_source(source_id);
         assert!(processor.has_environment_tail());
         assert!(processor.native_early_reflection_source_states[&source_id].draining);
 
-        let mut tail_energy = 0.0;
-        for _ in 0..128 {
+        let mut early_tail_energy = 0.0;
+        let mut late_tail_energy_after_early_release = 0.0;
+        for _ in 0..256 {
             processor.cached_binaural_processed.fill(0.0);
             processor.process_draining_early_reflections().unwrap();
-            tail_energy += processor
+            let early_active = processor
+                .native_early_reflection_source_states
+                .contains_key(&source_id);
+            let early_and_late_energy = processor
                 .cached_binaural_processed
                 .iter()
                 .map(|sample| sample * sample)
                 .sum::<f32>();
-            if !processor
-                .native_early_reflection_source_states
-                .contains_key(&source_id)
-            {
+            if early_active {
+                early_tail_energy += early_and_late_energy;
+            }
+            processor.cached_late_reverb_input.fill(0.0);
+            processor.late_reverb.process_block(
+                &processor.cached_late_reverb_input,
+                &mut processor.cached_binaural_processed,
+                true,
+            );
+            if !early_active {
+                late_tail_energy_after_early_release += processor
+                    .cached_binaural_processed
+                    .iter()
+                    .map(|sample| sample * sample)
+                    .sum::<f32>();
+            }
+            if !processor.has_environment_tail() {
                 break;
             }
         }
         assert!(
-            tail_energy > 0.0,
-            "delayed environment response was truncated"
+            early_tail_energy > 0.0,
+            "delayed early response was truncated"
+        );
+        assert!(
+            late_tail_energy_after_early_release > 0.0,
+            "shared late response stopped with the Voice"
         );
         assert!(
             !processor
                 .native_early_reflection_source_states
                 .contains_key(&source_id),
             "early tail did not finish in bound"
+        );
+        assert!(
+            !processor.has_environment_tail(),
+            "late tail did not finish in bound"
         );
     }
 
@@ -2260,6 +2300,7 @@ mod tests {
             let direct = (first_index..first_index + EARLY_REFLECTION_SOURCE_STATE_CAPACITY)
                 .map(|index| DirectAcousticResponse {
                     voice_id: SourceId::from(index as u64),
+                    routing_generation: 0,
                     gain: [1.0; 3],
                     environment_gain: [1.0; 3],
                     direct_lobes: Vec::new(),
@@ -2329,6 +2370,7 @@ mod tests {
             .iter()
             .map(|(source_id, _)| DirectAcousticResponse {
                 voice_id: *source_id,
+                routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
                 direct_lobes: Vec::new(),
@@ -2465,6 +2507,7 @@ mod tests {
                 .iter()
                 .map(|source_id| DirectAcousticResponse {
                     voice_id: *source_id,
+                    routing_generation: 0,
                     gain: [1.0; 3],
                     environment_gain: [1.0; 3],
                     direct_lobes: Vec::new(),
@@ -2618,6 +2661,7 @@ mod tests {
                 .iter()
                 .map(|source_id| DirectAcousticResponse {
                     voice_id: *source_id,
+                    routing_generation: 0,
                     gain: [1.0; 3],
                     environment_gain: [0.8, 0.7, 0.6],
                     direct_lobes: vec![

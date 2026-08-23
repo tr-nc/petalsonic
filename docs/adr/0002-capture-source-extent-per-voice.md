@@ -45,11 +45,11 @@ hidden Emitter center. Their selected power is normalized. Late injection remain
 listener-centric solve. This seam can later admit other propagation mechanisms without changing
 extent ownership or duplicating Voices.
 
-Completed solves are published only if their captured input generation is still current. Rendering
-also rejects spatial- or geometry-revision rollback. Exact per-sample caches include Voice,
-Emitter, spatial revision, geometry version, stable sample ID, and route. A source skipped by the
-stable global budget retains its prior response only up to its profile's age limit, then becomes
-explicitly deferred; deferred does not mean unity.
+Completed solves follow the compatibility rules in
+[ADR 0003](0003-publish-compatible-acoustic-responses.md). Exact per-sample caches include Voice
+route generation, Emitter, spatial revision, geometry version, stable sample ID, and route.
+A source skipped by the stable global budget retains its prior response only up to its profile's
+age limit, then becomes explicitly deferred; deferred does not mean unity.
 
 ## Consequences
 

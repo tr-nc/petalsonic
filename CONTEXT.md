@@ -55,3 +55,14 @@ The Direct Path's timing policy. `Immediate` is the currently supported model.
 
 **Play Command ID**:
 A caller-owned correlation value used only when per-Voice render telemetry is requested.
+
+**Voice Route Generation**:
+A worker-owned generation assigned whenever a Voice identity is activated or its captured routing
+is replaced. It is independent of ordinary pose revisions and prevents completed work from being
+applied to a retired or rerouted Voice.
+
+**Acoustic Publication Compatibility**:
+The rule for safely publishing completed asynchronous work: the acoustic scene version must still
+match, and each per-Voice result must still match its Voice identity and route generation. A newer
+listener/emitter pose revision makes a response spatially older but does not by itself make it
+incompatible.

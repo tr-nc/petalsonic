@@ -1227,6 +1227,17 @@ fn ranked_voices(
                 {
                     Some(listener_to_world_pose(listener_pose, local_pose))
                 }
+                DirectPlacement::ListenerPositionRelative(world_offset_pose)
+                    if matches!(
+                        voice.direct_path.geometry(),
+                        DirectGeometry::SimulatedTransmission
+                    ) =>
+                {
+                    Some(listener_position_relative_to_world_pose(
+                        listener_pose,
+                        world_offset_pose,
+                    ))
+                }
                 _ => None,
             };
             let environment_pose = match voice.environment_send.origin() {
@@ -2141,6 +2152,13 @@ fn listener_to_world_pose(listener: Pose, local: Pose) -> Pose {
     )
 }
 
+fn listener_position_relative_to_world_pose(listener: Pose, world_offset: Pose) -> Pose {
+    Pose::new(
+        listener.position + world_offset.position,
+        world_offset.rotation,
+    )
+}
+
 fn reflection_strength(tap: &EarlyReflectionTap) -> f32 {
     tap.gain.iter().sum()
 }
@@ -2358,6 +2376,23 @@ mod tests {
     use crate::domain::EmitterSpatialState;
     use crate::math::Pose;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn listener_position_relative_acoustic_pose_follows_translation_in_world_axes() {
+        let listener = Pose::new(
+            Vec3::new(10.0, 20.0, 30.0),
+            crate::math::Quat::from_rotation_x(-0.8),
+        );
+        let world_offset = Pose::new(
+            Vec3::new(0.0, -0.08, 0.0),
+            crate::math::Quat::from_rotation_y(0.4),
+        );
+
+        let resolved = listener_position_relative_to_world_pose(listener, world_offset);
+
+        assert_eq!(resolved.position, Vec3::new(10.0, 19.92, 30.0));
+        assert_eq!(resolved.rotation, world_offset.rotation);
+    }
 
     struct NoGeometry;
 

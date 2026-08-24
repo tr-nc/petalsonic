@@ -930,14 +930,20 @@ impl PetalSonicWorld {
                 reason: "Voice and combined emitter gain must be finite".into(),
             });
         }
-        if let crate::domain::DirectPlacement::ListenerRelative(pose) =
-            options.direct_path().placement()
-        {
-            Self::validate_extent_pose(
+        match options.direct_path().placement() {
+            crate::domain::DirectPlacement::ListenerRelative(pose) => Self::validate_extent_pose(
                 "play_options.direct_path.listener_relative",
                 pose,
                 state.desc.extent(),
-            )?;
+            )?,
+            crate::domain::DirectPlacement::ListenerPositionRelative(pose) => {
+                Self::validate_extent_pose(
+                    "play_options.direct_path.listener_position_relative",
+                    pose,
+                    state.desc.extent(),
+                )?
+            }
+            _ => {}
         }
         if let crate::domain::EnvironmentOrigin::World(pose) = options.environment_send().origin() {
             Self::validate_extent_pose(
@@ -1171,8 +1177,17 @@ impl PetalSonicWorld {
         }
 
         let direct_path = options.direct_path();
-        if let crate::domain::DirectPlacement::ListenerRelative(pose) = direct_path.placement() {
-            Self::validate_route_pose("play_options.direct_path.listener_relative", pose)?;
+        match direct_path.placement() {
+            crate::domain::DirectPlacement::ListenerRelative(pose) => {
+                Self::validate_route_pose("play_options.direct_path.listener_relative", pose)?
+            }
+            crate::domain::DirectPlacement::ListenerPositionRelative(pose) => {
+                Self::validate_route_pose(
+                    "play_options.direct_path.listener_position_relative",
+                    pose,
+                )?
+            }
+            _ => {}
         }
         if matches!(
             direct_path.placement(),
@@ -1568,6 +1583,12 @@ mod tests {
             Pose::from_position(crate::math::Vec3::splat(f32::NAN)),
         ));
         assert!(PetalSonicWorld::validate_spatial_routing(true, local_nan).is_err());
+
+        let position_relative_nan =
+            PlayOptions::once().with_direct_path(DirectPath::listener_position_relative(
+                Pose::from_position(crate::math::Vec3::splat(f32::NAN)),
+            ));
+        assert!(PetalSonicWorld::validate_spatial_routing(true, position_relative_nan).is_err());
 
         let disabled_with_geometry = PlayOptions::once().with_direct_path(
             DirectPath::disabled().with_geometry(DirectGeometry::SimulatedTransmission),

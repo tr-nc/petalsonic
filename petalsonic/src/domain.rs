@@ -149,6 +149,23 @@ mod tests {
     }
 
     #[test]
+    fn listener_position_relative_routing_is_copied_as_per_play_value_state() {
+        let world_offset = Pose::from_position(crate::math::Vec3::new(0.0, -0.08, 0.0));
+        let direct_path = DirectPath::listener_position_relative(world_offset)
+            .with_geometry(DirectGeometry::BypassTransmission);
+        let options = PlayOptions::once().with_direct_path(direct_path);
+
+        assert_eq!(
+            options.direct_path().placement(),
+            DirectPlacement::ListenerPositionRelative(world_offset)
+        );
+        assert_eq!(
+            options.direct_path().geometry(),
+            DirectGeometry::BypassTransmission
+        );
+    }
+
+    #[test]
     fn source_extent_defaults_to_a_compatible_point() {
         assert_eq!(SourceExtent::default(), SourceExtent::Point);
         assert_eq!(SourceExtent::Point.sample_count(), 1);
@@ -323,6 +340,12 @@ pub enum DirectPlacement {
     /// The position convention is x=right, y=up, z=front. The renderer does not convert this
     /// through a cached world pose, so listener translation and rotation cannot age the offset.
     ListenerRelative(Pose),
+    /// Follow the listener position while preserving this offset in world axes.
+    ///
+    /// The renderer removes listener translation but still transforms the offset through the
+    /// current listener orientation. This suits body-attached, gravity-aligned sounds: movement
+    /// cannot leave them behind, while looking down correctly moves a world-down offset forward.
+    ListenerPositionRelative(Pose),
     /// Do not render an audible direct path. An EnvironmentSend may remain active.
     Disabled,
 }
@@ -369,6 +392,15 @@ impl DirectPath {
     pub fn listener_relative(local_pose: Pose) -> Self {
         Self {
             placement: DirectPlacement::ListenerRelative(local_pose),
+            geometry: DirectGeometry::SimulatedTransmission,
+            propagation: DirectPropagation::Immediate,
+        }
+    }
+
+    /// A direct path that follows listener translation while retaining a world-axis offset.
+    pub fn listener_position_relative(world_offset_pose: Pose) -> Self {
+        Self {
+            placement: DirectPlacement::ListenerPositionRelative(world_offset_pose),
             geometry: DirectGeometry::SimulatedTransmission,
             propagation: DirectPropagation::Immediate,
         }

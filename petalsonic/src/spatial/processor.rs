@@ -1034,7 +1034,9 @@ impl SpatialProcessor {
         if let Some(play_command_id) = instance.take_first_render_command_id() {
             let direct_local_pose = match instance.direct_path.placement() {
                 DirectPlacement::ListenerRelative(local_pose) => Some(local_pose),
-                DirectPlacement::World => direct_local_position.map(Pose::from_position),
+                DirectPlacement::World | DirectPlacement::ListenerPositionRelative(_) => {
+                    direct_local_position.map(Pose::from_position)
+                }
                 DirectPlacement::Disabled => None,
             };
             let acoustic_origin = match instance.environment_send.origin() {
@@ -1208,6 +1210,10 @@ impl SpatialProcessor {
                 DirectPlacement::ListenerRelative(pose) => {
                     pose.position + pose.rotation * sample.local_position()
                 }
+                DirectPlacement::ListenerPositionRelative(pose) => self
+                    .world_vector_to_listener_position(
+                        pose.position + pose.rotation * sample.local_position(),
+                    ),
                 DirectPlacement::Disabled => continue,
             };
             let direction = normalized_direction(local_position);
@@ -1316,11 +1322,14 @@ impl SpatialProcessor {
     }
 
     fn world_to_listener_position(&self, world_position: Vec3) -> Vec3 {
-        let delta = world_position - self.listener_position;
+        self.world_vector_to_listener_position(world_position - self.listener_position)
+    }
+
+    fn world_vector_to_listener_position(&self, world_vector: Vec3) -> Vec3 {
         Vec3::new(
-            delta.dot(self.listener_right),
-            delta.dot(self.listener_up),
-            delta.dot(self.listener_front),
+            world_vector.dot(self.listener_right),
+            world_vector.dot(self.listener_up),
+            world_vector.dot(self.listener_front),
         )
     }
 
@@ -1332,6 +1341,9 @@ impl SpatialProcessor {
         match placement {
             DirectPlacement::World => Some(self.world_to_listener_position(emitter_world_position)),
             DirectPlacement::ListenerRelative(local_pose) => Some(local_pose.position),
+            DirectPlacement::ListenerPositionRelative(world_offset_pose) => {
+                Some(self.world_vector_to_listener_position(world_offset_pose.position))
+            }
             DirectPlacement::Disabled => None,
         }
     }
@@ -1931,6 +1943,54 @@ mod tests {
                 Some(local_pose.position)
             );
         }
+    }
+
+    #[test]
+    fn listener_position_relative_direct_keeps_world_gravity_offset_under_pitch() {
+        let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices: 1,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: false,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let world_offset = Pose::from_position(Vec3::new(0.0, -0.08, 0.0));
+
+        processor
+            .set_listener_pose(Pose::new(Vec3::new(40.0, -3.0, 12.0), Quat::IDENTITY))
+            .unwrap();
+        assert_eq!(
+            processor.resolve_direct_local_position(
+                DirectPlacement::ListenerPositionRelative(world_offset),
+                Vec3::new(999.0, 999.0, 999.0),
+            ),
+            Some(world_offset.position),
+        );
+
+        processor
+            .set_listener_pose(Pose::new(
+                Vec3::new(-8.0, 6.0, 2.0),
+                Quat::from_rotation_x(-89.0_f32.to_radians()),
+            ))
+            .unwrap();
+        let looking_down = processor
+            .resolve_direct_local_position(
+                DirectPlacement::ListenerPositionRelative(world_offset),
+                Vec3::new(-999.0, -999.0, -999.0),
+            )
+            .unwrap();
+        assert!(
+            looking_down.z > 0.079,
+            "world-down footstep did not move in front: {looking_down:?}"
+        );
+        assert!(
+            looking_down.y.abs() < 0.002,
+            "world-down footstep stayed below: {looking_down:?}"
+        );
     }
 
     #[test]

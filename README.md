@@ -60,7 +60,8 @@ fn main() -> Result<(), PetalSonicError> {
 - **Runtime Acoustics Control**: Toggle geometry-driven occlusion, reflections, and reverb without
   rebuilding the world or disabling HRTF spatialization
 - **Per-Voice Spatial Routing**: Fan one PCM cursor into an independent Direct Path and Environment
-  Send, including invariant listener-local direct placement and a captured world acoustic origin
+  Send, including listener-local or world-axis body-relative direct placement and a captured world
+  acoustic origin
 - **Cross-Platform**: Works on Windows, macOS, Linux, and more via CPAL
 
 ## Project Structure

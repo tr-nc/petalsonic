@@ -127,7 +127,8 @@ intact.
 ### Direct Path and Environment Send
 
 Each spatial Voice has one PCM cursor and two independent routes. `DirectPath` selects world,
-listener-relative, or disabled placement, plus orthogonal geometry and propagation policies.
+listener-relative, listener-position-relative, or disabled placement, plus orthogonal geometry and
+propagation policies.
 `EnvironmentSend` selects a following, fixed world, or disabled acoustic origin. Both routes use
 the same decoded block; the send is not mixed as a second direct signal.
 

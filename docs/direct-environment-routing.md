@@ -27,9 +27,9 @@ route is overridden:
 
 Non-spatial Emitters reject spatial route or spatial telemetry overrides.
 
-## Listener-local direct with a world-space acoustic origin
+## Body-relative direct with a world-space acoustic origin
 
-Local player footsteps can keep the direct sound at an invariant pose near the listener while the
+Local player footsteps can follow listener translation without inheriting camera pitch while the
 environment responds at the physical contact point:
 
 ```rust
@@ -40,7 +40,7 @@ use petalsonic::{
 
 let options = PlayOptions::once()
     .with_direct_path(
-        DirectPath::listener_relative(feet_local_pose)
+        DirectPath::listener_position_relative(feet_world_offset_pose)
             .with_geometry(DirectGeometry::BypassTransmission)
             .with_propagation(DirectPropagation::Immediate),
     )
@@ -54,9 +54,12 @@ world.play(emitter, options)?;
 # Ok::<(), petalsonic::PetalSonicError>(())
 ```
 
-`ListenerRelative` is consumed directly as listener-local x=right, y=up, z=front. PetalSonic does
-not synthesize a world pose and chase later listener frames, so listener translation and rotation
-cannot age the local invariant.
+`ListenerPositionRelative` treats the captured pose as a world-axis offset from the current
+listener position. Translation therefore cannot leave the direct sound behind, while every render
+block still projects the gravity-aligned offset through the latest listener orientation. Looking
+down moves a world-down footstep toward listener-local front. `ListenerRelative` remains available
+when both translation and rotation must preserve an invariant listener-local x=right, y=up,
+z=front pose.
 
 `EnvironmentSend::from_world_pose` is copied into the new Voice. Reusing or moving the Emitter for
 the next footstep does not relocate an older Voice's acoustic response. Use

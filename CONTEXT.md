@@ -44,8 +44,9 @@ rendering and acoustics.
 The world-space origin captured by an Environment Send. A fixed origin belongs to a Voice, not its reusable Emitter.
 
 **Direct Placement**:
-The coordinate semantics of the Direct Path: world, listener-relative, or disabled. It does not
-decide geometry transmission or propagation timing.
+The coordinate semantics of the Direct Path: world, listener-relative, listener-position-relative,
+or disabled. Listener-position-relative follows listener translation while keeping its offset in
+world axes. Placement does not decide geometry transmission or propagation timing.
 
 **Direct Geometry**:
 The Direct Path's obstruction/transmission policy. It is independent of Direct Placement.

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-25
+
 ### Added
 - Added generic `SourceExtent::{Point, WeightedSamples}` with stable sample IDs, strict bounded
   validation, normalized source power, and immutable per-Voice capture from complete spatial
@@ -21,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations (normalized power, world position, hit state, and three-band material
   transmission) plus cumulative ray, cache, extent, lobe, retained, and deferred diagnostics.
 - Added immutable per-Voice `DirectPath` and `EnvironmentSend` routing. One PCM cursor now feeds
-  independent direct and environmental semantics, including listener-relative direct placement,
-  fixed world acoustic origins, direct disablement, and environment disablement.
+  independent direct and environmental semantics, including listener-relative and
+  listener-position-relative direct placement, fixed world acoustic origins, direct disablement,
+  and environment disablement.
 - Added orthogonal `DirectGeometry` and `DirectPropagation` policies. Local sounds can bypass
   asynchronous transmission while retaining immediate native spatialization.
 - Added an independently bounded, opt-in `VoiceTelemetryEvent` stream correlated by
@@ -142,7 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RayTracer` trait - Custom ray tracing implementation support
 - Three-layer threading model (main thread, render thread, audio callback)
 
-[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/tr-nc/petalsonic/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/tr-nc/petalsonic/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/tr-nc/petalsonic/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/tr-nc/petalsonic/compare/v0.4.0...v0.5.0

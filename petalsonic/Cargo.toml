@@ -1,7 +1,7 @@
 [package]
 name = "petalsonic"
 description = "Real-time safe native spatial audio library for Rust"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Ruitian Yang <ruitian0716@gmail.com>"]
 license = "MIT"

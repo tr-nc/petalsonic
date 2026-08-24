@@ -12,7 +12,7 @@ Add PetalSonic to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-petalsonic = "0.7"
+petalsonic = "0.8"
 ```
 
 Basic usage example:

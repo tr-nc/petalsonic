@@ -672,6 +672,124 @@ struct PropagationWorkerContext {
     telemetry_sender: Sender<AcousticTelemetryEvent>,
 }
 
+struct AcousticPublisher {
+    input: Arc<SharedInput>,
+    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    counters: Arc<AcousticPropagationCounters>,
+    telemetry_sender: Sender<AcousticTelemetryEvent>,
+}
+
+impl AcousticPublisher {
+    /// Applies the ADR 0003 compatibility barrier to one completed frame.
+    ///
+    /// Scene replacement rejects the whole frame. Ordinary pose revisions are deliberately
+    /// absent, while retirement or rerouting removes one complete Voice envelope.
+    fn retain_compatible(
+        current: &InputState,
+        mut completed: CompletedAcousticFrame,
+    ) -> Option<CompletedAcousticFrame> {
+        if current.scene.as_ref().map(|scene| scene.version()) != Some(completed.geometry_version) {
+            return None;
+        }
+        completed
+            .voices
+            .retain(|voice| current.voice_route_is_current(voice.route));
+        Some(completed)
+    }
+
+    fn commit(
+        &self,
+        captured_wake_generation: u64,
+        completed: CompletedAcousticFrame,
+    ) -> Option<bool> {
+        self.counters.record_solve(completed.solve_time_us);
+        let publication_guard = self.input.state.lock().ok()?;
+        let newer_input_pending = publication_guard.wake_generation != captured_wake_generation;
+        let discarded_spatial_revision = completed.spatial_revision;
+        let discarded_geometry_version = completed.geometry_version;
+        let Some(completed) = Self::retain_compatible(&publication_guard, completed) else {
+            drop(publication_guard);
+            self.counters
+                .superseded_solve_count
+                .fetch_add(1, Ordering::Relaxed);
+            try_send_acoustic_telemetry(
+                &self.telemetry_sender,
+                &self.counters,
+                AcousticTelemetryEvent::SolveDiscarded {
+                    spatial_revision: discarded_spatial_revision,
+                    geometry_version: discarded_geometry_version,
+                    reason: AcousticDiscardReason::Superseded,
+                },
+            );
+            return Some(newer_input_pending);
+        };
+
+        let published_at = Instant::now();
+        let output = completed.into_solve_output(published_at);
+        let response_spatial_revision = output.response.spatial_revision;
+        let response_geometry_version = output.response.geometry_version;
+        let mut latest = self.latest_response.lock().ok()?;
+        *latest = Some(Arc::new(output.response));
+        drop(latest);
+        drop(publication_guard);
+
+        self.counters
+            .latest_spatial_revision
+            .store(response_spatial_revision, Ordering::Release);
+        self.counters
+            .latest_geometry_version
+            .store(response_geometry_version, Ordering::Release);
+        self.counters
+            .published_response_count
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut publication) = self.counters.last_publication.lock() {
+            *publication = Some(published_at);
+        }
+        for telemetry in output.telemetry {
+            self.counters.direct_ray_count.fetch_add(
+                (telemetry.direct.ray_count + telemetry.environment.ray_count) as u64,
+                Ordering::Relaxed,
+            );
+            self.counters.cache_hit_count.fetch_add(
+                (telemetry.direct.cache_hit_count + telemetry.environment.cache_hit_count) as u64,
+                Ordering::Relaxed,
+            );
+            self.counters
+                .processed_extent_count
+                .fetch_add(u64::from(telemetry.budget_member), Ordering::Relaxed);
+            self.counters
+                .lobe_count
+                .fetch_add(telemetry.lobes.len() as u64, Ordering::Relaxed);
+            match telemetry.solve_status {
+                AcousticSolveStatus::Solved => {}
+                AcousticSolveStatus::Retained => {
+                    self.counters
+                        .retained_response_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                AcousticSolveStatus::Deferred => {
+                    self.counters
+                        .deferred_response_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            try_send_acoustic_telemetry(
+                &self.telemetry_sender,
+                &self.counters,
+                AcousticTelemetryEvent::ExtentResponse(Box::new(telemetry)),
+            );
+        }
+        for conclusion in output.conclusions {
+            try_send_acoustic_telemetry(
+                &self.telemetry_sender,
+                &self.counters,
+                AcousticTelemetryEvent::VoiceConclusion(conclusion.telemetry),
+            );
+        }
+        Some(newer_input_pending)
+    }
+}
+
 fn propagation_loop(context: PropagationWorkerContext) {
     let PropagationWorkerContext {
         input,
@@ -683,6 +801,12 @@ fn propagation_loop(context: PropagationWorkerContext) {
         environmental_acoustics_budget,
         telemetry_sender,
     } = context;
+    let publisher = AcousticPublisher {
+        input: input.clone(),
+        latest_response,
+        counters,
+        telemetry_sender,
+    };
     let mut consumed_wake_generation = 0;
     let mut next_solve = Instant::now();
     let mut solver = AcousticSolver::new(0);
@@ -735,100 +859,12 @@ fn propagation_loop(context: PropagationWorkerContext) {
         let mut output = solver.solve_with_telemetry(&captured, distance_scaler, plan);
         let elapsed_us = started.elapsed().as_micros() as u64;
         output.response.solve_time_us = elapsed_us;
-        counters.record_solve(elapsed_us);
-
-        let Ok(publication_guard) = input.state.lock() else {
+        let Some(newer_input_pending) = publisher.commit(captured.wake_generation, output.into())
+        else {
             return;
         };
-        let newer_input_pending = publication_guard.wake_generation != captured.wake_generation;
-        let discarded_spatial_revision = output.response.spatial_revision;
-        let discarded_geometry_version = output.response.geometry_version;
-        let Some(output) = retain_compatible_completed_results(&publication_guard, output) else {
-            drop(publication_guard);
-            if newer_input_pending {
-                next_solve = Instant::now();
-            }
-            counters
-                .superseded_solve_count
-                .fetch_add(1, Ordering::Relaxed);
-            try_send_acoustic_telemetry(
-                &telemetry_sender,
-                &counters,
-                AcousticTelemetryEvent::SolveDiscarded {
-                    spatial_revision: discarded_spatial_revision,
-                    geometry_version: discarded_geometry_version,
-                    reason: AcousticDiscardReason::Superseded,
-                },
-            );
-            continue;
-        };
-
-        let mut response = output.response;
-        response.published_at = Instant::now();
-        let response_spatial_revision = response.spatial_revision;
-        let response_geometry_version = response.geometry_version;
-        let response_published_at = response.published_at;
-        let Ok(mut latest) = latest_response.lock() else {
-            return;
-        };
-        *latest = Some(Arc::new(response));
-        drop(latest);
-        drop(publication_guard);
         if newer_input_pending {
             next_solve = Instant::now();
-        }
-        counters
-            .latest_spatial_revision
-            .store(response_spatial_revision, Ordering::Release);
-        counters
-            .latest_geometry_version
-            .store(response_geometry_version, Ordering::Release);
-        counters
-            .published_response_count
-            .fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut publication) = counters.last_publication.lock() {
-            *publication = Some(response_published_at);
-        }
-        for telemetry in output.telemetry {
-            counters.direct_ray_count.fetch_add(
-                (telemetry.direct.ray_count + telemetry.environment.ray_count) as u64,
-                Ordering::Relaxed,
-            );
-            counters.cache_hit_count.fetch_add(
-                (telemetry.direct.cache_hit_count + telemetry.environment.cache_hit_count) as u64,
-                Ordering::Relaxed,
-            );
-            counters
-                .processed_extent_count
-                .fetch_add(u64::from(telemetry.budget_member), Ordering::Relaxed);
-            counters
-                .lobe_count
-                .fetch_add(telemetry.lobes.len() as u64, Ordering::Relaxed);
-            match telemetry.solve_status {
-                AcousticSolveStatus::Solved => {}
-                AcousticSolveStatus::Retained => {
-                    counters
-                        .retained_response_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                AcousticSolveStatus::Deferred => {
-                    counters
-                        .deferred_response_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            try_send_acoustic_telemetry(
-                &telemetry_sender,
-                &counters,
-                AcousticTelemetryEvent::ExtentResponse(Box::new(telemetry)),
-            );
-        }
-        for conclusion in output.conclusions {
-            try_send_acoustic_telemetry(
-                &telemetry_sender,
-                &counters,
-                AcousticTelemetryEvent::VoiceConclusion(conclusion.telemetry),
-            );
         }
     }
 }
@@ -838,32 +874,13 @@ fn propagation_loop(context: PropagationWorkerContext) {
 /// Ordinary pose revisions are deliberately absent from this compatibility seam. They make the
 /// completed response spatially older, not unsafe. A scene change invalidates the whole solve;
 /// Voice retirement or routing replacement invalidates only that Voice's result.
+#[cfg(test)]
 fn retain_compatible_completed_results(
     current: &InputState,
-    mut output: AcousticSolveOutput,
+    output: AcousticSolveOutput,
 ) -> Option<AcousticSolveOutput> {
-    if current.scene.as_ref().map(|scene| scene.version()) != Some(output.response.geometry_version)
-    {
-        return None;
-    }
-
-    output
-        .response
-        .direct
-        .retain(|response| current.voice_route_is_current(response.route_key()));
-    let compatible_voice_ids = output
-        .response
-        .direct
-        .iter()
-        .map(|response| response.voice_id.value())
-        .collect::<HashSet<_>>();
-    output
-        .telemetry
-        .retain(|event| compatible_voice_ids.contains(&event.voice_id));
-    output
-        .conclusions
-        .retain(|conclusion| current.voice_route_is_current(conclusion.route));
-    Some(output)
+    AcousticPublisher::retain_compatible(current, output.into())
+        .map(|completed| completed.into_solve_output(Instant::now()))
 }
 
 fn try_send_acoustic_telemetry(
@@ -902,6 +919,104 @@ struct AcousticSolveOutput {
     response: AcousticResponse,
     telemetry: Vec<AcousticExtentTelemetry>,
     conclusions: Vec<CompletedVoiceConclusion>,
+}
+
+/// Publication payload whose Voice-owned outputs cannot be filtered independently.
+struct CompletedAcousticFrame {
+    spatial_revision: u64,
+    geometry_version: u64,
+    late_reverb: LateReverbParameters,
+    solve_time_us: u64,
+    voices: Vec<CompletedVoice>,
+}
+
+/// One route generation's response and both telemetry views.
+struct CompletedVoice {
+    route: VoiceRouteKey,
+    response: Option<DirectAcousticResponse>,
+    telemetry: Option<AcousticExtentTelemetry>,
+    conclusion: AcousticVoiceConclusionTelemetry,
+}
+
+impl From<AcousticSolveOutput> for CompletedAcousticFrame {
+    fn from(output: AcousticSolveOutput) -> Self {
+        let AcousticSolveOutput {
+            response,
+            mut telemetry,
+            conclusions,
+        } = output;
+        let AcousticResponse {
+            spatial_revision,
+            geometry_version,
+            mut direct,
+            late_reverb,
+            solve_time_us,
+            ..
+        } = response;
+        let voices = conclusions
+            .into_iter()
+            .map(|completed| {
+                let response = direct
+                    .iter()
+                    .position(|response| response.route_key() == completed.route)
+                    .map(|index| direct.swap_remove(index));
+                let telemetry = telemetry
+                    .iter()
+                    .position(|telemetry| telemetry.voice_id == completed.telemetry.voice_id)
+                    .map(|index| telemetry.swap_remove(index));
+                debug_assert_eq!(response.is_some(), telemetry.is_some());
+                CompletedVoice {
+                    route: completed.route,
+                    response,
+                    telemetry,
+                    conclusion: completed.telemetry,
+                }
+            })
+            .collect();
+        debug_assert!(direct.is_empty());
+        debug_assert!(telemetry.is_empty());
+        Self {
+            spatial_revision,
+            geometry_version,
+            late_reverb,
+            solve_time_us,
+            voices,
+        }
+    }
+}
+
+impl CompletedAcousticFrame {
+    fn into_solve_output(self, published_at: Instant) -> AcousticSolveOutput {
+        let mut direct = Vec::with_capacity(self.voices.len());
+        let mut telemetry = Vec::with_capacity(self.voices.len());
+        let mut conclusions = Vec::with_capacity(self.voices.len());
+        for voice in self.voices {
+            if let Some(response) = voice.response {
+                direct.push(response);
+            }
+            if let Some(event) = voice.telemetry {
+                telemetry.push(event);
+            }
+            conclusions.push(CompletedVoiceConclusion {
+                route: voice.route,
+                telemetry: voice.conclusion,
+            });
+        }
+        direct.sort_by_key(|response| response.voice_id.value());
+        telemetry.sort_by_key(|event| event.voice_id);
+        AcousticSolveOutput {
+            response: AcousticResponse {
+                spatial_revision: self.spatial_revision,
+                geometry_version: self.geometry_version,
+                direct,
+                late_reverb: self.late_reverb,
+                published_at,
+                solve_time_us: self.solve_time_us,
+            },
+            telemetry,
+            conclusions,
+        }
+    }
 }
 
 struct CompletedVoiceConclusion {

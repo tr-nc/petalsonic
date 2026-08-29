@@ -13,7 +13,6 @@ use crate::events::{
     RuntimeCounters, RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceTelemetryDiagnostics,
     VoiceTelemetryEvent,
 };
-use crate::math::Pose;
 use crate::platform::output::{
     CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
 };
@@ -118,12 +117,7 @@ impl RuntimeIntent {
 
 pub(crate) trait OutputRuntimeDriver {
     fn drain_retired_resources(&mut self);
-    fn reconcile_output(
-        &mut self,
-        commands: &EngineCommandReceivers,
-        buses: &mut Vec<BusParams>,
-        request: OutputRecoveryRequest,
-    ) -> OutputRecoveryResult;
+    fn reconcile_output(&mut self, request: OutputRecoveryRequest) -> OutputRecoveryResult;
     fn emit_runtime_state(&self, state: RuntimeState);
 }
 
@@ -132,13 +126,8 @@ impl OutputRuntimeDriver for PetalSonicEngine {
         PetalSonicEngine::drain_retired_backend_resources(self);
     }
 
-    fn reconcile_output(
-        &mut self,
-        commands: &EngineCommandReceivers,
-        buses: &mut Vec<BusParams>,
-        request: OutputRecoveryRequest,
-    ) -> OutputRecoveryResult {
-        PetalSonicEngine::reconcile_output(self, commands, buses, request)
+    fn reconcile_output(&mut self, request: OutputRecoveryRequest) -> OutputRecoveryResult {
+        PetalSonicEngine::reconcile_output(self, request)
     }
 
     fn emit_runtime_state(&self, state: RuntimeState) {
@@ -222,7 +211,6 @@ impl AudioRuntime {
             crossbeam_channel::bounded(config.control_queue_capacity);
         let (lifecycle_sender, lifecycle_receiver) =
             crossbeam_channel::bounded(config.lifecycle_queue_capacity);
-        let listener_pose = Arc::new(Mutex::new(Pose::default()));
         let active_voice_count = Arc::new(AtomicUsize::new(0));
         let (retirement_sender, retirement_receiver) =
             crossbeam_channel::bounded(config.max_voices);
@@ -267,7 +255,6 @@ impl AudioRuntime {
         let (ports, observability) = PetalSonicEngine::create_runtime_ports(config);
         let startup = EngineStartup {
             desc: config.clone(),
-            listener_pose,
             active_voice_count: active_voice_count.clone(),
             retirement_sender,
             latest_spatial_frame: latest_spatial_frame.clone(),
@@ -666,11 +653,8 @@ impl AudioRuntime {
 
     pub(crate) fn supervisor_tick<D: OutputRuntimeDriver>(
         driver: &mut D,
-        commands: &EngineCommandReceivers,
-        bus_params: &Mutex<Vec<BusParams>>,
         runtime_state: &AtomicU8,
         recovery_attempts: &AtomicU64,
-        recovery_buses: &mut Vec<BusParams>,
         schedule: &mut SupervisorSchedule,
         now: Instant,
     ) {
@@ -685,10 +669,6 @@ impl AudioRuntime {
         }
 
         if state == RuntimeState::Running {
-            *recovery_buses = bus_params
-                .lock()
-                .map(|buses| buses.clone())
-                .unwrap_or_else(|_| vec![BusParams::default()]);
             schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
         }
         let elapsed = if state == RuntimeState::Recovering {
@@ -698,15 +678,11 @@ impl AudioRuntime {
         };
         schedule.last_advance = now;
         let retry_now = state == RuntimeState::Running || now >= schedule.next_retry;
-        let result = driver.reconcile_output(
-            commands,
-            recovery_buses,
-            OutputRecoveryRequest {
-                probe,
-                retry_now,
-                elapsed_without_output: elapsed,
-            },
-        );
+        let result = driver.reconcile_output(OutputRecoveryRequest {
+            probe,
+            retry_now,
+            elapsed_without_output: elapsed,
+        });
 
         if retry_now && !matches!(result, OutputRecoveryResult::Stable) {
             recovery_attempts.fetch_add(1, Ordering::Relaxed);
@@ -761,7 +737,16 @@ impl AudioRuntime {
                         return;
                     }
                 };
-                let mut engine = match PetalSonicEngine::new_with_output(startup, output) {
+                let initial_buses = bus_params
+                    .lock()
+                    .map(|buses| buses.clone())
+                    .unwrap_or_else(|_| vec![BusParams::default()]);
+                let mut engine = match PetalSonicEngine::new_with_output(
+                    startup,
+                    output,
+                    command_receivers.clone(),
+                    initial_buses,
+                ) {
                     Ok(engine) => engine,
                     Err(error) => {
                         runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
@@ -774,20 +759,13 @@ impl AudioRuntime {
                 }
                 let poll_interval = Duration::from_millis(20);
                 let mut schedule = SupervisorSchedule::new(Instant::now());
-                let mut recovery_buses = bus_params
-                    .lock()
-                    .map(|buses| buses.clone())
-                    .unwrap_or_else(|_| vec![BusParams::default()]);
                 engine.emit_runtime_state(RuntimeState::Recovering);
 
                 while !stop.load(Ordering::Acquire) {
                     Self::supervisor_tick(
                         &mut engine,
-                        &command_receivers,
-                        &bus_params,
                         &runtime_state,
                         &recovery_attempts,
-                        &mut recovery_buses,
                         &mut schedule,
                         Instant::now(),
                     );

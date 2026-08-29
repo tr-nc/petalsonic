@@ -737,6 +737,21 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
+    fn release_baseline(key: &str) -> u64 {
+        include_str!("../perf/balanced_near_capacity.baseline")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(candidate, value)| {
+                (candidate.trim() == key).then(|| {
+                    value
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| panic!("invalid {key} in release baseline"))
+                })
+            })
+            .unwrap_or_else(|| panic!("missing {key} in release baseline"))
+    }
+
     struct Harness {
         quantum: RenderQuantum,
         commands: Sender<PlaybackCommand>,
@@ -1000,5 +1015,84 @@ mod tests {
         assert_eq!(activity, 0, "steady render quantum allocated or freed");
         assert!(consumer.try_pop().is_some());
         assert!(harness.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn latency_profiles_select_only_bounded_refill_schedules() {
+        let responsive = RenderSchedule::for_profile(LatencyProfile::Responsive);
+        let balanced = RenderSchedule::for_profile(LatencyProfile::Balanced);
+        let robust = RenderSchedule::for_profile(LatencyProfile::Robust);
+
+        assert!(responsive.ring_blocks < balanced.ring_blocks);
+        assert!(balanced.ring_blocks < robust.ring_blocks);
+        for schedule in [responsive, balanced, robust] {
+            assert!(schedule.low_water_blocks < schedule.high_water_blocks);
+            assert!(schedule.high_water_blocks <= schedule.ring_blocks);
+            assert!(schedule.catch_up_chunk_blocks <= schedule.high_water_blocks);
+        }
+    }
+
+    #[test]
+    fn warmed_near_capacity_quantum_meets_release_budget() {
+        const VOICES: usize = 32;
+        const SAMPLES: usize = 1_024;
+        let block_size = 64;
+        let mut harness = harness(block_size, VOICES);
+        let source = Arc::new(PetalSonicAudioData::new(
+            vec![0.25 / VOICES as f32; block_size * 16],
+            48_000,
+            1,
+            Duration::from_secs_f64((block_size * 16) as f64 / 48_000.0),
+        ));
+        harness
+            .quantum
+            .active_voice_count
+            .store(VOICES, Ordering::Release);
+        for voice in 0..VOICES {
+            harness
+                .commands
+                .try_send(play_command(
+                    VoiceId::from(voice as u64 + 1),
+                    Emitter {
+                        world_id: 1,
+                        index: voice as u32,
+                        generation: 1,
+                    },
+                    source.clone(),
+                    block_size,
+                ))
+                .unwrap();
+        }
+        let mut consumer = harness.quantum.connect_output(44_100).unwrap();
+        harness.quantum.render();
+
+        let mut elapsed_us = [0u64; SAMPLES];
+        for elapsed in &mut elapsed_us {
+            while consumer.try_pop().is_some() {}
+            while harness.timing.try_recv().is_ok() {}
+            let start = Instant::now();
+            harness.quantum.render();
+            *elapsed = start.elapsed().as_micros() as u64;
+        }
+        elapsed_us.sort_unstable();
+        let p99 = elapsed_us[elapsed_us.len() * 99 / 100];
+        let device_period_us = block_size as u64 * 1_000_000 / 48_000;
+        if !cfg!(debug_assertions) {
+            assert_eq!(release_baseline("voices"), VOICES as u64);
+            assert_eq!(release_baseline("world_sample_rate"), 48_000);
+            assert_eq!(release_baseline("device_sample_rate"), 44_100);
+            assert_eq!(release_baseline("block_size"), block_size as u64);
+            assert!(
+                p99 * 100 < device_period_us * 80,
+                "full-quantum p99 {p99}us lacks 20% device-period margin"
+            );
+            let limit = release_baseline("p99_us")
+                .saturating_mul(100 + release_baseline("max_p99_regression_percent"))
+                .div_ceil(100);
+            assert!(
+                p99 <= limit,
+                "full-quantum p99 regressed: current={p99}us limit={limit}us"
+            );
+        }
     }
 }

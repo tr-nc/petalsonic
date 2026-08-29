@@ -948,12 +948,14 @@ mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
     use crate::domain::{DirectGeometry, DirectPath, EnvironmentSend, PlayCommandId};
-    use crate::engine::{EngineCommandReceivers, OutputRecoveryReason};
-    use crate::runtime::{
-        AudioRuntime, OUTPUT_RETRY_INTERVAL, OutputPreparation, OutputRuntimeDriver,
-        SupervisorSchedule,
+    use crate::engine::EngineCommandReceivers;
+    use crate::platform::output::fake::{
+        FakeDevice as PlatformFakeDevice, FakeOutputPlatform, FakeSampleFormat,
     };
-    use std::cell::Cell;
+    use crate::platform::output::{OutputDeviceState, OutputRecoveryRequest, OutputRecoveryResult};
+    use crate::runtime::{
+        AudioRuntime, OUTPUT_RETRY_INTERVAL, OutputRuntimeDriver, SupervisorSchedule,
+    };
     use std::sync::atomic::{AtomicU8, AtomicU64};
     use std::time::Instant;
 
@@ -1010,9 +1012,6 @@ mod tests {
         stream_failed: bool,
         permanent_format_failure: bool,
         prepared: Option<FakeDevice>,
-        requires_stop_to_prepare: bool,
-        actions: Vec<&'static str>,
-        checked_while_active: Cell<bool>,
         advanced: Duration,
         loop_cursor_frames: usize,
         loop_length_frames: usize,
@@ -1028,9 +1027,6 @@ mod tests {
                 stream_failed: false,
                 permanent_format_failure: false,
                 prepared: None,
-                requires_stop_to_prepare: false,
-                actions: Vec::new(),
-                checked_while_active: Cell::new(false),
                 advanced: Duration::ZERO,
                 loop_cursor_frames: 0,
                 loop_length_frames: 12_000,
@@ -1043,45 +1039,26 @@ mod tests {
     impl OutputRuntimeDriver for FakeOutputDriver {
         fn drain_retired_resources(&mut self) {}
 
-        fn output_recovery_reason(&self) -> Option<OutputRecoveryReason> {
-            if self.stream_failed {
-                Some(OutputRecoveryReason::StreamFailure)
-            } else if self.active != self.selected {
-                Some(OutputRecoveryReason::SelectionChanged)
-            } else {
-                None
-            }
-        }
-
-        fn prepare_selected_output(&mut self) -> OutputPreparation {
-            self.checked_while_active.set(self.active.is_some());
-            self.actions.push("prepare");
-            if self.selected.is_some() && self.requires_stop_to_prepare {
-                return OutputPreparation::RequiresStop;
-            }
-            self.prepared = self.selected;
-            if self.prepared.is_some() {
-                OutputPreparation::Ready
-            } else {
-                OutputPreparation::Unavailable
-            }
-        }
-
-        fn stop_output(&mut self) -> Result<()> {
-            self.actions.push("stop");
-            self.active = None;
-            Ok(())
-        }
-
-        fn advance_without_output(
+        fn reconcile_output(
             &mut self,
             _commands: &EngineCommandReceivers,
-            _buses: &mut [BusParams],
-            elapsed: Duration,
-        ) {
-            self.actions.push("advance");
-            self.advanced += elapsed;
-            let frames = (elapsed.as_secs_f64() * 48_000.0).floor() as usize;
+            _buses: &mut Vec<BusParams>,
+            request: OutputRecoveryRequest,
+        ) -> OutputRecoveryResult {
+            if self.active.is_some() && request.probe {
+                if !self.stream_failed && self.active == self.selected {
+                    return OutputRecoveryResult::Stable;
+                }
+                if !self.stream_failed {
+                    let Some(selected) = self.selected else {
+                        return OutputRecoveryResult::Stable;
+                    };
+                    self.prepared = Some(selected);
+                }
+                self.active = None;
+            }
+            self.advanced += request.elapsed_without_output;
+            let frames = (request.elapsed_without_output.as_secs_f64() * 48_000.0).floor() as usize;
             self.loop_cursor_frames = (self.loop_cursor_frames + frames) % self.loop_length_frames;
             if frames >= self.one_shot_remaining_frames {
                 self.one_shot_remaining_frames = 0;
@@ -1089,25 +1066,22 @@ mod tests {
             } else {
                 self.one_shot_remaining_frames -= frames;
             }
-        }
-
-        fn start_output(
-            &mut self,
-            _commands: EngineCommandReceivers,
-            _buses: Vec<BusParams>,
-        ) -> Result<()> {
-            self.actions.push("start");
+            if !request.retry_now {
+                return OutputRecoveryResult::Recovering;
+            }
             if self.permanent_format_failure {
-                return Err(PetalSonicError::PermanentDeviceFailure(
-                    "unsupported fake format".into(),
-                ));
+                return OutputRecoveryResult::Failed;
             }
             let Some(selected) = self.prepared.take().or(self.selected) else {
-                return Err(PetalSonicError::AudioDevice("no fake device".into()));
+                return OutputRecoveryResult::Recovering;
             };
             self.active = Some(selected);
             self.stream_failed = false;
-            Ok(())
+            OutputRecoveryResult::Running(OutputDeviceState {
+                diagnostic_name: selected.name.to_string(),
+                sample_rate: selected.sample_rate,
+                physical_channels: selected.channels,
+            })
         }
 
         fn emit_runtime_state(&self, _state: RuntimeState) {}
@@ -1117,6 +1091,53 @@ mod tests {
         let (_, regular) = crossbeam_channel::bounded(4);
         let (_, lifecycle) = crossbeam_channel::bounded(4);
         EngineCommandReceivers::new(regular, lifecycle)
+    }
+
+    #[test]
+    fn runtime_observes_fake_adapter_format_and_channel_recovery() {
+        let a = PlatformFakeDevice::stereo("A", 48_000);
+        let mut b = PlatformFakeDevice::stereo("B", 44_100);
+        b.state.physical_channels = 6;
+        b.sample_format = FakeSampleFormat::I16;
+        let (adapter, handle) = FakeOutputPlatform::scripted(vec![a, b], Some(0));
+        let desc = crate::config::PetalSonicWorldDesc {
+            environmental_acoustics_enabled: false,
+            ..Default::default()
+        };
+        let runtime =
+            AudioRuntime::start_with_output(&desc, move || Ok(Box::new(adapter))).unwrap();
+
+        let running_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < running_deadline
+            && runtime.runtime_status().state != RuntimeState::Running
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            runtime.runtime_status().active_output_device.as_deref(),
+            Some("A")
+        );
+        assert_eq!(runtime.diagnostics(0, &desc).output_sample_rate, 48_000);
+        assert_eq!(runtime.diagnostics(0, &desc).output_channels, 2);
+
+        handle.set_selected(Some(1));
+        handle.fail_stream();
+        let recovery_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < recovery_deadline
+            && runtime.runtime_status().active_output_device.as_deref() != Some("B")
+        {
+            std::thread::yield_now();
+        }
+
+        assert_eq!(runtime.runtime_status().state, RuntimeState::Running);
+        assert_eq!(
+            runtime.runtime_status().active_output_device.as_deref(),
+            Some("B")
+        );
+        assert_eq!(runtime.diagnostics(0, &desc).output_sample_rate, 44_100);
+        assert_eq!(runtime.diagnostics(0, &desc).output_channels, 6);
+        assert!(runtime.runtime_status().recovery_attempts >= 2);
+        runtime.close().unwrap();
     }
 
     #[test]
@@ -1211,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_default_device_switch_probes_b_before_releasing_a() {
+    fn runtime_publishes_running_after_default_device_recovery() {
         let a = FakeDevice {
             name: "A",
             sample_rate: 48_000,
@@ -1243,8 +1264,6 @@ mod tests {
             now,
         );
 
-        assert!(driver.checked_while_active.get());
-        assert_eq!(driver.actions, ["prepare", "stop", "advance", "start"]);
         assert_eq!(driver.active, Some(b));
         assert_eq!(
             AudioRuntime::load_runtime_state(&runtime_state),
@@ -1314,85 +1333,6 @@ mod tests {
         );
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 2);
     }
-
-    #[test]
-    fn fake_healthy_a_is_kept_when_new_default_is_not_openable() {
-        let a = FakeDevice {
-            name: "A",
-            sample_rate: 48_000,
-            channels: 2,
-        };
-        let mut driver = FakeOutputDriver::with_active(a);
-        driver.selected = None;
-        let commands = fake_command_receivers();
-        let buses = Mutex::new(vec![BusParams::default()]);
-        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
-        let recovery_attempts = AtomicU64::new(0);
-        let mut recovery_buses = vec![BusParams::default()];
-        let now = Instant::now();
-        let mut schedule = SupervisorSchedule::new(now);
-
-        AudioRuntime::supervisor_tick(
-            &mut driver,
-            &commands,
-            &buses,
-            &runtime_state,
-            &recovery_attempts,
-            &mut recovery_buses,
-            &mut schedule,
-            now,
-        );
-
-        assert_eq!(driver.active, Some(a));
-        assert_eq!(driver.actions, ["prepare"]);
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Running
-        );
-    }
-
-    #[test]
-    fn fake_exclusive_backend_falls_back_to_stop_then_rebuild() {
-        let a = FakeDevice {
-            name: "A",
-            sample_rate: 48_000,
-            channels: 2,
-        };
-        let b = FakeDevice {
-            name: "B",
-            sample_rate: 44_100,
-            channels: 2,
-        };
-        let mut driver = FakeOutputDriver::with_active(a);
-        driver.selected = Some(b);
-        driver.requires_stop_to_prepare = true;
-        let commands = fake_command_receivers();
-        let buses = Mutex::new(vec![BusParams::default()]);
-        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
-        let recovery_attempts = AtomicU64::new(0);
-        let mut recovery_buses = vec![BusParams::default()];
-        let now = Instant::now();
-        let mut schedule = SupervisorSchedule::new(now);
-
-        AudioRuntime::supervisor_tick(
-            &mut driver,
-            &commands,
-            &buses,
-            &runtime_state,
-            &recovery_attempts,
-            &mut recovery_buses,
-            &mut schedule,
-            now,
-        );
-
-        assert_eq!(driver.actions, ["prepare", "stop", "advance", "start"]);
-        assert_eq!(driver.active, Some(b));
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Running
-        );
-    }
-
     #[test]
     fn fake_permanent_format_failure_is_not_retried_as_missing_device() {
         let a = FakeDevice {

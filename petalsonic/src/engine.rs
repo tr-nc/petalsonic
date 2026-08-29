@@ -1,8 +1,6 @@
 use crate::acoustic_propagation::{AcousticResponse, AcousticVoice, AcousticVoiceInput};
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::{
-    LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SourceConfig, SpatialQuality,
-};
+use crate::config::{LatencyProfile, PetalSonicWorldDesc, SourceConfig, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
 use crate::error::PetalSonicError;
 use crate::error::Result;
@@ -11,46 +9,28 @@ use crate::events::{
 };
 use crate::math::Pose;
 use crate::mixer;
+use crate::platform::output::{
+    OutputCallback, OutputDeviceState, OutputPlatform, OutputPreparation, OutputRecoveryReason,
+    OutputRecoveryRequest, OutputRecoveryResult, PreparedOutput, StereoFrame,
+};
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, VoiceStart};
-use crate::runtime::OutputPreparation;
 use crate::spatial::{
     AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
     SpatialRenderContext,
 };
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SizedSample};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ringbuf::{
-    HeapCons, HeapProd, HeapRb,
-    traits::{Consumer, Observer, Producer, Split},
+    HeapProd, HeapRb,
+    traits::{Observer, Producer, Split},
 };
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-// Stereo frame for ring buffer
-#[derive(Clone, Copy, Debug)]
-struct StereoFrame {
-    left: f32,
-    right: f32,
-}
-
-impl Default for StereoFrame {
-    fn default() -> Self {
-        Self {
-            left: 0.0,
-            right: 0.0,
-        }
-    }
-}
-
 const MASTER_HEADROOM_DB: f32 = -6.0;
-const STARTUP_UNDERRUN_GRACE_CALLBACKS: usize = 8;
-const OUTPUT_FADE_IN_MILLISECONDS: usize = 10;
 const LOGICAL_CHANNELS: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,33 +79,10 @@ impl RenderSchedule {
     }
 }
 
-/// Context for audio callback - groups related parameters to reduce argument count
-///
-/// The audio callback runs on the real-time audio thread and must be extremely fast
-/// and lock-free to avoid audio glitches. It simply consumes pre-rendered samples
-/// from the ring buffer.
-struct AudioCallbackContext {
-    is_running: Arc<AtomicBool>,
-    frames_processed: Arc<AtomicUsize>,
-    underrun_count: Arc<AtomicUsize>,
-    /// Consumer end of ring buffer - reads pre-rendered audio samples (lock-free)
-    ring_buffer_consumer: HeapCons<StereoFrame>,
-    channels: u16,
-    startup_underrun_callbacks_remaining: usize,
-    fade_in_remaining_frames: usize,
-    fade_in_total_frames: usize,
-}
-
 #[derive(Clone)]
 pub(crate) struct EngineCommandReceivers {
     regular: Receiver<PlaybackCommand>,
     lifecycle: Receiver<PlaybackCommand>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutputRecoveryReason {
-    StreamFailure,
-    SelectionChanged,
 }
 
 impl EngineCommandReceivers {
@@ -178,38 +135,6 @@ struct PumpState {
     render_block_index: u64,
 }
 
-/// Parameters for stream creation - groups related parameters to reduce argument count
-struct StreamCreationParams {
-    is_running: Arc<AtomicBool>,
-    frames_processed: Arc<AtomicUsize>,
-    world_sample_rate: u32,
-    device_sample_rate: u32,
-    channels: u16,
-    active_playback: Arc<Mutex<HashMap<VoiceId, PlaybackInstance>>>,
-    command_receivers: EngineCommandReceivers,
-    event_sender: Sender<PetalSonicEvent>,
-    voice_telemetry_sender: Sender<VoiceTelemetryEvent>,
-    timing_sender: Sender<RenderTimingEvent>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AudioOutputDeviceInfo {
-    pub name: String,
-    pub is_default: bool,
-    pub aliases: Vec<String>,
-}
-
-struct AudioOutputDeviceCandidate {
-    device: cpal::Device,
-    info: AudioOutputDeviceInfo,
-}
-
-struct PreparedOutputDevice {
-    device: cpal::Device,
-    config: cpal::SupportedStreamConfig,
-    _probe_stream: cpal::Stream,
-}
-
 pub(crate) struct EngineObservability {
     pub frames_processed: Arc<AtomicUsize>,
     pub underrun_count: Arc<AtomicUsize>,
@@ -248,12 +173,12 @@ pub(crate) struct EngineStartup {
 /// Audio engine that manages real-time audio processing and output
 pub(crate) struct PetalSonicEngine {
     desc: PetalSonicWorldDesc,
-    stream: Option<cpal::Stream>,
-    prepared_output_device: Option<PreparedOutputDevice>,
+    output: Box<dyn OutputPlatform>,
+    prepared_output: Option<PreparedOutput>,
+    active_output: Option<OutputDeviceState>,
     is_running: Arc<AtomicBool>,
     frames_processed: Arc<AtomicUsize>,
     underrun_count: Arc<AtomicUsize>,
-    stream_error: Arc<AtomicBool>,
     current_device_name: Arc<Mutex<Option<String>>>,
     active_playback: Arc<std::sync::Mutex<HashMap<VoiceId, PlaybackInstance>>>,
     active_voice_count: Arc<AtomicUsize>,
@@ -290,8 +215,10 @@ pub(crate) struct PetalSonicEngine {
 }
 
 impl PetalSonicEngine {
-    /// Create the internal engine owned by a [`PetalSonicWorld`](crate::PetalSonicWorld).
-    pub(crate) fn new(startup: EngineStartup) -> Result<Self> {
+    pub(crate) fn new_with_output(
+        startup: EngineStartup,
+        output: Box<dyn OutputPlatform>,
+    ) -> Result<Self> {
         let EngineStartup {
             desc,
             listener_pose,
@@ -333,14 +260,14 @@ impl PetalSonicEngine {
         let master_gain_linear = crate::gain::db_to_linear(master_headroom_db);
 
         Ok(Self {
-            device_sample_rate: desc.sample_rate, // Will be updated when stream starts
+            device_sample_rate: desc.sample_rate,
             desc,
-            stream: None,
-            prepared_output_device: None,
+            output,
+            prepared_output: None,
+            active_output: None,
             is_running: Arc::new(AtomicBool::new(false)),
             frames_processed: ports.frames_processed,
             underrun_count: ports.underrun_count,
-            stream_error: Arc::new(AtomicBool::new(false)),
             current_device_name: ports.active_device_name,
             active_playback: Arc::new(std::sync::Mutex::new(HashMap::with_capacity(max_voices))),
             active_voice_count,
@@ -430,30 +357,23 @@ impl PetalSonicEngine {
         if self.is_running() {
             return Ok(());
         }
-
-        let requested_device = match &self.desc.output_device {
-            OutputDevicePolicy::FollowSystemDefault => None,
-            OutputDevicePolicy::PinnedNameContains(name) => Some(name.as_str()),
+        let prepared = match self.prepared_output.take() {
+            Some(prepared) => prepared,
+            None => match self.output.prepare(&self.desc.output_device) {
+                OutputPreparation::Ready(prepared) => prepared,
+                OutputPreparation::Unavailable | OutputPreparation::RequiresStop => {
+                    return Err(PetalSonicError::AudioDevice(
+                        "No selected output device is currently available".into(),
+                    ));
+                }
+                OutputPreparation::Failed(_) => {
+                    return Err(PetalSonicError::PermanentDeviceFailure(
+                        "Unsupported sample format".into(),
+                    ));
+                }
+            },
         };
-        let (device, device_config) = if let Some(prepared) = self.prepared_output_device.take() {
-            let PreparedOutputDevice {
-                device,
-                config,
-                _probe_stream,
-            } = prepared;
-            // Keep the selected device open across old-stream shutdown, then release
-            // the silent probe immediately before constructing the real stream.
-            drop(_probe_stream);
-            (device, config)
-        } else {
-            Self::init_audio_device(requested_device)?
-        };
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "Unknown output device".to_string());
-        let device_sample_rate = device_config.sample_rate().0;
-
-        self.device_sample_rate = device_sample_rate;
+        self.device_sample_rate = prepared.device.sample_rate;
         self.starting_buses = buses;
 
         log::info!(
@@ -462,51 +382,15 @@ impl PetalSonicEngine {
             self.master_gain_linear
         );
 
-        let buffer_size = Self::select_buffer_size(&device_config);
-        let physical_channels = device_config.channels();
-        let config = Self::create_stream_config(physical_channels, device_sample_rate, buffer_size);
-
         self.is_running.store(true, Ordering::Release);
-        self.stream_error.store(false, Ordering::Release);
-
-        let stream_result = self.build_stream(
-            &device,
-            &device_config,
-            &config,
-            device_sample_rate,
-            command_receivers.clone(),
-        );
-        let (stream, pump_state) = match stream_result {
-            Ok(result) => result,
-            Err(err) if !matches!(config.buffer_size, cpal::BufferSize::Default) => {
-                log::warn!(
-                    "PetalSonic failed to start stream with requested output buffer size ({}); retrying with the device default buffer size",
-                    err
-                );
-                let default_config = Self::create_stream_config(
-                    physical_channels,
-                    device_sample_rate,
-                    cpal::BufferSize::Default,
-                );
-                match self.build_stream(
-                    &device,
-                    &device_config,
-                    &default_config,
-                    device_sample_rate,
-                    command_receivers,
-                ) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.is_running.store(false, Ordering::Release);
-                        return Err(error);
-                    }
+        let (pump_state, callback) =
+            match self.create_output_session(prepared.device.sample_rate, command_receivers) {
+                Ok(session) => session,
+                Err(error) => {
+                    self.is_running.store(false, Ordering::Release);
+                    return Err(error);
                 }
-            }
-            Err(err) => {
-                self.is_running.store(false, Ordering::Release);
-                return Err(err);
-            }
-        };
+            };
 
         // Prefill before starting the device callback so normal startup does not begin
         // with a guaranteed underrun.
@@ -515,12 +399,13 @@ impl PetalSonicEngine {
             Self::pump_render_state(&mut state);
         }
 
-        if let Err(error) = stream.play() {
-            self.is_running.store(false, Ordering::Release);
-            return Err(PetalSonicError::AudioDevice(format!(
-                "Failed to start stream: {error}"
-            )));
-        }
+        let active_output = match self.output.open(prepared, callback) {
+            Ok(active) => active,
+            Err(error) => {
+                self.is_running.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
 
         let render_thread = match Self::spawn_render_thread(
             pump_state.clone(),
@@ -532,27 +417,26 @@ impl PetalSonicEngine {
             Ok(thread) => thread,
             Err(error) => {
                 self.is_running.store(false, Ordering::Release);
-                drop(stream);
+                let _ = self.output.stop();
                 return Err(error);
             }
         };
 
-        self.stream = Some(stream);
-        self.pump_state = Some(pump_state);
-        self.render_thread = Some(render_thread);
         if let Ok(mut current) = self.current_device_name.lock() {
-            *current = Some(device_name);
+            *current = Some(active_output.diagnostic_name.clone());
         }
         self.counters
             .output_sample_rate
-            .store(device_sample_rate as usize, Ordering::Relaxed);
+            .store(active_output.sample_rate as usize, Ordering::Relaxed);
         self.counters
             .output_channels
-            .store(physical_channels as usize, Ordering::Relaxed);
+            .store(active_output.physical_channels as usize, Ordering::Relaxed);
         self.counters
             .device_generation
             .fetch_add(1, Ordering::Relaxed);
-
+        self.active_output = Some(active_output);
+        self.pump_state = Some(pump_state);
+        self.render_thread = Some(render_thread);
         Ok(())
     }
 
@@ -582,423 +466,6 @@ impl PetalSonicEngine {
             })
     }
 
-    /// Initialize the audio device and retrieve its configuration
-    fn init_audio_device(
-        output_device_name_contains: Option<&str>,
-    ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
-        let host = cpal::default_host();
-        let device = match output_device_name_contains
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            Some(name_contains) => Self::find_output_device_by_name_contains(&host, name_contains)?,
-            None => host.default_output_device().ok_or_else(|| {
-                PetalSonicError::AudioDevice("No default output device available".into())
-            })?,
-        };
-
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "Unknown output device".to_string());
-        let device_config = device.default_output_config().map_err(|e| {
-            PetalSonicError::AudioDevice(format!(
-                "Failed to get default config for output device '{}': {}",
-                device_name, e
-            ))
-        })?;
-        let buffer_size = match device_config.buffer_size() {
-            cpal::SupportedBufferSize::Range { min, max } => {
-                format!("range {}..{} frames", min, max)
-            }
-            cpal::SupportedBufferSize::Unknown => "unknown".to_string(),
-        };
-
-        log::info!(
-            "PetalSonic output device: host={:?}, name='{}', sample_rate={} Hz, channels={}, format={:?}, buffer_size={}",
-            host.id(),
-            device_name,
-            device_config.sample_rate().0,
-            device_config.channels(),
-            device_config.sample_format(),
-            buffer_size
-        );
-
-        Ok((device, device_config))
-    }
-
-    fn find_output_device_by_name_contains(
-        host: &cpal::Host,
-        name_contains: &str,
-    ) -> Result<cpal::Device> {
-        let candidates = Self::output_device_candidates(host)?;
-        let mut matches: Vec<_> = candidates
-            .into_iter()
-            .filter(|candidate| Self::output_device_matches(&candidate.info, name_contains))
-            .collect();
-
-        if matches.is_empty() {
-            let available_devices = Self::output_device_candidates(host)?
-                .into_iter()
-                .map(|candidate| candidate.info)
-                .collect::<Vec<_>>();
-            return Err(PetalSonicError::AudioDevice(format!(
-                "No output device name or alias matches '{}'. Available output devices: {}",
-                name_contains,
-                Self::format_device_infos(&available_devices)
-            )));
-        }
-
-        let matched_devices: Vec<_> = matches
-            .iter()
-            .map(|candidate| candidate.info.clone())
-            .collect();
-        if matched_devices.len() > 1 {
-            log::warn!(
-                "PetalSonic output device substring '{}' matched multiple devices: {}; using {}",
-                name_contains,
-                Self::format_device_infos(&matched_devices),
-                Self::format_device_info(&matched_devices[0])
-            );
-        } else {
-            log::info!(
-                "PetalSonic output device substring '{}' matched {}",
-                name_contains,
-                Self::format_device_info(&matched_devices[0])
-            );
-        }
-
-        Ok(matches.remove(0).device)
-    }
-
-    fn output_device_candidates(host: &cpal::Host) -> Result<Vec<AudioOutputDeviceCandidate>> {
-        let default_name = host
-            .default_output_device()
-            .and_then(|device| device.name().ok());
-        let alsa_card_aliases = Self::alsa_card_aliases();
-        let output_devices = host.output_devices().map_err(|e| {
-            PetalSonicError::AudioDevice(format!("Failed to enumerate output devices: {}", e))
-        })?;
-
-        Ok(output_devices
-            .map(|device| {
-                let name = device
-                    .name()
-                    .unwrap_or_else(|_| "Unknown output device".to_string());
-                let aliases = Self::output_device_aliases(&name, &alsa_card_aliases);
-                let is_default = default_name.as_deref() == Some(name.as_str());
-                AudioOutputDeviceCandidate {
-                    device,
-                    info: AudioOutputDeviceInfo {
-                        name,
-                        is_default,
-                        aliases,
-                    },
-                }
-            })
-            .collect())
-    }
-
-    fn output_device_matches(info: &AudioOutputDeviceInfo, name_contains: &str) -> bool {
-        let requested = Self::normalize_device_name(name_contains);
-        if requested.is_empty() {
-            return false;
-        }
-
-        if Self::normalize_device_name(&info.name).contains(&requested) {
-            return true;
-        }
-
-        info.aliases.iter().any(|alias| {
-            let alias = Self::normalize_device_name(alias);
-            !alias.is_empty()
-                && (alias.contains(&requested) || alias.len() >= 3 && requested.contains(&alias))
-        })
-    }
-
-    fn output_device_aliases(
-        device_name: &str,
-        alsa_card_aliases: &HashMap<String, Vec<String>>,
-    ) -> Vec<String> {
-        let mut aliases = Vec::new();
-        for card_id in Self::alsa_card_ids_in_device_name(device_name) {
-            if let Some(card_aliases) = alsa_card_aliases.get(&card_id) {
-                aliases.extend(card_aliases.iter().cloned());
-            }
-        }
-        Self::dedup_strings(&mut aliases);
-        aliases
-    }
-
-    fn alsa_card_ids_in_device_name(device_name: &str) -> Vec<String> {
-        let mut ids = Vec::new();
-        let mut rest = device_name;
-        while let Some(index) = rest.find("CARD=") {
-            let after_card = &rest[index + "CARD=".len()..];
-            let id = after_card
-                .split(|ch: char| ch == ',' || ch == ':' || ch.is_whitespace())
-                .next()
-                .unwrap_or("")
-                .trim();
-            if !id.is_empty() {
-                ids.push(id.to_string());
-            }
-            rest = &after_card[id.len()..];
-        }
-        Self::dedup_strings(&mut ids);
-        ids
-    }
-
-    #[cfg(target_os = "linux")]
-    fn alsa_card_aliases() -> HashMap<String, Vec<String>> {
-        Self::parse_alsa_card_aliases(Path::new("/proc/asound/cards"))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn alsa_card_aliases() -> HashMap<String, Vec<String>> {
-        HashMap::new()
-    }
-
-    fn parse_alsa_card_aliases(path: &Path) -> HashMap<String, Vec<String>> {
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            return HashMap::new();
-        };
-
-        let mut aliases_by_id = HashMap::new();
-        let mut lines = contents.lines();
-        while let Some(line) = lines.next() {
-            let Some(open) = line.find('[') else {
-                continue;
-            };
-            let Some(close) = line[open + 1..].find(']').map(|offset| open + 1 + offset) else {
-                continue;
-            };
-            let card_id = line[open + 1..close].trim();
-            if card_id.is_empty() {
-                continue;
-            }
-
-            let mut aliases = vec![card_id.to_string()];
-            if let Some((_, display_name)) = line.split_once(" - ") {
-                aliases.push(display_name.trim().to_string());
-            }
-            if let Some(detail_line) = lines.next() {
-                let detail = detail_line
-                    .trim()
-                    .split_once(" at ")
-                    .map(|(name, _)| name)
-                    .unwrap_or_else(|| detail_line.trim());
-                if !detail.is_empty() {
-                    aliases.push(detail.to_string());
-                }
-            }
-
-            Self::dedup_strings(&mut aliases);
-            aliases_by_id.insert(card_id.to_string(), aliases);
-        }
-
-        aliases_by_id
-    }
-
-    fn dedup_strings(values: &mut Vec<String>) {
-        let mut seen = Vec::new();
-        values.retain(|value| {
-            let normalized = Self::normalize_device_name(value);
-            if normalized.is_empty() || seen.contains(&normalized) {
-                false
-            } else {
-                seen.push(normalized);
-                true
-            }
-        });
-    }
-
-    fn normalize_device_name(name: &str) -> String {
-        name.trim().to_lowercase()
-    }
-
-    fn format_device_infos(devices: &[AudioOutputDeviceInfo]) -> String {
-        if devices.is_empty() {
-            return "<none>".to_string();
-        }
-
-        devices
-            .iter()
-            .map(Self::format_device_info)
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    fn format_device_info(device: &AudioOutputDeviceInfo) -> String {
-        let default_marker = if device.is_default { " (default)" } else { "" };
-        if device.aliases.is_empty() {
-            return format!("'{}'{}", device.name, default_marker);
-        }
-
-        format!(
-            "'{}'{} (aliases: {})",
-            device.name,
-            default_marker,
-            device
-                .aliases
-                .iter()
-                .map(|alias| format!("'{}'", alias))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-
-    /// Create the stream configuration
-    fn create_stream_config(
-        channels: u16,
-        device_sample_rate: u32,
-        buffer_size: cpal::BufferSize,
-    ) -> cpal::StreamConfig {
-        cpal::StreamConfig {
-            channels,
-            sample_rate: cpal::SampleRate(device_sample_rate),
-            buffer_size,
-        }
-    }
-
-    fn select_buffer_size(device_config: &cpal::SupportedStreamConfig) -> cpal::BufferSize {
-        let Some(requested) = Self::requested_buffer_size() else {
-            log::info!("PetalSonic using default output buffer size");
-            return cpal::BufferSize::Default;
-        };
-
-        let chosen = match device_config.buffer_size() {
-            cpal::SupportedBufferSize::Range { min, max } => {
-                let clamped = requested.clamp(*min, *max);
-                if clamped != requested {
-                    log::warn!(
-                        "PetalSonic output buffer size {} frames outside supported range {}..{}, clamping to {}",
-                        requested,
-                        min,
-                        max,
-                        clamped
-                    );
-                }
-                clamped
-            }
-            cpal::SupportedBufferSize::Unknown => requested,
-        };
-
-        log::info!("PetalSonic forcing output buffer size: {} frames", chosen);
-        cpal::BufferSize::Fixed(chosen)
-    }
-
-    fn requested_buffer_size() -> Option<u32> {
-        const ENV_KEY: &str = "PETALSONIC_BUFFER_SIZE";
-
-        if let Ok(value) = std::env::var(ENV_KEY) {
-            if let Ok(parsed) = value.parse::<u32>()
-                && parsed > 0
-            {
-                return Some(parsed);
-            }
-
-            log::warn!(
-                "Invalid {} value '{}', falling back to platform defaults",
-                ENV_KEY,
-                value
-            );
-        }
-
-        Self::platform_default_buffer_size()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn platform_default_buffer_size() -> Option<u32> {
-        // Keep Linux fallback at 256 frames. Smaller fixed periods (e.g. 128 at 44.1 kHz)
-        // can push ALSA/bridge backends over their scheduling budget, which may trigger
-        // backend XRUN recovery artifacts (echo/phasey repeats, crackles) even when our
-        // own ring buffer does not report an underrun.
-        Some(1024)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn platform_default_buffer_size() -> Option<u32> {
-        None
-    }
-
-    /// Build an audio stream. Starting it is deliberately separate so the render
-    /// buffer can be prefilled before the first device callback.
-    fn build_stream(
-        &mut self,
-        device: &cpal::Device,
-        device_config: &cpal::SupportedStreamConfig,
-        config: &cpal::StreamConfig,
-        device_sample_rate: u32,
-        command_receivers: EngineCommandReceivers,
-    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>)> {
-        let is_running = self.is_running.clone();
-        let frames_processed = self.frames_processed.clone();
-        let world_sample_rate = self.desc.sample_rate;
-        let channels = LOGICAL_CHANNELS;
-        let active_playback = self.active_playback.clone();
-        let event_sender = self.event_sender.clone();
-        let voice_telemetry_sender = self.voice_telemetry_sender.clone();
-        let timing_sender = self.timing_sender.clone();
-
-        let result = match device_config.sample_format() {
-            cpal::SampleFormat::F32 => self.create_stream::<f32>(
-                device,
-                config,
-                StreamCreationParams {
-                    is_running,
-                    frames_processed,
-                    world_sample_rate,
-                    device_sample_rate,
-                    channels,
-                    active_playback,
-                    command_receivers: command_receivers.clone(),
-                    event_sender,
-                    voice_telemetry_sender,
-                    timing_sender,
-                },
-            )?,
-            cpal::SampleFormat::I16 => self.create_stream::<i16>(
-                device,
-                config,
-                StreamCreationParams {
-                    is_running,
-                    frames_processed,
-                    world_sample_rate,
-                    device_sample_rate,
-                    channels,
-                    active_playback,
-                    command_receivers: command_receivers.clone(),
-                    event_sender,
-                    voice_telemetry_sender,
-                    timing_sender,
-                },
-            )?,
-            cpal::SampleFormat::U16 => self.create_stream::<u16>(
-                device,
-                config,
-                StreamCreationParams {
-                    is_running,
-                    frames_processed,
-                    world_sample_rate,
-                    device_sample_rate,
-                    channels,
-                    active_playback,
-                    command_receivers,
-                    event_sender,
-                    voice_telemetry_sender,
-                    timing_sender,
-                },
-            )?,
-            _ => {
-                return Err(PetalSonicError::PermanentDeviceFailure(
-                    "Unsupported sample format".into(),
-                ));
-            }
-        };
-
-        Ok(result)
-    }
-
     /// Stop the audio engine
     pub(crate) fn stop(&mut self) -> Result<()> {
         self.is_running.store(false, Ordering::Release);
@@ -1010,11 +477,11 @@ impl PetalSonicEngine {
             })?;
         }
 
-        // Dropping the CPAL stream stops future callbacks. The producer is already
-        // quiescent, so no callback can race runtime teardown after this point.
-        drop(self.stream.take());
+        // The adapter returns only after the physical callback/stream is quiescent.
+        self.output.stop()?;
 
         self.pump_state = None;
+        self.active_output = None;
         self.drain_retired_backend_resources();
         if let Ok(mut current) = self.current_device_name.lock() {
             *current = None;
@@ -1028,26 +495,11 @@ impl PetalSonicEngine {
     }
 
     pub(crate) fn output_recovery_reason(&self) -> Option<OutputRecoveryReason> {
-        if !self.is_running() || self.stream_error.load(Ordering::Acquire) {
+        let Some(active) = &self.active_output else {
             return Some(OutputRecoveryReason::StreamFailure);
-        }
-        if !matches!(
-            self.desc.output_device,
-            OutputDevicePolicy::FollowSystemDefault
-        ) {
-            return None;
-        }
-
-        let default_name = cpal::default_host()
-            .default_output_device()
-            .and_then(|device| device.name().ok());
-        self.current_device_name
-            .lock()
-            .map(|current| {
-                (default_name.as_deref() != current.as_deref())
-                    .then_some(OutputRecoveryReason::SelectionChanged)
-            })
-            .unwrap_or(Some(OutputRecoveryReason::SelectionChanged))
+        };
+        self.output
+            .recovery_reason(&self.desc.output_device, active)
     }
 
     /// Opens the newly selected device before the current output is released.
@@ -1056,60 +508,57 @@ impl PetalSonicEngine {
     /// and negotiated format after the old stream has stopped, avoiding a second
     /// default-device lookup during the handoff.
     pub(crate) fn prepare_selected_output(&mut self) -> OutputPreparation {
-        let requested_device = match &self.desc.output_device {
-            OutputDevicePolicy::FollowSystemDefault => None,
-            OutputDevicePolicy::PinnedNameContains(name) => Some(name.as_str()),
-        };
-        let Ok((device, config)) = Self::init_audio_device(requested_device) else {
-            return OutputPreparation::Unavailable;
-        };
-        let stream_config = Self::create_stream_config(
-            config.channels(),
-            config.sample_rate().0,
-            cpal::BufferSize::Default,
-        );
-        let probe = match config.sample_format() {
-            cpal::SampleFormat::F32 => Self::build_silent_probe::<f32>(&device, &stream_config),
-            cpal::SampleFormat::I16 => Self::build_silent_probe::<i16>(&device, &stream_config),
-            cpal::SampleFormat::U16 => Self::build_silent_probe::<u16>(&device, &stream_config),
-            _ => return OutputPreparation::Unavailable,
-        };
-        let Ok(probe_stream) = probe else {
-            // Some platform backends cannot hold two output streams at once. The
-            // supervisor will perform the documented stop-then-rebuild fallback.
-            return OutputPreparation::RequiresStop;
-        };
-        self.prepared_output_device = Some(PreparedOutputDevice {
-            device,
-            config,
-            _probe_stream: probe_stream,
-        });
-        OutputPreparation::Ready
+        let preparation = self.output.prepare(&self.desc.output_device);
+        if let OutputPreparation::Ready(prepared) = &preparation {
+            self.prepared_output = Some(prepared.clone());
+        }
+        preparation
     }
 
-    fn build_silent_probe<T>(
-        device: &cpal::Device,
-        config: &cpal::StreamConfig,
-    ) -> Result<cpal::Stream>
-    where
-        T: SizedSample + FromSample<f32>,
-    {
-        device
-            .build_output_stream(
-                config,
-                move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                    for sample in data {
-                        *sample = T::from_sample(0.0);
+    pub(crate) fn reconcile_output(
+        &mut self,
+        command_receivers: &EngineCommandReceivers,
+        buses: &mut Vec<BusParams>,
+        request: OutputRecoveryRequest,
+    ) -> OutputRecoveryResult {
+        if self.is_running() {
+            if !request.probe {
+                return OutputRecoveryResult::Stable;
+            }
+            match self.output_recovery_reason() {
+                None => return OutputRecoveryResult::Stable,
+                Some(OutputRecoveryReason::SelectionChanged) => {
+                    if matches!(
+                        self.prepare_selected_output(),
+                        OutputPreparation::Unavailable
+                    ) {
+                        return OutputRecoveryResult::Stable;
                     }
-                },
-                move |_error| {},
-                None,
-            )
-            .map_err(|error| {
-                PetalSonicError::AudioDevice(format!(
-                    "Failed to open selected output device: {error}"
-                ))
-            })
+                }
+                Some(OutputRecoveryReason::StreamFailure) => {}
+            }
+            if self.stop().is_err() {
+                return OutputRecoveryResult::Failed;
+            }
+        }
+
+        self.advance_without_output(command_receivers, buses, request.elapsed_without_output);
+        if !request.retry_now {
+            return OutputRecoveryResult::Recovering;
+        }
+        match self.start(command_receivers.clone(), buses.clone()) {
+            Ok(()) => OutputRecoveryResult::Running(
+                self.active_output
+                    .clone()
+                    .expect("successful output start publishes typed device state"),
+            ),
+            Err(
+                PetalSonicError::AudioFormat(_)
+                | PetalSonicError::PermanentDeviceFailure(_)
+                | PetalSonicError::BackendUnavailable { .. },
+            ) => OutputRecoveryResult::Failed,
+            Err(_) => OutputRecoveryResult::Recovering,
+        }
     }
 
     pub(crate) fn emit_runtime_state(&self, state: RuntimeState) {
@@ -1226,57 +675,22 @@ impl PetalSonicEngine {
         }
     }
 
-    /// Create a typed audio stream
-    fn create_stream<T>(
+    fn create_output_session(
         &self,
-        device: &cpal::Device,
-        config: &cpal::StreamConfig,
-        params: StreamCreationParams,
-    ) -> Result<(cpal::Stream, Arc<Mutex<PumpState>>)>
-    where
-        T: SizedSample + FromSample<f32>,
-    {
-        let block_size = self.desc.block_size;
+        device_sample_rate: u32,
+        command_receivers: EngineCommandReceivers,
+    ) -> Result<(Arc<Mutex<PumpState>>, OutputCallback)> {
+        let channels = LOGICAL_CHANNELS;
         let resampler = Self::create_resampler(
-            params.world_sample_rate,
-            params.device_sample_rate,
-            params.channels,
-            block_size,
+            self.desc.sample_rate,
+            device_sample_rate,
+            channels,
+            self.desc.block_size,
         )?;
-
-        // ============================================================================
-        // Ring Buffer Setup: Lock-Free Audio Thread Communication
-        // ============================================================================
-        // The ring buffer decouples audio generation from audio consumption:
-        //
-        // - RENDER THREAD (producer): Generates audio samples at its own pace, mixing
-        //   and spatializing audio sources, then pushes samples to the ring buffer.
-        //   Can take locks and perform complex processing without blocking audio.
-        //
-        // - AUDIO CALLBACK (consumer): Runs on real-time audio thread with strict
-        //   timing requirements. Simply pops pre-rendered samples from ring buffer
-        //   (lock-free operation). If buffer is empty, outputs silence (underrun).
-        //
-        // Benefits:
-        // - Real-time safety: Audio callback never blocks on locks or complex processing
-        // - Buffer against timing jitter: Render thread can work ahead to prevent underruns
-        // - Performance isolation: Expensive processing happens off the audio thread
-        //
-        // The ring buffer stores frames at the device sample rate (after
-        // resampling), not the world sample rate.
-        //
-        // Size calculation: Must be large enough to buffer during render thread delays,
-        // but not so large that it introduces noticeable latency.
-
-        let ring_buffer_size = block_size * self.schedule.ring_blocks;
-        let ring_buffer = HeapRb::<StereoFrame>::new(ring_buffer_size);
-
-        // Split ring buffer into producer (render thread) and consumer (device callback)
-        // This is lock-free! Each thread gets exclusive ownership of its half.
-        let (producer, consumer) = ring_buffer.split();
-
+        let ring_buffer_size = self.desc.block_size * self.schedule.ring_blocks;
+        let (producer, consumer) = HeapRb::<StereoFrame>::new(ring_buffer_size).split();
         let pump_state = Arc::new(Mutex::new(PumpState {
-            active_playback: params.active_playback.clone(),
+            active_playback: self.active_playback.clone(),
             active_voice_count: self.active_voice_count.clone(),
             retirement_sender: self.retirement_sender.clone(),
             latest_spatial_frame: self.latest_spatial_frame.clone(),
@@ -1288,73 +702,44 @@ impl PetalSonicEngine {
             acoustic_response_retirement_sender: self.acoustic_response_retirement_sender.clone(),
             acoustic_voice_input: self.acoustic_voice_input.clone(),
             acoustic_scene_version: self.acoustic_scene_version.clone(),
-            resampler: resampler.clone(),
+            resampler,
             ring_buffer_producer: producer,
-            channels: config.channels,
-            block_size,
+            channels,
+            block_size: self.desc.block_size,
             spatial_processor: self.spatial_processor.clone(),
-            command_receivers: params.command_receivers,
+            command_receivers,
             listener_pose: self.listener_pose.clone(),
-            event_sender: params.event_sender,
-            voice_telemetry_sender: params.voice_telemetry_sender,
-            timing_sender: params.timing_sender,
+            event_sender: self.event_sender.clone(),
+            voice_telemetry_sender: self.voice_telemetry_sender.clone(),
+            timing_sender: self.timing_sender.clone(),
             master_gain_linear: self.master_gain_linear,
             buses: self.starting_buses.clone(),
             schedule: self.schedule,
             mixer_scratch: mixer::MixerScratch::new(self.desc.max_voices),
             completed_playbacks: Vec::with_capacity(self.desc.max_voices),
-            world_buffer: vec![0.0; block_size * params.channels as usize],
+            world_buffer: vec![0.0; self.desc.block_size * channels as usize],
             resampled_buffer: vec![
                 0.0;
-                ((block_size as f64 * params.device_sample_rate as f64
-                    / params.world_sample_rate as f64)
+                ((self.desc.block_size as f64 * device_sample_rate as f64
+                    / self.desc.sample_rate as f64)
                     .ceil() as usize
                     + 10)
-                    * params.channels as usize
+                    * channels as usize
             ],
             counters: self.counters.clone(),
             backend_retirement_sender: self.backend_retirement_sender.clone(),
             pending_backend_retirements: Vec::with_capacity(self.desc.max_voices),
             render_block_index: 0,
         }));
-
-        // Create context for audio callback (simplified - just consumes from ring buffer)
-        let mut context = AudioCallbackContext {
-            is_running: params.is_running,
-            frames_processed: params.frames_processed,
-            underrun_count: self.underrun_count.clone(),
-            ring_buffer_consumer: consumer,
-            channels: params.channels,
-            startup_underrun_callbacks_remaining: STARTUP_UNDERRUN_GRACE_CALLBACKS,
-            fade_in_remaining_frames: (params.device_sample_rate as usize
-                * OUTPUT_FADE_IN_MILLISECONDS
-                / 1000)
-                .max(1),
-            fade_in_total_frames: (params.device_sample_rate as usize
-                * OUTPUT_FADE_IN_MILLISECONDS
-                / 1000)
-                .max(1),
-        };
-
-        let stream_error = self.stream_error.clone();
-
-        let stream = device
-            .build_output_stream(
-                config,
-                move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                    Self::audio_callback(data, &mut context);
-                },
-                move |_err| {
-                    // Error formatting and recovery happen on the runtime thread.
-                    stream_error.store(true, Ordering::Release);
-                },
-                None,
-            )
-            .map_err(|e| PetalSonicError::AudioDevice(format!("Failed to build stream: {}", e)))?;
-
-        Ok((stream, pump_state))
+        let callback = OutputCallback::new(
+            self.is_running.clone(),
+            self.frames_processed.clone(),
+            self.underrun_count.clone(),
+            consumer,
+            device_sample_rate,
+        );
+        Ok((pump_state, callback))
     }
-
     fn pump_render_state(ctx: &mut PumpState) {
         // Bounded refill policy:
         // - aim to keep roughly 3 blocks buffered
@@ -1646,83 +1031,6 @@ impl PetalSonicEngine {
             Some(ResamplerType::Fast),
         )?;
         Ok(Arc::new(Mutex::new(resampler)))
-    }
-
-    /// Main audio callback that fills the output buffer
-    ///
-    /// CRITICAL: This runs on the real-time audio thread with strict timing requirements.
-    /// It MUST complete quickly and MUST NOT block on locks or perform heavy processing.
-    ///
-    /// This callback only consumes pre-rendered samples from the ring buffer (lock-free
-    /// operation). If the ring buffer is empty, it outputs silence and logs an underrun
-    /// warning. All actual audio processing happens in the separate render thread.
-    ///
-    /// Playback command processing has been moved to the render thread to avoid blocking
-    /// on world locks in this realtime-critical callback.
-    fn audio_callback<T>(data: &mut [T], ctx: &mut AudioCallbackContext)
-    where
-        T: SizedSample + FromSample<f32>,
-    {
-        let channels_usize = ctx.channels as usize;
-        let device_frames = data.len() / channels_usize;
-
-        // If not running, fill silence
-        if !ctx.is_running.load(Ordering::Relaxed) {
-            Self::fill_silence(data);
-            return;
-        }
-
-        // Consume samples from ring buffer to fill output (lock-free!)
-        // This is the only audio generation that happens on the real-time thread
-        let mut samples_consumed = 0;
-        for i in 0..device_frames {
-            if let Some(frame) = ctx.ring_buffer_consumer.try_pop() {
-                let fade_gain = if ctx.fade_in_remaining_frames > 0 {
-                    let completed = ctx
-                        .fade_in_total_frames
-                        .saturating_sub(ctx.fade_in_remaining_frames);
-                    ctx.fade_in_remaining_frames -= 1;
-                    completed as f32 / ctx.fade_in_total_frames.max(1) as f32
-                } else {
-                    1.0
-                };
-                let frame_start = i * channels_usize;
-                if channels_usize == 1 {
-                    data[frame_start] =
-                        T::from_sample((frame.left + frame.right) * 0.5 * fade_gain);
-                } else {
-                    data[frame_start] = T::from_sample(frame.left * fade_gain);
-                    data[frame_start + 1] = T::from_sample(frame.right * fade_gain);
-                    for sample in &mut data[frame_start + 2..frame_start + channels_usize] {
-                        *sample = T::from_sample(0.0);
-                    }
-                }
-                samples_consumed += 1;
-            } else {
-                // Not enough samples in ring buffer, fill rest with silence
-                // This indicates the render thread is falling behind
-                if ctx.startup_underrun_callbacks_remaining > 0 {
-                    ctx.startup_underrun_callbacks_remaining -= 1;
-                } else {
-                    ctx.underrun_count.fetch_add(1, Ordering::Relaxed);
-                }
-                data[i * channels_usize..].fill(T::from_sample(0.0f32));
-                break;
-            }
-        }
-
-        ctx.frames_processed
-            .fetch_add(samples_consumed, Ordering::Relaxed);
-    }
-
-    /// Fill buffer with silence
-    fn fill_silence<T>(data: &mut [T])
-    where
-        T: SizedSample + FromSample<f32>,
-    {
-        for sample in data.iter_mut() {
-            *sample = T::from_sample(0.0f32);
-        }
     }
 
     /// Process playback commands from the world and updates the active playback instances.
@@ -2118,6 +1426,7 @@ pub(crate) mod tests {
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::SourceConfig;
     use crate::playback::LoopMode;
+    use ringbuf::traits::Consumer;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
@@ -2218,112 +1527,6 @@ pub(crate) mod tests {
         assert_eq!(counters.event_queue_high_water.load(Ordering::Relaxed), 0);
         assert_eq!(counters.dropped_events.load(Ordering::Relaxed), 0);
     }
-
-    #[test]
-    fn device_callback_and_error_signal_do_not_allocate_or_free() {
-        let ring_buffer = HeapRb::<StereoFrame>::new(8);
-        let (mut producer, consumer) = ring_buffer.split();
-        for _ in 0..4 {
-            producer
-                .try_push(StereoFrame {
-                    left: 0.5,
-                    right: -0.5,
-                })
-                .unwrap();
-        }
-        let mut context = AudioCallbackContext {
-            is_running: Arc::new(AtomicBool::new(true)),
-            frames_processed: Arc::new(AtomicUsize::new(0)),
-            underrun_count: Arc::new(AtomicUsize::new(0)),
-            ring_buffer_consumer: consumer,
-            channels: 2,
-            startup_underrun_callbacks_remaining: 0,
-            fade_in_remaining_frames: 0,
-            fade_in_total_frames: 1,
-        };
-        let mut output = [0.0f32; 8];
-        let stream_error = AtomicBool::new(false);
-
-        let activity = callback_memory_activity(|| {
-            PetalSonicEngine::audio_callback(&mut output, &mut context);
-            // This is exactly the CPAL stream-error callback operation.
-            stream_error.store(true, Ordering::Release);
-        });
-
-        assert_eq!(activity, 0);
-        assert_eq!(output, [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5]);
-        assert!(stream_error.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn device_callback_maps_logical_stereo_to_physical_layout() {
-        let ring_buffer = HeapRb::<StereoFrame>::new(2);
-        let (mut producer, consumer) = ring_buffer.split();
-        producer
-            .try_push(StereoFrame {
-                left: 0.75,
-                right: -0.25,
-            })
-            .unwrap();
-        let mut context = AudioCallbackContext {
-            is_running: Arc::new(AtomicBool::new(true)),
-            frames_processed: Arc::new(AtomicUsize::new(0)),
-            underrun_count: Arc::new(AtomicUsize::new(0)),
-            ring_buffer_consumer: consumer,
-            channels: 6,
-            startup_underrun_callbacks_remaining: 0,
-            fade_in_remaining_frames: 0,
-            fade_in_total_frames: 1,
-        };
-        let mut output = [1.0f32; 6];
-
-        PetalSonicEngine::audio_callback(&mut output, &mut context);
-
-        assert_eq!(output, [0.75, -0.25, 0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn alsa_card_alias_parser_extracts_card_id_and_display_names() {
-        let path = std::env::temp_dir().join(format!(
-            "petalsonic-asound-cards-test-{}.txt",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            " 4 [KA3            ]: USB-Audio - FiiO KA3\n                      FiiO FiiO KA3 at usb-0000:00:14.0-11, high speed\n",
-        )
-        .unwrap();
-
-        let aliases = PetalSonicEngine::parse_alsa_card_aliases(&path);
-        let ka3_aliases = aliases.get("KA3").unwrap();
-        assert_eq!(
-            ka3_aliases,
-            &vec![
-                "KA3".to_string(),
-                "FiiO KA3".to_string(),
-                "FiiO FiiO KA3".to_string(),
-            ]
-        );
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn output_device_matching_accepts_linux_alias_and_pipewire_style_name() {
-        let device = AudioOutputDeviceInfo {
-            name: "sysdefault:CARD=KA3".to_string(),
-            is_default: false,
-            aliases: vec!["KA3".to_string(), "FiiO KA3".to_string()],
-        };
-
-        assert!(PetalSonicEngine::output_device_matches(&device, "ka3"));
-        assert!(PetalSonicEngine::output_device_matches(
-            &device,
-            "FiiO KA3 Analog Stereo"
-        ));
-        assert!(!PetalSonicEngine::output_device_matches(&device, "EX2050S"));
-    }
-
     #[test]
     fn public_quality_profiles_resolve_to_fixed_internal_plans() {
         let mut desc = PetalSonicWorldDesc {

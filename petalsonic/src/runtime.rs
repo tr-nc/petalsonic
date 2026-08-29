@@ -721,7 +721,7 @@ impl AudioRuntime {
                 schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
                 driver.emit_runtime_state(RuntimeState::Running);
             }
-            OutputRecoveryResult::Recovering => {
+            OutputRecoveryResult::Recovering(_cause) => {
                 if state == RuntimeState::Running {
                     runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
                     driver.emit_runtime_state(RuntimeState::Recovering);
@@ -730,7 +730,7 @@ impl AudioRuntime {
                     schedule.next_retry = now + OUTPUT_RETRY_INTERVAL;
                 }
             }
-            OutputRecoveryResult::Failed => {
+            OutputRecoveryResult::Failed(_failure) => {
                 if state == RuntimeState::Running {
                     driver.emit_runtime_state(RuntimeState::Recovering);
                 }

@@ -1082,13 +1082,19 @@ mod tests {
                 self.one_shot_remaining_frames -= frames;
             }
             if !request.retry_now {
-                return OutputRecoveryResult::Recovering;
+                return OutputRecoveryResult::Recovering(
+                    crate::platform::output::OutputRecoveryCause::DeviceUnavailable,
+                );
             }
             if self.permanent_format_failure {
-                return OutputRecoveryResult::Failed;
+                return OutputRecoveryResult::Failed(
+                    crate::platform::output::OutputFailure::UnsupportedSampleFormat,
+                );
             }
             let Some(selected) = self.prepared.take().or(self.selected) else {
-                return OutputRecoveryResult::Recovering;
+                return OutputRecoveryResult::Recovering(
+                    crate::platform::output::OutputRecoveryCause::DeviceUnavailable,
+                );
             };
             self.active = Some(selected);
             self.stream_failed = false;

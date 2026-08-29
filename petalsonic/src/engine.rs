@@ -10,8 +10,9 @@ use crate::events::{
 use crate::math::Pose;
 use crate::mixer;
 use crate::platform::output::{
-    OutputCallback, OutputDeviceState, OutputPlatform, OutputPreparation, OutputRecoveryReason,
-    OutputRecoveryRequest, OutputRecoveryResult, PreparedOutput, StereoFrame,
+    OutputCallback, OutputDeviceState, OutputFailure, OutputPlatform, OutputPreparation,
+    OutputRecoveryCause, OutputRecoveryReason, OutputRecoveryRequest, OutputRecoveryResult,
+    PreparedOutput, StereoFrame,
 };
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, VoiceStart};
 use crate::spatial::{
@@ -538,13 +539,13 @@ impl PetalSonicEngine {
                 Some(OutputRecoveryReason::StreamFailure) => {}
             }
             if self.stop().is_err() {
-                return OutputRecoveryResult::Failed;
+                return OutputRecoveryResult::Failed(OutputFailure::PlatformLifecycle);
             }
         }
 
         self.advance_without_output(command_receivers, buses, request.elapsed_without_output);
         if !request.retry_now {
-            return OutputRecoveryResult::Recovering;
+            return OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable);
         }
         match self.start(command_receivers.clone(), buses.clone()) {
             Ok(()) => OutputRecoveryResult::Running(
@@ -556,8 +557,8 @@ impl PetalSonicEngine {
                 PetalSonicError::AudioFormat(_)
                 | PetalSonicError::PermanentDeviceFailure(_)
                 | PetalSonicError::BackendUnavailable { .. },
-            ) => OutputRecoveryResult::Failed,
-            Err(_) => OutputRecoveryResult::Recovering,
+            ) => OutputRecoveryResult::Failed(OutputFailure::UnsupportedSampleFormat),
+            Err(_) => OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable),
         }
     }
 

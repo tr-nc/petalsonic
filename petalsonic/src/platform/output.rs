@@ -42,8 +42,13 @@ pub(crate) struct OutputRecoveryRequest {
 pub(crate) enum OutputRecoveryResult {
     Stable,
     Running(OutputDeviceState),
-    Recovering,
-    Failed,
+    Recovering(OutputRecoveryCause),
+    Failed(OutputFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputRecoveryCause {
+    DeviceUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +68,7 @@ pub(crate) enum OutputPreparation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputFailure {
     UnsupportedSampleFormat,
+    PlatformLifecycle,
 }
 
 /// The internal seam between logical stereo rendering and physical output.

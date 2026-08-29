@@ -6,10 +6,7 @@ use crate::domain::{
     BusParams, DirectPath, Emitter, EnvironmentSend, OcclusionProfile, PlayCommandId, PlaybackTag,
     SourceExtent, SpatialFrame, VoiceId,
 };
-use crate::engine::{
-    EngineCommandReceivers, EngineObservability, EngineStartup, OutputRecoveryReason,
-    PetalSonicEngine,
-};
+use crate::engine::{EngineCommandReceivers, EngineObservability, EngineStartup, PetalSonicEngine};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
     AcousticTelemetryDiagnostics, AcousticTelemetryEvent, PetalSonicEvent, RenderTimingEvent,
@@ -17,6 +14,9 @@ use crate::events::{
     VoiceTelemetryEvent,
 };
 use crate::math::Pose;
+use crate::platform::output::{
+    CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
+};
 use crate::playback::{LoopMode, PlaybackCommand};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -116,29 +116,14 @@ impl RuntimeIntent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutputPreparation {
-    Ready,
-    Unavailable,
-    RequiresStop,
-}
-
 pub(crate) trait OutputRuntimeDriver {
     fn drain_retired_resources(&mut self);
-    fn output_recovery_reason(&self) -> Option<OutputRecoveryReason>;
-    fn prepare_selected_output(&mut self) -> OutputPreparation;
-    fn stop_output(&mut self) -> Result<()>;
-    fn advance_without_output(
+    fn reconcile_output(
         &mut self,
         commands: &EngineCommandReceivers,
-        buses: &mut [BusParams],
-        elapsed: Duration,
-    );
-    fn start_output(
-        &mut self,
-        commands: EngineCommandReceivers,
-        buses: Vec<BusParams>,
-    ) -> Result<()>;
+        buses: &mut Vec<BusParams>,
+        request: OutputRecoveryRequest,
+    ) -> OutputRecoveryResult;
     fn emit_runtime_state(&self, state: RuntimeState);
 }
 
@@ -147,33 +132,13 @@ impl OutputRuntimeDriver for PetalSonicEngine {
         PetalSonicEngine::drain_retired_backend_resources(self);
     }
 
-    fn output_recovery_reason(&self) -> Option<OutputRecoveryReason> {
-        PetalSonicEngine::output_recovery_reason(self)
-    }
-
-    fn prepare_selected_output(&mut self) -> OutputPreparation {
-        PetalSonicEngine::prepare_selected_output(self)
-    }
-
-    fn stop_output(&mut self) -> Result<()> {
-        PetalSonicEngine::stop(self)
-    }
-
-    fn advance_without_output(
+    fn reconcile_output(
         &mut self,
         commands: &EngineCommandReceivers,
-        buses: &mut [BusParams],
-        elapsed: Duration,
-    ) {
-        PetalSonicEngine::advance_without_output(self, commands, buses, elapsed);
-    }
-
-    fn start_output(
-        &mut self,
-        commands: EngineCommandReceivers,
-        buses: Vec<BusParams>,
-    ) -> Result<()> {
-        PetalSonicEngine::start(self, commands, buses)
+        buses: &mut Vec<BusParams>,
+        request: OutputRecoveryRequest,
+    ) -> OutputRecoveryResult {
+        PetalSonicEngine::reconcile_output(self, commands, buses, request)
     }
 
     fn emit_runtime_state(&self, state: RuntimeState) {
@@ -235,9 +200,24 @@ pub(crate) struct AudioRuntime {
 
 impl AudioRuntime {
     pub(crate) fn start(config: &PetalSonicWorldDesc) -> Result<Self> {
-        #[cfg(target_os = "windows")]
-        crate::platform::ensure_audio_context()?;
+        Self::start_with_output_factory(
+            config,
+            Box::new(|| Ok(Box::new(CpalOutputPlatform::new()?) as Box<dyn OutputPlatform>)),
+        )
+    }
 
+    #[cfg(test)]
+    pub(crate) fn start_with_output(
+        config: &PetalSonicWorldDesc,
+        output: impl FnOnce() -> Result<Box<dyn OutputPlatform>> + Send + 'static,
+    ) -> Result<Self> {
+        Self::start_with_output_factory(config, Box::new(output))
+    }
+
+    fn start_with_output_factory(
+        config: &PetalSonicWorldDesc,
+        output: Box<dyn FnOnce() -> Result<Box<dyn OutputPlatform>> + Send>,
+    ) -> Result<Self> {
         let (command_sender, command_receiver) =
             crossbeam_channel::bounded(config.control_queue_capacity);
         let (lifecycle_sender, lifecycle_receiver) =
@@ -313,6 +293,7 @@ impl AudioRuntime {
         let supervisor_stop = Arc::new(AtomicBool::new(false));
         let supervisor_thread = Self::spawn_output_supervisor(
             startup,
+            output,
             EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
             bus_params.clone(),
             runtime_state.clone(),
@@ -695,75 +676,73 @@ impl AudioRuntime {
     ) {
         driver.drain_retired_resources();
         let state = Self::load_runtime_state(runtime_state);
-        let recovery_reason = (state == RuntimeState::Running && now >= schedule.next_health_probe)
-            .then(|| driver.output_recovery_reason())
-            .flatten();
-        let selection_preparation = matches!(
-            recovery_reason,
-            Some(OutputRecoveryReason::SelectionChanged)
-        )
-        .then(|| driver.prepare_selected_output());
-        let should_recover = state == RuntimeState::Recovering
-            || matches!(recovery_reason, Some(OutputRecoveryReason::StreamFailure))
-            || matches!(
-                selection_preparation,
-                Some(OutputPreparation::Ready | OutputPreparation::RequiresStop)
-            );
-
-        if state == RuntimeState::Running && now >= schedule.next_health_probe {
-            schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
-        }
-        if !should_recover {
+        let probe = state == RuntimeState::Running && now >= schedule.next_health_probe;
+        if state == RuntimeState::Running && !probe {
             return;
         }
-        if Self::load_runtime_state(runtime_state) == RuntimeState::Running {
-            let _ = driver.stop_output();
-            driver.emit_runtime_state(RuntimeState::Recovering);
-            runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
+        if !matches!(state, RuntimeState::Running | RuntimeState::Recovering) {
+            return;
+        }
+
+        if state == RuntimeState::Running {
             *recovery_buses = bus_params
                 .lock()
                 .map(|buses| buses.clone())
                 .unwrap_or_else(|_| vec![BusParams::default()]);
-            schedule.last_advance = now;
-            schedule.next_retry = now;
+            schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
         }
-        if Self::load_runtime_state(runtime_state) != RuntimeState::Recovering {
-            return;
-        }
-        let elapsed = now.saturating_duration_since(schedule.last_advance);
+        let elapsed = if state == RuntimeState::Recovering {
+            now.saturating_duration_since(schedule.last_advance)
+        } else {
+            Duration::ZERO
+        };
         schedule.last_advance = now;
-        driver.advance_without_output(commands, recovery_buses, elapsed);
-        if now < schedule.next_retry {
-            return;
-        }
+        let retry_now = state == RuntimeState::Running || now >= schedule.next_retry;
+        let result = driver.reconcile_output(
+            commands,
+            recovery_buses,
+            OutputRecoveryRequest {
+                probe,
+                retry_now,
+                elapsed_without_output: elapsed,
+            },
+        );
 
-        recovery_attempts.fetch_add(1, Ordering::Relaxed);
-        let next_buses = bus_params
-            .lock()
-            .map(|buses| buses.clone())
-            .unwrap_or_else(|_| recovery_buses.clone());
-        match driver.start_output(commands.clone(), next_buses) {
-            Ok(()) => {
+        if retry_now && !matches!(result, OutputRecoveryResult::Stable) {
+            recovery_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+        match result {
+            OutputRecoveryResult::Stable => {}
+            OutputRecoveryResult::Running(_device) => {
+                if state == RuntimeState::Running {
+                    driver.emit_runtime_state(RuntimeState::Recovering);
+                }
                 runtime_state.store(RuntimeState::Running as u8, Ordering::Release);
                 schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
                 driver.emit_runtime_state(RuntimeState::Running);
             }
-            Err(
-                PetalSonicError::AudioFormat(_)
-                | PetalSonicError::PermanentDeviceFailure(_)
-                | PetalSonicError::BackendUnavailable { .. },
-            ) => {
+            OutputRecoveryResult::Recovering(_cause) => {
+                if state == RuntimeState::Running {
+                    runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
+                    driver.emit_runtime_state(RuntimeState::Recovering);
+                }
+                if retry_now {
+                    schedule.next_retry = now + OUTPUT_RETRY_INTERVAL;
+                }
+            }
+            OutputRecoveryResult::Failed(_failure) => {
+                if state == RuntimeState::Running {
+                    driver.emit_runtime_state(RuntimeState::Recovering);
+                }
                 runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
                 driver.emit_runtime_state(RuntimeState::Failed);
-            }
-            Err(_) => {
-                schedule.next_retry = now + OUTPUT_RETRY_INTERVAL;
             }
         }
     }
 
     fn spawn_output_supervisor(
         startup: EngineStartup,
+        output: Box<dyn FnOnce() -> Result<Box<dyn OutputPlatform>> + Send>,
         command_receivers: EngineCommandReceivers,
         bus_params: Arc<Mutex<Vec<BusParams>>>,
         runtime_state: Arc<AtomicU8>,
@@ -774,16 +753,15 @@ impl AudioRuntime {
         let handle = std::thread::Builder::new()
             .name("petalsonic-output".into())
             .spawn(move || {
-                #[cfg(target_os = "windows")]
-                let _platform_thread = match crate::platform::initialize_output_thread() {
-                    Ok(apartment) => apartment,
+                let output = match output() {
+                    Ok(output) => output,
                     Err(error) => {
                         runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
                         let _ = startup_sender.send(Err(error));
                         return;
                     }
                 };
-                let mut engine = match PetalSonicEngine::new(startup) {
+                let mut engine = match PetalSonicEngine::new_with_output(startup, output) {
                     Ok(engine) => engine,
                     Err(error) => {
                         runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
@@ -815,7 +793,7 @@ impl AudioRuntime {
                     );
                     std::thread::park_timeout(poll_interval);
                 }
-                let _ = engine.stop_output();
+                let _ = engine.stop();
             })
             .map_err(|error| {
                 PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))

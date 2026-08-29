@@ -20,7 +20,7 @@ fn short_clip() -> ResidentClip {
     ResidentClip::from_mono_pcm(vec![0.25; 16], 48_000).unwrap()
 }
 
-fn wait_until<T>(mut observe: impl FnMut() -> Option<T>) -> T {
+fn wait_for_async_observation<T>(mut observe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + DEADLINE;
     loop {
         if let Some(value) = observe() {
@@ -41,7 +41,7 @@ fn world_owns_progress_and_reports_exact_voice_completion() {
         .play_controlled(emitter, PlayOptions::once(), PlaybackTag(41))
         .unwrap();
 
-    let completion = wait_until(|| {
+    let completion = wait_for_async_observation(|| {
         world.drain_events().into_iter().find(|event| {
             matches!(
                 event,
@@ -89,8 +89,41 @@ fn world_owns_progress_and_reports_exact_voice_completion() {
 }
 
 #[test]
-fn overload_is_bounded_and_lifecycle_capacity_remains_reserved() {
-    let event_world = PetalSonicWorld::new(PetalSonicWorldDesc {
+fn configured_capacities_are_synchronous() {
+    let world = PetalSonicWorld::new(PetalSonicWorldDesc {
+        max_emitters: 1,
+        max_voices: 16,
+        control_queue_capacity: 32,
+        ..recovering_world_desc()
+    })
+    .unwrap();
+    let emitter = world
+        .create_emitter(short_clip(), EmitterDesc::non_spatial())
+        .unwrap();
+    assert!(matches!(
+        world.create_emitter(short_clip(), EmitterDesc::non_spatial()),
+        Err(PetalSonicError::CapacityExceeded {
+            resource: "emitter",
+            limit: 1
+        })
+    ));
+    for _ in 0..16 {
+        world.play(emitter, PlayOptions::looping()).unwrap();
+    }
+    assert!(matches!(
+        world.play(emitter, PlayOptions::looping()),
+        Err(PetalSonicError::CapacityExceeded {
+            resource: "voice",
+            limit: 16
+        })
+    ));
+    assert_eq!(world.active_voice_count(), 16);
+    world.close().unwrap();
+}
+
+#[test]
+fn event_pressure_is_observable_through_world() {
+    let world = PetalSonicWorld::new(PetalSonicWorldDesc {
         max_emitters: 1,
         max_voices: 16,
         control_queue_capacity: 32,
@@ -98,60 +131,77 @@ fn overload_is_bounded_and_lifecycle_capacity_remains_reserved() {
         ..recovering_world_desc()
     })
     .unwrap();
-    let emitter = event_world
+    let emitter = world
         .create_emitter(short_clip(), EmitterDesc::non_spatial())
         .unwrap();
-    assert!(matches!(
-        event_world.create_emitter(short_clip(), EmitterDesc::non_spatial()),
-        Err(PetalSonicError::CapacityExceeded {
-            resource: "emitter",
-            limit: 1
-        })
-    ));
     for tag in 0..16 {
-        event_world
+        world
             .play_controlled(emitter, PlayOptions::once(), PlaybackTag(tag))
             .unwrap();
     }
-    assert!(matches!(
-        event_world.play(emitter, PlayOptions::once()),
-        Err(PetalSonicError::CapacityExceeded {
-            resource: "voice",
-            limit: 16
-        })
-    ));
 
-    wait_until(|| (event_world.diagnostics().dropped_events > 0).then_some(()));
-    let diagnostics = event_world.diagnostics();
+    wait_for_async_observation(|| (world.diagnostics().dropped_events > 0).then_some(()));
+    let diagnostics = world.diagnostics();
     assert_eq!(diagnostics.event_queue_high_water, 1);
     assert!(diagnostics.event_queue_depth <= 1);
     assert!(diagnostics.dropped_events > 0);
-    event_world.close().unwrap();
+    world.close().unwrap();
+}
 
-    let pressure_world = PetalSonicWorld::new(PetalSonicWorldDesc {
+#[test]
+fn lifecycle_capacity_remains_reserved_under_control_pressure() {
+    let world = PetalSonicWorld::new(PetalSonicWorldDesc {
         control_queue_capacity: 1,
         lifecycle_queue_capacity: 1,
         ..recovering_world_desc()
     })
     .unwrap();
-    let emitter = pressure_world
+    let emitter = world
         .create_emitter(short_clip(), EmitterDesc::non_spatial())
         .unwrap();
     let rejected = (0..10_000).any(|_| {
         matches!(
-            pressure_world.pause_emitter(emitter),
+            world.pause_emitter(emitter),
             Err(PetalSonicError::QueuePressure)
         )
     });
     assert!(rejected, "regular control queue never reported pressure");
-    pressure_world
+    world
         .stop_emitter(emitter)
         .expect("lifecycle reserve must remain independently available");
-    let diagnostics = pressure_world.diagnostics();
+    let diagnostics = world.diagnostics();
     assert_eq!(diagnostics.control_queue_high_water, 1);
     assert_eq!(diagnostics.lifecycle_queue_high_water, 1);
     assert!(diagnostics.rejected_commands > 0);
-    pressure_world.close().unwrap();
+    world.close().unwrap();
+}
+
+#[test]
+fn explicitly_stopped_control_cannot_alias_a_later_voice() {
+    let world = PetalSonicWorld::new(recovering_world_desc()).unwrap();
+    let emitter = world
+        .create_emitter(short_clip(), EmitterDesc::non_spatial())
+        .unwrap();
+    let retired = world
+        .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(11))
+        .unwrap();
+
+    world.stop_playback(retired).unwrap();
+    assert!(matches!(
+        world.pause_playback(retired),
+        Err(PetalSonicError::StalePlayback)
+    ));
+
+    let later = world
+        .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(12))
+        .unwrap();
+    assert_ne!(retired, later);
+    assert!(matches!(
+        world.pause_playback(retired),
+        Err(PetalSonicError::StalePlayback)
+    ));
+    world.pause_playback(later).unwrap();
+    world.close().unwrap();
 }
 
 #[test]
@@ -186,6 +236,10 @@ fn close_and_identity_are_isolated_per_world() {
     assert_eq!(first.runtime_status().state, RuntimeState::Closed);
     assert!(matches!(
         first.play(first_emitter, PlayOptions::once()),
+        Err(PetalSonicError::RuntimeClosed)
+    ));
+    assert!(matches!(
+        first.create_emitter(short_clip(), EmitterDesc::non_spatial()),
         Err(PetalSonicError::RuntimeClosed)
     ));
 

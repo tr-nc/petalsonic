@@ -1008,7 +1008,7 @@ mod tests {
         )))
     }
 
-    fn wait_until(mut predicate: impl FnMut() -> bool) {
+    fn wait_for_async_observation(mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !predicate() {
             assert!(Instant::now() < deadline, "World observation timed out");
@@ -1035,20 +1035,22 @@ mod tests {
             .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(77))
             .unwrap();
 
-        wait_until(|| world.runtime_status().active_output_device.as_deref() == Some("A"));
+        wait_for_async_observation(|| {
+            world.runtime_status().active_output_device.as_deref() == Some("A")
+        });
         assert_eq!(world.active_voice_count(), 1);
         assert_eq!(world.diagnostics().output_sample_rate, 48_000);
         assert_eq!(world.diagnostics().output_channels, 2);
 
         handle.set_selected(None);
         handle.fail_stream();
-        wait_until(|| world.runtime_status().state == RuntimeState::Recovering);
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Recovering);
 
         let one_shot = world
             .play_controlled(emitter, PlayOptions::once(), PlaybackTag(78))
             .unwrap();
         let mut completion = None;
-        wait_until(|| {
+        wait_for_async_observation(|| {
             completion = world.drain_events().into_iter().find(|event| {
                 matches!(
                     event,
@@ -1070,7 +1072,9 @@ mod tests {
         );
 
         handle.set_selected(Some(1));
-        wait_until(|| world.runtime_status().active_output_device.as_deref() == Some("B"));
+        wait_for_async_observation(|| {
+            world.runtime_status().active_output_device.as_deref() == Some("B")
+        });
 
         assert_eq!(world.runtime_status().state, RuntimeState::Running);
         assert_eq!(world.active_voice_count(), 1);
@@ -1097,7 +1101,7 @@ mod tests {
         };
         let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
 
-        wait_until(|| world.runtime_status().state == RuntimeState::Failed);
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Failed);
         let emitter = world
             .create_emitter(clip(), EmitterDesc::non_spatial())
             .unwrap_err();

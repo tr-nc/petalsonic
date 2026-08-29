@@ -3,7 +3,7 @@ use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::{
     LatencyProfile, OutputDevicePolicy, PetalSonicWorldDesc, SourceConfig, SpatialQuality,
 };
-use crate::domain::{BusParams, PlaybackControl, SpatialFrame};
+use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
 use crate::error::PetalSonicError;
 use crate::error::Result;
 use crate::events::{
@@ -16,7 +16,7 @@ use crate::spatial::{
     AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
     SpatialRenderContext,
 };
-use crate::world::{OutputPreparation, SourceId};
+use crate::world::OutputPreparation;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -138,9 +138,9 @@ impl EngineCommandReceivers {
 }
 
 struct PumpState {
-    active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    active_playback: Arc<Mutex<HashMap<VoiceId, PlaybackInstance>>>,
     active_voice_count: Arc<AtomicUsize>,
-    retirement_sender: Sender<SourceId>,
+    retirement_sender: Sender<VoiceId>,
     latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     current_spatial_frame: Option<Arc<SpatialFrame>>,
     pending_spatial_retirement: Option<Arc<SpatialFrame>>,
@@ -174,7 +174,7 @@ struct PumpState {
     resampled_buffer: Vec<f32>,
     counters: Arc<RuntimeCounters>,
     backend_retirement_sender: Sender<RetiredSpatialSource>,
-    pending_backend_retirements: Vec<(SourceId, RetiredSpatialSource)>,
+    pending_backend_retirements: Vec<(VoiceId, RetiredSpatialSource)>,
     render_block_index: u64,
 }
 
@@ -185,7 +185,7 @@ struct StreamCreationParams {
     world_sample_rate: u32,
     device_sample_rate: u32,
     channels: u16,
-    active_playback: Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    active_playback: Arc<Mutex<HashMap<VoiceId, PlaybackInstance>>>,
     command_receivers: EngineCommandReceivers,
     event_sender: Sender<PetalSonicEvent>,
     voice_telemetry_sender: Sender<VoiceTelemetryEvent>,
@@ -234,7 +234,7 @@ pub(crate) struct EngineStartup {
     pub desc: PetalSonicWorldDesc,
     pub listener_pose: Arc<Mutex<Pose>>,
     pub active_voice_count: Arc<AtomicUsize>,
-    pub retirement_sender: Sender<SourceId>,
+    pub retirement_sender: Sender<VoiceId>,
     pub latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     pub spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
     pub latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
@@ -255,9 +255,9 @@ pub(crate) struct PetalSonicEngine {
     underrun_count: Arc<AtomicUsize>,
     stream_error: Arc<AtomicBool>,
     current_device_name: Arc<Mutex<Option<String>>>,
-    active_playback: Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    active_playback: Arc<std::sync::Mutex<HashMap<VoiceId, PlaybackInstance>>>,
     active_voice_count: Arc<AtomicUsize>,
-    retirement_sender: Sender<SourceId>,
+    retirement_sender: Sender<VoiceId>,
     latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
     latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
@@ -1198,7 +1198,7 @@ impl PetalSonicEngine {
             && let Ok(mut processor) = processor.lock()
         {
             for completed in &self.recovery_completed_playbacks {
-                let _ = processor.retire_source(completed.voice_id);
+                let _ = processor.retire_voice(completed.voice_id);
             }
         }
         for completed in &self.recovery_completed_playbacks {
@@ -1493,7 +1493,7 @@ impl PetalSonicEngine {
         };
         let mut deferred = 0;
         for completed in &ctx.completed_playbacks {
-            let Some(retired) = processor.retire_source(completed.voice_id) else {
+            let Some(retired) = processor.retire_voice(completed.voice_id) else {
                 continue;
             };
             if let Err(error) = ctx.backend_retirement_sender.try_send(retired) {
@@ -1556,7 +1556,7 @@ impl PetalSonicEngine {
 
     fn apply_spatial_frame_to_voices(
         frame: &SpatialFrame,
-        active_playback: &mut HashMap<SourceId, PlaybackInstance>,
+        active_playback: &mut HashMap<VoiceId, PlaybackInstance>,
     ) {
         for instance in active_playback.values_mut() {
             if instance.detached {
@@ -1731,7 +1731,7 @@ impl PetalSonicEngine {
     /// for the render thread to access world locks.
     fn process_playback_commands(
         command_receivers: &EngineCommandReceivers,
-        active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
+        active_playback: &Arc<std::sync::Mutex<HashMap<VoiceId, PlaybackInstance>>>,
         active_voice_count: &Arc<AtomicUsize>,
         acoustic_voice_input: &AcousticVoiceInput,
         buses: &mut [BusParams],
@@ -1772,7 +1772,7 @@ impl PetalSonicEngine {
 
     fn apply_playback_command(
         command: PlaybackCommand,
-        active_playback: &mut HashMap<SourceId, PlaybackInstance>,
+        active_playback: &mut HashMap<VoiceId, PlaybackInstance>,
         active_voice_count: &AtomicUsize,
         acoustic_voice_input: &AcousticVoiceInput,
         buses: &mut [BusParams],
@@ -1811,7 +1811,7 @@ impl PetalSonicEngine {
                     }),
                     SourceConfig::NonSpatial { .. } => None,
                 };
-                let mut instance = PlaybackInstance::from_source(VoiceStart {
+                let mut instance = PlaybackInstance::from_voice(VoiceStart {
                     emitter,
                     audio_data: source,
                     config,
@@ -1927,7 +1927,7 @@ impl PetalSonicEngine {
         channels: u16,
         master_gain_linear: f32,
         resampler_arc: &Arc<Mutex<StreamingResampler>>,
-        active_playback: &Arc<std::sync::Mutex<HashMap<SourceId, PlaybackInstance>>>,
+        active_playback: &Arc<std::sync::Mutex<HashMap<VoiceId, PlaybackInstance>>>,
         spatial_processor: Option<&Arc<Mutex<SpatialProcessor>>>,
         buses: &[BusParams],
         mixer_scratch: &mut mixer::MixerScratch,
@@ -2361,7 +2361,7 @@ pub(crate) mod tests {
     fn render_thread_produces_audio_without_a_caller_pump() {
         let block_size = 256;
         let sample_rate = 48_000;
-        let source_id = SourceId::from(1);
+        let voice_id = VoiceId::from(1);
         let clip = Arc::new(PetalSonicAudioData::new(
             vec![0.25; block_size * 8],
             sample_rate,
@@ -2377,7 +2377,7 @@ pub(crate) mod tests {
         };
         command_sender
             .try_send(PlaybackCommand::Play {
-                voice_id: source_id,
+                voice_id: voice_id,
                 emitter,
                 source: clip,
                 config: SourceConfig::non_spatial(),
@@ -2484,7 +2484,7 @@ pub(crate) mod tests {
         for voice in 0..VOICES {
             command_sender
                 .try_send(PlaybackCommand::Play {
-                    voice_id: SourceId::from(voice as u64 + 1),
+                    voice_id: VoiceId::from(voice as u64 + 1),
                     emitter: crate::domain::Emitter {
                         world_id: 1,
                         index: voice as u32,
@@ -2650,7 +2650,7 @@ pub(crate) mod tests {
         let (sender, receiver) = crossbeam_channel::bounded(8);
         let (lifecycle_sender, lifecycle_receiver) = crossbeam_channel::bounded(8);
         let receivers = EngineCommandReceivers::new(receiver, lifecycle_receiver);
-        for (voice, detached) in [(SourceId::from(10), false), (SourceId::from(11), true)] {
+        for (voice, detached) in [(VoiceId::from(10), false), (VoiceId::from(11), true)] {
             sender
                 .try_send(PlaybackCommand::Play {
                     voice_id: voice,
@@ -2730,10 +2730,10 @@ pub(crate) mod tests {
         ])
         .unwrap();
         let mut voices = HashMap::new();
-        for (voice_id, detached) in [(SourceId::from(20), false), (SourceId::from(21), true)] {
+        for (voice_id, detached) in [(VoiceId::from(20), false), (VoiceId::from(21), true)] {
             voices.insert(
                 voice_id,
-                PlaybackInstance::from_source(VoiceStart {
+                PlaybackInstance::from_voice(VoiceStart {
                     emitter,
                     audio_data: clip.clone(),
                     config: SourceConfig::spatial(old_pose),
@@ -2762,9 +2762,9 @@ pub(crate) mod tests {
 
         PetalSonicEngine::apply_spatial_frame_to_voices(&frame, &mut voices);
 
-        assert_eq!(voices[&SourceId::from(20)].config.pose(), Some(new_pose));
-        assert_eq!(voices[&SourceId::from(21)].config.pose(), Some(old_pose));
-        assert_eq!(voices[&SourceId::from(20)].source_extent, captured_extent);
-        assert_eq!(voices[&SourceId::from(21)].source_extent, captured_extent);
+        assert_eq!(voices[&VoiceId::from(20)].config.pose(), Some(new_pose));
+        assert_eq!(voices[&VoiceId::from(21)].config.pose(), Some(old_pose));
+        assert_eq!(voices[&VoiceId::from(20)].source_extent, captured_extent);
+        assert_eq!(voices[&VoiceId::from(21)].source_extent, captured_extent);
     }
 }

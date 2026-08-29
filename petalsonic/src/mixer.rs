@@ -1,10 +1,10 @@
 // Mixer module - handles mixing of audio sources
 // This contains the mixing logic for both spatial and non-spatial sources
 
+use crate::domain::VoiceId;
 use crate::events::VoiceTelemetryEvent;
 use crate::playback::{PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor, SpatialRenderContext};
-use crate::world::SourceId;
 use crate::{BusParams, gain};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,25 +12,25 @@ use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CompletedPlayback {
-    pub voice_id: SourceId,
+    pub voice_id: VoiceId,
     pub emitter: crate::domain::Emitter,
     pub completion_tag: Option<crate::domain::PlaybackTag>,
 }
 
 /// Reusable identity lists for one render quantum.
 pub struct MixerScratch {
-    spatial_ids: Vec<SourceId>,
-    muted_spatial_ids: Vec<SourceId>,
-    non_spatial_ids: Vec<SourceId>,
+    spatial_voice_ids: Vec<VoiceId>,
+    muted_spatial_voice_ids: Vec<VoiceId>,
+    non_spatial_voice_ids: Vec<VoiceId>,
     voice_telemetry: Vec<VoiceTelemetryEvent>,
 }
 
 impl MixerScratch {
     pub fn new(max_voices: usize) -> Self {
         Self {
-            spatial_ids: Vec::with_capacity(max_voices),
-            muted_spatial_ids: Vec::with_capacity(max_voices),
-            non_spatial_ids: Vec::with_capacity(max_voices),
+            spatial_voice_ids: Vec::with_capacity(max_voices),
+            muted_spatial_voice_ids: Vec::with_capacity(max_voices),
+            non_spatial_voice_ids: Vec::with_capacity(max_voices),
             voice_telemetry: Vec::with_capacity(max_voices.saturating_mul(4)),
         }
     }
@@ -55,7 +55,7 @@ pub struct MixProfilingSummary {
 pub fn mix_playback_instances_with_metrics(
     world_buffer: &mut [f32],
     channels: u16,
-    active_playback: &Arc<Mutex<HashMap<SourceId, PlaybackInstance>>>,
+    active_playback: &Arc<Mutex<HashMap<VoiceId, PlaybackInstance>>>,
     spatial_processor: Option<&mut SpatialProcessor>,
     buses: &[BusParams],
     render_context: SpatialRenderContext,
@@ -66,13 +66,13 @@ pub fn mix_playback_instances_with_metrics(
         return MixProfilingSummary::default();
     };
 
-    scratch.spatial_ids.clear();
-    scratch.muted_spatial_ids.clear();
-    scratch.non_spatial_ids.clear();
+    scratch.spatial_voice_ids.clear();
+    scratch.muted_spatial_voice_ids.clear();
+    scratch.non_spatial_voice_ids.clear();
     scratch.voice_telemetry.clear();
 
     let output_frames = world_buffer.len() / channels.max(1) as usize;
-    for (source_id, instance) in active_playback.iter_mut() {
+    for (voice_id, instance) in active_playback.iter_mut() {
         // Only process playing instances
         if !matches!(instance.info.play_state, PlayState::Playing) {
             continue;
@@ -87,15 +87,15 @@ pub fn mix_playback_instances_with_metrics(
         if bus.muted || gain::db_to_linear(bus.gain_db) == 0.0 {
             instance.advance_silently(output_frames);
             if is_spatial {
-                scratch.muted_spatial_ids.push(*source_id);
+                scratch.muted_spatial_voice_ids.push(*voice_id);
             }
             continue;
         }
 
         if is_spatial {
-            scratch.spatial_ids.push(*source_id);
+            scratch.spatial_voice_ids.push(*voice_id);
         } else {
-            scratch.non_spatial_ids.push(*source_id);
+            scratch.non_spatial_voice_ids.push(*voice_id);
         }
     }
 
@@ -103,8 +103,8 @@ pub fn mix_playback_instances_with_metrics(
 
     // Process non-spatial sources first
     let direct_start = Instant::now();
-    for source_id in &scratch.non_spatial_ids {
-        if let Some(instance) = active_playback.get_mut(source_id) {
+    for voice_id in &scratch.non_spatial_voice_ids {
+        if let Some(instance) = active_playback.get_mut(voice_id) {
             instance.fill_buffer(world_buffer, channels);
         }
     }
@@ -112,16 +112,16 @@ pub fn mix_playback_instances_with_metrics(
 
     // Process spatial sources if spatial processor is available
     if let Some(processor) = spatial_processor {
-        for source_id in &scratch.muted_spatial_ids {
-            processor.silence_source_state(*source_id);
+        for voice_id in &scratch.muted_spatial_voice_ids {
+            processor.silence_voice_state(*voice_id);
         }
-        if !scratch.spatial_ids.is_empty()
+        if !scratch.spatial_voice_ids.is_empty()
             || processor.has_environment_tail()
             || processor.has_pending_voice_telemetry()
         {
             let spatial_start = Instant::now();
             if let Ok(metrics) = processor.process_spatial_sources_with_metrics(
-                &scratch.spatial_ids,
+                &scratch.spatial_voice_ids,
                 &mut active_playback,
                 world_buffer,
                 render_context,
@@ -131,9 +131,9 @@ pub fn mix_playback_instances_with_metrics(
                 profiling.spatial_metrics = Some(metrics);
             }
         }
-    } else if !scratch.spatial_ids.is_empty() {
-        for source_id in &scratch.spatial_ids {
-            if let Some(instance) = active_playback.get_mut(source_id) {
+    } else if !scratch.spatial_voice_ids.is_empty() {
+        for voice_id in &scratch.spatial_voice_ids {
+            if let Some(instance) = active_playback.get_mut(voice_id) {
                 instance.advance_silently(output_frames);
             }
         }
@@ -141,11 +141,11 @@ pub fn mix_playback_instances_with_metrics(
 
     // Reclaim only after every source has completed this quantum. Explicit stops
     // clear their completion tag before entering the de-click ramp.
-    for (source_id, instance) in active_playback.iter_mut() {
+    for (voice_id, instance) in active_playback.iter_mut() {
         let _ = instance.check_and_clear_end_flag();
         if instance.should_reclaim() {
             completed_playbacks.push(CompletedPlayback {
-                voice_id: *source_id,
+                voice_id: *voice_id,
                 emitter: instance.emitter,
                 completion_tag: instance.completion_tag,
             });
@@ -213,7 +213,7 @@ mod tests {
                 1,
                 Duration::from_secs_f64(16.0 / 48_000.0),
             ));
-            let mut voice = PlaybackInstance::from_source(VoiceStart {
+            let mut voice = PlaybackInstance::from_voice(VoiceStart {
                 emitter: Emitter {
                     world_id: 1,
                     index: id,
@@ -237,7 +237,7 @@ mod tests {
             active
                 .lock()
                 .unwrap()
-                .insert(SourceId::from(id as u64), voice);
+                .insert(VoiceId::from(id as u64), voice);
         }
 
         let buses = [
@@ -264,8 +264,8 @@ mod tests {
 
         assert_eq!(output, [0.5; 8]);
         let active = active.lock().unwrap();
-        assert_eq!(active[&SourceId::from(1)].info.current_frame, 0);
-        assert_eq!(active[&SourceId::from(2)].info.current_frame, 4);
+        assert_eq!(active[&VoiceId::from(1)].info.current_frame, 0);
+        assert_eq!(active[&VoiceId::from(2)].info.current_frame, 4);
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
                 1,
                 Duration::from_secs_f64(32.0 / 48_000.0),
             ));
-            let mut voice = PlaybackInstance::from_source(VoiceStart {
+            let mut voice = PlaybackInstance::from_voice(VoiceStart {
                 emitter: Emitter {
                     world_id: 1,
                     index: id,
@@ -302,7 +302,7 @@ mod tests {
             active
                 .lock()
                 .unwrap()
-                .insert(SourceId::from(id as u64), voice);
+                .insert(VoiceId::from(id as u64), voice);
         }
         let buses = [
             BusParams::default(),
@@ -327,7 +327,7 @@ mod tests {
         );
 
         let active = active.lock().unwrap();
-        assert_eq!(active[&SourceId::from(1)].info.current_frame, 2);
-        assert_eq!(active[&SourceId::from(2)].info.current_frame, 4);
+        assert_eq!(active[&VoiceId::from(1)].info.current_frame, 2);
+        assert_eq!(active[&VoiceId::from(2)].info.current_frame, 4);
     }
 }

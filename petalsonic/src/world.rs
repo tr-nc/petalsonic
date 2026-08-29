@@ -1,113 +1,23 @@
-use crate::acoustic_propagation::{AcousticPropagation, AcousticResponse};
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::domain::{
     Bus, BusParams, Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
     SpatialFrame, VoiceId,
 };
-use crate::engine::{
-    EngineCommandReceivers, EngineObservability, EngineStartup, OutputRecoveryReason,
-    PetalSonicEngine,
-};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
     AcousticTelemetryDiagnostics, AcousticTelemetryEvent, PetalSonicEvent, RenderTimingEvent,
-    RuntimeCounters, RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceTelemetryDiagnostics,
+    RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceTelemetryDiagnostics,
     VoiceTelemetryEvent,
 };
 use crate::math::Pose;
-use crate::playback::PlaybackCommand;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crate::runtime::{AudioRuntime, RuntimeIntent};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 const MIN_PLAYBACK_RATE: f32 = 0.01;
 const MAX_PLAYBACK_RATE: f32 = 4.0;
-const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutputPreparation {
-    Ready,
-    Unavailable,
-    RequiresStop,
-}
-
-trait OutputRuntimeDriver {
-    fn drain_retired_resources(&mut self);
-    fn output_recovery_reason(&self) -> Option<OutputRecoveryReason>;
-    fn prepare_selected_output(&mut self) -> OutputPreparation;
-    fn stop_output(&mut self) -> Result<()>;
-    fn advance_without_output(
-        &mut self,
-        commands: &EngineCommandReceivers,
-        buses: &mut [BusParams],
-        elapsed: Duration,
-    );
-    fn start_output(
-        &mut self,
-        commands: EngineCommandReceivers,
-        buses: Vec<BusParams>,
-    ) -> Result<()>;
-    fn emit_runtime_state(&self, state: RuntimeState);
-}
-
-impl OutputRuntimeDriver for PetalSonicEngine {
-    fn drain_retired_resources(&mut self) {
-        PetalSonicEngine::drain_retired_backend_resources(self);
-    }
-
-    fn output_recovery_reason(&self) -> Option<OutputRecoveryReason> {
-        PetalSonicEngine::output_recovery_reason(self)
-    }
-
-    fn prepare_selected_output(&mut self) -> OutputPreparation {
-        PetalSonicEngine::prepare_selected_output(self)
-    }
-
-    fn stop_output(&mut self) -> Result<()> {
-        PetalSonicEngine::stop(self)
-    }
-
-    fn advance_without_output(
-        &mut self,
-        commands: &EngineCommandReceivers,
-        buses: &mut [BusParams],
-        elapsed: Duration,
-    ) {
-        PetalSonicEngine::advance_without_output(self, commands, buses, elapsed);
-    }
-
-    fn start_output(
-        &mut self,
-        commands: EngineCommandReceivers,
-        buses: Vec<BusParams>,
-    ) -> Result<()> {
-        PetalSonicEngine::start(self, commands, buses)
-    }
-
-    fn emit_runtime_state(&self, state: RuntimeState) {
-        PetalSonicEngine::emit_runtime_state(self, state);
-    }
-}
-
-struct SupervisorSchedule {
-    next_retry: Instant,
-    next_health_probe: Instant,
-    last_advance: Instant,
-}
-
-impl SupervisorSchedule {
-    fn new(now: Instant) -> Self {
-        Self {
-            next_retry: now,
-            next_health_probe: now,
-            last_advance: now,
-        }
-    }
-}
 
 #[derive(Clone)]
 struct EmitterState {
@@ -272,329 +182,26 @@ impl EmitterRegistry {
 pub struct PetalSonicWorld {
     world_id: u64,
     desc: crate::config::PetalSonicWorldDesc,
-    bus_params: Arc<Mutex<Vec<BusParams>>>,
     emitters: Mutex<EmitterRegistry>,
     next_voice_id: AtomicU64,
-    active_voice_count: Arc<AtomicUsize>,
     controlled_voices: Mutex<HashMap<VoiceId, ControlledVoiceState>>,
-    retirement_receiver: Receiver<VoiceId>,
-    latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
-    spatial_retirement_receiver: Receiver<Arc<SpatialFrame>>,
-    spatial_frame_revision: AtomicU64,
-    spatial_sim_time_bits: AtomicU64,
-    acoustic_propagation: AcousticPropagation,
-    acoustic_response_retirement_receiver: Receiver<Arc<AcousticResponse>>,
-    acoustic_scene_version: Arc<AtomicU64>,
-    environmental_acoustics_enabled: Arc<AtomicBool>,
-    command_sender: Sender<PlaybackCommand>,
-    lifecycle_sender: Sender<PlaybackCommand>,
-    counters: Arc<RuntimeCounters>,
-    frames_processed: Arc<AtomicUsize>,
-    underrun_count: Arc<AtomicUsize>,
-    active_output_device: Arc<Mutex<Option<String>>>,
-    event_receiver: Receiver<PetalSonicEvent>,
-    voice_telemetry_receiver: Receiver<VoiceTelemetryEvent>,
-    acoustic_telemetry_receiver: Receiver<AcousticTelemetryEvent>,
-    timing_receiver: Receiver<RenderTimingEvent>,
-    runtime_state: Arc<AtomicU8>,
-    recovery_attempts: Arc<AtomicU64>,
-    supervisor_stop: Arc<AtomicBool>,
-    close_lock: Mutex<()>,
-    supervisor_thread: Mutex<Option<JoinHandle<()>>>,
+    runtime: AudioRuntime,
 }
 
 impl PetalSonicWorld {
     pub fn new(config: crate::config::PetalSonicWorldDesc) -> Result<Self> {
         Self::validate_config(&config)?;
-        #[cfg(target_os = "windows")]
-        crate::platform::ensure_audio_context()?;
         let world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
-
-        let (command_sender, command_receiver) =
-            crossbeam_channel::bounded(config.control_queue_capacity);
-        let (lifecycle_sender, lifecycle_receiver) =
-            crossbeam_channel::bounded(config.lifecycle_queue_capacity);
-        let listener_pose = Arc::new(Mutex::new(Pose::default()));
-        let active_voice_count = Arc::new(AtomicUsize::new(0));
-        let (retirement_sender, retirement_receiver) =
-            crossbeam_channel::bounded(config.max_voices);
-        let latest_spatial_frame = Arc::new(Mutex::new(None));
-        let (spatial_retirement_sender, spatial_retirement_receiver) =
-            crossbeam_channel::bounded(1);
-        let initial_acoustic_scene = config.acoustic_scene.clone().map(Arc::new);
-        let acoustic_scene_version = Arc::new(AtomicU64::new(
-            initial_acoustic_scene
-                .as_ref()
-                .map(|scene| scene.version())
-                .unwrap_or(0),
-        ));
-        let environmental_acoustics_enabled =
-            Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
-        let acoustic_propagation = AcousticPropagation::new(
-            config.distance_scaler,
-            environmental_acoustics_enabled.clone(),
-            config.environmental_acoustics_quality,
-            config.environmental_acoustics_budget,
-            config.max_voices,
-            config.event_queue_capacity,
-        )
-        .map_err(|error| {
-            PetalSonicError::Engine(format!(
-                "Failed to start acoustic propagation worker: {error}"
-            ))
-        })?;
-        let acoustic_telemetry_receiver = acoustic_propagation.telemetry_receiver();
-        if let Some(scene) = initial_acoustic_scene {
-            acoustic_propagation.publish_scene(scene).map_err(|_| {
-                PetalSonicError::Engine("Failed to publish initial acoustic scene".into())
-            })?;
-        }
-        let (acoustic_response_retirement_sender, acoustic_response_retirement_receiver) =
-            crossbeam_channel::bounded(2);
-        let bus_params = Arc::new(Mutex::new(
-            std::iter::once(BusParams::default())
-                .chain(config.buses.iter().map(|bus| bus.params()))
-                .collect::<Vec<_>>(),
-        ));
-        let (ports, observability) = PetalSonicEngine::create_runtime_ports(&config);
-        let startup = EngineStartup {
-            desc: config.clone(),
-            listener_pose,
-            active_voice_count: active_voice_count.clone(),
-            retirement_sender,
-            latest_spatial_frame: latest_spatial_frame.clone(),
-            spatial_retirement_sender,
-            latest_acoustic_response: acoustic_propagation.latest_response_slot(),
-            acoustic_response_retirement_sender,
-            acoustic_voice_input: acoustic_propagation.voice_input(),
-            acoustic_scene_version: acoustic_scene_version.clone(),
-            environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
-            ports,
-        };
-        let EngineObservability {
-            frames_processed,
-            underrun_count,
-            active_device_name,
-            event_receiver,
-            voice_telemetry_receiver,
-            timing_receiver,
-            counters,
-        } = observability;
-        let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
-        let recovery_attempts = Arc::new(AtomicU64::new(0));
-        let supervisor_stop = Arc::new(AtomicBool::new(false));
-        let supervisor_thread = Self::spawn_output_supervisor(
-            startup,
-            EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
-            bus_params.clone(),
-            runtime_state.clone(),
-            recovery_attempts.clone(),
-            supervisor_stop.clone(),
-        )?;
+        let runtime = AudioRuntime::start(&config)?;
 
         Ok(Self {
             world_id,
             emitters: Mutex::new(EmitterRegistry::new(config.max_emitters, world_id)),
-            bus_params,
             controlled_voices: Mutex::new(HashMap::with_capacity(config.max_voices)),
             desc: config,
             next_voice_id: AtomicU64::new(0),
-            active_voice_count,
-            retirement_receiver,
-            latest_spatial_frame,
-            spatial_retirement_receiver,
-            spatial_frame_revision: AtomicU64::new(0),
-            spatial_sim_time_bits: AtomicU64::new(0.0f64.to_bits()),
-            acoustic_propagation,
-            acoustic_response_retirement_receiver,
-            acoustic_scene_version,
-            environmental_acoustics_enabled,
-            command_sender,
-            lifecycle_sender,
-            counters,
-            frames_processed,
-            underrun_count,
-            active_output_device: active_device_name,
-            event_receiver,
-            voice_telemetry_receiver,
-            acoustic_telemetry_receiver,
-            timing_receiver,
-            runtime_state,
-            recovery_attempts,
-            supervisor_stop,
-            close_lock: Mutex::new(()),
-            supervisor_thread: Mutex::new(Some(supervisor_thread)),
+            runtime,
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn supervisor_tick<D: OutputRuntimeDriver>(
-        driver: &mut D,
-        commands: &EngineCommandReceivers,
-        bus_params: &Mutex<Vec<BusParams>>,
-        runtime_state: &AtomicU8,
-        recovery_attempts: &AtomicU64,
-        recovery_buses: &mut Vec<BusParams>,
-        schedule: &mut SupervisorSchedule,
-        now: Instant,
-    ) {
-        driver.drain_retired_resources();
-        let state = Self::load_runtime_state(runtime_state);
-        let recovery_reason = (state == RuntimeState::Running && now >= schedule.next_health_probe)
-            .then(|| driver.output_recovery_reason())
-            .flatten();
-        let selection_preparation = matches!(
-            recovery_reason,
-            Some(OutputRecoveryReason::SelectionChanged)
-        )
-        .then(|| driver.prepare_selected_output());
-        let should_recover = state == RuntimeState::Recovering
-            || matches!(recovery_reason, Some(OutputRecoveryReason::StreamFailure))
-            || matches!(
-                selection_preparation,
-                Some(OutputPreparation::Ready | OutputPreparation::RequiresStop)
-            );
-
-        if state == RuntimeState::Running && now >= schedule.next_health_probe {
-            schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
-        }
-
-        if !should_recover {
-            return;
-        }
-
-        if Self::load_runtime_state(runtime_state) == RuntimeState::Running {
-            let _ = driver.stop_output();
-            driver.emit_runtime_state(RuntimeState::Recovering);
-            runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
-            *recovery_buses = bus_params
-                .lock()
-                .map(|buses| buses.clone())
-                .unwrap_or_else(|_| vec![BusParams::default()]);
-            schedule.last_advance = now;
-            schedule.next_retry = now;
-        }
-
-        if Self::load_runtime_state(runtime_state) != RuntimeState::Recovering {
-            return;
-        }
-
-        let elapsed = now.saturating_duration_since(schedule.last_advance);
-        schedule.last_advance = now;
-        driver.advance_without_output(commands, recovery_buses, elapsed);
-
-        if now < schedule.next_retry {
-            return;
-        }
-
-        recovery_attempts.fetch_add(1, Ordering::Relaxed);
-        let next_buses = bus_params
-            .lock()
-            .map(|buses| buses.clone())
-            .unwrap_or_else(|_| recovery_buses.clone());
-        match driver.start_output(commands.clone(), next_buses) {
-            Ok(()) => {
-                runtime_state.store(RuntimeState::Running as u8, Ordering::Release);
-                schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
-                driver.emit_runtime_state(RuntimeState::Running);
-            }
-            Err(
-                PetalSonicError::AudioFormat(_)
-                | PetalSonicError::PermanentDeviceFailure(_)
-                | PetalSonicError::BackendUnavailable { .. },
-            ) => {
-                runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                driver.emit_runtime_state(RuntimeState::Failed);
-            }
-            Err(_) => {
-                schedule.next_retry = now + OUTPUT_RETRY_INTERVAL;
-            }
-        }
-    }
-
-    fn spawn_output_supervisor(
-        startup: EngineStartup,
-        command_receivers: EngineCommandReceivers,
-        bus_params: Arc<Mutex<Vec<BusParams>>>,
-        runtime_state: Arc<AtomicU8>,
-        recovery_attempts: Arc<AtomicU64>,
-        stop: Arc<AtomicBool>,
-    ) -> Result<JoinHandle<()>> {
-        let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
-        let handle = std::thread::Builder::new()
-            .name("petalsonic-output".into())
-            .spawn(move || {
-                #[cfg(target_os = "windows")]
-                let _platform_thread = match crate::platform::initialize_output_thread() {
-                    Ok(apartment) => apartment,
-                    Err(error) => {
-                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                        let _ = startup_sender.send(Err(error));
-                        return;
-                    }
-                };
-                let mut engine = match PetalSonicEngine::new(startup) {
-                    Ok(engine) => engine,
-                    Err(error) => {
-                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                        let _ = startup_sender.send(Err(error));
-                        return;
-                    }
-                };
-                if startup_sender.send(Ok(())).is_err() {
-                    return;
-                }
-                let poll_interval = Duration::from_millis(20);
-                let mut schedule = SupervisorSchedule::new(Instant::now());
-                let mut recovery_buses = bus_params
-                    .lock()
-                    .map(|buses| buses.clone())
-                    .unwrap_or_else(|_| vec![BusParams::default()]);
-                engine.emit_runtime_state(RuntimeState::Recovering);
-
-                while !stop.load(Ordering::Acquire) {
-                    Self::supervisor_tick(
-                        &mut engine,
-                        &command_receivers,
-                        &bus_params,
-                        &runtime_state,
-                        &recovery_attempts,
-                        &mut recovery_buses,
-                        &mut schedule,
-                        Instant::now(),
-                    );
-
-                    std::thread::park_timeout(poll_interval);
-                }
-                let _ = engine.stop_output();
-            })
-            .map_err(|error| {
-                PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))
-            })?;
-
-        match startup_receiver.recv() {
-            Ok(Ok(())) => Ok(handle),
-            Ok(Err(error)) => {
-                let _ = handle.join();
-                Err(error)
-            }
-            Err(_) => {
-                let _ = handle.join();
-                Err(PetalSonicError::Engine(
-                    "Output supervisor exited during initialization".into(),
-                ))
-            }
-        }
-    }
-
-    fn load_runtime_state(state: &AtomicU8) -> RuntimeState {
-        match state.load(Ordering::Acquire) {
-            value if value == RuntimeState::Running as u8 => RuntimeState::Running,
-            value if value == RuntimeState::Recovering as u8 => RuntimeState::Recovering,
-            value if value == RuntimeState::Failed as u8 => RuntimeState::Failed,
-            value if value == RuntimeState::Closing as u8 => RuntimeState::Closing,
-            _ => RuntimeState::Closed,
-        }
     }
 
     fn validate_config(config: &crate::config::PetalSonicWorldDesc) -> Result<()> {
@@ -689,7 +296,7 @@ impl PetalSonicWorld {
     }
 
     pub fn create_emitter(&self, clip: ResidentClip, desc: EmitterDesc) -> Result<Emitter> {
-        self.ensure_open()?;
+        self.runtime.ensure_open()?;
         Self::validate_emitter_desc(&desc)?;
         self.validate_optional_bus(desc.bus())?;
         let clip = self.prepare_clip(clip)?;
@@ -729,7 +336,7 @@ impl PetalSonicWorld {
                 reason: "extent changes must be published in a complete SpatialFrame".into(),
             });
         }
-        self.try_send(PlaybackCommand::UpdateEmitter(
+        self.runtime.try_submit(RuntimeIntent::UpdateEmitter(
             emitter,
             desc.source_config(0.0),
             bus_index,
@@ -743,10 +350,8 @@ impl PetalSonicWorld {
     /// An unconsumed older frame is replaced on the caller thread. The render thread
     /// observes only complete frame generations and never accumulates stale movement.
     pub fn publish_spatial_frame(&self, frame: SpatialFrame) -> Result<()> {
-        self.ensure_open()?;
-        self.drain_retired_spatial_frames();
-        self.drain_retired_acoustic_responses();
-        let current_revision = self.spatial_frame_revision.load(Ordering::Acquire);
+        self.runtime.ensure_open()?;
+        let (current_revision, current_sim_time) = self.runtime.spatial_cursor();
         if frame.revision() <= current_revision {
             return Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame.revision",
@@ -755,7 +360,6 @@ impl PetalSonicWorld {
                 ),
             });
         }
-        let current_sim_time = f64::from_bits(self.spatial_sim_time_bits.load(Ordering::Acquire));
         if !frame.sim_time_seconds().is_finite() || frame.sim_time_seconds() < current_sim_time {
             return Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame.sim_time_seconds",
@@ -781,33 +385,20 @@ impl PetalSonicWorld {
                 emitter.extent(),
             )?;
         }
-        let mut latest = self
-            .latest_spatial_frame
-            .try_lock()
-            .map_err(|_| PetalSonicError::QueuePressure)?;
         let mut emitters = self
             .emitters
             .try_lock()
             .map_err(|_| PetalSonicError::QueuePressure)?;
         emitters.apply_spatial_frame(&frame)?;
         let frame = Arc::new(frame);
-        self.acoustic_propagation
-            .publish_spatial_frame(frame.clone())
-            .map_err(|_| PetalSonicError::QueuePressure)?;
-        self.spatial_frame_revision
-            .store(frame.revision(), Ordering::Release);
-        self.spatial_sim_time_bits
-            .store(frame.sim_time_seconds().to_bits(), Ordering::Release);
-        *latest = Some(frame);
-        Ok(())
+        self.runtime.publish_spatial_frame(frame)
     }
 
     /// Publishes a newer immutable acoustic-scene version by swapping a shared handle.
     /// Geometry and unchanged BVH chunks remain owned and shared by the snapshot backend.
     pub fn publish_acoustic_scene(&self, snapshot: AcousticSceneSnapshot) -> Result<()> {
-        self.ensure_open()?;
-        self.drain_retired_acoustic_responses();
-        let current = self.acoustic_scene_version.load(Ordering::Acquire);
+        self.runtime.ensure_open()?;
+        let current = self.runtime.acoustic_scene_version();
         if snapshot.version() <= current {
             return Err(PetalSonicError::InvalidConfiguration {
                 field: "acoustic_scene.version",
@@ -815,12 +406,7 @@ impl PetalSonicWorld {
             });
         }
         let snapshot = Arc::new(snapshot);
-        self.acoustic_propagation
-            .publish_scene(snapshot.clone())
-            .map_err(|_| PetalSonicError::QueuePressure)?;
-        self.acoustic_scene_version
-            .store(snapshot.version(), Ordering::Release);
-        Ok(())
+        self.runtime.publish_acoustic_scene(snapshot)
     }
 
     /// Enables or disables all geometry-driven environmental effects at the next render block.
@@ -828,32 +414,29 @@ impl PetalSonicWorld {
     /// This latest-value control does not rebuild the output runtime. Native HRTF
     /// spatialization, distance attenuation, air absorption, and playback remain active.
     pub fn set_environmental_acoustics_enabled(&self, enabled: bool) -> Result<()> {
-        self.ensure_open()?;
-        self.acoustic_propagation.set_enabled(enabled);
-        Ok(())
+        self.runtime.set_environmental_acoustics_enabled(enabled)
     }
 
     pub fn environmental_acoustics_enabled(&self) -> bool {
-        self.environmental_acoustics_enabled.load(Ordering::Acquire)
+        self.runtime.environmental_acoustics_enabled()
     }
 
     /// Changes the bounded geometry-driven acoustics quality at the next propagation solve.
     ///
     /// This latest-value control does not rebuild the output runtime or interrupt playback.
     pub fn set_environmental_acoustics_quality(&self, quality: f32) -> Result<()> {
-        self.ensure_open()?;
+        self.runtime.ensure_open()?;
         if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
             return Err(PetalSonicError::InvalidConfiguration {
                 field: "environmental_acoustics_quality",
                 reason: "must be finite and in the inclusive range 0.0..=1.0".into(),
             });
         }
-        self.acoustic_propagation.set_quality(quality);
-        Ok(())
+        self.runtime.set_environmental_acoustics_quality(quality)
     }
 
     pub fn environmental_acoustics_quality(&self) -> f32 {
-        self.acoustic_propagation.quality()
+        self.runtime.environmental_acoustics_quality()
     }
 
     pub fn destroy_emitter(&self, emitter: Emitter) -> Result<()> {
@@ -862,7 +445,8 @@ impl PetalSonicWorld {
             .lock()
             .map_err(|_| PetalSonicError::Engine("Emitter registry is poisoned".into()))?;
         emitters.get(emitter)?;
-        self.try_send(PlaybackCommand::DestroyEmitter(emitter))?;
+        self.runtime
+            .try_submit(RuntimeIntent::DestroyEmitter(emitter))?;
         emitters.remove(emitter)?;
         if let Ok(mut controlled) = self.controlled_voices.lock() {
             controlled.retain(|_, voice| voice.emitter != emitter || voice.detached);
@@ -928,13 +512,13 @@ impl PetalSonicWorld {
             )?;
         }
         let bus_index = self.resolve_bus(options.bus().or(state.desc.bus()))?;
-        self.reserve_voice()?;
+        self.runtime.reserve_voice()?;
         let voice_id = VoiceId::from(self.next_voice_id.fetch_add(1, Ordering::Relaxed));
         if completion_tag.is_some() {
             let mut controlled = match self.controlled_voices.lock() {
                 Ok(controlled) => controlled,
                 Err(_) => {
-                    self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
+                    self.runtime.release_reserved_voice();
                     return Err(PetalSonicError::Engine(
                         "Playback registry is poisoned".into(),
                     ));
@@ -948,7 +532,7 @@ impl PetalSonicWorld {
                 },
             );
         }
-        let command = PlaybackCommand::Play {
+        let intent = RuntimeIntent::Play {
             voice_id,
             emitter,
             source: state.clip.data.clone(),
@@ -963,10 +547,9 @@ impl PetalSonicWorld {
             play_command_id: options.play_command_id(),
             source_extent: state.desc.extent().clone(),
             occlusion_profile: options.occlusion_profile(state.desc.occlusion_profile()),
-            mono_scratch: vec![0.0; self.desc.block_size],
         };
-        if let Err(error) = self.try_send(command) {
-            self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
+        if let Err(error) = self.runtime.try_submit(intent) {
+            self.runtime.release_reserved_voice();
             if completion_tag.is_some()
                 && let Ok(mut controlled) = self.controlled_voices.lock()
             {
@@ -977,31 +560,22 @@ impl PetalSonicWorld {
         Ok(voice_id)
     }
 
-    fn reserve_voice(&self) -> Result<()> {
-        self.active_voice_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.desc.max_voices).then_some(active + 1)
-            })
-            .map(|_| ())
-            .map_err(|_| PetalSonicError::CapacityExceeded {
-                resource: "voice",
-                limit: self.desc.max_voices,
-            })
-    }
-
     pub fn pause_emitter(&self, emitter: Emitter) -> Result<()> {
         self.emitter_state(emitter)?;
-        self.try_send(PlaybackCommand::PauseEmitter(emitter))
+        self.runtime
+            .try_submit(RuntimeIntent::PauseEmitter(emitter))
     }
 
     pub fn resume_emitter(&self, emitter: Emitter) -> Result<()> {
         self.emitter_state(emitter)?;
-        self.try_send(PlaybackCommand::ResumeEmitter(emitter))
+        self.runtime
+            .try_submit(RuntimeIntent::ResumeEmitter(emitter))
     }
 
     pub fn stop_emitter(&self, emitter: Emitter) -> Result<()> {
         self.emitter_state(emitter)?;
-        self.try_send(PlaybackCommand::StopEmitter(emitter))?;
+        self.runtime
+            .try_submit(RuntimeIntent::StopEmitter(emitter))?;
         if let Ok(mut controlled) = self.controlled_voices.lock() {
             controlled.retain(|_, voice| voice.emitter != emitter);
         }
@@ -1010,31 +584,33 @@ impl PetalSonicWorld {
 
     pub fn seek_emitter(&self, emitter: Emitter, progress: f32) -> Result<()> {
         self.emitter_state(emitter)?;
-        self.try_send(PlaybackCommand::SeekEmitter(emitter, progress))
+        self.runtime
+            .try_submit(RuntimeIntent::SeekEmitter(emitter, progress))
     }
 
     pub fn pause_playback(&self, control: PlaybackControl) -> Result<()> {
         self.ensure_controlled(control)?;
-        self.try_send(PlaybackCommand::PauseVoice(control.voice_id))
+        self.runtime
+            .try_submit(RuntimeIntent::PauseVoice(control.voice_id))
     }
 
     pub fn resume_playback(&self, control: PlaybackControl) -> Result<()> {
         self.ensure_controlled(control)?;
-        self.try_send(PlaybackCommand::ResumeVoice(control.voice_id))
+        self.runtime
+            .try_submit(RuntimeIntent::ResumeVoice(control.voice_id))
     }
 
     pub fn set_playback_rate(&self, control: PlaybackControl, playback_rate: f32) -> Result<()> {
         self.ensure_controlled(control)?;
         Self::validate_playback_rate(playback_rate)?;
-        self.try_send(PlaybackCommand::SetVoiceRate(
-            control.voice_id,
-            playback_rate,
-        ))
+        self.runtime
+            .try_submit(RuntimeIntent::SetVoiceRate(control.voice_id, playback_rate))
     }
 
     pub fn stop_playback(&self, control: PlaybackControl) -> Result<()> {
         self.ensure_controlled(control)?;
-        self.try_send(PlaybackCommand::StopVoice(control.voice_id))?;
+        self.runtime
+            .try_submit(RuntimeIntent::StopVoice(control.voice_id))?;
         self.controlled_voices
             .lock()
             .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
@@ -1044,11 +620,12 @@ impl PetalSonicWorld {
 
     pub fn seek_playback(&self, control: PlaybackControl, progress: f32) -> Result<()> {
         self.ensure_controlled(control)?;
-        self.try_send(PlaybackCommand::SeekVoice(control.voice_id, progress))
+        self.runtime
+            .try_submit(RuntimeIntent::SeekVoice(control.voice_id, progress))
     }
 
     pub fn stop_all(&self) -> Result<()> {
-        self.try_send(PlaybackCommand::StopAll)?;
+        self.runtime.try_submit(RuntimeIntent::StopAll)?;
         self.controlled_voices
             .lock()
             .map_err(|_| PetalSonicError::Engine("Playback registry is poisoned".into()))?
@@ -1083,23 +660,12 @@ impl PetalSonicWorld {
     pub fn set_bus_params(&self, bus: Bus, params: BusParams) -> Result<()> {
         let index = self.resolve_bus(Some(bus))?;
         Self::validate_bus_params(params)?;
-        let mut current = self
-            .bus_params
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("Bus state is poisoned".into()))?;
-        self.try_send(PlaybackCommand::UpdateBus(index, params))?;
-        current[index] = params;
-        Ok(())
+        self.runtime.set_bus_params(index, params)
     }
 
     pub fn bus_params(&self, bus: Bus) -> Result<BusParams> {
         let index = self.resolve_bus(Some(bus))?;
-        self.bus_params
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("Bus state is poisoned".into()))?
-            .get(index)
-            .copied()
-            .ok_or(PetalSonicError::StaleBus)
+        self.runtime.bus_params(index)
     }
 
     fn validate_optional_bus(&self, bus: Option<Bus>) -> Result<()> {
@@ -1284,153 +850,41 @@ impl PetalSonicWorld {
         }
     }
 
-    fn try_send(&self, command: PlaybackCommand) -> Result<()> {
-        self.ensure_open()?;
-        let lifecycle = matches!(
-            &command,
-            PlaybackCommand::StopVoice(_)
-                | PlaybackCommand::StopEmitter(_)
-                | PlaybackCommand::DestroyEmitter(_)
-                | PlaybackCommand::StopAll
-        );
-        let sender = if lifecycle {
-            &self.lifecycle_sender
-        } else {
-            &self.command_sender
-        };
-        match sender.try_send(command) {
-            Ok(()) => {
-                let high_water = if lifecycle {
-                    &self.counters.lifecycle_queue_high_water
-                } else {
-                    &self.counters.control_queue_high_water
-                };
-                RuntimeCounters::observe_high_water(high_water, sender.len());
-                Ok(())
-            }
-            Err(TrySendError::Full(_)) => {
-                self.counters
-                    .rejected_commands
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(PetalSonicError::QueuePressure)
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.counters
-                    .rejected_commands
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(PetalSonicError::RuntimeClosed)
-            }
-        }
-    }
-
     pub fn sample_rate(&self) -> u32 {
         self.desc.sample_rate
     }
 
     pub fn is_running(&self) -> bool {
-        Self::load_runtime_state(&self.runtime_state) == RuntimeState::Running
+        self.runtime.runtime_status().state == RuntimeState::Running
     }
 
     pub fn runtime_status(&self) -> RuntimeStatus {
-        let active_output_device = self
-            .active_output_device
-            .lock()
-            .map(|device| device.clone())
-            .unwrap_or_default();
-        RuntimeStatus {
-            state: Self::load_runtime_state(&self.runtime_state),
-            recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
-            active_output_device,
-        }
+        self.runtime.runtime_status()
     }
 
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
-        let (
-            render_iterations,
-            render_time_p50_us,
-            render_time_p95_us,
-            render_time_p99_us,
-            render_time_max_us,
-        ) = self.counters.render_summary();
-        let acoustics = self.acoustic_propagation.diagnostics();
-        RuntimeDiagnostics {
-            frames_processed: self.frames_processed.load(Ordering::Relaxed),
-            underrun_count: self.underrun_count.load(Ordering::Relaxed),
-            active_emitters: self
-                .emitters
-                .lock()
-                .map(|emitters| emitters.len)
-                .unwrap_or_default(),
-            active_voices: self.active_voice_count.load(Ordering::Acquire),
-            control_queue_depth: self.command_sender.len(),
-            control_queue_high_water: self
-                .counters
-                .control_queue_high_water
-                .load(Ordering::Relaxed),
-            lifecycle_queue_depth: self.lifecycle_sender.len(),
-            lifecycle_queue_high_water: self
-                .counters
-                .lifecycle_queue_high_water
-                .load(Ordering::Relaxed),
-            event_queue_depth: self.event_receiver.len(),
-            event_queue_high_water: self.counters.event_queue_high_water.load(Ordering::Relaxed),
-            timing_queue_depth: self.timing_receiver.len(),
-            timing_queue_high_water: self
-                .counters
-                .timing_queue_high_water
-                .load(Ordering::Relaxed),
-            rejected_commands: self.counters.rejected_commands.load(Ordering::Relaxed),
-            dropped_events: self.counters.dropped_events.load(Ordering::Relaxed),
-            dropped_timing_events: self.counters.dropped_timing_events.load(Ordering::Relaxed),
-            render_iterations,
-            render_time_p50_us,
-            render_time_p95_us,
-            render_time_p99_us,
-            render_time_max_us,
-            acoustic_solve_count: acoustics.solve_count,
-            acoustic_superseded_solve_count: acoustics.superseded_solve_count,
-            acoustic_published_response_count: acoustics.published_response_count,
-            acoustic_response_spatial_revision: acoustics.latest_spatial_revision,
-            acoustic_response_geometry_version: acoustics.latest_geometry_version,
-            acoustic_last_solve_time_us: acoustics.last_solve_time_us,
-            acoustic_solve_time_p50_us: acoustics.solve_time_p50_us,
-            acoustic_solve_time_p95_us: acoustics.solve_time_p95_us,
-            acoustic_solve_time_p99_us: acoustics.solve_time_p99_us,
-            acoustic_solve_time_max_us: acoustics.solve_time_max_us,
-            acoustic_response_age_ms: acoustics.response_age_ms,
-            acoustic_direct_ray_count: acoustics.direct_ray_count,
-            acoustic_sample_cache_hit_count: acoustics.cache_hit_count,
-            acoustic_processed_extent_count: acoustics.processed_extent_count,
-            acoustic_lobe_count: acoustics.lobe_count,
-            acoustic_retained_response_count: acoustics.retained_response_count,
-            acoustic_deferred_response_count: acoustics.deferred_response_count,
-            acoustic_render_rejected_response_count: self
-                .counters
-                .acoustic_render_rejected_responses
-                .load(Ordering::Relaxed),
-            device_generation: self.counters.device_generation.load(Ordering::Relaxed),
-            recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
-            output_sample_rate: self.counters.output_sample_rate.load(Ordering::Relaxed) as u32,
-            output_channels: self.counters.output_channels.load(Ordering::Relaxed) as u16,
-            spatial_quality: self.desc.spatial_quality,
-            latency_profile: self.desc.latency_profile,
-        }
+        let active_emitters = self
+            .emitters
+            .lock()
+            .map(|emitters| emitters.len)
+            .unwrap_or_default();
+        self.runtime.diagnostics(active_emitters, &self.desc)
     }
 
     pub fn active_voice_count(&self) -> usize {
-        self.active_voice_count.load(Ordering::Acquire)
+        self.runtime.active_voice_count()
     }
 
     pub fn frames_processed(&self) -> usize {
-        self.frames_processed.load(Ordering::Relaxed)
+        self.runtime.frames_processed()
     }
 
     pub fn underrun_count(&self) -> usize {
-        self.underrun_count.load(Ordering::Relaxed)
+        self.runtime.underrun_count()
     }
 
     pub fn drain_events(&self) -> Vec<PetalSonicEvent> {
-        let events = self.event_receiver.try_iter().collect::<Vec<_>>();
+        let events = self.runtime.drain_events();
         self.drain_retired_controls();
         if let Ok(mut controlled) = self.controlled_voices.lock() {
             for event in &events {
@@ -1444,98 +898,42 @@ impl PetalSonicWorld {
 
     /// Drains opt-in per-Voice render telemetry without consuming lifecycle events.
     pub fn drain_voice_telemetry(&self) -> Vec<VoiceTelemetryEvent> {
-        self.voice_telemetry_receiver.try_iter().collect()
+        self.runtime.drain_voice_telemetry()
     }
 
     /// Reports pressure on the independently bounded Voice telemetry queue.
     pub fn voice_telemetry_diagnostics(&self) -> VoiceTelemetryDiagnostics {
-        VoiceTelemetryDiagnostics {
-            queue_depth: self.voice_telemetry_receiver.len(),
-            queue_high_water: self
-                .counters
-                .voice_telemetry_queue_high_water
-                .load(Ordering::Relaxed),
-            dropped_events: self
-                .counters
-                .dropped_voice_telemetry
-                .load(Ordering::Relaxed),
-        }
+        self.runtime.voice_telemetry_diagnostics()
     }
 
     /// Drains worker-side source-extent telemetry without consuming Voice or lifecycle events.
     pub fn drain_acoustic_telemetry(&self) -> Vec<AcousticTelemetryEvent> {
-        self.acoustic_telemetry_receiver.try_iter().collect()
+        self.runtime.drain_acoustic_telemetry()
     }
 
     /// Reports pressure on the independently bounded acoustics telemetry queue.
     pub fn acoustic_telemetry_diagnostics(&self) -> AcousticTelemetryDiagnostics {
-        let (queue_high_water, dropped_events) = self.acoustic_propagation.telemetry_pressure();
-        AcousticTelemetryDiagnostics {
-            queue_depth: self.acoustic_telemetry_receiver.len(),
-            queue_high_water,
-            dropped_events,
-        }
+        self.runtime.acoustic_telemetry_diagnostics()
     }
 
     fn drain_retired_controls(&self) {
         if let Ok(mut controlled) = self.controlled_voices.lock() {
-            while let Ok(voice_id) = self.retirement_receiver.try_recv() {
+            for voice_id in self.runtime.drain_retired_voice_ids() {
                 controlled.remove(&voice_id);
             }
         }
     }
 
-    fn drain_retired_spatial_frames(&self) {
-        while self.spatial_retirement_receiver.try_recv().is_ok() {}
-    }
-
-    fn drain_retired_acoustic_responses(&self) {
-        while self
-            .acoustic_response_retirement_receiver
-            .try_recv()
-            .is_ok()
-        {}
-    }
-
     pub fn drain_timing_events(&self) -> Vec<RenderTimingEvent> {
-        self.timing_receiver.try_iter().collect()
+        self.runtime.drain_timing_events()
     }
 
     pub fn close(&self) -> Result<()> {
-        let _close_guard = self
-            .close_lock
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("World close lock is poisoned".into()))?;
-        if Self::load_runtime_state(&self.runtime_state) == RuntimeState::Closed {
-            return Ok(());
-        }
-        self.runtime_state
-            .store(RuntimeState::Closing as u8, Ordering::Release);
-        self.acoustic_propagation.close();
-        self.supervisor_stop.store(true, Ordering::Release);
-        if let Some(supervisor) = self
-            .supervisor_thread
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("Output supervisor lock is poisoned".into()))?
-            .take()
-        {
-            supervisor.thread().unpark();
-            supervisor.join().map_err(|_| {
-                PetalSonicError::Engine("Output supervisor panicked while shutting down".into())
-            })?;
-        }
-        self.active_voice_count.store(0, Ordering::Release);
-        self.runtime_state
-            .store(RuntimeState::Closed as u8, Ordering::Release);
-        Ok(())
+        self.runtime.close()
     }
 
     fn ensure_open(&self) -> Result<()> {
-        match Self::load_runtime_state(&self.runtime_state) {
-            RuntimeState::Failed => Err(PetalSonicError::RuntimeFailed),
-            RuntimeState::Closing | RuntimeState::Closed => Err(PetalSonicError::RuntimeClosed),
-            _ => Ok(()),
-        }
+        self.runtime.ensure_open()
     }
 }
 
@@ -1550,7 +948,14 @@ mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
     use crate::domain::{DirectGeometry, DirectPath, EnvironmentSend, PlayCommandId};
+    use crate::engine::{EngineCommandReceivers, OutputRecoveryReason};
+    use crate::runtime::{
+        AudioRuntime, OUTPUT_RETRY_INTERVAL, OutputPreparation, OutputRuntimeDriver,
+        SupervisorSchedule,
+    };
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicU8, AtomicU64};
+    use std::time::Instant;
 
     #[test]
     fn spatial_routing_rejects_invalid_or_inapplicable_policies() {
@@ -1827,7 +1232,7 @@ mod tests {
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
-        PetalSonicWorld::supervisor_tick(
+        AudioRuntime::supervisor_tick(
             &mut driver,
             &commands,
             &buses,
@@ -1842,7 +1247,7 @@ mod tests {
         assert_eq!(driver.actions, ["prepare", "stop", "advance", "start"]);
         assert_eq!(driver.active, Some(b));
         assert_eq!(
-            PetalSonicWorld::load_runtime_state(&runtime_state),
+            AudioRuntime::load_runtime_state(&runtime_state),
             RuntimeState::Running
         );
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
@@ -1871,7 +1276,7 @@ mod tests {
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
-        PetalSonicWorld::supervisor_tick(
+        AudioRuntime::supervisor_tick(
             &mut driver,
             &commands,
             &buses,
@@ -1882,13 +1287,13 @@ mod tests {
             now,
         );
         assert_eq!(
-            PetalSonicWorld::load_runtime_state(&runtime_state),
+            AudioRuntime::load_runtime_state(&runtime_state),
             RuntimeState::Recovering
         );
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
 
         driver.selected = Some(b);
-        PetalSonicWorld::supervisor_tick(
+        AudioRuntime::supervisor_tick(
             &mut driver,
             &commands,
             &buses,
@@ -1904,7 +1309,7 @@ mod tests {
         assert_eq!(driver.loop_cursor_frames, 0);
         assert!(driver.one_shot_completed);
         assert_eq!(
-            PetalSonicWorld::load_runtime_state(&runtime_state),
+            AudioRuntime::load_runtime_state(&runtime_state),
             RuntimeState::Running
         );
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 2);
@@ -1927,7 +1332,7 @@ mod tests {
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
-        PetalSonicWorld::supervisor_tick(
+        AudioRuntime::supervisor_tick(
             &mut driver,
             &commands,
             &buses,
@@ -1941,7 +1346,7 @@ mod tests {
         assert_eq!(driver.active, Some(a));
         assert_eq!(driver.actions, ["prepare"]);
         assert_eq!(
-            PetalSonicWorld::load_runtime_state(&runtime_state),
+            AudioRuntime::load_runtime_state(&runtime_state),
             RuntimeState::Running
         );
     }
@@ -1969,7 +1374,7 @@ mod tests {
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
-        PetalSonicWorld::supervisor_tick(
+        AudioRuntime::supervisor_tick(
             &mut driver,
             &commands,
             &buses,
@@ -1983,7 +1388,7 @@ mod tests {
         assert_eq!(driver.actions, ["prepare", "stop", "advance", "start"]);
         assert_eq!(driver.active, Some(b));
         assert_eq!(
-            PetalSonicWorld::load_runtime_state(&runtime_state),
+            AudioRuntime::load_runtime_state(&runtime_state),
             RuntimeState::Running
         );
     }
@@ -2006,7 +1411,7 @@ mod tests {
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
-        PetalSonicWorld::supervisor_tick(
+        AudioRuntime::supervisor_tick(
             &mut driver,
             &commands,
             &buses,
@@ -2018,7 +1423,7 @@ mod tests {
         );
 
         assert_eq!(
-            PetalSonicWorld::load_runtime_state(&runtime_state),
+            AudioRuntime::load_runtime_state(&runtime_state),
             RuntimeState::Failed
         );
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
@@ -2154,17 +1559,6 @@ mod tests {
         assert_eq!(diagnostics.active_voices, VOICES);
         assert!(diagnostics.control_queue_depth <= 128);
         assert!(diagnostics.control_queue_high_water <= 128);
-        assert_eq!(
-            world
-                .latest_spatial_frame
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .emitters()
-                .len(),
-            EMITTERS
-        );
         assert_eq!(queue_pressure_observed, diagnostics.rejected_commands > 0);
 
         world.stop_all().unwrap();
@@ -2207,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_publication_overwrites_unconsumed_frames_atomically() {
+    fn spatial_publication_accepts_latest_complete_frames_without_control_queue_growth() {
         let desc = crate::config::PetalSonicWorldDesc {
             output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
                 "petalsonic-test-device-that-does-not-exist".into(),
@@ -2246,14 +1640,21 @@ mod tests {
             ))
             .unwrap();
 
-        let latest = world
-            .latest_spatial_frame
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("latest frame should remain available while recovering");
-        assert_eq!(latest.listener(), second_listener);
-        assert_eq!(latest.emitters()[0].pose, second_emitter);
+        assert!(matches!(
+            world.publish_spatial_frame(SpatialFrame::new(
+                1,
+                0.2,
+                second_listener,
+                vec![crate::domain::EmitterSpatialState::new(
+                    emitter,
+                    second_emitter,
+                )],
+            )),
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.revision",
+                ..
+            })
+        ));
         assert_eq!(world.diagnostics().control_queue_depth, 0);
         world.close().unwrap();
     }

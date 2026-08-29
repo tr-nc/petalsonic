@@ -85,6 +85,7 @@ mod mixer;
 mod occlusion;
 mod platform;
 mod playback;
+mod runtime;
 mod source_extent;
 mod spatial;
 mod world;

@@ -191,17 +191,32 @@ pub struct PetalSonicWorld {
 impl PetalSonicWorld {
     pub fn new(config: crate::config::PetalSonicWorldDesc) -> Result<Self> {
         Self::validate_config(&config)?;
-        let world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
         let runtime = AudioRuntime::start(&config)?;
+        Ok(Self::from_runtime(config, runtime))
+    }
 
-        Ok(Self {
+    #[cfg(test)]
+    fn new_with_output(
+        config: crate::config::PetalSonicWorldDesc,
+        output: impl FnOnce() -> Result<Box<dyn crate::platform::output::OutputPlatform>>
+        + Send
+        + 'static,
+    ) -> Result<Self> {
+        Self::validate_config(&config)?;
+        let runtime = AudioRuntime::start_with_output(&config, output)?;
+        Ok(Self::from_runtime(config, runtime))
+    }
+
+    fn from_runtime(config: crate::config::PetalSonicWorldDesc, runtime: AudioRuntime) -> Self {
+        let world_id = NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed);
+        Self {
             world_id,
             emitters: Mutex::new(EmitterRegistry::new(config.max_emitters, world_id)),
             controlled_voices: Mutex::new(HashMap::with_capacity(config.max_voices)),
             desc: config,
             next_voice_id: AtomicU64::new(0),
             runtime,
-        })
+        }
     }
 
     fn validate_config(config: &crate::config::PetalSonicWorldDesc) -> Result<()> {
@@ -1138,6 +1153,52 @@ mod tests {
         assert_eq!(runtime.diagnostics(0, &desc).output_channels, 6);
         assert!(runtime.runtime_status().recovery_attempts >= 2);
         runtime.close().unwrap();
+    }
+
+    #[test]
+    fn world_keeps_emitter_and_voice_identity_across_fake_output_recovery() {
+        let a = PlatformFakeDevice::stereo("A", 48_000);
+        let mut b = PlatformFakeDevice::stereo("B", 96_000);
+        b.sample_format = FakeSampleFormat::U16;
+        let (adapter, handle) = FakeOutputPlatform::scripted(vec![a, b], Some(0));
+        let desc = crate::config::PetalSonicWorldDesc {
+            environmental_acoustics_enabled: false,
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap();
+        let control = world
+            .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(77))
+            .unwrap();
+
+        let running_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < running_deadline
+            && world.runtime_status().active_output_device.as_deref() != Some("A")
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(world.active_voice_count(), 1);
+
+        handle.set_selected(Some(1));
+        handle.fail_stream();
+        let recovery_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < recovery_deadline
+            && world.runtime_status().active_output_device.as_deref() != Some("B")
+        {
+            std::thread::yield_now();
+        }
+
+        assert_eq!(world.runtime_status().state, RuntimeState::Running);
+        assert_eq!(world.active_voice_count(), 1);
+        world.pause_playback(control).unwrap();
+        world.resume_playback(control).unwrap();
+        world
+            .update_emitter(emitter, EmitterDesc::non_spatial())
+            .unwrap();
+        assert!(world.diagnostics().device_generation >= 2);
+        world.close().unwrap();
     }
 
     #[test]

@@ -1120,6 +1120,33 @@ mod tests {
     }
 
     #[test]
+    fn fake_adapter_stop_quiesces_callback_before_returning() {
+        let device = FakeDevice::stereo("A", 48_000);
+        let (mut adapter, handle) = FakeOutputPlatform::scripted(vec![device], Some(0));
+        let OutputPreparation::Ready(prepared) =
+            adapter.prepare(&OutputDevicePolicy::FollowSystemDefault)
+        else {
+            panic!("A must prepare");
+        };
+        adapter
+            .open(
+                prepared,
+                callback_for(
+                    &[StereoFrame {
+                        left: 1.0,
+                        right: -1.0,
+                    }],
+                    48_000,
+                ),
+            )
+            .unwrap();
+        adapter.stop().unwrap();
+        handle.advance(1);
+        assert!(handle.captured().is_empty());
+        assert_eq!(handle.actions(), ["prepare", "open", "stop"]);
+    }
+
+    #[test]
     fn fake_adapter_classifies_supported_and_permanent_formats() {
         for format in [
             FakeSampleFormat::F32,

@@ -963,7 +963,6 @@ mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
     use crate::domain::{DirectGeometry, DirectPath, EnvironmentSend, PlayCommandId};
-    use crate::engine::EngineCommandReceivers;
     use crate::platform::output::fake::{
         FakeDevice as PlatformFakeDevice, FakeOutputPlatform, FakeSampleFormat,
     };
@@ -1054,12 +1053,7 @@ mod tests {
     impl OutputRuntimeDriver for FakeOutputDriver {
         fn drain_retired_resources(&mut self) {}
 
-        fn reconcile_output(
-            &mut self,
-            _commands: &EngineCommandReceivers,
-            _buses: &mut Vec<BusParams>,
-            request: OutputRecoveryRequest,
-        ) -> OutputRecoveryResult {
+        fn reconcile_output(&mut self, request: OutputRecoveryRequest) -> OutputRecoveryResult {
             if self.active.is_some() && request.probe {
                 if !self.stream_failed && self.active == self.selected {
                     return OutputRecoveryResult::Stable;
@@ -1106,12 +1100,6 @@ mod tests {
         }
 
         fn emit_runtime_state(&self, _state: RuntimeState) {}
-    }
-
-    fn fake_command_receivers() -> EngineCommandReceivers {
-        let (_, regular) = crossbeam_channel::bounded(4);
-        let (_, lifecycle) = crossbeam_channel::bounded(4);
-        EngineCommandReceivers::new(regular, lifecycle)
     }
 
     #[test]
@@ -1312,21 +1300,15 @@ mod tests {
         };
         let mut driver = FakeOutputDriver::with_active(a);
         driver.selected = Some(b);
-        let commands = fake_command_receivers();
-        let buses = Mutex::new(vec![BusParams::default()]);
         let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
         let recovery_attempts = AtomicU64::new(0);
-        let mut recovery_buses = vec![BusParams::default()];
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
         AudioRuntime::supervisor_tick(
             &mut driver,
-            &commands,
-            &buses,
             &runtime_state,
             &recovery_attempts,
-            &mut recovery_buses,
             &mut schedule,
             now,
         );
@@ -1354,21 +1336,15 @@ mod tests {
         let mut driver = FakeOutputDriver::with_active(a);
         driver.stream_failed = true;
         driver.selected = None;
-        let commands = fake_command_receivers();
-        let buses = Mutex::new(vec![BusParams::default()]);
         let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
         let recovery_attempts = AtomicU64::new(0);
-        let mut recovery_buses = vec![BusParams::default()];
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
         AudioRuntime::supervisor_tick(
             &mut driver,
-            &commands,
-            &buses,
             &runtime_state,
             &recovery_attempts,
-            &mut recovery_buses,
             &mut schedule,
             now,
         );
@@ -1381,11 +1357,8 @@ mod tests {
         driver.selected = Some(b);
         AudioRuntime::supervisor_tick(
             &mut driver,
-            &commands,
-            &buses,
             &runtime_state,
             &recovery_attempts,
-            &mut recovery_buses,
             &mut schedule,
             now + OUTPUT_RETRY_INTERVAL,
         );
@@ -1410,21 +1383,15 @@ mod tests {
         let mut driver = FakeOutputDriver::with_active(a);
         driver.active = None;
         driver.permanent_format_failure = true;
-        let commands = fake_command_receivers();
-        let buses = Mutex::new(vec![BusParams::default()]);
         let runtime_state = AtomicU8::new(RuntimeState::Recovering as u8);
         let recovery_attempts = AtomicU64::new(0);
-        let mut recovery_buses = vec![BusParams::default()];
         let now = Instant::now();
         let mut schedule = SupervisorSchedule::new(now);
 
         AudioRuntime::supervisor_tick(
             &mut driver,
-            &commands,
-            &buses,
             &runtime_state,
             &recovery_attempts,
-            &mut recovery_buses,
             &mut schedule,
             now,
         );

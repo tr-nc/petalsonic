@@ -7,7 +7,6 @@ use crate::playback::{PlayState, PlaybackInstance};
 use crate::spatial::{SpatialProcessingMetrics, SpatialProcessor, SpatialRenderContext};
 use crate::{BusParams, gain};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -55,17 +54,13 @@ pub struct MixProfilingSummary {
 pub fn mix_playback_instances_with_metrics(
     world_buffer: &mut [f32],
     channels: u16,
-    active_playback: &Arc<Mutex<HashMap<VoiceId, PlaybackInstance>>>,
+    active_playback: &mut HashMap<VoiceId, PlaybackInstance>,
     spatial_processor: Option<&mut SpatialProcessor>,
     buses: &[BusParams],
     render_context: SpatialRenderContext,
     scratch: &mut MixerScratch,
     completed_playbacks: &mut Vec<CompletedPlayback>,
 ) -> MixProfilingSummary {
-    let Ok(mut active_playback) = active_playback.try_lock() else {
-        return MixProfilingSummary::default();
-    };
-
     scratch.spatial_voice_ids.clear();
     scratch.muted_spatial_voice_ids.clear();
     scratch.non_spatial_voice_ids.clear();
@@ -122,7 +117,7 @@ pub fn mix_playback_instances_with_metrics(
             let spatial_start = Instant::now();
             if let Ok(metrics) = processor.process_spatial_sources_with_metrics(
                 &scratch.spatial_voice_ids,
-                &mut active_playback,
+                active_playback,
                 world_buffer,
                 render_context,
                 &mut scratch.voice_telemetry,
@@ -178,6 +173,7 @@ mod tests {
     use crate::config::SourceConfig;
     use crate::domain::Emitter;
     use crate::playback::{LoopMode, VoiceStart};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -205,7 +201,7 @@ mod tests {
 
     #[test]
     fn paused_gameplay_freezes_while_music_keeps_rendering() {
-        let active = Arc::new(Mutex::new(HashMap::new()));
+        let mut active = HashMap::new();
         for (id, bus_index, sample) in [(1, 1, 1.0), (2, 2, 0.5)] {
             let audio = Arc::new(PetalSonicAudioData::new(
                 vec![sample; 16],
@@ -234,10 +230,7 @@ mod tests {
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
-            active
-                .lock()
-                .unwrap()
-                .insert(VoiceId::from(id as u64), voice);
+            active.insert(VoiceId::from(id as u64), voice);
         }
 
         let buses = [
@@ -254,7 +247,7 @@ mod tests {
         mix_playback_instances_with_metrics(
             &mut output,
             2,
-            &active,
+            &mut active,
             None,
             &buses,
             SpatialRenderContext::default(),
@@ -263,14 +256,13 @@ mod tests {
         );
 
         assert_eq!(output, [0.5; 8]);
-        let active = active.lock().unwrap();
         assert_eq!(active[&VoiceId::from(1)].info.current_frame, 0);
         assert_eq!(active[&VoiceId::from(2)].info.current_frame, 4);
     }
 
     #[test]
     fn playback_rate_only_changes_the_selected_bus() {
-        let active = Arc::new(Mutex::new(HashMap::new()));
+        let mut active = HashMap::new();
         for (id, bus_index) in [(1, 1), (2, 2)] {
             let audio = Arc::new(PetalSonicAudioData::new(
                 (0..32).map(|sample| sample as f32).collect(),
@@ -299,10 +291,7 @@ mod tests {
                 mono_scratch: vec![0.0; 4],
             });
             voice.play_from_beginning();
-            active
-                .lock()
-                .unwrap()
-                .insert(VoiceId::from(id as u64), voice);
+            active.insert(VoiceId::from(id as u64), voice);
         }
         let buses = [
             BusParams::default(),
@@ -318,7 +307,7 @@ mod tests {
         mix_playback_instances_with_metrics(
             &mut output,
             2,
-            &active,
+            &mut active,
             None,
             &buses,
             SpatialRenderContext::default(),
@@ -326,7 +315,6 @@ mod tests {
             &mut completed,
         );
 
-        let active = active.lock().unwrap();
         assert_eq!(active[&VoiceId::from(1)].info.current_frame, 2);
         assert_eq!(active[&VoiceId::from(2)].info.current_frame, 4);
     }

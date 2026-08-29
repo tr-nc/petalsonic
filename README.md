@@ -35,6 +35,8 @@ fn main() -> Result<(), PetalSonicError> {
 
     // Publish the listener and all spatial Emitters as one complete game-frame snapshot.
     world.publish_spatial_frame(SpatialFrame::new(
+        1,
+        0.0,
         Pose::from_position(Vec3::ZERO),
         vec![EmitterSpatialState::new(
             emitter,

@@ -14,9 +14,8 @@ use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
 use crate::domain::{
     BusParams, DirectPath, Emitter, EnvironmentOrigin, EnvironmentSend, OcclusionProfile,
-    PlayCommandId, PlaybackTag, SourceExtent,
+    PlayCommandId, PlaybackTag, SourceExtent, VoiceId,
 };
-use crate::world::SourceId;
 use std::fmt;
 use std::sync::Arc;
 
@@ -138,7 +137,7 @@ pub struct PlaybackInstance {
 }
 
 impl PlaybackInstance {
-    pub(crate) fn from_source(start: VoiceStart) -> Self {
+    pub(crate) fn from_voice(start: VoiceStart) -> Self {
         let VoiceStart {
             emitter,
             audio_data,
@@ -497,7 +496,7 @@ impl PlaybackInstance {
 #[allow(clippy::large_enum_variant)]
 pub enum PlaybackCommand {
     Play {
-        voice_id: SourceId,
+        voice_id: VoiceId,
         emitter: Emitter,
         source: Arc<PetalSonicAudioData>,
         config: SourceConfig,
@@ -513,11 +512,11 @@ pub enum PlaybackCommand {
         occlusion_profile: OcclusionProfile,
         mono_scratch: Vec<f32>,
     },
-    PauseVoice(SourceId),
-    StopVoice(SourceId),
-    SeekVoice(SourceId, f32),
-    ResumeVoice(SourceId),
-    SetVoiceRate(SourceId, f32),
+    PauseVoice(VoiceId),
+    StopVoice(VoiceId),
+    SeekVoice(VoiceId, f32),
+    ResumeVoice(VoiceId),
+    SetVoiceRate(VoiceId, f32),
     PauseEmitter(Emitter),
     ResumeEmitter(Emitter),
     StopEmitter(Emitter),
@@ -619,7 +618,7 @@ mod tests {
             1,
             Duration::from_secs_f64(4.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_source(VoiceStart {
+        let mut instance = PlaybackInstance::from_voice(VoiceStart {
             emitter: Emitter {
                 world_id: 1,
                 index: 0,
@@ -665,7 +664,7 @@ mod tests {
             1,
             Duration::from_secs_f64(4.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_source(VoiceStart {
+        let mut instance = PlaybackInstance::from_voice(VoiceStart {
             emitter: Emitter {
                 world_id: 1,
                 index: 0,
@@ -712,7 +711,7 @@ mod tests {
             1,
             Duration::from_secs_f64(1_000.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_source(VoiceStart {
+        let mut instance = PlaybackInstance::from_voice(VoiceStart {
             emitter: Emitter {
                 world_id: 1,
                 index: 0,

@@ -7,7 +7,6 @@ pub use crate::source_extent::{
     ExtentSample, ExtentSampleId, MAX_EXTENT_RADIUS_WORLD_UNITS, MAX_EXTENT_SAMPLES, SourceExtent,
     WeightedSamples,
 };
-use crate::world::SourceId;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -306,11 +305,36 @@ impl std::fmt::Display for Emitter {
     }
 }
 
-/// Opaque handle for one explicitly controlled playback voice.
+/// Internal identity for one playback Voice.
+///
+/// IDs are allocated monotonically and never reused within a World, so a stale
+/// control cannot alias a later Voice after the earlier one is reclaimed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct VoiceId(u64);
+
+impl std::fmt::Display for VoiceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VoiceId({})", self.0)
+    }
+}
+
+impl From<u64> for VoiceId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl VoiceId {
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// Opaque handle for one explicitly controlled playback Voice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlaybackControl {
     pub(crate) world_id: u64,
-    pub(crate) voice_id: SourceId,
+    pub(crate) voice_id: VoiceId,
 }
 
 impl std::fmt::Display for PlaybackControl {

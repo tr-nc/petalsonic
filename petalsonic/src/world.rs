@@ -2,7 +2,7 @@ use crate::acoustic_propagation::{AcousticPropagation, AcousticResponse};
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::domain::{
     Bus, BusParams, Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
-    SpatialFrame,
+    SpatialFrame, VoiceId,
 };
 use crate::engine::{
     EngineCommandReceivers, EngineObservability, EngineStartup, OutputRecoveryReason,
@@ -106,31 +106,6 @@ impl SupervisorSchedule {
             next_health_probe: now,
             last_advance: now,
         }
-    }
-}
-
-/// Internal identity for one playback voice.
-///
-/// IDs are never reused within a world, so a stale control cannot alias a later
-/// voice even after the earlier slot has been reclaimed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SourceId(u64);
-
-impl std::fmt::Display for SourceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "VoiceId({})", self.0)
-    }
-}
-
-impl From<u64> for SourceId {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl SourceId {
-    pub(crate) fn value(self) -> u64 {
-        self.0
     }
 }
 
@@ -301,8 +276,8 @@ pub struct PetalSonicWorld {
     emitters: Mutex<EmitterRegistry>,
     next_voice_id: AtomicU64,
     active_voice_count: Arc<AtomicUsize>,
-    controlled_voices: Mutex<HashMap<SourceId, ControlledVoiceState>>,
-    retirement_receiver: Receiver<SourceId>,
+    controlled_voices: Mutex<HashMap<VoiceId, ControlledVoiceState>>,
+    retirement_receiver: Receiver<VoiceId>,
     latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
     spatial_retirement_receiver: Receiver<Arc<SpatialFrame>>,
     spatial_frame_revision: AtomicU64,
@@ -917,7 +892,7 @@ impl PetalSonicWorld {
         emitter: Emitter,
         options: PlayOptions,
         completion_tag: Option<PlaybackTag>,
-    ) -> Result<SourceId> {
+    ) -> Result<VoiceId> {
         self.drain_retired_controls();
         self.ensure_open()?;
         let state = self.emitter_state(emitter)?;
@@ -954,7 +929,7 @@ impl PetalSonicWorld {
         }
         let bus_index = self.resolve_bus(options.bus().or(state.desc.bus()))?;
         self.reserve_voice()?;
-        let voice_id = SourceId(self.next_voice_id.fetch_add(1, Ordering::Relaxed));
+        let voice_id = VoiceId::from(self.next_voice_id.fetch_add(1, Ordering::Relaxed));
         if completion_tag.is_some() {
             let mut controlled = match self.controlled_voices.lock() {
                 Ok(controlled) => controlled,

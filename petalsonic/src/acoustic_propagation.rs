@@ -1,5 +1,6 @@
 use crate::acoustics::{AcousticMaterial, AcousticRay, AcousticSceneSnapshot};
 use crate::config::EnvironmentalAcousticsBudget;
+use crate::domain::VoiceId;
 use crate::domain::{
     DirectGeometry, DirectPath, DirectPlacement, Emitter, EnvironmentOrigin, EnvironmentSend,
     MAX_DIRECT_LOBES, MAX_EXTENT_SAMPLES, OcclusionProfile, SourceExtent, SpatialFrame,
@@ -12,7 +13,6 @@ use crate::events::{
 };
 use crate::math::{Pose, Vec3};
 use crate::spatial::LateReverbParameters;
-use crate::world::SourceId;
 use crossbeam_channel::{Receiver, Sender};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
@@ -82,7 +82,7 @@ pub(crate) struct EarlyReflectionTap {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DirectAcousticResponse {
-    pub voice_id: SourceId,
+    pub voice_id: VoiceId,
     pub(crate) routing_generation: u64,
     pub gain: [f32; 3],
     pub environment_gain: [f32; 3],
@@ -121,7 +121,7 @@ pub(crate) struct AcousticResponse {
 
 impl AcousticResponse {
     #[cfg(test)]
-    pub(crate) fn direct_gain(&self, voice_id: SourceId) -> [f32; 3] {
+    pub(crate) fn direct_gain(&self, voice_id: VoiceId) -> [f32; 3] {
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
@@ -129,7 +129,7 @@ impl AcousticResponse {
             .unwrap_or([1.0; 3])
     }
 
-    pub(crate) fn direct_gain_target(&self, voice_id: SourceId) -> Option<[f32; 3]> {
+    pub(crate) fn direct_gain_target(&self, voice_id: VoiceId) -> Option<[f32; 3]> {
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
@@ -139,7 +139,7 @@ impl AcousticResponse {
     }
 
     #[cfg(test)]
-    pub(crate) fn environment_gain(&self, voice_id: SourceId) -> [f32; 3] {
+    pub(crate) fn environment_gain(&self, voice_id: VoiceId) -> [f32; 3] {
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
@@ -147,7 +147,7 @@ impl AcousticResponse {
             .unwrap_or([1.0; 3])
     }
 
-    pub(crate) fn environment_gain_target(&self, voice_id: SourceId) -> Option<[f32; 3]> {
+    pub(crate) fn environment_gain_target(&self, voice_id: VoiceId) -> Option<[f32; 3]> {
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
@@ -157,7 +157,7 @@ impl AcousticResponse {
             })
     }
 
-    pub(crate) fn early_reflections(&self, voice_id: SourceId) -> &[EarlyReflectionTap] {
+    pub(crate) fn early_reflections(&self, voice_id: VoiceId) -> &[EarlyReflectionTap] {
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
@@ -165,7 +165,7 @@ impl AcousticResponse {
             .unwrap_or_default()
     }
 
-    pub(crate) fn direct_lobes_target(&self, voice_id: SourceId) -> Option<&[DirectLobeTarget]> {
+    pub(crate) fn direct_lobes_target(&self, voice_id: VoiceId) -> Option<&[DirectLobeTarget]> {
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
@@ -175,7 +175,7 @@ impl AcousticResponse {
             })
     }
 
-    pub(crate) fn telemetry(&self, voice_id: SourceId) -> Option<EnvironmentResponseTelemetry> {
+    pub(crate) fn telemetry(&self, voice_id: VoiceId) -> Option<EnvironmentResponseTelemetry> {
         self.direct
             .iter()
             .any(|response| response.voice_id == voice_id)
@@ -190,7 +190,7 @@ impl AcousticResponse {
 /// Immutable routing and the latest compatible emitter state for one active Voice.
 #[derive(Clone, Debug)]
 pub(crate) struct AcousticVoice {
-    pub voice_id: SourceId,
+    pub voice_id: VoiceId,
     pub emitter: Emitter,
     pub emitter_world_pose: Pose,
     pub acoustic_priority: f32,
@@ -214,7 +214,7 @@ impl AcousticVoice {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct VoiceRouteKey {
-    voice_id: SourceId,
+    voice_id: VoiceId,
     routing_generation: u64,
 }
 
@@ -326,7 +326,7 @@ impl AcousticVoiceInput {
         self.input.changed.notify_one();
     }
 
-    pub(crate) fn retire(&self, voice_id: SourceId) {
+    pub(crate) fn retire(&self, voice_id: VoiceId) {
         let Ok(mut state) = self.input.state.lock() else {
             return;
         };
@@ -924,7 +924,7 @@ enum RouteKind {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SampleCacheKey {
-    voice_id: SourceId,
+    voice_id: VoiceId,
     routing_generation: u64,
     emitter: Emitter,
     spatial_revision: u64,
@@ -1528,7 +1528,7 @@ struct ExtentTrace {
 struct RouteTraceContext {
     listener: Vec3,
     ray_epsilon_world: f32,
-    voice_id: SourceId,
+    voice_id: VoiceId,
     routing_generation: u64,
     emitter: Emitter,
     route: RouteKind,
@@ -2737,7 +2737,7 @@ mod tests {
             )),
             scene: Arc::new(AcousticSceneSnapshot::new(17, query)),
             voices: vec![AcousticVoice {
-                voice_id: SourceId::from(1),
+                voice_id: VoiceId::from(1),
                 routing_generation: 1,
                 emitter,
                 emitter_world_pose: Pose::from_position(Vec3::Z),
@@ -2828,7 +2828,7 @@ mod tests {
         budget_input.voices = (0..10)
             .map(|index| {
                 let mut voice = budget_input.voices[0].clone();
-                voice.voice_id = SourceId::from(index as u64);
+                voice.voice_id = VoiceId::from(index as u64);
                 voice.emitter = Emitter {
                     world_id: 1,
                     index,
@@ -2874,7 +2874,7 @@ mod tests {
         captured.voices[0].source_extent = eight_sample_extent();
         for (voice_id, routing_generation) in [(2, 2), (3, 3)] {
             let mut voice = captured.voices[0].clone();
-            voice.voice_id = SourceId::from(voice_id);
+            voice.voice_id = VoiceId::from(voice_id);
             voice.routing_generation = routing_generation;
             captured.voices.push(voice);
         }
@@ -2894,11 +2894,11 @@ mod tests {
         current.voices = captured.voices.clone();
         current
             .voices
-            .retain(|voice| voice.voice_id != SourceId::from(3));
+            .retain(|voice| voice.voice_id != VoiceId::from(3));
         let rerouted = current
             .voices
             .iter_mut()
-            .find(|voice| voice.voice_id == SourceId::from(2))
+            .find(|voice| voice.voice_id == VoiceId::from(2))
             .unwrap();
         rerouted.routing_generation = 20;
         rerouted.environment_send = EnvironmentSend::from_world_pose(Pose::from_position(-Vec3::Z));
@@ -2910,7 +2910,7 @@ mod tests {
             captured.spatial.revision()
         );
         assert_eq!(filtered.response.direct.len(), 1);
-        assert_eq!(filtered.response.direct[0].voice_id, SourceId::from(1));
+        assert_eq!(filtered.response.direct[0].voice_id, VoiceId::from(1));
         assert_eq!(filtered.telemetry.len(), 1);
         assert_eq!(filtered.conclusions.len(), 1);
         assert_eq!(filtered.conclusions[0].telemetry.voice_id, 1);
@@ -2960,7 +2960,7 @@ mod tests {
         workload.voices = (0..EXTENTS)
             .map(|index| {
                 let mut voice = workload.voices[0].clone();
-                voice.voice_id = SourceId::from(index as u64);
+                voice.voice_id = VoiceId::from(index as u64);
                 voice.emitter = Emitter {
                     world_id: 1,
                     index: index as u32,
@@ -3551,7 +3551,7 @@ mod tests {
         input.voices[0].emitter_world_pose = Pose::from_position(Vec3::X);
         input.voices[0].acoustic_priority = 2.0;
         let mut voice_b = input.voices[0].clone();
-        voice_b.voice_id = SourceId::from(2);
+        voice_b.voice_id = VoiceId::from(2);
         voice_b.emitter = emitter_b;
         voice_b.emitter_world_pose = Pose::from_position(-Vec3::X);
         voice_b.acoustic_priority = 1.0;
@@ -3577,7 +3577,7 @@ mod tests {
             .response
             .direct
             .iter()
-            .find(|response| response.voice_id == SourceId::from(1))
+            .find(|response| response.voice_id == VoiceId::from(1))
             .unwrap();
         assert_eq!(voice_a.solve_status, DirectSolveStatus::Solved);
         assert_eq!(voice_a.gain, [0.2; 3]);
@@ -3605,7 +3605,7 @@ mod tests {
             .response
             .direct
             .iter()
-            .find(|response| response.voice_id == SourceId::from(1))
+            .find(|response| response.voice_id == VoiceId::from(1))
             .unwrap();
         assert_eq!(voice_a.solve_status, DirectSolveStatus::Retained);
         assert_eq!(voice_a.gain, [0.2; 3]);
@@ -3660,13 +3660,10 @@ mod tests {
             .response
             .direct
             .iter()
-            .find(|response| response.voice_id == SourceId::from(1))
+            .find(|response| response.voice_id == VoiceId::from(1))
             .unwrap();
         assert_eq!(voice_a.solve_status, DirectSolveStatus::Deferred);
-        assert_eq!(
-            deferred.response.direct_gain_target(SourceId::from(1)),
-            None
-        );
+        assert_eq!(deferred.response.direct_gain_target(VoiceId::from(1)), None);
         let deferred_telemetry = deferred
             .telemetry
             .iter()
@@ -3725,7 +3722,7 @@ mod tests {
     fn budget_ranking_prefers_audible_priority_and_resists_small_rank_churn() {
         let mut input = input(Arc::new(NoGeometry));
         let mut quiet = input.voices[0].clone();
-        quiet.voice_id = SourceId::from(2);
+        quiet.voice_id = VoiceId::from(2);
         quiet.audibility = 0.1;
         quiet.acoustic_priority = 1.0;
         input.voices[0].audibility = 1.0;
@@ -3733,12 +3730,12 @@ mod tests {
         input.voices.push(quiet);
 
         let first = ranked_voices(&input, &HashSet::new());
-        assert_eq!(first[0].voice.voice_id, SourceId::from(1));
+        assert_eq!(first[0].voice.voice_id, VoiceId::from(1));
 
         let previous = [input.voices[0].route_key()].into_iter().collect();
         input.voices[1].audibility = 0.95;
         let stable = ranked_voices(&input, &previous);
-        assert_eq!(stable[0].voice.voice_id, SourceId::from(1));
+        assert_eq!(stable[0].voice.voice_id, VoiceId::from(1));
     }
 
     #[test]
@@ -3746,7 +3743,7 @@ mod tests {
         let input_port = AcousticVoiceInput::isolated(2);
         let attached = input(Arc::new(NoGeometry)).voices.remove(0);
         let mut detached = attached.clone();
-        detached.voice_id = SourceId::from(2);
+        detached.voice_id = VoiceId::from(2);
         detached.detached = true;
         input_port.activate(attached.clone());
         input_port.activate(detached);
@@ -3764,7 +3761,7 @@ mod tests {
         let emitter = input.voices[0].emitter;
         input.voices = vec![
             AcousticVoice {
-                voice_id: SourceId::from(41),
+                voice_id: VoiceId::from(41),
                 emitter,
                 emitter_world_pose: Pose::from_position(Vec3::Z),
                 acoustic_priority: 1.0,
@@ -3778,7 +3775,7 @@ mod tests {
                 routing_generation: 1,
             },
             AcousticVoice {
-                voice_id: SourceId::from(42),
+                voice_id: VoiceId::from(42),
                 emitter,
                 emitter_world_pose: Pose::from_position(Vec3::Z),
                 acoustic_priority: 1.0,
@@ -3795,10 +3792,10 @@ mod tests {
 
         let response = solve_response(&input, 1.0);
         assert_eq!(response.direct.len(), 2);
-        assert_eq!(response.environment_gain(SourceId::from(41)), [0.2; 3]);
-        assert_eq!(response.environment_gain(SourceId::from(42)), [0.8; 3]);
-        assert_eq!(response.direct_gain(SourceId::from(41)), [1.0; 3]);
-        assert_eq!(response.direct_gain(SourceId::from(42)), [1.0; 3]);
+        assert_eq!(response.environment_gain(VoiceId::from(41)), [0.2; 3]);
+        assert_eq!(response.environment_gain(VoiceId::from(42)), [0.8; 3]);
+        assert_eq!(response.direct_gain(VoiceId::from(41)), [1.0; 3]);
+        assert_eq!(response.direct_gain(VoiceId::from(42)), [1.0; 3]);
     }
 
     #[test]
@@ -3884,7 +3881,7 @@ mod tests {
             generation: 1,
         };
         propagation.voice_input().activate(AcousticVoice {
-            voice_id: SourceId::from(1),
+            voice_id: VoiceId::from(1),
             emitter,
             emitter_world_pose: Pose::from_position(Vec3::Z),
             acoustic_priority: 1.0,

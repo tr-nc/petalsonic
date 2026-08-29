@@ -2912,8 +2912,21 @@ mod tests {
         assert_eq!(filtered.response.direct.len(), 1);
         assert_eq!(filtered.response.direct[0].voice_id, VoiceId::from(1));
         assert_eq!(filtered.telemetry.len(), 1);
+        assert_eq!(filtered.telemetry[0].voice_id, 1);
+        assert_eq!(
+            filtered.telemetry[0].spatial_revision,
+            captured.spatial.revision()
+        );
+        assert_eq!(
+            filtered.telemetry[0].response_spatial_revision,
+            captured.spatial.revision()
+        );
         assert_eq!(filtered.conclusions.len(), 1);
         assert_eq!(filtered.conclusions[0].telemetry.voice_id, 1);
+        assert_eq!(
+            filtered.conclusions[0].telemetry.spatial_revision,
+            captured.spatial.revision()
+        );
         assert_eq!(
             filtered.telemetry[0].extent_sample_count,
             MAX_EXTENT_SAMPLES

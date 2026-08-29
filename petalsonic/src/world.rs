@@ -2357,6 +2357,41 @@ mod tests {
     }
 
     #[test]
+    fn retired_control_cannot_alias_a_later_voice() {
+        let desc = crate::config::PetalSonicWorldDesc {
+            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
+                "petalsonic-test-device-that-does-not-exist".into(),
+            ),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new(desc).unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap();
+
+        let retired = world
+            .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(1))
+            .unwrap();
+        world.stop_playback(retired).unwrap();
+        assert!(matches!(
+            world.pause_playback(retired),
+            Err(PetalSonicError::StalePlayback)
+        ));
+
+        let later = world
+            .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(2))
+            .unwrap();
+        assert_ne!(retired, later);
+        assert!(matches!(
+            world.pause_playback(retired),
+            Err(PetalSonicError::StalePlayback)
+        ));
+        world.pause_playback(later).unwrap();
+        world.stop_playback(later).unwrap();
+        world.close().unwrap();
+    }
+
+    #[test]
     fn world_can_be_recreated_after_close() {
         let desc = crate::config::PetalSonicWorldDesc {
             output_device: crate::config::OutputDevicePolicy::PinnedNameContains(

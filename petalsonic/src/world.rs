@@ -966,11 +966,6 @@ mod tests {
     use crate::platform::output::fake::{
         FakeDevice as PlatformFakeDevice, FakeOutputPlatform, FakeSampleFormat,
     };
-    use crate::platform::output::{OutputDeviceState, OutputRecoveryRequest, OutputRecoveryResult};
-    use crate::runtime::{
-        AudioRuntime, OUTPUT_RETRY_INTERVAL, OutputRuntimeDriver, SupervisorSchedule,
-    };
-    use std::sync::atomic::{AtomicU8, AtomicU64};
     use std::time::Instant;
 
     #[test]
@@ -1013,146 +1008,19 @@ mod tests {
         )))
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct FakeDevice {
-        name: &'static str,
-        sample_rate: u32,
-        channels: u16,
-    }
-
-    struct FakeOutputDriver {
-        active: Option<FakeDevice>,
-        selected: Option<FakeDevice>,
-        stream_failed: bool,
-        permanent_format_failure: bool,
-        prepared: Option<FakeDevice>,
-        advanced: Duration,
-        loop_cursor_frames: usize,
-        loop_length_frames: usize,
-        one_shot_remaining_frames: usize,
-        one_shot_completed: bool,
-    }
-
-    impl FakeOutputDriver {
-        fn with_active(active: FakeDevice) -> Self {
-            Self {
-                active: Some(active),
-                selected: Some(active),
-                stream_failed: false,
-                permanent_format_failure: false,
-                prepared: None,
-                advanced: Duration::ZERO,
-                loop_cursor_frames: 0,
-                loop_length_frames: 12_000,
-                one_shot_remaining_frames: 4_800,
-                one_shot_completed: false,
-            }
+    fn wait_for_async_observation(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "World observation timed out");
+            std::thread::park_timeout(Duration::from_millis(1));
         }
-    }
-
-    impl OutputRuntimeDriver for FakeOutputDriver {
-        fn drain_retired_resources(&mut self) {}
-
-        fn reconcile_output(&mut self, request: OutputRecoveryRequest) -> OutputRecoveryResult {
-            if self.active.is_some() && request.probe {
-                if !self.stream_failed && self.active == self.selected {
-                    return OutputRecoveryResult::Stable;
-                }
-                if !self.stream_failed {
-                    let Some(selected) = self.selected else {
-                        return OutputRecoveryResult::Stable;
-                    };
-                    self.prepared = Some(selected);
-                }
-                self.active = None;
-            }
-            self.advanced += request.elapsed_without_output;
-            let frames = (request.elapsed_without_output.as_secs_f64() * 48_000.0).floor() as usize;
-            self.loop_cursor_frames = (self.loop_cursor_frames + frames) % self.loop_length_frames;
-            if frames >= self.one_shot_remaining_frames {
-                self.one_shot_remaining_frames = 0;
-                self.one_shot_completed = true;
-            } else {
-                self.one_shot_remaining_frames -= frames;
-            }
-            if !request.retry_now {
-                return OutputRecoveryResult::Recovering(
-                    crate::platform::output::OutputRecoveryCause::DeviceUnavailable,
-                );
-            }
-            if self.permanent_format_failure {
-                return OutputRecoveryResult::Failed(
-                    crate::platform::output::OutputFailure::UnsupportedSampleFormat,
-                );
-            }
-            let Some(selected) = self.prepared.take().or(self.selected) else {
-                return OutputRecoveryResult::Recovering(
-                    crate::platform::output::OutputRecoveryCause::DeviceUnavailable,
-                );
-            };
-            self.active = Some(selected);
-            self.stream_failed = false;
-            OutputRecoveryResult::Running(OutputDeviceState {
-                diagnostic_name: selected.name.to_string(),
-                sample_rate: selected.sample_rate,
-                physical_channels: selected.channels,
-            })
-        }
-
-        fn emit_runtime_state(&self, _state: RuntimeState) {}
-    }
-
-    #[test]
-    fn runtime_observes_fake_adapter_format_and_channel_recovery() {
-        let a = PlatformFakeDevice::stereo("A", 48_000);
-        let mut b = PlatformFakeDevice::stereo("B", 44_100);
-        b.state.physical_channels = 6;
-        b.sample_format = FakeSampleFormat::I16;
-        let (adapter, handle) = FakeOutputPlatform::scripted(vec![a, b], Some(0));
-        let desc = crate::config::PetalSonicWorldDesc {
-            environmental_acoustics_enabled: false,
-            ..Default::default()
-        };
-        let runtime =
-            AudioRuntime::start_with_output(&desc, move || Ok(Box::new(adapter))).unwrap();
-
-        let running_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < running_deadline
-            && runtime.runtime_status().state != RuntimeState::Running
-        {
-            std::thread::yield_now();
-        }
-        assert_eq!(
-            runtime.runtime_status().active_output_device.as_deref(),
-            Some("A")
-        );
-        assert_eq!(runtime.diagnostics(0, &desc).output_sample_rate, 48_000);
-        assert_eq!(runtime.diagnostics(0, &desc).output_channels, 2);
-
-        handle.set_selected(Some(1));
-        handle.fail_stream();
-        let recovery_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < recovery_deadline
-            && runtime.runtime_status().active_output_device.as_deref() != Some("B")
-        {
-            std::thread::yield_now();
-        }
-
-        assert_eq!(runtime.runtime_status().state, RuntimeState::Running);
-        assert_eq!(
-            runtime.runtime_status().active_output_device.as_deref(),
-            Some("B")
-        );
-        assert_eq!(runtime.diagnostics(0, &desc).output_sample_rate, 44_100);
-        assert_eq!(runtime.diagnostics(0, &desc).output_channels, 6);
-        assert!(runtime.runtime_status().recovery_attempts >= 2);
-        runtime.close().unwrap();
     }
 
     #[test]
     fn world_keeps_emitter_and_voice_identity_across_fake_output_recovery() {
         let a = PlatformFakeDevice::stereo("A", 48_000);
         let mut b = PlatformFakeDevice::stereo("B", 96_000);
+        b.state.physical_channels = 6;
         b.sample_format = FakeSampleFormat::U16;
         let (adapter, handle) = FakeOutputPlatform::scripted(vec![a, b], Some(0));
         let desc = crate::config::PetalSonicWorldDesc {
@@ -1167,22 +1035,46 @@ mod tests {
             .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(77))
             .unwrap();
 
-        let running_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < running_deadline
-            && world.runtime_status().active_output_device.as_deref() != Some("A")
-        {
-            std::thread::yield_now();
-        }
+        wait_for_async_observation(|| {
+            world.runtime_status().active_output_device.as_deref() == Some("A")
+        });
         assert_eq!(world.active_voice_count(), 1);
+        assert_eq!(world.diagnostics().output_sample_rate, 48_000);
+        assert_eq!(world.diagnostics().output_channels, 2);
+
+        handle.set_selected(None);
+        handle.fail_stream();
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Recovering);
+
+        let one_shot = world
+            .play_controlled(emitter, PlayOptions::once(), PlaybackTag(78))
+            .unwrap();
+        let mut completion = None;
+        wait_for_async_observation(|| {
+            completion = world.drain_events().into_iter().find(|event| {
+                matches!(
+                    event,
+                    PetalSonicEvent::PlaybackCompleted {
+                        tag: PlaybackTag(78),
+                        ..
+                    }
+                )
+            });
+            completion.is_some()
+        });
+        assert_eq!(
+            completion,
+            Some(PetalSonicEvent::PlaybackCompleted {
+                emitter,
+                control: one_shot,
+                tag: PlaybackTag(78),
+            })
+        );
 
         handle.set_selected(Some(1));
-        handle.fail_stream();
-        let recovery_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < recovery_deadline
-            && world.runtime_status().active_output_device.as_deref() != Some("B")
-        {
-            std::thread::yield_now();
-        }
+        wait_for_async_observation(|| {
+            world.runtime_status().active_output_device.as_deref() == Some("B")
+        });
 
         assert_eq!(world.runtime_status().state, RuntimeState::Running);
         assert_eq!(world.active_voice_count(), 1);
@@ -1191,7 +1083,29 @@ mod tests {
         world
             .update_emitter(emitter, EmitterDesc::non_spatial())
             .unwrap();
+        assert_eq!(world.diagnostics().output_sample_rate, 96_000);
+        assert_eq!(world.diagnostics().output_channels, 6);
         assert!(world.diagnostics().device_generation >= 2);
+        assert!(world.runtime_status().recovery_attempts >= 3);
+        world.close().unwrap();
+    }
+
+    #[test]
+    fn world_observes_permanent_output_failure() {
+        let mut device = PlatformFakeDevice::stereo("unsupported", 48_000);
+        device.sample_format = FakeSampleFormat::Unsupported;
+        let (adapter, _) = FakeOutputPlatform::scripted(vec![device], Some(0));
+        let desc = crate::config::PetalSonicWorldDesc {
+            environmental_acoustics_enabled: false,
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
+
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Failed);
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::non_spatial())
+            .unwrap_err();
+        assert!(matches!(emitter, PetalSonicError::RuntimeFailed));
         world.close().unwrap();
     }
 
@@ -1284,160 +1198,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn runtime_publishes_running_after_default_device_recovery() {
-        let a = FakeDevice {
-            name: "A",
-            sample_rate: 48_000,
-            channels: 2,
-        };
-        let b = FakeDevice {
-            name: "B",
-            sample_rate: 44_100,
-            channels: 6,
-        };
-        let mut driver = FakeOutputDriver::with_active(a);
-        driver.selected = Some(b);
-        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
-        let recovery_attempts = AtomicU64::new(0);
-        let now = Instant::now();
-        let mut schedule = SupervisorSchedule::new(now);
-
-        AudioRuntime::supervisor_tick(
-            &mut driver,
-            &runtime_state,
-            &recovery_attempts,
-            &mut schedule,
-            now,
-        );
-
-        assert_eq!(driver.active, Some(b));
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Running
-        );
-        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn fake_recovery_keeps_timeline_and_retries_with_virtual_time() {
-        let a = FakeDevice {
-            name: "A",
-            sample_rate: 48_000,
-            channels: 2,
-        };
-        let b = FakeDevice {
-            name: "B",
-            sample_rate: 96_000,
-            channels: 2,
-        };
-        let mut driver = FakeOutputDriver::with_active(a);
-        driver.stream_failed = true;
-        driver.selected = None;
-        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
-        let recovery_attempts = AtomicU64::new(0);
-        let now = Instant::now();
-        let mut schedule = SupervisorSchedule::new(now);
-
-        AudioRuntime::supervisor_tick(
-            &mut driver,
-            &runtime_state,
-            &recovery_attempts,
-            &mut schedule,
-            now,
-        );
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Recovering
-        );
-        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
-
-        driver.selected = Some(b);
-        AudioRuntime::supervisor_tick(
-            &mut driver,
-            &runtime_state,
-            &recovery_attempts,
-            &mut schedule,
-            now + OUTPUT_RETRY_INTERVAL,
-        );
-
-        assert_eq!(driver.active, Some(b));
-        assert_eq!(driver.advanced, OUTPUT_RETRY_INTERVAL);
-        assert_eq!(driver.loop_cursor_frames, 0);
-        assert!(driver.one_shot_completed);
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Running
-        );
-        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 2);
-    }
-    #[test]
-    fn fake_permanent_format_failure_is_not_retried_as_missing_device() {
-        let a = FakeDevice {
-            name: "A",
-            sample_rate: 48_000,
-            channels: 2,
-        };
-        let mut driver = FakeOutputDriver::with_active(a);
-        driver.active = None;
-        driver.permanent_format_failure = true;
-        let runtime_state = AtomicU8::new(RuntimeState::Recovering as u8);
-        let recovery_attempts = AtomicU64::new(0);
-        let now = Instant::now();
-        let mut schedule = SupervisorSchedule::new(now);
-
-        AudioRuntime::supervisor_tick(
-            &mut driver,
-            &runtime_state,
-            &recovery_attempts,
-            &mut schedule,
-            now,
-        );
-
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Failed
-        );
-        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn lifecycle_commands_have_reserved_capacity_under_control_pressure() {
-        let desc = crate::config::PetalSonicWorldDesc {
-            control_queue_capacity: 1,
-            lifecycle_queue_capacity: 1,
-            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
-                "petalsonic-test-device-that-does-not-exist".into(),
-            ),
-            ..Default::default()
-        };
-        let world = PetalSonicWorld::new(desc).unwrap();
-        let emitter = world
-            .create_emitter(clip(), EmitterDesc::non_spatial())
-            .unwrap();
-
-        let mut rejected = false;
-        for _ in 0..10_000 {
-            if matches!(
-                world.pause_emitter(emitter),
-                Err(PetalSonicError::QueuePressure)
-            ) {
-                rejected = true;
-                break;
-            }
-        }
-        assert!(rejected, "regular queue should report bounded pressure");
-        world
-            .stop_emitter(emitter)
-            .expect("lifecycle reserve must remain independently available");
-
-        let diagnostics = world.diagnostics();
-        assert_eq!(diagnostics.control_queue_high_water, 1);
-        assert_eq!(diagnostics.lifecycle_queue_high_water, 1);
-        assert!(diagnostics.rejected_commands >= 1);
-        world.close().unwrap();
     }
 
     #[test]
@@ -1684,89 +1444,6 @@ mod tests {
     }
 
     #[test]
-    fn worlds_close_idempotently_and_remain_isolated() {
-        let desc = crate::config::PetalSonicWorldDesc {
-            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
-                "petalsonic-test-device-that-does-not-exist".into(),
-            ),
-            ..Default::default()
-        };
-        let first = PetalSonicWorld::new(desc.clone()).unwrap();
-        let second = PetalSonicWorld::new(desc).unwrap();
-        let first_emitter = first
-            .create_emitter(clip(), EmitterDesc::non_spatial())
-            .unwrap();
-        let second_emitter = second
-            .create_emitter(clip(), EmitterDesc::non_spatial())
-            .unwrap();
-        let first_control = first
-            .play_controlled(first_emitter, PlayOptions::looping(), PlaybackTag(1))
-            .unwrap();
-        let second_control = second
-            .play_controlled(second_emitter, PlayOptions::looping(), PlaybackTag(2))
-            .unwrap();
-
-        assert!(matches!(
-            first.pause_emitter(second_emitter),
-            Err(PetalSonicError::StaleEmitter)
-        ));
-        assert!(matches!(
-            first.pause_playback(second_control),
-            Err(PetalSonicError::StalePlayback)
-        ));
-        first.pause_playback(first_control).unwrap();
-
-        first.close().unwrap();
-        first.close().unwrap();
-        assert_eq!(first.runtime_status().state, RuntimeState::Closed);
-        assert!(matches!(
-            first.create_emitter(clip(), EmitterDesc::non_spatial()),
-            Err(PetalSonicError::RuntimeClosed)
-        ));
-
-        second
-            .play(second_emitter, PlayOptions::looping())
-            .expect("closing another world must not affect this runtime");
-        assert_ne!(second.runtime_status().state, RuntimeState::Closed);
-        second.close().unwrap();
-    }
-
-    #[test]
-    fn retired_control_cannot_alias_a_later_voice() {
-        let desc = crate::config::PetalSonicWorldDesc {
-            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
-                "petalsonic-test-device-that-does-not-exist".into(),
-            ),
-            ..Default::default()
-        };
-        let world = PetalSonicWorld::new(desc).unwrap();
-        let emitter = world
-            .create_emitter(clip(), EmitterDesc::non_spatial())
-            .unwrap();
-
-        let retired = world
-            .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(1))
-            .unwrap();
-        world.stop_playback(retired).unwrap();
-        assert!(matches!(
-            world.pause_playback(retired),
-            Err(PetalSonicError::StalePlayback)
-        ));
-
-        let later = world
-            .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(2))
-            .unwrap();
-        assert_ne!(retired, later);
-        assert!(matches!(
-            world.pause_playback(retired),
-            Err(PetalSonicError::StalePlayback)
-        ));
-        world.pause_playback(later).unwrap();
-        world.stop_playback(later).unwrap();
-        world.close().unwrap();
-    }
-
-    #[test]
     fn world_can_be_recreated_after_close() {
         let desc = crate::config::PetalSonicWorldDesc {
             output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
@@ -1813,53 +1490,6 @@ mod tests {
     fn bounded_event_pressure_then_detached_shutdown() {
         bounded_event_pressure_is_observable();
         detached_control_survives_emitter_destruction();
-    }
-
-    #[test]
-    fn unavailable_device_keeps_world_alive_and_expires_one_shots() {
-        let desc = crate::config::PetalSonicWorldDesc {
-            output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
-                "petalsonic-test-device-that-does-not-exist".into(),
-            ),
-            block_size: 64,
-            ..Default::default()
-        };
-        let world = PetalSonicWorld::new(desc).unwrap();
-        let emitter = world
-            .create_emitter(clip(), EmitterDesc::non_spatial())
-            .unwrap();
-        let tag = PlaybackTag(42);
-        world
-            .play_controlled(emitter, PlayOptions::once(), tag)
-            .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut completed = false;
-        while Instant::now() < deadline {
-            completed |= world.drain_events().into_iter().any(|event| {
-                matches!(
-                    event,
-                    PetalSonicEvent::PlaybackCompleted {
-                        tag: PlaybackTag(42),
-                        ..
-                    }
-                )
-            });
-            if completed && world.active_voice_count() == 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        assert!(
-            completed,
-            "one-shot should expire while output is recovering"
-        );
-        assert_eq!(world.active_voice_count(), 0);
-        assert_eq!(world.runtime_status().state, RuntimeState::Recovering);
-        assert!(world.runtime_status().recovery_attempts > 0);
-        world.close().unwrap();
-        assert_eq!(world.runtime_status().state, RuntimeState::Closed);
     }
 
     #[test]

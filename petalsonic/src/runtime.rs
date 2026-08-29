@@ -808,3 +808,178 @@ impl Drop for AudioRuntime {
         let _ = self.close();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::output::{
+        OutputDeviceState, OutputRecoveryCause, OutputRecoveryRequest, OutputRecoveryResult,
+    };
+    use std::sync::atomic::{AtomicU8, AtomicU64};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FakeDevice {
+        name: &'static str,
+        sample_rate: u32,
+        channels: u16,
+    }
+
+    struct SupervisorFakeDriver {
+        active: Option<FakeDevice>,
+        selected: Option<FakeDevice>,
+        stream_failed: bool,
+        prepared: Option<FakeDevice>,
+        advanced: Duration,
+        loop_cursor_frames: usize,
+        loop_length_frames: usize,
+        one_shot_remaining_frames: usize,
+        one_shot_completed: bool,
+    }
+
+    impl SupervisorFakeDriver {
+        fn with_active(active: FakeDevice) -> Self {
+            Self {
+                active: Some(active),
+                selected: Some(active),
+                stream_failed: false,
+                prepared: None,
+                advanced: Duration::ZERO,
+                loop_cursor_frames: 0,
+                loop_length_frames: 12_000,
+                one_shot_remaining_frames: 4_800,
+                one_shot_completed: false,
+            }
+        }
+    }
+
+    impl OutputRuntimeDriver for SupervisorFakeDriver {
+        fn drain_retired_resources(&mut self) {}
+
+        fn reconcile_output(&mut self, request: OutputRecoveryRequest) -> OutputRecoveryResult {
+            if self.active.is_some() && request.probe {
+                if !self.stream_failed && self.active == self.selected {
+                    return OutputRecoveryResult::Stable;
+                }
+                if !self.stream_failed {
+                    let Some(selected) = self.selected else {
+                        return OutputRecoveryResult::Stable;
+                    };
+                    self.prepared = Some(selected);
+                }
+                self.active = None;
+            }
+            self.advanced += request.elapsed_without_output;
+            let frames = (request.elapsed_without_output.as_secs_f64() * 48_000.0).floor() as usize;
+            self.loop_cursor_frames = (self.loop_cursor_frames + frames) % self.loop_length_frames;
+            if frames >= self.one_shot_remaining_frames {
+                self.one_shot_remaining_frames = 0;
+                self.one_shot_completed = true;
+            } else {
+                self.one_shot_remaining_frames -= frames;
+            }
+            if !request.retry_now {
+                return OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable);
+            }
+            let Some(selected) = self.prepared.take().or(self.selected) else {
+                return OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable);
+            };
+            self.active = Some(selected);
+            self.stream_failed = false;
+            OutputRecoveryResult::Running(OutputDeviceState {
+                diagnostic_name: selected.name.to_string(),
+                sample_rate: selected.sample_rate,
+                physical_channels: selected.channels,
+            })
+        }
+
+        fn emit_runtime_state(&self, _state: RuntimeState) {}
+    }
+
+    #[test]
+    fn supervisor_publishes_running_after_default_device_recovery() {
+        let a = FakeDevice {
+            name: "A",
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let b = FakeDevice {
+            name: "B",
+            sample_rate: 44_100,
+            channels: 6,
+        };
+        let mut driver = SupervisorFakeDriver::with_active(a);
+        driver.selected = Some(b);
+        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+
+        AudioRuntime::supervisor_tick(
+            &mut driver,
+            &runtime_state,
+            &recovery_attempts,
+            &mut schedule,
+            now,
+        );
+
+        assert_eq!(driver.active, Some(b));
+        assert_eq!(
+            AudioRuntime::load_runtime_state(&runtime_state),
+            RuntimeState::Running
+        );
+        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn recovery_accumulates_elapsed_time_and_advances_voice_timelines() {
+        let a = FakeDevice {
+            name: "A",
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let b = FakeDevice {
+            name: "B",
+            sample_rate: 96_000,
+            channels: 2,
+        };
+        let mut driver = SupervisorFakeDriver::with_active(a);
+        driver.stream_failed = true;
+        driver.selected = None;
+        let runtime_state = AtomicU8::new(RuntimeState::Running as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+
+        AudioRuntime::supervisor_tick(
+            &mut driver,
+            &runtime_state,
+            &recovery_attempts,
+            &mut schedule,
+            now,
+        );
+        assert_eq!(
+            AudioRuntime::load_runtime_state(&runtime_state),
+            RuntimeState::Recovering
+        );
+        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
+
+        driver.selected = Some(b);
+        AudioRuntime::supervisor_tick(
+            &mut driver,
+            &runtime_state,
+            &recovery_attempts,
+            &mut schedule,
+            now + OUTPUT_RETRY_INTERVAL,
+        );
+
+        assert_eq!(driver.active, Some(b));
+        assert_eq!(driver.advanced, OUTPUT_RETRY_INTERVAL);
+        assert_eq!(driver.loop_cursor_frames, 0);
+        assert!(driver.one_shot_completed);
+        assert_eq!(
+            AudioRuntime::load_runtime_state(&runtime_state),
+            RuntimeState::Running
+        );
+        assert_eq!(recovery_attempts.load(Ordering::Relaxed), 2);
+    }
+}

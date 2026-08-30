@@ -698,9 +698,11 @@ mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::PetalSonicWorldDesc;
-    use crate::domain::{Emitter, SourceExtent};
+    use crate::domain::{DirectPath, Emitter, EnvironmentSend, OcclusionProfile, SourceExtent};
     use crate::engine::PetalSonicEngine;
     use crate::playback::LoopMode;
+    use crate::realtime_latest::Publisher;
+    use crate::spatial::LateReverbParameters;
     use ringbuf::traits::Consumer;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -721,6 +723,7 @@ mod tests {
 
     struct Harness {
         quantum: RenderQuantum,
+        acoustic_responses: Publisher<AcousticResponse>,
         commands: Sender<PlaybackCommand>,
         events: crossbeam_channel::Receiver<PetalSonicEvent>,
         timing: crossbeam_channel::Receiver<RenderTimingEvent>,
@@ -738,7 +741,7 @@ mod tests {
         let (_lifecycle, lifecycle) = crossbeam_channel::bounded(max_voices.max(1));
         let (retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
         let (_, spatial_frames) = RealtimeLatest::bounded(1);
-        let (_, acoustic_responses) = RealtimeLatest::bounded(2);
+        let (acoustic_responses, acoustic_response_consumer) = RealtimeLatest::bounded(2);
         let (backend_retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
         let (ports, observability) = PetalSonicEngine::create_runtime_ports(&desc);
         let startup = EngineStartup {
@@ -746,7 +749,7 @@ mod tests {
             active_voice_count: Arc::new(AtomicUsize::new(0)),
             retirement_sender,
             spatial_frames,
-            acoustic_responses,
+            acoustic_responses: acoustic_response_consumer,
             acoustic_voice_input: AcousticVoiceInput::isolated(max_voices.max(1)),
             acoustic_scene_version: Arc::new(AtomicU64::new(0)),
             environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
@@ -760,9 +763,63 @@ mod tests {
                 backend_retirement_sender,
             )
             .unwrap(),
+            acoustic_responses,
             commands,
             events: observability.event_receiver,
             timing: observability.timing_receiver,
+        }
+    }
+
+    fn empty_acoustic_response(revision: u64) -> Arc<AcousticResponse> {
+        Arc::new(AcousticResponse {
+            spatial_revision: revision,
+            geometry_version: 0,
+            direct: Vec::new(),
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 0,
+        })
+    }
+
+    #[test]
+    fn acoustic_replacements_progress_without_spatial_or_scene_publication() {
+        let mut harness = harness(16, 1);
+        let emitter = Emitter {
+            world_id: 1,
+            index: 0,
+            generation: 1,
+        };
+
+        for revision in 1..=6 {
+            let voice_id = VoiceId::from(revision);
+            harness
+                .quantum
+                .acoustic_voice_input
+                .activate(AcousticVoice {
+                    voice_id,
+                    emitter,
+                    emitter_world_pose: crate::math::Pose::identity(),
+                    acoustic_priority: 1.0,
+                    audibility: 1.0,
+                    detached: false,
+                    direct_path: DirectPath::default(),
+                    environment_send: EnvironmentSend::default(),
+                    source_extent: SourceExtent::Point,
+                    occlusion_profile: OcclusionProfile::PointExact,
+                    routing_generation: 0,
+                });
+            harness
+                .acoustic_responses
+                .publish_latest(empty_acoustic_response(revision))
+                .unwrap();
+
+            harness.quantum.render();
+
+            assert_eq!(
+                harness.quantum.processor.acoustic_response_generation(),
+                Some((revision, 0))
+            );
+            harness.quantum.acoustic_voice_input.retire(voice_id);
         }
     }
 

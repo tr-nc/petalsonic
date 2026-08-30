@@ -390,8 +390,6 @@ impl AudioRuntime {
 
     pub(crate) fn publish_spatial_frame(&self, frame: Arc<SpatialFrame>) -> Result<()> {
         self.ensure_open()?;
-        self.drain_retired_spatial_frames();
-        self.drain_retired_acoustic_responses();
         self.acoustic_propagation
             .publish_spatial_frame(frame.clone())
             .map_err(|_| PetalSonicError::QueuePressure)?;
@@ -400,7 +398,7 @@ impl AudioRuntime {
         self.spatial_sim_time_bits
             .store(frame.sim_time_seconds().to_bits(), Ordering::Release);
         self.spatial_frames
-            .publish(frame)
+            .publish_latest(frame)
             .map_err(|_| PetalSonicError::QueuePressure)
     }
 
@@ -413,7 +411,6 @@ impl AudioRuntime {
         snapshot: Arc<AcousticSceneSnapshot>,
     ) -> Result<()> {
         self.ensure_open()?;
-        self.drain_retired_acoustic_responses();
         self.acoustic_propagation
             .publish_scene(snapshot.clone())
             .map_err(|_| PetalSonicError::QueuePressure)?;
@@ -602,14 +599,6 @@ impl AudioRuntime {
         self.retirement_receiver.try_iter().collect()
     }
 
-    fn drain_retired_spatial_frames(&self) {
-        self.spatial_frames.drain_retired();
-    }
-
-    fn drain_retired_acoustic_responses(&self) {
-        self.acoustic_propagation.drain_retired_responses();
-    }
-
     pub(crate) fn close(&self) -> Result<()> {
         let _close_guard = self
             .close_lock
@@ -634,8 +623,6 @@ impl AudioRuntime {
         };
         self.acoustic_propagation.close();
         self.spatial_frames.close();
-        self.drain_retired_spatial_frames();
-        self.drain_retired_acoustic_responses();
         self.active_voice_count.store(0, Ordering::Release);
         self.runtime_state
             .store(RuntimeState::Closed as u8, Ordering::Release);

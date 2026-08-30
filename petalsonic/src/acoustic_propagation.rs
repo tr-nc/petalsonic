@@ -582,10 +582,6 @@ impl AcousticPropagation {
         self.response_consumer.lock().ok()?.take()
     }
 
-    pub(crate) fn drain_retired_responses(&self) {
-        self.response_publication.drain_retired();
-    }
-
     pub(crate) fn voice_input(&self) -> AcousticVoiceInput {
         AcousticVoiceInput {
             input: self.input.clone(),
@@ -734,7 +730,7 @@ impl AcousticPublisher {
         let response_spatial_revision = output.response.spatial_revision;
         let response_geometry_version = output.response.geometry_version;
         self.response_publication
-            .publish(Arc::new(output.response))
+            .publish_latest(Arc::new(output.response))
             .ok()?;
         drop(publication_guard);
 

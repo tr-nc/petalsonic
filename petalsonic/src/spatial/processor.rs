@@ -555,6 +555,13 @@ impl SpatialProcessor {
         AcousticResponseReplacement::Accepted(self.acoustic_response.replace(response))
     }
 
+    #[cfg(test)]
+    pub(crate) fn acoustic_response_generation(&self) -> Option<(u64, u64)> {
+        self.acoustic_response
+            .as_ref()
+            .map(|response| (response.spatial_revision, response.geometry_version))
+    }
+
     pub(crate) fn retire_voice(&mut self, voice_id: VoiceId) -> Option<RetiredSpatialSource> {
         let native_hrtf = self.native_hrtf_source_states.remove(&voice_id);
         let native_direct = self.native_direct_source_states.remove(&voice_id);

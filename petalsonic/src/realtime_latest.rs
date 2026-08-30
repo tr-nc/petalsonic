@@ -45,9 +45,9 @@ impl<T> RealtimeLatest<T> {
     }
 }
 
-/// The producer/control endpoint. Clones publish into the same latest slot and
-/// may drain the same retirement queue; the owning control module decides which
-/// clone performs draining.
+/// The producer/control endpoint. Every publication cycle first reclaims values
+/// retired by its own consumer, so progress never depends on another subsystem's
+/// control tick.
 pub(crate) struct Publisher<T> {
     shared: Arc<Shared<T>>,
     retirement_receiver: Receiver<Arc<T>>,
@@ -63,7 +63,8 @@ impl<T> Clone for Publisher<T> {
 }
 
 impl<T> Publisher<T> {
-    pub(crate) fn publish(&self, value: Arc<T>) -> Result<(), PublishError> {
+    pub(crate) fn publish_latest(&self, value: Arc<T>) -> Result<(), PublishError> {
+        self.drain_retired();
         if !self.shared.consumer_connected.load(Ordering::Acquire) {
             return Err(PublishError::Disconnected);
         }
@@ -80,7 +81,7 @@ impl<T> Publisher<T> {
     }
 
     /// Destroys every returned value on the calling control thread.
-    pub(crate) fn drain_retired(&self) -> usize {
+    fn drain_retired(&self) -> usize {
         self.retirement_receiver.try_iter().count()
     }
 
@@ -172,28 +173,39 @@ mod tests {
     #[test]
     fn replace_before_consume_observes_only_the_latest_value() {
         let (publisher, mut consumer) = RealtimeLatest::bounded(1);
-        publisher.publish(Arc::new(1)).unwrap();
-        publisher.publish(Arc::new(2)).unwrap();
+        publisher.publish_latest(Arc::new(1)).unwrap();
+        publisher.publish_latest(Arc::new(2)).unwrap();
 
         assert_eq!(consumer.consume().as_deref(), Some(&2));
         assert!(consumer.consume().is_none());
     }
 
     #[test]
-    fn full_retirement_defers_the_next_consume_until_control_drains() {
+    fn full_retirement_is_reclaimed_by_the_next_producer_cycle() {
         let (publisher, mut consumer) = RealtimeLatest::bounded(1);
-        publisher.publish(Arc::new(1)).unwrap();
+        publisher.publish_latest(Arc::new(1)).unwrap();
         let first = consumer.consume().unwrap();
         consumer.retire(first);
-        publisher.publish(Arc::new(2)).unwrap();
+        publisher.publish_latest(Arc::new(2)).unwrap();
         let second = consumer.consume().unwrap();
         consumer.retire(second);
-        publisher.publish(Arc::new(3)).unwrap();
 
-        assert!(consumer.consume().is_none());
         assert_eq!(publisher.drain_retired(), 1);
-        assert_eq!(consumer.consume().as_deref(), Some(&3));
-        assert_eq!(publisher.drain_retired(), 1);
+    }
+
+    #[test]
+    fn producer_cycles_reclaim_retirements_without_an_unrelated_control_tick() {
+        let (publisher, mut consumer) = RealtimeLatest::bounded(1);
+        for voice_generation in 1..=4 {
+            publisher
+                .publish_latest(Arc::new(voice_generation))
+                .unwrap();
+            let response = consumer
+                .consume()
+                .expect("each acoustic publication must unblock its own retirement path");
+            assert_eq!(*response, voice_generation);
+            consumer.retire(response);
+        }
     }
 
     #[test]
@@ -202,7 +214,7 @@ mod tests {
         consumer.disconnect();
 
         assert_eq!(
-            publisher.publish(Arc::new(1)),
+            publisher.publish_latest(Arc::new(1)),
             Err(PublishError::Disconnected)
         );
     }
@@ -212,7 +224,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let (publisher, mut consumer) = RealtimeLatest::bounded(1);
         publisher
-            .publish(Arc::new(DropProbe(drops.clone())))
+            .publish_latest(Arc::new(DropProbe(drops.clone())))
             .unwrap();
         let first = consumer.consume().unwrap();
         consumer.retire(first);
@@ -227,14 +239,14 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let (publisher, _consumer) = RealtimeLatest::bounded(1);
         publisher
-            .publish(Arc::new(DropProbe(drops.clone())))
+            .publish_latest(Arc::new(DropProbe(drops.clone())))
             .unwrap();
 
         publisher.close();
 
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(
-            publisher.publish(Arc::new(DropProbe(drops.clone()))),
+            publisher.publish_latest(Arc::new(DropProbe(drops.clone()))),
             Err(PublishError::Disconnected)
         );
         assert_eq!(drops.load(Ordering::Relaxed), 2);

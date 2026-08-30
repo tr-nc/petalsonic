@@ -6,6 +6,8 @@ struct RealtimeProbeAllocator;
 thread_local! {
     static PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static PROBE_ACTIVITY: Cell<usize> = const { Cell::new(0) };
+    static ACOUSTIC_LOOKUP_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static ACOUSTIC_LOOKUP_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[global_allocator]
@@ -46,4 +48,20 @@ pub(crate) fn realtime_memory_activity(operation: impl FnOnce()) -> usize {
     operation();
     PROBE_ACTIVE.with(|active| active.set(false));
     PROBE_ACTIVITY.with(Cell::get)
+}
+
+pub(crate) fn record_acoustic_response_lookup() {
+    ACOUSTIC_LOOKUP_PROBE_ACTIVE.with(|active| {
+        if active.get() {
+            ACOUSTIC_LOOKUP_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+pub(crate) fn acoustic_response_lookup_activity(operation: impl FnOnce()) -> usize {
+    ACOUSTIC_LOOKUP_COUNT.with(|count| count.set(0));
+    ACOUSTIC_LOOKUP_PROBE_ACTIVE.with(|active| active.set(true));
+    operation();
+    ACOUSTIC_LOOKUP_PROBE_ACTIVE.with(|active| active.set(false));
+    ACOUSTIC_LOOKUP_COUNT.with(Cell::get)
 }

@@ -1733,6 +1733,182 @@ mod tests {
         })
     }
 
+    fn lookup_contract_processor(max_voices: usize) -> SpatialProcessor {
+        SpatialProcessor::new(SpatialProcessorConfig {
+            sample_rate: 48_000,
+            frame_size: 8,
+            max_voices,
+            distance_scaler: 1.0,
+            native_hrtf_path: None,
+            hrtf_gain: 0.0,
+            use_ambisonics: true,
+            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
+        })
+        .unwrap()
+    }
+
+    fn lookup_contract_voice(voice_id: VoiceId) -> PlaybackInstance {
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; 64],
+            48_000,
+            1,
+            Duration::from_secs_f64(64.0 / 48_000.0),
+        ));
+        let mut voice = prepare_test_voice(
+            voice_id,
+            Emitter {
+                world_id: 1,
+                index: 0,
+                generation: 1,
+            },
+            audio,
+            EmitterDesc::spatial(Pose::from_position(Vec3::Z)),
+            PlayOptions::looping().with_environment_send(EnvironmentSend::follow_emitter()),
+            None,
+            0,
+            8,
+        )
+        .start()
+        .1;
+        voice.set_mix_parameters(crate::domain::BusParams::default());
+        voice
+    }
+
+    fn lookup_contract_response(
+        voice_id: VoiceId,
+        early_reflections: Vec<EarlyReflectionTap>,
+    ) -> Arc<AcousticResponse> {
+        Arc::new(AcousticResponse {
+            spatial_revision: 1,
+            geometry_version: 1,
+            direct: vec![DirectAcousticResponse {
+                voice_id,
+                routing_generation: 0,
+                gain: [1.0; 3],
+                environment_gain: [1.0; 3],
+                direct_lobes: Vec::new(),
+                environment_representatives: Vec::new(),
+                solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
+                cache_age_seconds: 0.0,
+                early_reflections,
+            }],
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 1,
+        })
+    }
+
+    fn render_lookup_contract_quantum(
+        processor: &mut SpatialProcessor,
+        voice_id: VoiceId,
+        voices: &mut HashMap<VoiceId, PlaybackInstance>,
+    ) -> usize {
+        let mut output = [0.0; 16];
+        let mut events = Vec::new();
+        crate::test_support::acoustic_response_lookup_activity(|| {
+            processor
+                .process_spatial_sources_with_metrics(
+                    &[voice_id],
+                    voices,
+                    &mut output,
+                    SpatialRenderContext::default(),
+                    &mut events,
+                )
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn each_active_voice_resolves_one_acoustic_envelope_per_quantum() {
+        let missing_voice_id = VoiceId::from(11);
+        let mut missing_processor = lookup_contract_processor(1);
+        missing_processor.replace_acoustic_response(empty_acoustic_response(1, 1));
+        let mut missing_voices =
+            HashMap::from([(missing_voice_id, lookup_contract_voice(missing_voice_id))]);
+        let missing_entry = render_lookup_contract_quantum(
+            &mut missing_processor,
+            missing_voice_id,
+            &mut missing_voices,
+        );
+
+        let no_tap_voice_id = VoiceId::from(12);
+        let mut no_tap_processor = lookup_contract_processor(1);
+        no_tap_processor
+            .replace_acoustic_response(lookup_contract_response(no_tap_voice_id, Vec::new()));
+        let mut no_tap_voices =
+            HashMap::from([(no_tap_voice_id, lookup_contract_voice(no_tap_voice_id))]);
+        let no_tap = render_lookup_contract_quantum(
+            &mut no_tap_processor,
+            no_tap_voice_id,
+            &mut no_tap_voices,
+        );
+
+        let new_state_voice_id = VoiceId::from(13);
+        let mut new_state_processor = lookup_contract_processor(1);
+        new_state_processor.replace_acoustic_response(lookup_contract_response(
+            new_state_voice_id,
+            vec![EarlyReflectionTap {
+                path_id: 13,
+                arrival_direction: Vec3::Z,
+                delay_seconds: 0.01,
+                gain: [0.1; 3],
+            }],
+        ));
+        let mut new_state_voices = HashMap::from([(
+            new_state_voice_id,
+            lookup_contract_voice(new_state_voice_id),
+        )]);
+        let new_state = render_lookup_contract_quantum(
+            &mut new_state_processor,
+            new_state_voice_id,
+            &mut new_state_voices,
+        );
+
+        let retired_voice_id = VoiceId::from(14);
+        let reused_voice_id = VoiceId::from(15);
+        let mut reuse_processor = lookup_contract_processor(1);
+        reuse_processor.replace_acoustic_response(lookup_contract_response(
+            retired_voice_id,
+            vec![EarlyReflectionTap {
+                path_id: 14,
+                arrival_direction: Vec3::Z,
+                delay_seconds: 0.01,
+                gain: [0.1; 3],
+            }],
+        ));
+        let mut retired_voices =
+            HashMap::from([(retired_voice_id, lookup_contract_voice(retired_voice_id))]);
+        render_lookup_contract_quantum(&mut reuse_processor, retired_voice_id, &mut retired_voices);
+        reuse_processor.silence_voice_state(retired_voice_id);
+        assert!(
+            reuse_processor
+                .free_native_early_reflection_source_states
+                .is_empty()
+        );
+        reuse_processor.replace_acoustic_response(lookup_contract_response(
+            reused_voice_id,
+            vec![EarlyReflectionTap {
+                path_id: 15,
+                arrival_direction: Vec3::Z,
+                delay_seconds: 0.01,
+                gain: [0.1; 3],
+            }],
+        ));
+        let mut reused_voices =
+            HashMap::from([(reused_voice_id, lookup_contract_voice(reused_voice_id))]);
+        let pool_reuse = render_lookup_contract_quantum(
+            &mut reuse_processor,
+            reused_voice_id,
+            &mut reused_voices,
+        );
+
+        assert_eq!(
+            [missing_entry, no_tap, new_state, pool_reuse],
+            [1, 1, 1, 1],
+            "missing entry, no tap, new state, and pool reuse must each resolve exactly once"
+        );
+    }
+
     #[test]
     fn render_accepts_lagging_pose_but_rejects_response_rollbacks_and_wrong_scene() {
         let mut processor = SpatialProcessor::new(SpatialProcessorConfig {

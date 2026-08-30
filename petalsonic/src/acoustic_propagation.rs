@@ -172,6 +172,8 @@ impl<'a> VoiceAcousticResponse<'a> {
 
 impl AcousticResponse {
     pub(crate) fn voice_response(&self, voice_id: VoiceId) -> Option<VoiceAcousticResponse<'_>> {
+        #[cfg(test)]
+        crate::test_support::record_acoustic_response_lookup();
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)

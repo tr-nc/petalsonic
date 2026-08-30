@@ -360,6 +360,15 @@ impl AudioRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_spatial_publication_blocked<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _latest = self
+            .latest_spatial_frame
+            .lock()
+            .expect("spatial publication slot is poisoned");
+        operation()
+    }
+
     pub(crate) fn acoustic_scene_version(&self) -> u64 {
         self.acoustic_scene_version.load(Ordering::Acquire)
     }

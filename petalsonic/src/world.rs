@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_runtime_shutdown_does_not_report_a_child_failure() {
+    fn normal_render_and_runtime_shutdown_does_not_report_a_child_failure() {
         let device = PlatformFakeDevice::stereo("A", 48_000);
         let (adapter, _) = FakeOutputPlatform::scripted(vec![device], Some(0));
         let desc = crate::config::PetalSonicWorldDesc {
@@ -1142,6 +1142,29 @@ mod tests {
         let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
 
         world.close().unwrap();
+        assert_eq!(world.runtime_status().state, RuntimeState::Closed);
+    }
+
+    #[test]
+    fn world_surfaces_render_child_panic_in_status_and_close() {
+        let device = PlatformFakeDevice::stereo("A", 48_000);
+        let (adapter, _) = FakeOutputPlatform::scripted(vec![device], Some(0));
+        let desc = crate::config::PetalSonicWorldDesc {
+            environmental_acoustics_enabled: false,
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Running);
+
+        world.runtime.panic_render_worker_for_test();
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Failed);
+        let close_error = world
+            .close()
+            .expect_err("a render child panic must remain visible during close");
+        assert!(
+            close_error.to_string().contains("render"),
+            "close did not attribute the render failure: {close_error}"
+        );
         assert_eq!(world.runtime_status().state, RuntimeState::Closed);
     }
 

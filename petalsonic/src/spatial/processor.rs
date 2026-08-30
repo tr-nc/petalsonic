@@ -624,16 +624,16 @@ impl SpatialProcessor {
             .or_insert_with(NativeDirectSourceState::new);
     }
 
-    fn ensure_native_early_reflection_state_for_voice(&mut self, voice_id: VoiceId) {
+    fn ensure_native_early_reflection_state_for_voice(
+        &mut self,
+        voice_id: VoiceId,
+        voice_acoustics: Option<VoiceAcousticResponse<'_>>,
+    ) {
         if self
             .native_early_reflection_source_states
             .contains_key(&voice_id)
             || !self.environmental_acoustics_active
-            || self
-                .acoustic_response
-                .as_ref()
-                .and_then(|response| response.voice_response(voice_id))
-                .is_none_or(|response| response.early_reflections().is_empty())
+            || voice_acoustics.is_none_or(|response| response.early_reflections().is_empty())
         {
             return;
         }
@@ -645,16 +645,7 @@ impl SpatialProcessor {
         }
 
         let reusable_voice_id = self.native_early_reflection_source_states.iter().find_map(
-            |(candidate_voice_id, state)| {
-                (state.is_released()
-                    && state.voice_id.is_none_or(|voice_id| {
-                        self.acoustic_response
-                            .as_ref()
-                            .and_then(|response| response.voice_response(voice_id))
-                            .is_none_or(|response| response.early_reflections().is_empty())
-                    }))
-                .then_some(*candidate_voice_id)
-            },
+            |(candidate_voice_id, state)| state.is_released().then_some(*candidate_voice_id),
         );
         if let Some(reusable_voice_id) = reusable_voice_id
             && let Some(mut state) = self
@@ -693,17 +684,25 @@ impl SpatialProcessor {
             ..SpatialProcessingMetrics::default()
         };
 
-        // Ensure all spatial sources have backend state created before processing.
-        // This guarantees newly played spatial sources participate in the very first
-        // block, avoiding a "first block louder" case where distance attenuation /
-        // air absorption would still be at their default values.
+        // Clear accumulation buffers before entering the per-Voice quantum path.
+        self.cached_summed_encoded_buf.fill(0.0);
+        self.cached_binaural_processed.fill(0.0);
+        self.cached_late_reverb_input.fill(0.0);
+        self.direction_field_active = false;
+
+        // Resolve one immutable acoustic envelope at each active Voice's quantum entry. The same
+        // envelope drives backend preparation and every direct/environment/reflection consumer.
+        let acoustic_response = self.acoustic_response.clone();
         for voice_id in spatial_voice_ids {
-            let Some(instance) = instances.get(voice_id) else {
+            let Some(instance) = instances.get_mut(voice_id) else {
                 continue;
             };
             if !instance.render_state.is_spatial() {
                 continue;
             }
+            let voice_acoustics = acoustic_response
+                .as_deref()
+                .and_then(|response| response.voice_response(*voice_id));
 
             if let Some(play_command_id) = instance.telemetry_command_id() {
                 self.voice_energy_accumulators
@@ -729,23 +728,16 @@ impl SpatialProcessor {
                 EnvironmentOrigin::Disabled
             ) {
                 self.ensure_native_environment_state_for_voice(*voice_id);
-                self.ensure_native_early_reflection_state_for_voice(*voice_id);
+                self.ensure_native_early_reflection_state_for_voice(*voice_id, voice_acoustics);
             }
-        }
 
-        // Clear accumulation buffers
-        self.cached_summed_encoded_buf.fill(0.0);
-        self.cached_binaural_processed.fill(0.0);
-        self.cached_late_reverb_input.fill(0.0);
-        self.direction_field_active = false;
-
-        // Process each spatial source and accumulate detailed timing.
-        for voice_id in spatial_voice_ids {
-            let Some(instance) = instances.get_mut(voice_id) else {
-                continue;
-            };
-            let source_metrics =
-                self.process_single_source(*voice_id, instance, render_context, events)?;
+            let source_metrics = self.process_single_source(
+                *voice_id,
+                voice_acoustics,
+                instance,
+                render_context,
+                events,
+            )?;
             metrics.direct_processing_time_us += source_metrics.direct_processing_time_us;
             metrics.early_reflection_time_us += source_metrics.early_reflection_time_us;
             metrics.ambisonics_encoding_time_us += source_metrics.ambisonics_encoding_time_us;
@@ -884,14 +876,11 @@ impl SpatialProcessor {
     fn process_single_source(
         &mut self,
         voice_id: VoiceId,
+        voice_acoustics: Option<VoiceAcousticResponse<'_>>,
         instance: &mut PlaybackInstance,
         render_context: SpatialRenderContext,
         events: &mut Vec<VoiceTelemetryEvent>,
     ) -> Result<SourceProcessingMetrics> {
-        let acoustic_response = self.acoustic_response.clone();
-        let voice_acoustics = acoustic_response
-            .as_deref()
-            .and_then(|response| response.voice_response(voice_id));
         // Get spatial configuration (position + per-source volume)
         let emitter_position = match instance.render_state.spatial_pose() {
             Some(pose) => pose.position,
@@ -2535,9 +2524,9 @@ mod tests {
             published_at: Instant::now(),
             solve_time_us: 1,
         }));
-        processor.ensure_native_early_reflection_state_for_voice(voice_id);
         let acoustic_response = processor.acoustic_response.clone().unwrap();
         let voice_acoustics = acoustic_response.voice_response(voice_id);
+        processor.ensure_native_early_reflection_state_for_voice(voice_id, voice_acoustics);
 
         let mut reflected_energy = 0.0;
         for block in 0..8 {
@@ -2617,9 +2606,9 @@ mod tests {
             published_at: Instant::now(),
             solve_time_us: 1,
         }));
-        processor.ensure_native_early_reflection_state_for_voice(voice_id);
         let acoustic_response = processor.acoustic_response.clone().unwrap();
         let voice_acoustics = acoustic_response.voice_response(voice_id);
+        processor.ensure_native_early_reflection_state_for_voice(voice_id, voice_acoustics);
         let play_command_id = PlayCommandId(88);
         processor.voice_energy_accumulators.insert(
             voice_id,
@@ -2755,9 +2744,11 @@ mod tests {
                 published_at: Instant::now(),
                 solve_time_us: 1,
             }));
+            let acoustic_response = processor.acoustic_response.clone().unwrap();
             for index in first_index..first_index + EARLY_REFLECTION_SOURCE_STATE_CAPACITY {
-                processor
-                    .ensure_native_early_reflection_state_for_voice(VoiceId::from(index as u64));
+                let voice_id = VoiceId::from(index as u64);
+                let voice_acoustics = acoustic_response.voice_response(voice_id);
+                processor.ensure_native_early_reflection_state_for_voice(voice_id, voice_acoustics);
             }
             assert!(
                 processor.native_early_reflection_source_states.len()
@@ -2827,10 +2818,11 @@ mod tests {
             published_at: Instant::now(),
             solve_time_us: 1,
         }));
-        for (voice_id, _) in &sources {
-            processor.ensure_native_early_reflection_state_for_voice(*voice_id);
-        }
         let acoustic_response = processor.acoustic_response.clone().unwrap();
+        for (voice_id, _) in &sources {
+            let voice_acoustics = acoustic_response.voice_response(*voice_id);
+            processor.ensure_native_early_reflection_state_for_voice(*voice_id, voice_acoustics);
+        }
         processor.cached_input_buf.fill(0.1);
         for _ in 0..32 {
             processor.cached_binaural_processed.fill(0.0);

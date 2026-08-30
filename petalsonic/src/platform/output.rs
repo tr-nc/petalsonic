@@ -51,13 +51,13 @@ pub(crate) enum OutputRecoveryCause {
     DeviceUnavailable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PreparedOutput {
     token: u64,
     pub(crate) device: OutputDeviceState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OutputPreparation {
     Ready(PreparedOutput),
     Unavailable,
@@ -76,6 +76,8 @@ pub(crate) enum OutputFailure {
 /// Implementations own device discovery, selection, negotiation, stream/callback
 /// construction, physical channel mapping, and platform lifecycle. The engine can
 /// only bind a pre-rendered logical-stereo consumer to an opaque prepared output.
+/// `Ready` yields the sole capability for that prepared physical handle: the
+/// owner must either move it into `open` or retain it until `shutdown` succeeds.
 pub(crate) trait OutputPlatform {
     fn prepare(&mut self, policy: &OutputDevicePolicy) -> OutputPreparation;
 
@@ -91,9 +93,14 @@ pub(crate) trait OutputPlatform {
         active: &OutputDeviceState,
     ) -> Option<OutputRecoveryReason>;
 
-    /// Stops the active callback/stream but intentionally preserves a prepared
-    /// replacement so shared-mode handoff can probe B before releasing A.
-    fn stop(&mut self) -> Result<()>;
+    /// Stops the active callback/stream while preserving the one prepared
+    /// replacement represented by the caller's linear `PreparedOutput`.
+    fn stop_active_preserving_prepared(&mut self) -> Result<()>;
+
+    /// Releases every active and prepared physical handle. A successful return
+    /// is the only platform transition that permits the owner to become fully
+    /// stopped and discard any remaining `PreparedOutput` capability.
+    fn shutdown(&mut self) -> Result<()>;
 }
 
 pub(crate) struct OutputCallback {
@@ -683,8 +690,14 @@ impl OutputPlatform for CpalOutputPlatform {
             .then_some(OutputRecoveryReason::SelectionChanged)
     }
 
-    fn stop(&mut self) -> Result<()> {
+    fn stop_active_preserving_prepared(&mut self) -> Result<()> {
         drop(self.stream.take());
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        drop(self.stream.take());
+        drop(self.prepared.take());
         Ok(())
     }
 }
@@ -777,9 +790,12 @@ pub(crate) mod fake {
             self.0.lock().unwrap().stop_fails = false;
         }
 
-        pub(crate) fn has_active_output(&self) -> bool {
+        pub(crate) fn output_ownership(&self) -> (bool, bool) {
             let state = self.0.lock().unwrap();
-            state.active.is_some() || state.callback.is_some()
+            (
+                state.active.is_some() || state.callback.is_some(),
+                state.prepared.is_some(),
+            )
         }
 
         pub(crate) fn advance(&self, frames: usize) {
@@ -914,9 +930,9 @@ pub(crate) mod fake {
                 .then_some(OutputRecoveryReason::SelectionChanged)
         }
 
-        fn stop(&mut self) -> Result<()> {
+        fn stop_active_preserving_prepared(&mut self) -> Result<()> {
             let mut state = self.state.lock().unwrap();
-            state.actions.push("stop");
+            state.actions.push("stop-active");
             if state.stop_fails || state.stop_failures_remaining > 0 {
                 state.stop_failures_remaining = state.stop_failures_remaining.saturating_sub(1);
                 return Err(PetalSonicError::AudioDevice(
@@ -925,6 +941,21 @@ pub(crate) mod fake {
             }
             state.callback = None;
             state.active = None;
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.actions.push("shutdown");
+            if state.stop_fails || state.stop_failures_remaining > 0 {
+                state.stop_failures_remaining = state.stop_failures_remaining.saturating_sub(1);
+                return Err(PetalSonicError::AudioDevice(
+                    "scripted fake output shutdown failure".into(),
+                ));
+            }
+            state.callback = None;
+            state.active = None;
+            state.prepared = None;
             Ok(())
         }
     }
@@ -1097,7 +1128,7 @@ mod tests {
         let OutputPreparation::Ready(prepared_b) = adapter.prepare(&policy) else {
             panic!("B must prepare before A is stopped");
         };
-        adapter.stop().unwrap();
+        adapter.stop_active_preserving_prepared().unwrap();
         let callback = callback_for(
             &[StereoFrame {
                 left: 0.25,
@@ -1111,7 +1142,7 @@ mod tests {
         assert_eq!(&handle.captured()[2..], &[0.25, -0.5, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(
             handle.actions(),
-            ["prepare", "open", "prepare", "stop", "open"]
+            ["prepare", "open", "prepare", "stop-active", "open"]
         );
     }
 
@@ -1137,6 +1168,24 @@ mod tests {
     }
 
     #[test]
+    fn fake_shutdown_discards_an_unopened_prepared_handle() {
+        let device = FakeDevice::stereo("A", 48_000);
+        let (mut adapter, handle) = FakeOutputPlatform::scripted(vec![device], Some(0));
+        let OutputPreparation::Ready(prepared) =
+            adapter.prepare(&OutputDevicePolicy::FollowSystemDefault)
+        else {
+            panic!("A must prepare");
+        };
+
+        assert_eq!(handle.output_ownership(), (false, true));
+        adapter.shutdown().unwrap();
+        assert_eq!(handle.output_ownership(), (false, false));
+        assert_eq!(handle.actions(), ["prepare", "shutdown"]);
+
+        drop(prepared);
+    }
+
+    #[test]
     fn fake_adapter_reports_exclusive_stop_then_rebuild_fallback() {
         let a = FakeDevice::stereo("A", 48_000);
         let mut b = FakeDevice::stereo("B", 44_100);
@@ -1149,14 +1198,14 @@ mod tests {
         adapter.open(prepared_a, callback_for(&[], 48_000)).unwrap();
         handle.set_selected(Some(1));
         assert_eq!(adapter.prepare(&policy), OutputPreparation::RequiresStop);
-        adapter.stop().unwrap();
+        adapter.shutdown().unwrap();
         let OutputPreparation::Ready(prepared_b) = adapter.prepare(&policy) else {
             panic!("B must prepare after A stops");
         };
         adapter.open(prepared_b, callback_for(&[], 44_100)).unwrap();
         assert_eq!(
             handle.actions(),
-            ["prepare", "open", "prepare", "stop", "prepare", "open"]
+            ["prepare", "open", "prepare", "shutdown", "prepare", "open"]
         );
     }
 
@@ -1181,10 +1230,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        adapter.stop().unwrap();
+        adapter.shutdown().unwrap();
         handle.advance(1);
         assert!(handle.captured().is_empty());
-        assert_eq!(handle.actions(), ["prepare", "open", "stop"]);
+        assert_eq!(handle.actions(), ["prepare", "open", "shutdown"]);
     }
 
     #[test]
@@ -1203,7 +1252,7 @@ mod tests {
                 panic!("supported fake format must prepare");
             };
             adapter.open(prepared, callback_for(&[], 48_000)).unwrap();
-            adapter.stop().unwrap();
+            adapter.shutdown().unwrap();
         }
 
         let mut unsupported = FakeDevice::stereo("unsupported", 48_000);

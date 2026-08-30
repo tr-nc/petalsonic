@@ -241,22 +241,19 @@ impl PreparedVoice {
             source_extent,
             occlusion_profile,
         } = accepted;
-        let acoustic_voice = match render_state.spatial_pose() {
-            Some(pose) => Some(AcousticVoice {
-                voice_id,
-                emitter,
-                emitter_world_pose: pose,
-                acoustic_priority: 1.0,
-                audibility: render_state.volume_linear(),
-                detached,
-                direct_path,
-                environment_send,
-                source_extent: source_extent.clone(),
-                occlusion_profile,
-                routing_generation: 0,
-            }),
-            None => None,
-        };
+        let acoustic_voice = render_state.spatial_pose().map(|pose| AcousticVoice {
+            voice_id,
+            emitter,
+            emitter_world_pose: pose,
+            acoustic_priority: 1.0,
+            audibility: render_state.volume_linear(),
+            detached,
+            direct_path,
+            environment_send,
+            source_extent: source_extent.clone(),
+            occlusion_profile,
+            routing_generation: 0,
+        });
         let total_frames = audio_data.total_frames();
         let sample_rate = audio_data.sample_rate();
         let mut playback = PlaybackInstance {

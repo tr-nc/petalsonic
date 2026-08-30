@@ -22,6 +22,13 @@ enum SessionState {
         signal: Arc<AtomicBool>,
         render_thread: JoinHandle<()>,
     },
+    /// The render thread/connection is quiesced, but the platform still owns a
+    /// stream or prepared handle because `stop` failed. Only a successful
+    /// cleanup retry may transition this state to `Stopped`.
+    CleanupPending {
+        device: Option<OutputDeviceState>,
+        prior_failure: Option<String>,
+    },
 }
 
 /// Owns every physical-output lifecycle fact behind `reconcile` and `close`.
@@ -68,6 +75,11 @@ impl OutputSession {
     }
 
     pub(crate) fn reconcile(&mut self, request: OutputRecoveryRequest) -> OutputRecoveryResult {
+        if matches!(self.state, SessionState::CleanupPending { .. })
+            && self.retry_pending_cleanup().is_err()
+        {
+            return OutputRecoveryResult::Failed(OutputFailure::PlatformLifecycle);
+        }
         if let SessionState::Running { device, .. } = &self.state {
             if !request.probe {
                 return OutputRecoveryResult::Stable;
@@ -95,8 +107,11 @@ impl OutputSession {
                             }
                         }
                         OutputPreparation::Failed(failure) => {
-                            let _ = self.stop_running();
-                            return OutputRecoveryResult::Failed(failure);
+                            return if self.stop_running().is_ok() {
+                                OutputRecoveryResult::Failed(failure)
+                            } else {
+                                OutputRecoveryResult::Failed(OutputFailure::PlatformLifecycle)
+                            };
                         }
                     }
                 }
@@ -114,7 +129,11 @@ impl OutputSession {
         if !request.retry_now {
             return OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable);
         }
-        match self.start_prepared() {
+        let result = self.start_prepared();
+        if matches!(self.state, SessionState::CleanupPending { .. }) {
+            return OutputRecoveryResult::Failed(OutputFailure::PlatformLifecycle);
+        }
+        match result {
             Ok(device) => OutputRecoveryResult::Running(device),
             Err(
                 PetalSonicError::AudioFormat(_)
@@ -126,13 +145,22 @@ impl OutputSession {
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
-        match self.state {
+        match &self.state {
             SessionState::Running { .. } => self.stop_running(),
             SessionState::Prepared(_) => {
-                self.state = SessionState::Stopped;
-                self.platform.stop()
+                let SessionState::Prepared(prepared) =
+                    std::mem::replace(&mut self.state, SessionState::Stopped)
+                else {
+                    unreachable!("state was matched as prepared")
+                };
+                self.state = SessionState::CleanupPending {
+                    device: Some(prepared.device),
+                    prior_failure: None,
+                };
+                self.retry_pending_cleanup()
             }
             SessionState::Stopped => Ok(()),
+            SessionState::CleanupPending { .. } => self.retry_pending_cleanup(),
         }
     }
 
@@ -158,6 +186,12 @@ impl OutputSession {
                     PetalSonicError::Engine("Running output lost its device state".into())
                 });
             }
+            pending @ SessionState::CleanupPending { .. } => {
+                self.state = pending;
+                return Err(PetalSonicError::Engine(
+                    "Output cleanup must complete before starting a new session".into(),
+                ));
+            }
         };
 
         log::info!(
@@ -165,11 +199,18 @@ impl OutputSession {
             MASTER_HEADROOM_DB,
             crate::gain::db_to_linear(MASTER_HEADROOM_DB)
         );
-        let consumer = self
+        let prepared_device = prepared.device.clone();
+        let consumer = match self
             .render
             .lock()
-            .map_err(|_| PetalSonicError::Engine("Render state is poisoned".into()))?
-            .connect_output(prepared.device.sample_rate)?;
+            .map_err(|_| PetalSonicError::Engine("Render state is poisoned".into()))
+            .and_then(|mut render| render.connect_output(prepared.device.sample_rate))
+        {
+            Ok(consumer) => consumer,
+            Err(error) => {
+                return Err(self.rollback_start_failure(Some(prepared_device), error));
+            }
+        };
         let signal = Arc::new(AtomicBool::new(true));
         if let Ok(mut render) = self.render.lock() {
             render.render();
@@ -186,9 +227,8 @@ impl OutputSession {
             Ok(active) => active,
             Err(error) => {
                 signal.store(false, Ordering::Release);
-                let _ = self.platform.stop();
                 self.disconnect_render();
-                return Err(error);
+                return Err(self.rollback_start_failure(Some(prepared_device), error));
             }
         };
         let render_thread = match Self::spawn_render_thread(
@@ -200,9 +240,8 @@ impl OutputSession {
             Ok(thread) => thread,
             Err(error) => {
                 signal.store(false, Ordering::Release);
-                let _ = self.platform.stop();
                 self.disconnect_render();
-                return Err(error);
+                return Err(self.rollback_start_failure(Some(active), error));
             }
         };
         self.publish_running_device(&active);
@@ -216,9 +255,9 @@ impl OutputSession {
 
     fn stop_running(&mut self) -> Result<()> {
         let SessionState::Running {
+            device,
             signal,
             render_thread,
-            ..
         } = std::mem::replace(&mut self.state, SessionState::Stopped)
         else {
             return Ok(());
@@ -228,12 +267,64 @@ impl OutputSession {
         let thread_result = render_thread.join().map_err(|_| {
             PetalSonicError::Engine("Render thread panicked while shutting down".into())
         });
-        let platform_result = self.platform.stop();
         self.disconnect_render();
-        if let Ok(mut current) = self.current_device_name.lock() {
-            *current = None;
+        let prior_failure = thread_result.as_ref().err().map(ToString::to_string);
+        self.state = SessionState::CleanupPending {
+            device: Some(device),
+            prior_failure,
+        };
+        match self.retry_pending_cleanup() {
+            Ok(()) => thread_result,
+            Err(error) => Err(error),
         }
-        thread_result.and(platform_result)
+    }
+
+    fn rollback_start_failure(
+        &mut self,
+        device: Option<OutputDeviceState>,
+        primary: PetalSonicError,
+    ) -> PetalSonicError {
+        let primary_message = primary.to_string();
+        self.state = SessionState::CleanupPending {
+            device,
+            prior_failure: Some(primary_message),
+        };
+        match self.retry_pending_cleanup() {
+            Ok(()) => primary,
+            Err(error) => error,
+        }
+    }
+
+    fn retry_pending_cleanup(&mut self) -> Result<()> {
+        let SessionState::CleanupPending {
+            device,
+            prior_failure,
+        } = std::mem::replace(&mut self.state, SessionState::Stopped)
+        else {
+            return Ok(());
+        };
+        match self.platform.stop() {
+            Ok(()) => {
+                if let Ok(mut current) = self.current_device_name.lock() {
+                    *current = None;
+                }
+                Ok(())
+            }
+            Err(cleanup_error) => {
+                let reported = if let Some(prior) = &prior_failure {
+                    PetalSonicError::Engine(format!(
+                        "{prior}; output cleanup also failed: {cleanup_error}"
+                    ))
+                } else {
+                    cleanup_error
+                };
+                self.state = SessionState::CleanupPending {
+                    device,
+                    prior_failure,
+                };
+                Err(reported)
+            }
+        }
     }
 
     fn disconnect_render(&self) {
@@ -245,7 +336,9 @@ impl OutputSession {
     fn active_device(&self) -> Option<OutputDeviceState> {
         match &self.state {
             SessionState::Running { device, .. } => Some(device.clone()),
-            SessionState::Stopped | SessionState::Prepared(_) => None,
+            SessionState::Stopped
+            | SessionState::Prepared(_)
+            | SessionState::CleanupPending { .. } => None,
         }
     }
 
@@ -436,5 +529,91 @@ mod tests {
         session.close().unwrap();
 
         assert_eq!(handle.actions(), ["prepare", "open", "stop"]);
+    }
+
+    #[test]
+    fn close_retries_a_failed_stop_without_losing_stream_ownership() {
+        let (mut session, handle) = session_fixture(vec![FakeDevice::stereo("A", 48_000)], 0);
+        assert!(matches!(
+            session.reconcile(retry(false)),
+            OutputRecoveryResult::Running(_)
+        ));
+        handle.fail_next_stop();
+
+        assert!(session.close().is_err());
+        assert!(handle.has_active_output());
+        session.close().unwrap();
+
+        assert!(!handle.has_active_output());
+        assert_eq!(handle.actions(), ["prepare", "open", "stop", "stop"]);
+    }
+
+    #[test]
+    fn persistent_stop_failure_remains_owned_until_cleanup_succeeds() {
+        let (mut session, handle) = session_fixture(vec![FakeDevice::stereo("A", 48_000)], 0);
+        assert!(matches!(
+            session.reconcile(retry(false)),
+            OutputRecoveryResult::Running(_)
+        ));
+        handle.fail_all_stops();
+
+        assert!(session.close().is_err());
+        assert!(session.close().is_err());
+        assert!(handle.has_active_output());
+        handle.allow_stops();
+        session.close().unwrap();
+
+        assert!(!handle.has_active_output());
+        assert_eq!(
+            handle.actions(),
+            ["prepare", "open", "stop", "stop", "stop"]
+        );
+    }
+
+    #[test]
+    fn failed_open_rollback_blocks_reconcile_until_stop_cleanup_succeeds() {
+        let (mut session, handle) = session_fixture(vec![FakeDevice::stereo("A", 48_000)], 0);
+        handle.fail_next_open();
+        handle.fail_next_stop();
+
+        assert_eq!(
+            session.reconcile(retry(false)),
+            OutputRecoveryResult::Failed(OutputFailure::PlatformLifecycle)
+        );
+        session.close().unwrap();
+
+        assert_eq!(handle.actions(), ["prepare", "open", "stop", "stop"]);
+    }
+
+    #[test]
+    fn reconcile_cannot_restart_until_failed_stream_cleanup_completes() {
+        let (mut session, handle) = session_fixture(vec![FakeDevice::stereo("A", 48_000)], 0);
+        assert!(matches!(
+            session.reconcile(retry(false)),
+            OutputRecoveryResult::Running(_)
+        ));
+        handle.fail_stream();
+        handle.fail_next_stop();
+
+        assert_eq!(
+            session.reconcile(retry(true)),
+            OutputRecoveryResult::Failed(OutputFailure::PlatformLifecycle)
+        );
+        assert!(handle.has_active_output());
+        assert_eq!(
+            session.reconcile(OutputRecoveryRequest {
+                probe: false,
+                retry_now: false,
+                elapsed_without_output: Duration::ZERO,
+            }),
+            OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable)
+        );
+        assert!(!handle.has_active_output());
+        assert_eq!(handle.actions(), ["prepare", "open", "stop", "stop"]);
+
+        assert!(matches!(
+            session.reconcile(retry(false)),
+            OutputRecoveryResult::Running(_)
+        ));
     }
 }

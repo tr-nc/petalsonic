@@ -742,6 +742,8 @@ pub(crate) mod fake {
         callback: Option<OutputCallback>,
         stream_failed: bool,
         fail_next_open: bool,
+        stop_failures_remaining: usize,
+        stop_fails: bool,
         captured: Vec<f32>,
         actions: Vec<&'static str>,
         virtual_time: Duration,
@@ -761,6 +763,23 @@ pub(crate) mod fake {
 
         pub(crate) fn fail_next_open(&self) {
             self.0.lock().unwrap().fail_next_open = true;
+        }
+
+        pub(crate) fn fail_next_stop(&self) {
+            self.0.lock().unwrap().stop_failures_remaining += 1;
+        }
+
+        pub(crate) fn fail_all_stops(&self) {
+            self.0.lock().unwrap().stop_fails = true;
+        }
+
+        pub(crate) fn allow_stops(&self) {
+            self.0.lock().unwrap().stop_fails = false;
+        }
+
+        pub(crate) fn has_active_output(&self) -> bool {
+            let state = self.0.lock().unwrap();
+            state.active.is_some() || state.callback.is_some()
         }
 
         pub(crate) fn advance(&self, frames: usize) {
@@ -898,6 +917,12 @@ pub(crate) mod fake {
         fn stop(&mut self) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.actions.push("stop");
+            if state.stop_fails || state.stop_failures_remaining > 0 {
+                state.stop_failures_remaining = state.stop_failures_remaining.saturating_sub(1);
+                return Err(PetalSonicError::AudioDevice(
+                    "scripted fake output stop failure".into(),
+                ));
+            }
             state.callback = None;
             state.active = None;
             Ok(())

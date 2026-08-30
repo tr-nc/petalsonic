@@ -18,6 +18,22 @@ pub enum RuntimeState {
     Closed = 4,
 }
 
+impl RuntimeState {
+    pub(crate) fn load(state: &std::sync::atomic::AtomicU8) -> Self {
+        Self::from_storage(state.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn from_storage(value: u8) -> Self {
+        match value {
+            value if value == Self::Running as u8 => Self::Running,
+            value if value == Self::Recovering as u8 => Self::Recovering,
+            value if value == Self::Failed as u8 => Self::Failed,
+            value if value == Self::Closing as u8 => Self::Closing,
+            _ => Self::Closed,
+        }
+    }
+}
+
 /// Pull-based health snapshot. Device names are diagnostic, not stable identifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeStatus {

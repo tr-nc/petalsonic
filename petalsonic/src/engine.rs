@@ -12,13 +12,51 @@ use crate::platform::output::{
 };
 use crate::playback::PlaybackCommand;
 use crate::render::RenderQuantum;
+use crate::runtime_health::RuntimeFailurePublisher;
 use crate::spatial::RetiredSpatialSource;
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::{fmt, panic};
 
 pub(crate) const MASTER_HEADROOM_DB: f32 = -6.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderWorkerFailure {
+    StatePoisoned,
+    UnexpectedExit,
+    Panicked,
+}
+
+impl fmt::Display for RenderWorkerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StatePoisoned => formatter.write_str("render state was poisoned"),
+            Self::UnexpectedExit => formatter.write_str("render child exited unexpectedly"),
+            Self::Panicked => formatter.write_str("render child panicked"),
+        }
+    }
+}
+
+type RenderThread = JoinHandle<std::result::Result<(), RenderWorkerFailure>>;
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RenderWorkerFaultInjector {
+    fault: Arc<std::sync::atomic::AtomicU8>,
+}
+
+#[cfg(test)]
+impl RenderWorkerFaultInjector {
+    pub(crate) fn panic(&self) {
+        self.fault.store(1, Ordering::Release);
+    }
+
+    fn take_panicking_fault(&self) -> bool {
+        self.fault.swap(0, Ordering::AcqRel) == 1
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct EngineCommandReceivers {
@@ -82,7 +120,10 @@ pub(crate) struct PetalSonicEngine {
     event_sender: Sender<PetalSonicEvent>,
     counters: Arc<RuntimeCounters>,
     render: Arc<Mutex<RenderQuantum>>,
-    render_thread: Option<JoinHandle<()>>,
+    runtime_failure: RuntimeFailurePublisher,
+    render_thread: Option<RenderThread>,
+    #[cfg(test)]
+    render_worker_fault: RenderWorkerFaultInjector,
     backend_retirement_receiver: Receiver<RetiredSpatialSource>,
 }
 
@@ -92,6 +133,8 @@ impl PetalSonicEngine {
         output: Box<dyn OutputPlatform>,
         command_receivers: EngineCommandReceivers,
         buses: Vec<BusParams>,
+        runtime_failure: RuntimeFailurePublisher,
+        #[cfg(test)] render_worker_fault: RenderWorkerFaultInjector,
     ) -> Result<Self> {
         let desc = startup.desc.clone();
         let frames_processed = startup.ports.frames_processed.clone();
@@ -113,7 +156,10 @@ impl PetalSonicEngine {
             event_sender,
             counters,
             render: Arc::new(Mutex::new(render)),
+            runtime_failure,
             render_thread: None,
+            #[cfg(test)]
+            render_worker_fault,
             backend_retirement_receiver: retirement_receiver,
         })
     }
@@ -213,6 +259,9 @@ impl PetalSonicEngine {
             self.is_running.clone(),
             self.desc.block_size,
             self.desc.sample_rate,
+            self.runtime_failure.clone(),
+            #[cfg(test)]
+            self.render_worker_fault.clone(),
         ) {
             Ok(thread) => thread,
             Err(error) => {
@@ -246,7 +295,9 @@ impl PetalSonicEngine {
         is_running: Arc<AtomicBool>,
         block_size: usize,
         sample_rate: u32,
-    ) -> Result<JoinHandle<()>> {
+        runtime_failure: RuntimeFailurePublisher,
+        #[cfg(test)] render_worker_fault: RenderWorkerFaultInjector,
+    ) -> Result<RenderThread> {
         let wake_interval = render
             .lock()
             .map_err(|_| PetalSonicError::Engine("Render state is poisoned".into()))?
@@ -255,12 +306,31 @@ impl PetalSonicEngine {
         std::thread::Builder::new()
             .name("petalsonic-render".into())
             .spawn(move || {
-                while is_running.load(Ordering::Acquire) {
-                    if let Ok(mut render) = render.lock() {
+                let completion = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    while is_running.load(Ordering::Acquire) {
+                        #[cfg(test)]
+                        if render_worker_fault.take_panicking_fault() {
+                            panic!("injected render child panic");
+                        }
+                        let mut render = render
+                            .lock()
+                            .map_err(|_| RenderWorkerFailure::StatePoisoned)?;
                         render.render();
+                        drop(render);
+                        std::thread::park_timeout(wake_interval);
                     }
-                    std::thread::park_timeout(wake_interval);
+                    Ok(())
+                }));
+                let completion = match completion {
+                    Ok(Ok(())) if !is_running.load(Ordering::Acquire) => Ok(()),
+                    Ok(Ok(())) => Err(RenderWorkerFailure::UnexpectedExit),
+                    Ok(Err(failure)) => Err(failure),
+                    Err(_) => Err(RenderWorkerFailure::Panicked),
+                };
+                if completion.is_err() {
+                    runtime_failure.publish();
                 }
+                completion
             })
             .map_err(|error| {
                 PetalSonicError::Engine(format!("Failed to start render thread: {error}"))
@@ -271,9 +341,17 @@ impl PetalSonicEngine {
         self.is_running.store(false, Ordering::Release);
         if let Some(thread) = self.render_thread.take() {
             thread.thread().unpark();
-            thread.join().map_err(|_| {
-                PetalSonicError::Engine("Render thread panicked while shutting down".into())
-            })?;
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(failure)) => {
+                    return Err(PetalSonicError::Engine(failure.to_string()));
+                }
+                Err(_) => {
+                    return Err(PetalSonicError::Engine(
+                        "Render child join observed an unclassified panic".into(),
+                    ));
+                }
+            }
         }
         self.output.stop()?;
         if let Ok(mut render) = self.render.lock() {

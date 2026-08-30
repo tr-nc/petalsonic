@@ -12,13 +12,16 @@ use crate::events::{
     EnvironmentResponse as EnvironmentResponseTelemetry,
 };
 use crate::math::{Pose, Vec3};
+use crate::runtime_children::{
+    ChildCancellation, ChildStartup, RuntimeChildFailure, RuntimeChildKind, RuntimeChildResult,
+    RuntimeChildren,
+};
 use crate::spatial::LateReverbParameters;
 use crossbeam_channel::{Receiver, Sender};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
@@ -478,60 +481,82 @@ pub(crate) struct AcousticPropagation {
     counters: Arc<AcousticPropagationCounters>,
     enabled: Arc<AtomicBool>,
     quality_bits: AtomicU32,
-    stop: Arc<AtomicBool>,
-    worker: Mutex<Option<JoinHandle<()>>>,
     telemetry_receiver: Receiver<AcousticTelemetryEvent>,
+    #[cfg(test)]
+    worker_fault: Arc<std::sync::atomic::AtomicU8>,
+}
+
+pub(crate) struct AcousticWorker {
+    context: PropagationWorkerContext,
+    cancellation: ChildCancellation,
+}
+
+impl AcousticWorker {
+    pub(crate) fn start(self, children: &mut RuntimeChildren) -> crate::error::Result<()> {
+        let cancellation = self.cancellation.clone();
+        children.spawn(
+            RuntimeChildKind::Acoustics,
+            "petalsonic-acoustics",
+            cancellation,
+            move |startup, cancellation| self.run(startup, cancellation),
+        )
+    }
+
+    fn run(self, startup: ChildStartup, cancellation: ChildCancellation) -> RuntimeChildResult {
+        startup.ready()?;
+        propagation_loop(self.context, &cancellation)
+    }
 }
 
 impl AcousticPropagation {
-    pub(crate) fn new(
+    pub(crate) fn prepare(
         distance_scaler: f32,
         enabled: Arc<AtomicBool>,
         environmental_acoustics_quality: f32,
         environmental_acoustics_budget: EnvironmentalAcousticsBudget,
         max_voices: usize,
         telemetry_capacity: usize,
-    ) -> std::io::Result<Self> {
+    ) -> (Self, AcousticWorker) {
         let input = Arc::new(SharedInput {
             state: Mutex::new(InputState::new(environmental_acoustics_quality, max_voices)),
             changed: Condvar::new(),
         });
         let latest_response = Arc::new(Mutex::new(None));
         let counters = Arc::new(AcousticPropagationCounters::default());
-        let stop = Arc::new(AtomicBool::new(false));
         let (telemetry_sender, telemetry_receiver) = crossbeam_channel::bounded(telemetry_capacity);
-        let worker = {
+        #[cfg(test)]
+        let worker_fault = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let cancellation = {
             let input = input.clone();
-            let latest_response = latest_response.clone();
-            let counters = counters.clone();
-            let enabled = enabled.clone();
-            let stop = stop.clone();
-            let telemetry_sender = telemetry_sender.clone();
-            std::thread::Builder::new()
-                .name("petalsonic-acoustics".into())
-                .spawn(move || {
-                    propagation_loop(PropagationWorkerContext {
-                        input,
-                        latest_response,
-                        counters,
-                        enabled,
-                        stop,
-                        distance_scaler,
-                        environmental_acoustics_budget,
-                        telemetry_sender,
-                    })
-                })?
+            ChildCancellation::new(move || input.changed.notify_one())
         };
-        Ok(Self {
-            input,
-            latest_response,
-            counters,
-            enabled,
-            quality_bits: AtomicU32::new(environmental_acoustics_quality.to_bits()),
-            stop,
-            worker: Mutex::new(Some(worker)),
-            telemetry_receiver,
-        })
+        let worker = AcousticWorker {
+            context: PropagationWorkerContext {
+                input: input.clone(),
+                latest_response: latest_response.clone(),
+                counters: counters.clone(),
+                enabled: enabled.clone(),
+                distance_scaler,
+                environmental_acoustics_budget,
+                telemetry_sender,
+                #[cfg(test)]
+                worker_fault: worker_fault.clone(),
+            },
+            cancellation,
+        };
+        (
+            Self {
+                input,
+                latest_response,
+                counters,
+                enabled,
+                quality_bits: AtomicU32::new(environmental_acoustics_quality.to_bits()),
+                telemetry_receiver,
+                #[cfg(test)]
+                worker_fault,
+            },
+            worker,
+        )
     }
 
     pub(crate) fn publish_spatial_frame(
@@ -639,25 +664,22 @@ impl AcousticPropagation {
         f32::from_bits(self.quality_bits.load(Ordering::Acquire))
     }
 
-    pub(crate) fn close(&self) {
-        let state = self.input.state.lock().ok();
-        self.stop.store(true, Ordering::Release);
-        drop(state);
+    #[cfg(test)]
+    pub(crate) fn fail_worker_for_test(&self) {
+        self.worker_fault.store(1, Ordering::Release);
         self.input.changed.notify_one();
-        if let Ok(mut worker) = self.worker.lock()
-            && let Some(worker) = worker.take()
-        {
-            let _ = worker.join();
-        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_worker_for_test(&self) {
+        self.worker_fault.store(2, Ordering::Release);
+        self.input.changed.notify_one();
+    }
+
+    pub(crate) fn clear_published_response(&self) {
         if let Ok(mut response) = self.latest_response.lock() {
             response.take();
         }
-    }
-}
-
-impl Drop for AcousticPropagation {
-    fn drop(&mut self) {
-        self.close();
     }
 }
 
@@ -666,10 +688,11 @@ struct PropagationWorkerContext {
     latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
     counters: Arc<AcousticPropagationCounters>,
     enabled: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
     distance_scaler: f32,
     environmental_acoustics_budget: EnvironmentalAcousticsBudget,
     telemetry_sender: Sender<AcousticTelemetryEvent>,
+    #[cfg(test)]
+    worker_fault: Arc<std::sync::atomic::AtomicU8>,
 }
 
 struct AcousticPublisher {
@@ -701,9 +724,11 @@ impl AcousticPublisher {
         &self,
         captured_wake_generation: u64,
         completed: CompletedAcousticFrame,
-    ) -> Option<bool> {
+    ) -> std::result::Result<bool, RuntimeChildFailure> {
         self.counters.record_solve(completed.solve_time_us);
-        let publication_guard = self.input.state.lock().ok()?;
+        let publication_guard = self.input.state.lock().map_err(|_| {
+            RuntimeChildFailure::new("acoustics publication input state is poisoned")
+        })?;
         let newer_input_pending = publication_guard.wake_generation != captured_wake_generation;
         let discarded_spatial_revision = completed.spatial_revision;
         let discarded_geometry_version = completed.geometry_version;
@@ -721,14 +746,16 @@ impl AcousticPublisher {
                     reason: AcousticDiscardReason::Superseded,
                 },
             );
-            return Some(newer_input_pending);
+            return Ok(newer_input_pending);
         };
 
         let published_at = Instant::now();
         let output = completed.into_solve_output(published_at);
         let response_spatial_revision = output.response.spatial_revision;
         let response_geometry_version = output.response.geometry_version;
-        let mut latest = self.latest_response.lock().ok()?;
+        let mut latest = self.latest_response.lock().map_err(|_| {
+            RuntimeChildFailure::new("acoustics published response state is poisoned")
+        })?;
         *latest = Some(Arc::new(output.response));
         drop(latest);
         drop(publication_guard);
@@ -786,20 +813,24 @@ impl AcousticPublisher {
                 AcousticTelemetryEvent::VoiceConclusion(conclusion.telemetry),
             );
         }
-        Some(newer_input_pending)
+        Ok(newer_input_pending)
     }
 }
 
-fn propagation_loop(context: PropagationWorkerContext) {
+fn propagation_loop(
+    context: PropagationWorkerContext,
+    cancellation: &ChildCancellation,
+) -> RuntimeChildResult {
     let PropagationWorkerContext {
         input,
         latest_response,
         counters,
         enabled,
-        stop,
         distance_scaler,
         environmental_acoustics_budget,
         telemetry_sender,
+        #[cfg(test)]
+        worker_fault,
     } = context;
     let publisher = AcousticPublisher {
         input: input.clone(),
@@ -810,20 +841,30 @@ fn propagation_loop(context: PropagationWorkerContext) {
     let mut consumed_wake_generation = 0;
     let mut next_solve = Instant::now();
     let mut solver = AcousticSolver::new(0);
-    while !stop.load(Ordering::Acquire) {
+    while !cancellation.is_requested() {
         let captured = {
-            let Ok(mut state) = input.state.lock() else {
-                return;
-            };
+            let mut state = input
+                .state
+                .lock()
+                .map_err(|_| RuntimeChildFailure::new("acoustics input state is poisoned"))?;
             loop {
-                if stop.load(Ordering::Acquire) {
-                    return;
+                #[cfg(test)]
+                match worker_fault.swap(0, Ordering::AcqRel) {
+                    1 => {
+                        return Err(RuntimeChildFailure::new(
+                            "injected acoustics worker failure",
+                        ));
+                    }
+                    2 => panic!("injected acoustics worker panic"),
+                    _ => {}
+                }
+                if cancellation.is_requested() {
+                    return Ok(());
                 }
                 if !enabled.load(Ordering::Acquire) {
-                    let Ok(next_state) = input.changed.wait(state) else {
-                        return;
-                    };
-                    state = next_state;
+                    state = input.changed.wait(state).map_err(|_| {
+                        RuntimeChildFailure::new("acoustics input wait state is poisoned")
+                    })?;
                     continue;
                 }
                 let captured = (state.wake_generation != consumed_wake_generation)
@@ -834,15 +875,15 @@ fn propagation_loop(context: PropagationWorkerContext) {
                     break captured;
                 }
                 if captured.is_none() {
-                    let Ok(next_state) = input.changed.wait(state) else {
-                        return;
-                    };
-                    state = next_state;
+                    state = input.changed.wait(state).map_err(|_| {
+                        RuntimeChildFailure::new("acoustics input wait state is poisoned")
+                    })?;
                 } else {
                     let wait = next_solve.saturating_duration_since(now);
-                    let Ok((next_state, _)) = input.changed.wait_timeout(state, wait) else {
-                        return;
-                    };
+                    let (next_state, _) =
+                        input.changed.wait_timeout(state, wait).map_err(|_| {
+                            RuntimeChildFailure::new("acoustics timed input wait state is poisoned")
+                        })?;
                     state = next_state;
                 }
             }
@@ -859,14 +900,12 @@ fn propagation_loop(context: PropagationWorkerContext) {
         let mut output = solver.solve_with_telemetry(&captured, distance_scaler, plan);
         let elapsed_us = started.elapsed().as_micros() as u64;
         output.response.solve_time_us = elapsed_us;
-        let Some(newer_input_pending) = publisher.commit(captured.wake_generation, output.into())
-        else {
-            return;
-        };
+        let newer_input_pending = publisher.commit(captured.wake_generation, output.into())?;
         if newer_input_pending {
             next_solve = Instant::now();
         }
     }
+    Ok(())
 }
 
 /// Filters one completed solve against the current scene and per-Voice routing lifetimes.
@@ -2490,7 +2529,28 @@ mod tests {
     use crate::acoustics::{AcousticHit, AcousticMaterial, AcousticRayQuerySnapshot};
     use crate::domain::EmitterSpatialState;
     use crate::math::Pose;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU8, AtomicUsize};
+
+    fn start_propagation(
+        enabled: bool,
+        quality: f32,
+        max_voices: usize,
+        telemetry_capacity: usize,
+    ) -> (AcousticPropagation, RuntimeChildren) {
+        let state = Arc::new(AtomicU8::new(crate::events::RuntimeState::Recovering as u8));
+        let mut children =
+            RuntimeChildren::new(crate::runtime_health::RuntimeFailurePublisher::new(state));
+        let (propagation, worker) = AcousticPropagation::prepare(
+            1.0,
+            Arc::new(AtomicBool::new(enabled)),
+            quality,
+            EnvironmentalAcousticsBudget::default(),
+            max_voices,
+            telemetry_capacity,
+        );
+        worker.start(&mut children).unwrap();
+        (propagation, children)
+    }
 
     #[test]
     fn listener_position_relative_acoustic_pose_follows_translation_in_world_axes() {
@@ -3994,15 +4054,7 @@ mod tests {
     #[test]
     fn rapid_pose_revisions_publish_compatible_response_before_short_voice_deadline() {
         let query = Arc::new(BlockingOpenGeometry::new());
-        let propagation = AcousticPropagation::new(
-            1.0,
-            Arc::new(AtomicBool::new(true)),
-            0.0,
-            EnvironmentalAcousticsBudget::default(),
-            1,
-            16,
-        )
-        .unwrap();
+        let (propagation, children) = start_propagation(true, 0.0, 1, 16);
         let emitter = Emitter {
             world_id: 1,
             index: 0,
@@ -4108,20 +4160,13 @@ mod tests {
                         && conclusion.environment == AcousticRouteOutcome::Applied
             )
         }));
-        propagation.close();
+        children.close().unwrap();
+        propagation.clear_published_response();
     }
 
     #[test]
     fn worker_keeps_only_latest_complete_input_and_closes_cleanly() {
-        let propagation = AcousticPropagation::new(
-            1.0,
-            Arc::new(AtomicBool::new(true)),
-            0.5,
-            EnvironmentalAcousticsBudget::default(),
-            8,
-            8,
-        )
-        .unwrap();
+        let (propagation, children) = start_propagation(true, 0.5, 8, 8);
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(17, Arc::new(UnitRoom))))
             .unwrap();
@@ -4168,21 +4213,13 @@ mod tests {
         assert!(diagnostics.published_response_count >= 1);
         assert_eq!(diagnostics.latest_spatial_revision, 12);
         assert_eq!(diagnostics.latest_geometry_version, 17);
-        propagation.close();
-        assert!(propagation.worker.lock().unwrap().is_none());
+        children.close().unwrap();
+        propagation.clear_published_response();
     }
 
     #[test]
     fn disabled_worker_waits_for_reenable_before_solving() {
-        let propagation = AcousticPropagation::new(
-            1.0,
-            Arc::new(AtomicBool::new(false)),
-            0.5,
-            EnvironmentalAcousticsBudget::default(),
-            8,
-            8,
-        )
-        .unwrap();
+        let (propagation, children) = start_propagation(false, 0.5, 8, 8);
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();
@@ -4207,20 +4244,13 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        propagation.close();
+        children.close().unwrap();
+        propagation.clear_published_response();
     }
 
     #[test]
     fn quality_change_wakes_the_existing_worker_without_new_scene_input() {
-        let propagation = AcousticPropagation::new(
-            1.0,
-            Arc::new(AtomicBool::new(true)),
-            0.5,
-            EnvironmentalAcousticsBudget::default(),
-            8,
-            8,
-        )
-        .unwrap();
+        let (propagation, children) = start_propagation(true, 0.5, 8, 8);
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();
@@ -4242,15 +4272,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let initial_solve_count = propagation.diagnostics().solve_count;
-        let worker_thread_id = propagation
-            .worker
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .thread()
-            .id();
-
         propagation.set_quality(1.0);
         assert_eq!(propagation.quality(), 1.0);
         while propagation.diagnostics().solve_count == initial_solve_count {
@@ -4260,22 +4281,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(
-            propagation
-                .worker
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .thread()
-                .id(),
-            worker_thread_id
-        );
-
         let settled_solve_count = propagation.diagnostics().solve_count;
         propagation.set_quality(1.0);
         std::thread::sleep(Duration::from_millis(75));
         assert_eq!(propagation.diagnostics().solve_count, settled_solve_count);
-        propagation.close();
+        children.close().unwrap();
+        propagation.clear_published_response();
     }
 }

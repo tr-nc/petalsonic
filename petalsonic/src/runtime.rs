@@ -2,6 +2,8 @@ use crate::acoustic_propagation::{AcousticPropagation, AcousticResponse};
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::config::{PetalSonicWorldDesc, SourceConfig};
 use crate::domain::{BusParams, Emitter, SpatialFrame, VoiceId};
+#[cfg(test)]
+use crate::engine::RenderWorkerFaultInjector;
 use crate::engine::{EngineCommandReceivers, EngineObservability, EngineStartup, PetalSonicEngine};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
@@ -13,10 +15,13 @@ use crate::platform::output::{
     CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
 };
 use crate::playback::{AcceptedVoice, PlaybackCommand};
+use crate::runtime_children::{
+    ChildCancellation, RuntimeChildFailure, RuntimeChildKind, RuntimeChildren,
+};
+use crate::runtime_health::RuntimeFailurePublisher;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub(crate) const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
@@ -132,9 +137,10 @@ pub(crate) struct AudioRuntime {
     timing_receiver: Receiver<RenderTimingEvent>,
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
-    supervisor_stop: Arc<AtomicBool>,
+    children: RuntimeChildren,
+    #[cfg(test)]
+    render_worker_fault: RenderWorkerFaultInjector,
     close_lock: Mutex<()>,
-    supervisor_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AudioRuntime {
@@ -176,19 +182,21 @@ impl AudioRuntime {
         ));
         let environmental_acoustics_enabled =
             Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
-        let acoustic_propagation = AcousticPropagation::new(
+        let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
+        let runtime_failure = RuntimeFailurePublisher::new(runtime_state.clone());
+        let recovery_attempts = Arc::new(AtomicU64::new(0));
+        let mut children = RuntimeChildren::new(runtime_failure.clone());
+        #[cfg(test)]
+        let render_worker_fault = RenderWorkerFaultInjector::default();
+        let (acoustic_propagation, acoustic_worker) = AcousticPropagation::prepare(
             config.distance_scaler,
             environmental_acoustics_enabled.clone(),
             config.environmental_acoustics_quality,
             config.environmental_acoustics_budget,
             config.max_voices,
             config.event_queue_capacity,
-        )
-        .map_err(|error| {
-            PetalSonicError::Engine(format!(
-                "Failed to start acoustic propagation worker: {error}"
-            ))
-        })?;
+        );
+        acoustic_worker.start(&mut children)?;
         let acoustic_telemetry_receiver = acoustic_propagation.telemetry_receiver();
         if let Some(scene) = initial_acoustic_scene {
             acoustic_propagation.publish_scene(scene).map_err(|_| {
@@ -225,17 +233,17 @@ impl AudioRuntime {
             timing_receiver,
             counters,
         } = observability;
-        let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
-        let recovery_attempts = Arc::new(AtomicU64::new(0));
-        let supervisor_stop = Arc::new(AtomicBool::new(false));
-        let supervisor_thread = Self::spawn_output_supervisor(
+        Self::start_output_child(
+            &mut children,
             startup,
             output,
             EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
             bus_params.clone(),
             runtime_state.clone(),
             recovery_attempts.clone(),
-            supervisor_stop.clone(),
+            runtime_failure,
+            #[cfg(test)]
+            render_worker_fault.clone(),
         )?;
 
         Ok(Self {
@@ -264,14 +272,15 @@ impl AudioRuntime {
             timing_receiver,
             runtime_state,
             recovery_attempts,
-            supervisor_stop,
+            children,
+            #[cfg(test)]
+            render_worker_fault,
             close_lock: Mutex::new(()),
-            supervisor_thread: Mutex::new(Some(supervisor_thread)),
         })
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {
-        match Self::load_runtime_state(&self.runtime_state) {
+        match RuntimeState::load(&self.runtime_state) {
             RuntimeState::Failed => Err(PetalSonicError::RuntimeFailed),
             RuntimeState::Closing | RuntimeState::Closed => Err(PetalSonicError::RuntimeClosed),
             _ => Ok(()),
@@ -407,6 +416,21 @@ impl AudioRuntime {
         self.acoustic_propagation.quality()
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_acoustic_worker_for_test(&self) {
+        self.acoustic_propagation.fail_worker_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_acoustic_worker_for_test(&self) {
+        self.acoustic_propagation.panic_worker_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_render_worker_for_test(&self) {
+        self.render_worker_fault.panic();
+    }
+
     pub(crate) fn set_bus_params(&self, index: usize, params: BusParams) -> Result<()> {
         let mut current = self
             .bus_params
@@ -433,7 +457,7 @@ impl AudioRuntime {
             .map(|device| device.clone())
             .unwrap_or_default();
         RuntimeStatus {
-            state: Self::load_runtime_state(&self.runtime_state),
+            state: RuntimeState::load(&self.runtime_state),
             recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
             active_output_device,
         }
@@ -584,30 +608,19 @@ impl AudioRuntime {
             .close_lock
             .lock()
             .map_err(|_| PetalSonicError::Engine("Runtime close lock is poisoned".into()))?;
-        if Self::load_runtime_state(&self.runtime_state) == RuntimeState::Closed {
+        if RuntimeState::load(&self.runtime_state) == RuntimeState::Closed {
             return Ok(());
         }
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
-        self.supervisor_stop.store(true, Ordering::Release);
-        let shutdown_error = match self.supervisor_thread.lock() {
-            Ok(mut owner) => owner.take().and_then(|supervisor| {
-                supervisor.thread().unpark();
-                supervisor.join().err().map(|_| {
-                    PetalSonicError::Engine("Output supervisor panicked while shutting down".into())
-                })
-            }),
-            Err(_) => Some(PetalSonicError::Engine(
-                "Output supervisor lock is poisoned".into(),
-            )),
-        };
-        self.acoustic_propagation.close();
+        let shutdown_result = self.children.close();
+        self.acoustic_propagation.clear_published_response();
         self.drain_retired_spatial_frames();
         self.drain_retired_acoustic_responses();
         self.active_voice_count.store(0, Ordering::Release);
         self.runtime_state
             .store(RuntimeState::Closed as u8, Ordering::Release);
-        shutdown_error.map_or(Ok(()), Err)
+        shutdown_result
     }
 
     pub(crate) fn supervisor_tick<D: OutputRuntimeDriver>(
@@ -618,7 +631,7 @@ impl AudioRuntime {
         now: Instant,
     ) {
         driver.drain_retired_resources();
-        let state = Self::load_runtime_state(runtime_state);
+        let state = RuntimeState::load(runtime_state);
         let probe = state == RuntimeState::Running && now >= schedule.next_health_probe;
         if state == RuntimeState::Running && !probe {
             return;
@@ -649,16 +662,22 @@ impl AudioRuntime {
         match result {
             OutputRecoveryResult::Stable => {}
             OutputRecoveryResult::Running(_device) => {
-                if state == RuntimeState::Running {
-                    driver.emit_runtime_state(RuntimeState::Recovering);
+                if Self::transition_runtime_state(runtime_state, state, RuntimeState::Running) {
+                    if state == RuntimeState::Running {
+                        driver.emit_runtime_state(RuntimeState::Recovering);
+                    }
+                    schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
+                    driver.emit_runtime_state(RuntimeState::Running);
                 }
-                runtime_state.store(RuntimeState::Running as u8, Ordering::Release);
-                schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
-                driver.emit_runtime_state(RuntimeState::Running);
             }
             OutputRecoveryResult::Recovering(_cause) => {
-                if state == RuntimeState::Running {
-                    runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
+                if state == RuntimeState::Running
+                    && Self::transition_runtime_state(
+                        runtime_state,
+                        state,
+                        RuntimeState::Recovering,
+                    )
+                {
                     driver.emit_runtime_state(RuntimeState::Recovering);
                 }
                 if retry_now {
@@ -666,35 +685,50 @@ impl AudioRuntime {
                 }
             }
             OutputRecoveryResult::Failed(_failure) => {
-                if state == RuntimeState::Running {
-                    driver.emit_runtime_state(RuntimeState::Recovering);
+                if Self::transition_runtime_state(runtime_state, state, RuntimeState::Failed) {
+                    if state == RuntimeState::Running {
+                        driver.emit_runtime_state(RuntimeState::Recovering);
+                    }
+                    driver.emit_runtime_state(RuntimeState::Failed);
                 }
-                runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                driver.emit_runtime_state(RuntimeState::Failed);
             }
         }
     }
 
-    fn spawn_output_supervisor(
+    fn transition_runtime_state(
+        runtime_state: &AtomicU8,
+        observed: RuntimeState,
+        next: RuntimeState,
+    ) -> bool {
+        runtime_state
+            .compare_exchange(
+                observed as u8,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn start_output_child(
+        children: &mut RuntimeChildren,
         startup: EngineStartup,
         output: Box<dyn FnOnce() -> Result<Box<dyn OutputPlatform>> + Send>,
         command_receivers: EngineCommandReceivers,
         bus_params: Arc<Mutex<Vec<BusParams>>>,
         runtime_state: Arc<AtomicU8>,
         recovery_attempts: Arc<AtomicU64>,
-        stop: Arc<AtomicBool>,
-    ) -> Result<JoinHandle<()>> {
-        let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
-        let handle = std::thread::Builder::new()
-            .name("petalsonic-output".into())
-            .spawn(move || {
+        runtime_failure: RuntimeFailurePublisher,
+        #[cfg(test)] render_worker_fault: RenderWorkerFaultInjector,
+    ) -> Result<()> {
+        children.spawn(
+            RuntimeChildKind::Output,
+            "petalsonic-output",
+            ChildCancellation::passive(),
+            move |child_startup, cancellation| {
                 let output = match output() {
                     Ok(output) => output,
-                    Err(error) => {
-                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                        let _ = startup_sender.send(Err(error));
-                        return;
-                    }
+                    Err(error) => return Err(child_startup.failed(error)),
                 };
                 let initial_buses = bus_params
                     .lock()
@@ -705,22 +739,19 @@ impl AudioRuntime {
                     output,
                     command_receivers.clone(),
                     initial_buses,
+                    runtime_failure,
+                    #[cfg(test)]
+                    render_worker_fault,
                 ) {
                     Ok(engine) => engine,
-                    Err(error) => {
-                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                        let _ = startup_sender.send(Err(error));
-                        return;
-                    }
+                    Err(error) => return Err(child_startup.failed(error)),
                 };
-                if startup_sender.send(Ok(())).is_err() {
-                    return;
-                }
+                child_startup.ready()?;
                 let poll_interval = Duration::from_millis(20);
                 let mut schedule = SupervisorSchedule::new(Instant::now());
                 engine.emit_runtime_state(RuntimeState::Recovering);
 
-                while !stop.load(Ordering::Acquire) {
+                while !cancellation.is_requested() {
                     Self::supervisor_tick(
                         &mut engine,
                         &runtime_state,
@@ -730,35 +761,11 @@ impl AudioRuntime {
                     );
                     std::thread::park_timeout(poll_interval);
                 }
-                let _ = engine.stop();
-            })
-            .map_err(|error| {
-                PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))
-            })?;
-
-        match startup_receiver.recv() {
-            Ok(Ok(())) => Ok(handle),
-            Ok(Err(error)) => {
-                let _ = handle.join();
-                Err(error)
-            }
-            Err(_) => {
-                let _ = handle.join();
-                Err(PetalSonicError::Engine(
-                    "Output supervisor exited during initialization".into(),
-                ))
-            }
-        }
-    }
-
-    pub(crate) fn load_runtime_state(state: &AtomicU8) -> RuntimeState {
-        match state.load(Ordering::Acquire) {
-            value if value == RuntimeState::Running as u8 => RuntimeState::Running,
-            value if value == RuntimeState::Recovering as u8 => RuntimeState::Recovering,
-            value if value == RuntimeState::Failed as u8 => RuntimeState::Failed,
-            value if value == RuntimeState::Closing as u8 => RuntimeState::Closing,
-            _ => RuntimeState::Closed,
-        }
+                engine.stop().map_err(|error| {
+                    RuntimeChildFailure::new(format!("failed to stop output engine: {error}"))
+                })
+            },
+        )
     }
 }
 
@@ -854,6 +861,47 @@ mod tests {
         fn emit_runtime_state(&self, _state: RuntimeState) {}
     }
 
+    struct ChildFailureDuringOutputRecovery<'a> {
+        runtime_state: &'a AtomicU8,
+    }
+
+    impl OutputRuntimeDriver for ChildFailureDuringOutputRecovery<'_> {
+        fn drain_retired_resources(&mut self) {}
+
+        fn reconcile_output(&mut self, _request: OutputRecoveryRequest) -> OutputRecoveryResult {
+            self.runtime_state
+                .store(RuntimeState::Failed as u8, Ordering::Release);
+            OutputRecoveryResult::Running(OutputDeviceState {
+                diagnostic_name: "A".into(),
+                sample_rate: 48_000,
+                physical_channels: 2,
+            })
+        }
+
+        fn emit_runtime_state(&self, _state: RuntimeState) {}
+    }
+
+    #[test]
+    fn output_recovery_cannot_overwrite_a_concurrent_child_failure() {
+        let runtime_state = AtomicU8::new(RuntimeState::Recovering as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+        let mut driver = ChildFailureDuringOutputRecovery {
+            runtime_state: &runtime_state,
+        };
+
+        AudioRuntime::supervisor_tick(
+            &mut driver,
+            &runtime_state,
+            &recovery_attempts,
+            &mut schedule,
+            now,
+        );
+
+        assert_eq!(RuntimeState::load(&runtime_state), RuntimeState::Failed);
+    }
+
     #[test]
     fn supervisor_publishes_running_after_default_device_recovery() {
         let a = FakeDevice {
@@ -882,10 +930,7 @@ mod tests {
         );
 
         assert_eq!(driver.active, Some(b));
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Running
-        );
+        assert_eq!(RuntimeState::load(&runtime_state), RuntimeState::Running);
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
     }
 
@@ -916,10 +961,7 @@ mod tests {
             &mut schedule,
             now,
         );
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Recovering
-        );
+        assert_eq!(RuntimeState::load(&runtime_state), RuntimeState::Recovering);
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 1);
 
         driver.selected = Some(b);
@@ -935,10 +977,7 @@ mod tests {
         assert_eq!(driver.advanced, OUTPUT_RETRY_INTERVAL);
         assert_eq!(driver.loop_cursor_frames, 0);
         assert!(driver.one_shot_completed);
-        assert_eq!(
-            AudioRuntime::load_runtime_state(&runtime_state),
-            RuntimeState::Running
-        );
+        assert_eq!(RuntimeState::load(&runtime_state), RuntimeState::Running);
         assert_eq!(recovery_attempts.load(Ordering::Relaxed), 2);
     }
 }

@@ -6,7 +6,9 @@ use super::native_ambisonics::{
 use super::native_hrtf::{
     NativeHrtfRenderMetrics, NativeHrtfRenderer, NativeHrtfSourceState, NativeHrtfTable,
 };
-use crate::acoustic_propagation::{AcousticResponse, DirectLobeTarget, MAX_EARLY_REFLECTION_TAPS};
+use crate::acoustic_propagation::{
+    AcousticResponse, DirectLobeTarget, VoiceAcousticResponse, MAX_EARLY_REFLECTION_TAPS,
+};
 use crate::domain::VoiceId;
 use crate::domain::{
     DirectGeometry, DirectPlacement, Emitter, EnvironmentOrigin, MAX_DIRECT_LOBES,
@@ -879,6 +881,10 @@ impl SpatialProcessor {
         render_context: SpatialRenderContext,
         events: &mut Vec<VoiceTelemetryEvent>,
     ) -> Result<SourceProcessingMetrics> {
+        let acoustic_response = self.acoustic_response.clone();
+        let voice_acoustics = acoustic_response
+            .as_deref()
+            .and_then(|response| response.voice_response(voice_id));
         // Get spatial configuration (position + per-source volume)
         let emitter_position = match instance.render_state.spatial_pose() {
             Some(pose) => pose.position,
@@ -975,7 +981,7 @@ impl SpatialProcessor {
         }
         if frames_filled > 0 {
             self.observe_voice_render(
-                voice_id,
+                voice_acoustics,
                 instance,
                 emitter_position,
                 direct_local_position,

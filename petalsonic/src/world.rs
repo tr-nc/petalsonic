@@ -1022,6 +1022,77 @@ mod tests {
         }
     }
 
+    struct BlockingShutdownAcoustics {
+        first_call: std::sync::atomic::AtomicBool,
+        entered: Mutex<bool>,
+        entered_changed: std::sync::Condvar,
+        released: Mutex<bool>,
+        released_changed: std::sync::Condvar,
+    }
+
+    impl BlockingShutdownAcoustics {
+        fn new() -> Self {
+            Self {
+                first_call: std::sync::atomic::AtomicBool::new(true),
+                entered: Mutex::new(false),
+                entered_changed: std::sync::Condvar::new(),
+                released: Mutex::new(false),
+                released_changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let entered = self.entered.lock().unwrap();
+            let (_entered, timeout) = self
+                .entered_changed
+                .wait_timeout_while(entered, Duration::from_secs(1), |entered| !*entered)
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "acoustics worker never entered the controlled solve"
+            );
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.released_changed.notify_all();
+        }
+    }
+
+    impl AcousticRayQuerySnapshot for BlockingShutdownAcoustics {
+        fn trace_any_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            assert_eq!(rays.len(), hits.len());
+            hits.fill(false);
+        }
+
+        fn trace_closest_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [Option<AcousticHit>],
+        ) {
+            assert_eq!(rays.len(), hits.len());
+            if self.first_call.swap(false, Ordering::AcqRel) {
+                *self.entered.lock().unwrap() = true;
+                self.entered_changed.notify_all();
+                let released = self.released.lock().unwrap();
+                drop(
+                    self.released_changed
+                        .wait_while(released, |released| !*released)
+                        .unwrap(),
+                );
+            }
+            hits.fill(None);
+        }
+    }
+
     #[test]
     fn spatial_routing_rejects_invalid_or_inapplicable_policies() {
         let local_nan = PlayOptions::once().with_direct_path(DirectPath::listener_relative(
@@ -1197,6 +1268,66 @@ mod tests {
 
         world.close().unwrap();
         assert_eq!(world.runtime_status().state, RuntimeState::Closed);
+    }
+
+    #[test]
+    fn shutdown_keeps_the_acoustic_consumer_alive_until_the_producer_is_quiesced() {
+        let acoustics = Arc::new(BlockingShutdownAcoustics::new());
+        let device = PlatformFakeDevice::stereo("ordered-shutdown", 48_000);
+        let (adapter, output) = FakeOutputPlatform::scripted(vec![device], Some(0));
+        let world = PetalSonicWorld::new_with_output(
+            crate::config::PetalSonicWorldDesc {
+                acoustic_scene: Some(AcousticSceneSnapshot::new(1, acoustics.clone())),
+                environmental_acoustics_enabled: true,
+                ..Default::default()
+            },
+            move || Ok(Box::new(adapter)),
+        )
+        .unwrap();
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::spatial(Pose::identity()))
+            .unwrap();
+        world.play(emitter, PlayOptions::looping()).unwrap();
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                1,
+                0.0,
+                Pose::identity(),
+                vec![crate::domain::EmitterSpatialState::new(
+                    emitter,
+                    Pose::identity(),
+                )],
+            ))
+            .unwrap();
+        acoustics.wait_until_entered();
+
+        std::thread::scope(|scope| {
+            let close = scope.spawn(|| world.close());
+            wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Closing);
+
+            let observation_deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < observation_deadline && !output.actions().contains(&"shutdown") {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            let output_stopped_before_acoustics = output.actions().contains(&"shutdown");
+            acoustics.release();
+
+            let close_result = close.join().unwrap();
+            assert!(
+                !output_stopped_before_acoustics,
+                "output consumer stopped while its acoustic producer was still solving"
+            );
+            close_result.expect("ordered runtime shutdown must not report consumer disconnection");
+        });
+        assert_eq!(world.runtime_status().state, RuntimeState::Closed);
+        assert_eq!(
+            output
+                .actions()
+                .iter()
+                .filter(|action| **action == "shutdown")
+                .count(),
+            1
+        );
     }
 
     #[test]

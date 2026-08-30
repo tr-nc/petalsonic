@@ -77,28 +77,10 @@ impl PlaybackInfo {
     }
 }
 
-pub(crate) struct VoiceStart {
-    pub emitter: Emitter,
-    pub audio_data: Arc<PetalSonicAudioData>,
-    pub config: SourceConfig,
-    pub loop_mode: LoopMode,
-    pub bus_index: usize,
-    pub playback_rate: f32,
-    pub detached: bool,
-    pub completion_tag: Option<PlaybackTag>,
-    pub direct_path: DirectPath,
-    pub environment_send: EnvironmentSend,
-    pub play_command_id: Option<PlayCommandId>,
-    pub source_extent: SourceExtent,
-    pub occlusion_profile: OcclusionProfile,
-    pub mono_scratch: Vec<f32>,
-}
-
 /// One Voice whose caller-facing validation, identity, and immutable routing were accepted.
 ///
-/// The World captures this value while it owns the Emitter registry. The runtime can then
-/// prepare render-owned storage without reconstructing or independently interpreting the
-/// accepted Voice facts.
+/// The World captures this value from a validated Emitter snapshot. The runtime can then prepare
+/// render-owned storage without reconstructing or independently interpreting the accepted facts.
 pub(crate) struct AcceptedVoice {
     voice_id: VoiceId,
     emitter: Emitter,
@@ -147,62 +129,114 @@ impl AcceptedVoice {
     /// Performs every allocation required to hand this Voice to the render thread.
     pub(crate) fn prepare(self, block_size: usize) -> PreparedVoice {
         PreparedVoice {
-            voice_id: self.voice_id,
-            start: VoiceStart {
-                emitter: self.emitter,
-                audio_data: self.audio_data,
-                config: self.config,
-                loop_mode: self.loop_mode,
-                bus_index: self.bus_index,
-                playback_rate: self.playback_rate,
-                detached: self.detached,
-                completion_tag: self.completion_tag,
-                direct_path: self.direct_path,
-                environment_send: self.environment_send,
-                play_command_id: self.play_command_id,
-                source_extent: self.source_extent,
-                occlusion_profile: self.occlusion_profile,
-                mono_scratch: vec![0.0; block_size],
-            },
+            accepted: self,
+            mono_scratch: vec![0.0; block_size],
         }
     }
 }
 
 /// A fully allocated Voice ready for one allocation-free render-quantum admission.
 pub(crate) struct PreparedVoice {
-    voice_id: VoiceId,
-    start: VoiceStart,
+    accepted: AcceptedVoice,
+    mono_scratch: Vec<f32>,
 }
 
 impl PreparedVoice {
     /// Starts the single playback cursor and derives its matching acoustics route from the same
     /// captured facts. No caller can accidentally prepare the two consumers differently.
     pub(crate) fn start(self) -> (VoiceId, PlaybackInstance, Option<AcousticVoice>) {
-        let acoustic_voice = match &self.start.config {
+        let Self {
+            accepted,
+            mono_scratch,
+        } = self;
+        let AcceptedVoice {
+            voice_id,
+            emitter,
+            audio_data,
+            config,
+            loop_mode,
+            bus_index,
+            playback_rate,
+            detached,
+            completion_tag,
+            direct_path,
+            environment_send,
+            play_command_id,
+            source_extent,
+            occlusion_profile,
+        } = accepted;
+        let acoustic_voice = match &config {
             SourceConfig::Spatial { pose, .. } => Some(AcousticVoice {
-                voice_id: self.voice_id,
-                emitter: self.start.emitter,
+                voice_id,
+                emitter,
                 emitter_world_pose: *pose,
                 acoustic_priority: 1.0,
-                audibility: self.start.config.volume(),
-                detached: self.start.detached,
-                direct_path: self.start.direct_path,
-                environment_send: self.start.environment_send,
-                source_extent: self.start.source_extent.clone(),
-                occlusion_profile: self.start.occlusion_profile,
+                audibility: config.volume(),
+                detached,
+                direct_path,
+                environment_send,
+                source_extent: source_extent.clone(),
+                occlusion_profile,
                 routing_generation: 0,
             }),
             SourceConfig::NonSpatial { .. } => None,
         };
-        let mut playback = PlaybackInstance::from_voice(self.start);
+        let total_frames = audio_data.total_frames();
+        let sample_rate = audio_data.sample_rate();
+        let mut playback = PlaybackInstance {
+            emitter,
+            detached,
+            completion_tag,
+            direct_path,
+            environment_send,
+            source_extent,
+            occlusion_profile,
+            play_command_id,
+            first_render_pending: play_command_id.is_some(),
+            environment_response_pending: play_command_id.is_some()
+                && !matches!(environment_send.origin(), EnvironmentOrigin::Disabled),
+            audio_data,
+            info: PlaybackInfo::new(total_frames),
+            config,
+            loop_mode,
+            bus_index,
+            reached_end_this_iteration: false,
+            sample_rate,
+            cursor: 0.0,
+            voice_rate: playback_rate,
+            mix_gain_linear: 1.0,
+            mix_rate: playback_rate,
+            mono_scratch,
+            fade_out_remaining_frames: 0,
+            fade_out_total_frames: 0,
+            retired: false,
+        };
         playback.play_from_beginning();
-        (self.voice_id, playback, acoustic_voice)
+        (voice_id, playback, acoustic_voice)
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn from_start(voice_id: VoiceId, start: VoiceStart) -> Self {
-        Self { voice_id, start }
-    }
+#[cfg(test)]
+pub(crate) fn prepare_test_voice(
+    voice_id: VoiceId,
+    emitter: Emitter,
+    audio_data: Arc<PetalSonicAudioData>,
+    emitter_desc: EmitterDesc,
+    options: PlayOptions,
+    completion_tag: Option<PlaybackTag>,
+    bus_index: usize,
+    block_size: usize,
+) -> PreparedVoice {
+    AcceptedVoice::capture(
+        voice_id,
+        emitter,
+        &ResidentClip::from_audio_data(audio_data),
+        &emitter_desc,
+        options,
+        completion_tag,
+        bus_index,
+    )
+    .prepare(block_size)
 }
 
 /// Active playback instance
@@ -249,57 +283,6 @@ pub struct PlaybackInstance {
 }
 
 impl PlaybackInstance {
-    pub(crate) fn from_voice(start: VoiceStart) -> Self {
-        let VoiceStart {
-            emitter,
-            audio_data,
-            config,
-            loop_mode,
-            bus_index,
-            playback_rate,
-            detached,
-            completion_tag,
-            direct_path,
-            environment_send,
-            play_command_id,
-            source_extent,
-            occlusion_profile,
-            mono_scratch,
-        } = start;
-        let total_frames = audio_data.total_frames();
-        let sample_rate = audio_data.sample_rate();
-        let info = PlaybackInfo::new(total_frames);
-
-        Self {
-            emitter,
-            detached,
-            completion_tag,
-            direct_path,
-            environment_send,
-            source_extent,
-            occlusion_profile,
-            play_command_id,
-            first_render_pending: play_command_id.is_some(),
-            environment_response_pending: play_command_id.is_some()
-                && !matches!(environment_send.origin(), EnvironmentOrigin::Disabled),
-            audio_data,
-            info,
-            config,
-            loop_mode,
-            bus_index,
-            reached_end_this_iteration: false,
-            sample_rate,
-            cursor: 0.0,
-            voice_rate: playback_rate,
-            mix_gain_linear: 1.0,
-            mix_rate: playback_rate,
-            mono_scratch,
-            fade_out_remaining_frames: 0,
-            fade_out_total_frames: 0,
-            retired: false,
-        }
-    }
-
     /// Resume playing from current position
     pub fn resume(&mut self) {
         self.info.play_state = PlayState::Playing;
@@ -670,7 +653,6 @@ impl fmt::Debug for PlaybackCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SourceConfig;
     use crate::domain::{
         EmitterDesc, ExtentSample, ExtentSampleId, PlayCommandId, PlayOptions, ResidentClip,
     };
@@ -763,28 +745,22 @@ mod tests {
             1,
             Duration::from_secs_f64(4.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_voice(VoiceStart {
-            emitter: Emitter {
+        let mut instance = prepare_test_voice(
+            VoiceId::from(1),
+            Emitter {
                 world_id: 1,
                 index: 0,
                 generation: 1,
             },
-            audio_data: audio,
-            config: SourceConfig::non_spatial(),
-            loop_mode: LoopMode::Infinite,
-            bus_index: 0,
-            playback_rate: 1.0,
-            detached: false,
-            completion_tag: None,
-            direct_path: DirectPath::default(),
-            environment_send: EnvironmentSend::default(),
-            play_command_id: None,
-            source_extent: SourceExtent::Point,
-            occlusion_profile: OcclusionProfile::PointExact,
-            mono_scratch: vec![0.0; 4],
-        });
-
-        instance.play_from_beginning();
+            audio,
+            EmitterDesc::non_spatial(),
+            PlayOptions::looping(),
+            None,
+            0,
+            4,
+        )
+        .start()
+        .1;
 
         let mut stereo = [0.0; 8];
         let frames = instance.fill_buffer(&mut stereo, 2);
@@ -809,27 +785,22 @@ mod tests {
             1,
             Duration::from_secs_f64(4.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_voice(VoiceStart {
-            emitter: Emitter {
+        let mut instance = prepare_test_voice(
+            VoiceId::from(1),
+            Emitter {
                 world_id: 1,
                 index: 0,
                 generation: 1,
             },
-            audio_data: audio,
-            config: SourceConfig::non_spatial(),
-            loop_mode: LoopMode::Once,
-            bus_index: 0,
-            playback_rate: 2.0,
-            detached: false,
-            completion_tag: None,
-            direct_path: DirectPath::default(),
-            environment_send: EnvironmentSend::default(),
-            play_command_id: None,
-            source_extent: SourceExtent::Point,
-            occlusion_profile: OcclusionProfile::PointExact,
-            mono_scratch: vec![0.0; 4],
-        });
-        instance.play_from_beginning();
+            audio,
+            EmitterDesc::non_spatial(),
+            PlayOptions::once().with_playback_rate(2.0),
+            None,
+            0,
+            4,
+        )
+        .start()
+        .1;
         instance.set_mix_parameters(BusParams::default());
 
         let mut output = [0.0; 4];
@@ -856,27 +827,22 @@ mod tests {
             1,
             Duration::from_secs_f64(1_000.0 / 48_000.0),
         ));
-        let mut instance = PlaybackInstance::from_voice(VoiceStart {
-            emitter: Emitter {
+        let mut instance = prepare_test_voice(
+            VoiceId::from(1),
+            Emitter {
                 world_id: 1,
                 index: 0,
                 generation: 1,
             },
-            audio_data: audio,
-            config: SourceConfig::non_spatial(),
-            loop_mode: LoopMode::Infinite,
-            bus_index: 0,
-            playback_rate: 1.0,
-            detached: false,
-            completion_tag: Some(PlaybackTag(9)),
-            direct_path: DirectPath::default(),
-            environment_send: EnvironmentSend::default(),
-            play_command_id: None,
-            source_extent: SourceExtent::Point,
-            occlusion_profile: OcclusionProfile::PointExact,
-            mono_scratch: vec![0.0; 256],
-        });
-        instance.play_from_beginning();
+            audio,
+            EmitterDesc::non_spatial(),
+            PlayOptions::looping(),
+            Some(PlaybackTag(9)),
+            0,
+            256,
+        )
+        .start()
+        .1;
         instance.begin_fade_out();
 
         let mut output = [0.0; 240];

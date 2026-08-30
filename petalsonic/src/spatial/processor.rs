@@ -1691,9 +1691,11 @@ mod tests {
     use super::*;
     use crate::acoustic_propagation::{DirectAcousticResponse, EarlyReflectionTap};
     use crate::audio_data::PetalSonicAudioData;
-    use crate::domain::{DirectPath, Emitter, EnvironmentSend, PlayCommandId};
+    use crate::domain::{
+        DirectPath, Emitter, EmitterDesc, EnvironmentSend, PlayCommandId, PlayOptions,
+    };
     use crate::math::Quat;
-    use crate::playback::{LoopMode, VoiceStart};
+    use crate::playback::prepare_test_voice;
     use std::time::Duration;
 
     fn empty_acoustic_response(
@@ -1805,23 +1807,20 @@ mod tests {
             1,
             Duration::from_secs_f64(64.0 / 48_000.0),
         ));
-        let mut voice = PlaybackInstance::from_voice(VoiceStart {
+        let mut voice = prepare_test_voice(
+            voice_id,
             emitter,
-            audio_data: audio,
-            config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
-            loop_mode: LoopMode::Infinite,
-            bus_index: 0,
-            playback_rate: 1.0,
-            detached: false,
-            completion_tag: None,
-            direct_path: DirectPath::default(),
-            environment_send: EnvironmentSend::disabled(),
-            play_command_id: None,
-            source_extent,
-            occlusion_profile: profile,
-            mono_scratch: vec![0.0; 8],
-        });
-        voice.play_from_beginning();
+            audio,
+            EmitterDesc::spatial(Pose::from_position(Vec3::Z))
+                .with_extent(source_extent)
+                .with_occlusion_profile(profile),
+            PlayOptions::looping().with_environment_send(EnvironmentSend::disabled()),
+            None,
+            0,
+            8,
+        )
+        .start()
+        .1;
         voice.set_mix_parameters(crate::domain::BusParams::default());
         let mut voices = [(voice_id, voice)].into_iter().collect();
         let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
@@ -1996,28 +1995,27 @@ mod tests {
                 1,
                 Duration::from_secs_f64(32.0 / 48_000.0),
             ));
-            let mut voice = PlaybackInstance::from_voice(VoiceStart {
-                emitter: Emitter {
+            let mut voice = prepare_test_voice(
+                voice_id,
+                Emitter {
                     world_id: 1,
                     index: 0,
                     generation: 1,
                 },
-                audio_data: audio,
-                config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
-                loop_mode: LoopMode::Once,
-                bus_index: 0,
-                playback_rate: 1.0,
-                detached: false,
-                completion_tag: None,
-                direct_path: DirectPath::listener_relative(Pose::from_position(Vec3::X))
-                    .with_geometry(DirectGeometry::BypassTransmission),
-                environment_send,
-                play_command_id: None,
-                source_extent: crate::domain::SourceExtent::Point,
-                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-                mono_scratch: vec![0.0; 8],
-            });
-            voice.play_from_beginning();
+                audio,
+                EmitterDesc::spatial(Pose::from_position(Vec3::Z)),
+                PlayOptions::once()
+                    .with_direct_path(
+                        DirectPath::listener_relative(Pose::from_position(Vec3::X))
+                            .with_geometry(DirectGeometry::BypassTransmission),
+                    )
+                    .with_environment_send(environment_send),
+                None,
+                0,
+                8,
+            )
+            .start()
+            .1;
             voice.set_mix_parameters(crate::domain::BusParams::default());
             let mut voices = HashMap::from([(voice_id, voice)]);
             let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
@@ -2072,24 +2070,24 @@ mod tests {
             1,
             Duration::from_secs_f64(32.0 / 48_000.0),
         ));
-        let mut voice = PlaybackInstance::from_voice(VoiceStart {
+        let mut voice = prepare_test_voice(
+            voice_id,
             emitter,
-            audio_data: audio,
-            config: SourceConfig::spatial(Pose::from_position(Vec3::new(99.0, 2.0, 8.0))),
-            loop_mode: LoopMode::Once,
-            bus_index: 0,
-            playback_rate: 1.0,
-            detached: false,
-            completion_tag: None,
-            direct_path: DirectPath::listener_relative(direct_local_pose)
-                .with_geometry(DirectGeometry::BypassTransmission),
-            environment_send: EnvironmentSend::from_world_pose(acoustic_origin),
-            play_command_id: Some(play_command_id),
-            source_extent: crate::domain::SourceExtent::Point,
-            occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-            mono_scratch: vec![0.0; 8],
-        });
-        voice.play_from_beginning();
+            audio,
+            EmitterDesc::spatial(Pose::from_position(Vec3::new(99.0, 2.0, 8.0))),
+            PlayOptions::once()
+                .with_direct_path(
+                    DirectPath::listener_relative(direct_local_pose)
+                        .with_geometry(DirectGeometry::BypassTransmission),
+                )
+                .with_environment_send(EnvironmentSend::from_world_pose(acoustic_origin))
+                .with_play_command_id(play_command_id),
+            None,
+            0,
+            8,
+        )
+        .start()
+        .1;
         voice.set_mix_parameters(crate::domain::BusParams::default());
         let mut voices = HashMap::from([(voice_id, voice)]);
         let mut processor = SpatialProcessor::new(SpatialProcessorConfig {
@@ -2686,34 +2684,33 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, voice_id)| {
-                let mut voice = PlaybackInstance::from_voice(VoiceStart {
-                    emitter: Emitter {
+                let mut voice = prepare_test_voice(
+                    *voice_id,
+                    Emitter {
                         world_id: 1,
                         index: index as u32,
                         generation: 1,
                     },
-                    audio_data: audio.clone(),
-                    config: SourceConfig::spatial(Pose::from_position(Vec3::Z)),
-                    loop_mode: LoopMode::Infinite,
-                    bus_index: 0,
-                    playback_rate: 1.0,
-                    detached: false,
-                    completion_tag: None,
-                    direct_path: DirectPath::listener_relative(Pose::from_position(Vec3::new(
-                        index as f32 * 0.02 - 0.07,
-                        -0.08,
-                        0.2,
-                    )))
-                    .with_geometry(DirectGeometry::BypassTransmission),
-                    environment_send: EnvironmentSend::from_world_pose(Pose::from_position(
-                        Vec3::new(index as f32 - 3.5, 0.0, 4.0),
-                    )),
-                    play_command_id: None,
-                    source_extent: crate::domain::SourceExtent::Point,
-                    occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-                    mono_scratch: vec![0.0; FRAMES],
-                });
-                voice.play_from_beginning();
+                    audio.clone(),
+                    EmitterDesc::spatial(Pose::from_position(Vec3::Z)),
+                    PlayOptions::looping()
+                        .with_direct_path(
+                            DirectPath::listener_relative(Pose::from_position(Vec3::new(
+                                index as f32 * 0.02 - 0.07,
+                                -0.08,
+                                0.2,
+                            )))
+                            .with_geometry(DirectGeometry::BypassTransmission),
+                        )
+                        .with_environment_send(EnvironmentSend::from_world_pose(
+                            Pose::from_position(Vec3::new(index as f32 - 3.5, 0.0, 4.0)),
+                        )),
+                    None,
+                    0,
+                    FRAMES,
+                )
+                .start()
+                .1;
                 voice.set_mix_parameters(crate::domain::BusParams::default());
                 (*voice_id, voice)
             })
@@ -2842,31 +2839,28 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, voice_id)| {
-                let mut voice = PlaybackInstance::from_voice(VoiceStart {
-                    emitter: Emitter {
+                let mut voice = prepare_test_voice(
+                    *voice_id,
+                    Emitter {
                         world_id: 1,
                         index: index as u32,
                         generation: 1,
                     },
-                    audio_data: audio.clone(),
-                    config: SourceConfig::spatial(Pose::from_position(Vec3::new(
+                    audio.clone(),
+                    EmitterDesc::spatial(Pose::from_position(Vec3::new(
                         index as f32 - 3.5,
                         0.0,
                         4.0,
-                    ))),
-                    loop_mode: LoopMode::Infinite,
-                    bus_index: 0,
-                    playback_rate: 1.0,
-                    detached: false,
-                    completion_tag: None,
-                    direct_path: DirectPath::default(),
-                    environment_send: EnvironmentSend::default(),
-                    play_command_id: None,
-                    source_extent: extent.clone(),
-                    occlusion_profile: profile,
-                    mono_scratch: vec![0.0; FRAMES],
-                });
-                voice.play_from_beginning();
+                    )))
+                    .with_extent(extent.clone())
+                    .with_occlusion_profile(profile),
+                    PlayOptions::looping(),
+                    None,
+                    0,
+                    FRAMES,
+                )
+                .start()
+                .1;
                 voice.set_mix_parameters(crate::domain::BusParams::default());
                 (*voice_id, voice)
             })

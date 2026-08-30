@@ -26,26 +26,11 @@ impl Default for SourceConfig {
 }
 
 impl SourceConfig {
-    /// Create a non-spatial source configuration at 0 dB (unity gain).
-    #[cfg(test)]
-    pub fn non_spatial() -> Self {
-        Self::NonSpatial { volume_db: 0.0 }
-    }
-
     /// Create a non-spatial source configuration with a volume in decibels.
     ///
     /// `0.0` dB is unity, negative values attenuate, positive values amplify.
     pub fn non_spatial_with_volume_db(volume_db: f32) -> Self {
         Self::NonSpatial { volume_db }
-    }
-
-    /// Create a spatial source configuration with the given pose at 0 dB (unity gain).
-    #[cfg(test)]
-    pub fn spatial(pose: Pose) -> Self {
-        Self::Spatial {
-            pose,
-            volume_db: 0.0,
-        }
     }
 
     /// Create a spatial source configuration with pose and volume in decibels.

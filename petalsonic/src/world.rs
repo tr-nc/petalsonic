@@ -1509,7 +1509,7 @@ mod tests {
                 Pose::identity(),
                 vec![
                     crate::domain::EmitterSpatialState::new(emitter, new_pose)
-                        .with_extent(new_extent),
+                        .with_extent(new_extent.clone()),
                 ],
             ))
         });
@@ -1580,6 +1580,136 @@ mod tests {
                 old_pose.position + crate::math::Vec3::new(1.0, 0.0, 0.0),
             ]
         );
+
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                2,
+                2.0,
+                Pose::identity(),
+                vec![
+                    crate::domain::EmitterSpatialState::new(emitter, new_pose)
+                        .with_extent(new_extent),
+                ],
+            ))
+            .expect("the failed revision and time must remain available for retry");
+        world.close().unwrap();
+    }
+
+    #[test]
+    fn world_play_delivers_captured_routes_and_playback_rate_to_render_behavior() {
+        let (adapter, handle) = FakeOutputPlatform::scripted(
+            vec![PlatformFakeDevice::stereo("voice-admission", 48_000)],
+            Some(0),
+        );
+        let world = PetalSonicWorld::new_with_output(
+            crate::config::PetalSonicWorldDesc {
+                block_size: 64,
+                ..Default::default()
+            },
+            move || Ok(Box::new(adapter)),
+        )
+        .unwrap();
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Running);
+        let emitter_pose = Pose::from_position(crate::math::Vec3::new(6.0, 1.0, -4.0));
+        let emitter = world
+            .create_emitter(
+                ResidentClip::from_audio_data(Arc::new(PetalSonicAudioData::new(
+                    vec![0.25; 4_096],
+                    48_000,
+                    1,
+                    Duration::from_secs_f64(4_096.0 / 48_000.0),
+                ))),
+                EmitterDesc::spatial(emitter_pose),
+            )
+            .unwrap();
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                1,
+                0.0,
+                Pose::identity(),
+                vec![crate::domain::EmitterSpatialState::new(
+                    emitter,
+                    emitter_pose,
+                )],
+            ))
+            .unwrap();
+        let direct_pose = Pose::from_position(crate::math::Vec3::new(0.2, -0.1, 0.5));
+        let acoustic_origin = Pose::from_position(crate::math::Vec3::new(9.0, 3.0, -7.0));
+        world
+            .play(
+                emitter,
+                PlayOptions::once()
+                    .with_playback_rate(2.0)
+                    .with_direct_path(DirectPath::listener_relative(direct_pose))
+                    .with_environment_send(EnvironmentSend::from_world_pose(acoustic_origin))
+                    .with_play_command_id(PlayCommandId(801)),
+            )
+            .unwrap();
+        let slow = world
+            .play_controlled(
+                emitter,
+                PlayOptions::once()
+                    .with_playback_rate(0.5)
+                    .with_play_command_id(PlayCommandId(802)),
+                PlaybackTag(802),
+            )
+            .unwrap();
+
+        let mut first_render = None;
+        wait_for_async_observation(|| {
+            handle.advance(64);
+            first_render =
+                world
+                    .drain_voice_telemetry()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        VoiceTelemetryEvent::FirstRendered(event)
+                            if event.play_command_id == PlayCommandId(801) =>
+                        {
+                            Some(event)
+                        }
+                        _ => None,
+                    });
+            first_render.is_some()
+        });
+        let first_render = first_render.unwrap();
+        assert_eq!(first_render.emitter, emitter);
+        assert_eq!(first_render.direct_local_pose, Some(direct_pose));
+        assert_eq!(first_render.acoustic_origin, Some(acoustic_origin));
+
+        let mut observed_completions = Vec::new();
+        wait_for_async_observation(|| {
+            handle.advance(64);
+            observed_completions.extend(world.drain_events());
+            world.active_voice_count() == 1
+        });
+        assert!(
+            !observed_completions.iter().any(|event| {
+                matches!(
+                    event,
+                    PetalSonicEvent::PlaybackCompleted {
+                        control,
+                        tag: PlaybackTag(802),
+                        ..
+                    } if *control == slow
+                )
+            }),
+            "the 0.5x Voice completed no later than the 2.0x Voice"
+        );
+        wait_for_async_observation(|| {
+            handle.advance(64);
+            observed_completions.extend(world.drain_events());
+            observed_completions.iter().any(|event| {
+                matches!(
+                    event,
+                    PetalSonicEvent::PlaybackCompleted {
+                        control,
+                        tag: PlaybackTag(802),
+                        ..
+                    } if *control == slow
+                )
+            })
+        });
         world.close().unwrap();
     }
 

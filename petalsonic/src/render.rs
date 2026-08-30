@@ -681,10 +681,10 @@ fn apply_master_gain_and_limit(buffer: &mut [f32], frames_out: usize, channels: 
 mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
-    use crate::config::{PetalSonicWorldDesc, SourceConfig};
-    use crate::domain::{Emitter, SourceExtent};
+    use crate::config::PetalSonicWorldDesc;
+    use crate::domain::{Emitter, EmitterDesc, PlayOptions, SourceExtent};
     use crate::engine::PetalSonicEngine;
-    use crate::playback::{LoopMode, PreparedVoice, VoiceStart};
+    use crate::playback::prepare_test_voice;
     use ringbuf::traits::Consumer;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -759,24 +759,15 @@ mod tests {
         clip: Arc<PetalSonicAudioData>,
         block_size: usize,
     ) -> PlaybackCommand {
-        PlaybackCommand::Play(PreparedVoice::from_start(
+        PlaybackCommand::Play(prepare_test_voice(
             voice_id,
-            VoiceStart {
-                emitter,
-                audio_data: clip,
-                config: SourceConfig::non_spatial(),
-                loop_mode: LoopMode::Infinite,
-                detached: false,
-                completion_tag: None,
-                bus_index: 0,
-                playback_rate: 1.0,
-                direct_path: crate::domain::DirectPath::default(),
-                environment_send: crate::domain::EnvironmentSend::default(),
-                play_command_id: None,
-                source_extent: SourceExtent::Point,
-                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-                mono_scratch: vec![0.0; block_size],
-            },
+            emitter,
+            clip,
+            EmitterDesc::non_spatial(),
+            PlayOptions::looping(),
+            None,
+            0,
+            block_size,
         ))
     }
 
@@ -878,23 +869,22 @@ mod tests {
             Duration::from_secs_f64(64.0 / 48_000.0),
         ));
         for (id, detached) in [(1, false), (2, true)] {
-            let mut voice = PlaybackInstance::from_voice(VoiceStart {
+            let mut options = PlayOptions::looping();
+            if detached {
+                options = options.detached();
+            }
+            let voice = prepare_test_voice(
+                VoiceId::from(id),
                 emitter,
-                audio_data: clip.clone(),
-                config: SourceConfig::spatial(old_pose),
-                loop_mode: LoopMode::Infinite,
-                bus_index: 0,
-                playback_rate: 1.0,
-                detached,
-                completion_tag: None,
-                direct_path: crate::domain::DirectPath::default(),
-                environment_send: crate::domain::EnvironmentSend::default(),
-                play_command_id: None,
-                source_extent: SourceExtent::Point,
-                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-                mono_scratch: vec![0.0; 32],
-            });
-            voice.play_from_beginning();
+                clip.clone(),
+                EmitterDesc::spatial(old_pose),
+                options,
+                None,
+                0,
+                32,
+            )
+            .start()
+            .1;
             harness
                 .quantum
                 .active_playback

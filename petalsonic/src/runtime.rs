@@ -2,7 +2,7 @@ use crate::acoustic_propagation::AcousticPropagation;
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::config::{PetalSonicWorldDesc, SourceConfig};
 use crate::domain::{BusParams, Emitter, SpatialFrame, VoiceId};
-use crate::engine::{EngineCommandReceivers, EngineObservability, EngineStartup, PetalSonicEngine};
+use crate::engine::{EngineObservability, PetalSonicEngine, PreparedEngine};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
     AcousticTelemetryDiagnostics, AcousticTelemetryEvent, PetalSonicEvent, RenderTimingEvent,
@@ -203,24 +203,24 @@ impl AudioRuntime {
                 .chain(config.buses.iter().map(|bus| bus.params()))
                 .collect::<Vec<_>>(),
         ));
-        let (ports, observability) = PetalSonicEngine::create_runtime_ports(config);
-        let startup = EngineStartup {
-            desc: config.clone(),
-            active_voice_count: active_voice_count.clone(),
+        let (startup, observability) = PreparedEngine::new(
+            config.clone(),
+            active_voice_count.clone(),
             retirement_sender,
-            spatial_frames: spatial_frame_consumer,
-            acoustic_responses: acoustic_propagation
+            spatial_frame_consumer,
+            acoustic_propagation
                 .take_response_consumer()
                 .ok_or_else(|| {
                     PetalSonicError::Engine(
                         "Acoustic response consumer is already connected".into(),
                     )
                 })?,
-            acoustic_voice_input: acoustic_propagation.voice_input(),
-            acoustic_scene_version: acoustic_scene_version.clone(),
-            environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
-            ports,
-        };
+            acoustic_propagation.voice_input(),
+            acoustic_scene_version.clone(),
+            environmental_acoustics_enabled.clone(),
+            command_receiver,
+            lifecycle_receiver,
+        );
         let EngineObservability {
             frames_processed,
             underrun_count,
@@ -234,7 +234,6 @@ impl AudioRuntime {
             &mut services,
             startup,
             output,
-            EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
             bus_params.clone(),
             runtime_state.clone(),
             recovery_attempts.clone(),
@@ -687,9 +686,8 @@ impl AudioRuntime {
 
     fn start_output_child(
         services: &mut RuntimeServices,
-        startup: EngineStartup,
+        startup: PreparedEngine,
         output: Box<dyn FnOnce() -> Result<Box<dyn OutputPlatform>> + Send>,
-        command_receivers: EngineCommandReceivers,
         bus_params: Arc<Mutex<Vec<BusParams>>>,
         runtime_state: Arc<AtomicU8>,
         recovery_attempts: Arc<AtomicU64>,
@@ -711,7 +709,6 @@ impl AudioRuntime {
                 let mut engine = match PetalSonicEngine::new_with_output(
                     startup,
                     output,
-                    command_receivers.clone(),
                     initial_buses,
                     runtime_failure,
                     #[cfg(test)]

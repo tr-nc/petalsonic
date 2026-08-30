@@ -3,16 +3,16 @@
 //! The output engine schedules this module; it does not reach through the seam to
 //! coordinate Voices, DSP processors, buffers, telemetry, or retirement.
 
-use crate::acoustic_propagation::{AcousticResponse, AcousticVoice, AcousticVoiceInput};
+use crate::acoustic_propagation::{AcousticResponse, AcousticVoiceInput};
 use crate::audio_data::{ResamplerType, StreamingResampler};
-use crate::config::{LatencyProfile, SourceConfig, SpatialQuality};
+use crate::config::{LatencyProfile, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
 use crate::engine::{EngineCommandReceivers, EngineStartup};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeCounters, VoiceTelemetryEvent};
 use crate::mixer::{self, CompletedPlayback, MixerScratch};
 use crate::platform::output::StereoFrame;
-use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, VoiceStart};
+use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance};
 use crate::spatial::{
     AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
     SpatialRenderContext,
@@ -337,56 +337,8 @@ impl RenderQuantum {
 
     fn apply_command(&mut self, command: PlaybackCommand) {
         match command {
-            PlaybackCommand::Play {
-                voice_id,
-                emitter,
-                source,
-                config,
-                loop_mode,
-                detached,
-                completion_tag,
-                bus_index,
-                playback_rate,
-                direct_path,
-                environment_send,
-                play_command_id,
-                source_extent,
-                occlusion_profile,
-                mono_scratch,
-            } => {
-                let acoustic_voice = match &config {
-                    SourceConfig::Spatial { pose, .. } => Some(AcousticVoice {
-                        voice_id,
-                        emitter,
-                        emitter_world_pose: *pose,
-                        acoustic_priority: 1.0,
-                        audibility: config.volume(),
-                        detached,
-                        direct_path,
-                        environment_send,
-                        source_extent: source_extent.clone(),
-                        occlusion_profile,
-                        routing_generation: 0,
-                    }),
-                    SourceConfig::NonSpatial { .. } => None,
-                };
-                let mut instance = PlaybackInstance::from_voice(VoiceStart {
-                    emitter,
-                    audio_data: source,
-                    config,
-                    loop_mode,
-                    bus_index,
-                    playback_rate,
-                    direct_path,
-                    environment_send,
-                    play_command_id,
-                    source_extent,
-                    occlusion_profile,
-                    detached,
-                    completion_tag,
-                    mono_scratch,
-                });
-                instance.play_from_beginning();
+            PlaybackCommand::Play(prepared) => {
+                let (voice_id, instance, acoustic_voice) = prepared.start();
                 if self.active_playback.insert(voice_id, instance).is_some() {
                     self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -730,9 +682,9 @@ mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::PetalSonicWorldDesc;
-    use crate::domain::{Emitter, SourceExtent};
+    use crate::domain::{Emitter, EmitterDesc, PlayOptions, SourceExtent};
     use crate::engine::PetalSonicEngine;
-    use crate::playback::LoopMode;
+    use crate::playback::prepare_test_voice;
     use ringbuf::traits::Consumer;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -807,23 +759,16 @@ mod tests {
         clip: Arc<PetalSonicAudioData>,
         block_size: usize,
     ) -> PlaybackCommand {
-        PlaybackCommand::Play {
+        PlaybackCommand::Play(prepare_test_voice(
             voice_id,
             emitter,
-            source: clip,
-            config: SourceConfig::non_spatial(),
-            loop_mode: LoopMode::Infinite,
-            detached: false,
-            completion_tag: None,
-            bus_index: 0,
-            playback_rate: 1.0,
-            direct_path: crate::domain::DirectPath::default(),
-            environment_send: crate::domain::EnvironmentSend::default(),
-            play_command_id: None,
-            source_extent: SourceExtent::Point,
-            occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-            mono_scratch: vec![0.0; block_size],
-        }
+            clip,
+            EmitterDesc::non_spatial(),
+            PlayOptions::looping(),
+            None,
+            0,
+            block_size,
+        ))
     }
 
     #[test]
@@ -924,23 +869,22 @@ mod tests {
             Duration::from_secs_f64(64.0 / 48_000.0),
         ));
         for (id, detached) in [(1, false), (2, true)] {
-            let mut voice = PlaybackInstance::from_voice(VoiceStart {
+            let mut options = PlayOptions::looping();
+            if detached {
+                options = options.detached();
+            }
+            let voice = prepare_test_voice(
+                VoiceId::from(id),
                 emitter,
-                audio_data: clip.clone(),
-                config: SourceConfig::spatial(old_pose),
-                loop_mode: LoopMode::Infinite,
-                bus_index: 0,
-                playback_rate: 1.0,
-                detached,
-                completion_tag: None,
-                direct_path: crate::domain::DirectPath::default(),
-                environment_send: crate::domain::EnvironmentSend::default(),
-                play_command_id: None,
-                source_extent: SourceExtent::Point,
-                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-                mono_scratch: vec![0.0; 32],
-            });
-            voice.play_from_beginning();
+                clip.clone(),
+                EmitterDesc::spatial(old_pose),
+                options,
+                None,
+                0,
+                32,
+            )
+            .start()
+            .1;
             harness
                 .quantum
                 .active_playback

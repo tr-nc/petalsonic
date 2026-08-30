@@ -10,6 +10,7 @@ use crate::events::{
     VoiceTelemetryEvent,
 };
 use crate::math::Pose;
+use crate::playback::AcceptedVoice;
 use crate::runtime::{AudioRuntime, RuntimeIntent};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +43,21 @@ struct EmitterRegistry {
     free: Vec<u32>,
     len: usize,
     limit: usize,
+}
+
+/// A complete spatial frame checked against the currently locked Emitter registry.
+///
+/// Construction performs no mutation. Keeping the registry lock until `commit` means the
+/// checked handles and completeness proof cannot become stale between runtime publication and
+/// the caller-facing Emitter state update.
+struct ValidatedSpatialUpdate {
+    frame: Arc<SpatialFrame>,
+}
+
+impl ValidatedSpatialUpdate {
+    fn publication(&self) -> Arc<SpatialFrame> {
+        self.frame.clone()
+    }
 }
 
 impl EmitterRegistry {
@@ -132,7 +148,7 @@ impl EmitterRegistry {
         Ok(state)
     }
 
-    fn apply_spatial_frame(&mut self, frame: &SpatialFrame) -> Result<()> {
+    fn prepare_spatial_update(&self, frame: Arc<SpatialFrame>) -> Result<ValidatedSpatialUpdate> {
         let expected = self
             .slots
             .iter()
@@ -166,12 +182,18 @@ impl EmitterRegistry {
             }
         }
 
-        for spatial in frame.emitters() {
-            let desc = &mut self.get_mut(spatial.emitter)?.desc;
+        Ok(ValidatedSpatialUpdate { frame })
+    }
+
+    fn commit_spatial_update(&mut self, update: ValidatedSpatialUpdate) {
+        for spatial in update.frame.emitters() {
+            let desc = &mut self
+                .get_mut(spatial.emitter)
+                .expect("validated spatial Emitter changed while its registry lock was held")
+                .desc;
             desc.set_pose(spatial.pose);
             desc.set_extent(spatial.extent().clone());
         }
-        Ok(())
     }
 }
 
@@ -366,21 +388,10 @@ impl PetalSonicWorld {
     /// observes only complete frame generations and never accumulates stale movement.
     pub fn publish_spatial_frame(&self, frame: SpatialFrame) -> Result<()> {
         self.runtime.ensure_open()?;
-        let (current_revision, current_sim_time) = self.runtime.spatial_cursor();
-        if frame.revision() <= current_revision {
-            return Err(PetalSonicError::InvalidConfiguration {
-                field: "spatial_frame.revision",
-                reason: format!(
-                    "must increase monotonically beyond the current revision {current_revision}"
-                ),
-            });
-        }
-        if !frame.sim_time_seconds().is_finite() || frame.sim_time_seconds() < current_sim_time {
+        if !frame.sim_time_seconds().is_finite() {
             return Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame.sim_time_seconds",
-                reason: format!(
-                    "must be finite and monotonic beyond the current time {current_sim_time}"
-                ),
+                reason: "must be finite".into(),
             });
         }
         if frame.emitters().iter().any(|emitter| {
@@ -404,9 +415,28 @@ impl PetalSonicWorld {
             .emitters
             .try_lock()
             .map_err(|_| PetalSonicError::QueuePressure)?;
-        emitters.apply_spatial_frame(&frame)?;
+        let (current_revision, current_sim_time) = self.runtime.spatial_cursor();
+        if frame.revision() <= current_revision {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.revision",
+                reason: format!(
+                    "must increase monotonically beyond the current revision {current_revision}"
+                ),
+            });
+        }
+        if frame.sim_time_seconds() < current_sim_time {
+            return Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.sim_time_seconds",
+                reason: format!(
+                    "must be finite and monotonic beyond the current time {current_sim_time}"
+                ),
+            });
+        }
         let frame = Arc::new(frame);
-        self.runtime.publish_spatial_frame(frame)
+        let update = emitters.prepare_spatial_update(frame)?;
+        self.runtime.publish_spatial_frame(update.publication())?;
+        emitters.commit_spatial_update(update);
+        Ok(())
     }
 
     /// Publishes a newer immutable acoustic-scene version by swapping a shared handle.
@@ -547,22 +577,15 @@ impl PetalSonicWorld {
                 },
             );
         }
-        let intent = RuntimeIntent::Play {
+        let intent = RuntimeIntent::Play(AcceptedVoice::capture(
             voice_id,
             emitter,
-            source: state.clip.data.clone(),
-            config: state.desc.source_config(options.gain_db),
-            loop_mode: options.loop_mode,
-            detached: options.detached,
+            &state.clip,
+            &state.desc,
+            options,
             completion_tag,
             bus_index,
-            playback_rate: options.playback_rate(),
-            direct_path: options.direct_path(),
-            environment_send: options.environment_send(),
-            play_command_id: options.play_command_id(),
-            source_extent: state.desc.extent().clone(),
-            occlusion_profile: options.occlusion_profile(state.desc.occlusion_profile()),
-        };
+        ));
         if let Err(error) = self.runtime.try_submit(intent) {
             self.runtime.release_reserved_voice();
             if completion_tag.is_some()
@@ -961,12 +984,43 @@ impl Drop for PetalSonicWorld {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acoustics::{AcousticHit, AcousticRay, AcousticRayQuerySnapshot};
     use crate::audio_data::PetalSonicAudioData;
-    use crate::domain::{DirectGeometry, DirectPath, EnvironmentSend, PlayCommandId};
+    use crate::domain::{
+        DirectGeometry, DirectPath, EnvironmentSend, ExtentSample, ExtentSampleId, PlayCommandId,
+        SourceExtent,
+    };
+    use crate::events::{AcousticTelemetryEvent, VoiceTelemetryEvent};
     use crate::platform::output::fake::{
         FakeDevice as PlatformFakeDevice, FakeOutputPlatform, FakeSampleFormat,
     };
     use std::time::Instant;
+
+    struct OpenAcoustics;
+
+    impl AcousticRayQuerySnapshot for OpenAcoustics {
+        fn trace_any_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [bool],
+        ) {
+            assert_eq!(rays.len(), hits.len());
+            hits.fill(false);
+        }
+
+        fn trace_closest_hit_batch(
+            &self,
+            rays: &[AcousticRay],
+            _min_distances: &[f32],
+            _max_distances: &[f32],
+            hits: &mut [Option<AcousticHit>],
+        ) {
+            assert_eq!(rays.len(), hits.len());
+            hits.fill(None);
+        }
+    }
 
     #[test]
     fn spatial_routing_rejects_invalid_or_inapplicable_policies() {
@@ -1394,6 +1448,272 @@ mod tests {
     }
 
     #[test]
+    fn failed_runtime_spatial_publication_preserves_the_pose_and_extent_for_the_next_voice() {
+        let (adapter, _) = FakeOutputPlatform::scripted(
+            vec![PlatformFakeDevice::stereo("spatial-transaction", 48_000)],
+            Some(0),
+        );
+        let desc = crate::config::PetalSonicWorldDesc {
+            acoustic_scene: Some(AcousticSceneSnapshot::new(1, Arc::new(OpenAcoustics))),
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
+        let old_pose = Pose::from_position(crate::math::Vec3::new(10.0, 2.0, -3.0));
+        let new_pose = Pose::from_position(crate::math::Vec3::new(-20.0, 4.0, 7.0));
+        let old_extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(
+                ExtentSampleId(41),
+                crate::math::Vec3::new(-1.0, 0.0, 0.0),
+                1.0,
+            )
+            .unwrap(),
+            ExtentSample::new(
+                ExtentSampleId(42),
+                crate::math::Vec3::new(1.0, 0.0, 0.0),
+                1.0,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let new_extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(
+                ExtentSampleId(91),
+                crate::math::Vec3::new(0.0, 1.0, 0.0),
+                1.0,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let emitter = world
+            .create_emitter(
+                clip(),
+                EmitterDesc::spatial(old_pose).with_extent(old_extent.clone()),
+            )
+            .unwrap();
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                1,
+                1.0,
+                Pose::identity(),
+                vec![
+                    crate::domain::EmitterSpatialState::new(emitter, old_pose)
+                        .with_extent(old_extent),
+                ],
+            ))
+            .unwrap();
+
+        let failed = world.runtime.with_spatial_publication_blocked(|| {
+            world.publish_spatial_frame(SpatialFrame::new(
+                2,
+                2.0,
+                Pose::identity(),
+                vec![
+                    crate::domain::EmitterSpatialState::new(emitter, new_pose)
+                        .with_extent(new_extent.clone()),
+                ],
+            ))
+        });
+        assert!(matches!(failed, Err(PetalSonicError::QueuePressure)));
+
+        world
+            .play(
+                emitter,
+                PlayOptions::looping().with_play_command_id(PlayCommandId(700)),
+            )
+            .unwrap();
+        let mut first_render = None;
+        wait_for_async_observation(|| {
+            first_render =
+                world
+                    .drain_voice_telemetry()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        VoiceTelemetryEvent::FirstRendered(event)
+                            if event.play_command_id == PlayCommandId(700) =>
+                        {
+                            Some(event)
+                        }
+                        _ => None,
+                    });
+            first_render.is_some()
+        });
+        let first_render = first_render.unwrap();
+        assert_eq!(first_render.spatial_revision, 1);
+        assert_eq!(first_render.acoustic_origin, Some(old_pose));
+
+        let mut extent_response = None;
+        wait_for_async_observation(|| {
+            extent_response = world
+                .drain_acoustic_telemetry()
+                .into_iter()
+                .find_map(|event| match event {
+                    AcousticTelemetryEvent::ExtentResponse(response)
+                        if response.emitter == emitter =>
+                    {
+                        Some(response)
+                    }
+                    _ => None,
+                });
+            extent_response.is_some()
+        });
+        let extent_response = extent_response.unwrap();
+        assert_eq!(extent_response.spatial_revision, 1);
+        assert_eq!(extent_response.extent_sample_count, 2);
+        assert_eq!(
+            extent_response
+                .direct
+                .samples
+                .iter()
+                .map(|sample| sample.sample_id)
+                .collect::<Vec<_>>(),
+            vec![ExtentSampleId(41), ExtentSampleId(42)]
+        );
+        assert_eq!(
+            extent_response
+                .direct
+                .samples
+                .iter()
+                .map(|sample| sample.world_position)
+                .collect::<Vec<_>>(),
+            vec![
+                old_pose.position + crate::math::Vec3::new(-1.0, 0.0, 0.0),
+                old_pose.position + crate::math::Vec3::new(1.0, 0.0, 0.0),
+            ]
+        );
+
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                2,
+                2.0,
+                Pose::identity(),
+                vec![
+                    crate::domain::EmitterSpatialState::new(emitter, new_pose)
+                        .with_extent(new_extent),
+                ],
+            ))
+            .expect("the failed revision and time must remain available for retry");
+        world.close().unwrap();
+    }
+
+    #[test]
+    fn world_play_delivers_captured_routes_and_playback_rate_to_render_behavior() {
+        let (adapter, handle) = FakeOutputPlatform::scripted(
+            vec![PlatformFakeDevice::stereo("voice-admission", 48_000)],
+            Some(0),
+        );
+        let world = PetalSonicWorld::new_with_output(
+            crate::config::PetalSonicWorldDesc {
+                block_size: 64,
+                ..Default::default()
+            },
+            move || Ok(Box::new(adapter)),
+        )
+        .unwrap();
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Running);
+        let emitter_pose = Pose::from_position(crate::math::Vec3::new(6.0, 1.0, -4.0));
+        let emitter = world
+            .create_emitter(
+                ResidentClip::from_audio_data(Arc::new(PetalSonicAudioData::new(
+                    vec![0.25; 4_096],
+                    48_000,
+                    1,
+                    Duration::from_secs_f64(4_096.0 / 48_000.0),
+                ))),
+                EmitterDesc::spatial(emitter_pose),
+            )
+            .unwrap();
+        world
+            .publish_spatial_frame(SpatialFrame::new(
+                1,
+                0.0,
+                Pose::identity(),
+                vec![crate::domain::EmitterSpatialState::new(
+                    emitter,
+                    emitter_pose,
+                )],
+            ))
+            .unwrap();
+        let direct_pose = Pose::from_position(crate::math::Vec3::new(0.2, -0.1, 0.5));
+        let acoustic_origin = Pose::from_position(crate::math::Vec3::new(9.0, 3.0, -7.0));
+        world
+            .play(
+                emitter,
+                PlayOptions::once()
+                    .with_playback_rate(2.0)
+                    .with_direct_path(DirectPath::listener_relative(direct_pose))
+                    .with_environment_send(EnvironmentSend::from_world_pose(acoustic_origin))
+                    .with_play_command_id(PlayCommandId(801)),
+            )
+            .unwrap();
+        let slow = world
+            .play_controlled(
+                emitter,
+                PlayOptions::once()
+                    .with_playback_rate(0.5)
+                    .with_play_command_id(PlayCommandId(802)),
+                PlaybackTag(802),
+            )
+            .unwrap();
+
+        let mut first_render = None;
+        wait_for_async_observation(|| {
+            handle.advance(64);
+            first_render =
+                world
+                    .drain_voice_telemetry()
+                    .into_iter()
+                    .find_map(|event| match event {
+                        VoiceTelemetryEvent::FirstRendered(event)
+                            if event.play_command_id == PlayCommandId(801) =>
+                        {
+                            Some(event)
+                        }
+                        _ => None,
+                    });
+            first_render.is_some()
+        });
+        let first_render = first_render.unwrap();
+        assert_eq!(first_render.emitter, emitter);
+        assert_eq!(first_render.direct_local_pose, Some(direct_pose));
+        assert_eq!(first_render.acoustic_origin, Some(acoustic_origin));
+
+        let mut observed_completions = Vec::new();
+        wait_for_async_observation(|| {
+            handle.advance(64);
+            observed_completions.extend(world.drain_events());
+            world.active_voice_count() == 1
+        });
+        assert!(
+            !observed_completions.iter().any(|event| {
+                matches!(
+                    event,
+                    PetalSonicEvent::PlaybackCompleted {
+                        control,
+                        tag: PlaybackTag(802),
+                        ..
+                    } if *control == slow
+                )
+            }),
+            "the 0.5x Voice completed no later than the 2.0x Voice"
+        );
+        wait_for_async_observation(|| {
+            handle.advance(64);
+            observed_completions.extend(world.drain_events());
+            observed_completions.iter().any(|event| {
+                matches!(
+                    event,
+                    PetalSonicEvent::PlaybackCompleted {
+                        control,
+                        tag: PlaybackTag(802),
+                        ..
+                    } if *control == slow
+                )
+            })
+        });
+        world.close().unwrap();
+    }
+
+    #[test]
     fn spatial_publication_rejects_torn_or_non_monotonic_solver_inputs() {
         let desc = crate::config::PetalSonicWorldDesc {
             output_device: crate::config::OutputDevicePolicy::PinnedNameContains(
@@ -1569,7 +1889,7 @@ mod tests {
             vec![crate::domain::EmitterSpatialState::new(first, moved)],
         );
         assert!(matches!(
-            registry.apply_spatial_frame(&incomplete),
+            registry.prepare_spatial_update(Arc::new(incomplete)),
             Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame",
                 ..
@@ -1589,7 +1909,8 @@ mod tests {
                 crate::domain::EmitterSpatialState::new(second, Pose::default()),
             ],
         );
-        registry.apply_spatial_frame(&complete).unwrap();
+        let update = registry.prepare_spatial_update(Arc::new(complete)).unwrap();
+        registry.commit_spatial_update(update);
         assert_eq!(registry.get(first).unwrap().desc.pose(), Some(moved));
     }
 

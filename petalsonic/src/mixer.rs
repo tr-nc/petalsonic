@@ -170,9 +170,8 @@ pub(crate) fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusPara
 mod tests {
     use super::*;
     use crate::audio_data::PetalSonicAudioData;
-    use crate::config::SourceConfig;
-    use crate::domain::Emitter;
-    use crate::playback::{LoopMode, VoiceStart};
+    use crate::domain::{Emitter, EmitterDesc, PlayOptions};
+    use crate::playback::prepare_test_voice;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -209,27 +208,22 @@ mod tests {
                 1,
                 Duration::from_secs_f64(16.0 / 48_000.0),
             ));
-            let mut voice = PlaybackInstance::from_voice(VoiceStart {
-                emitter: Emitter {
+            let voice = prepare_test_voice(
+                VoiceId::from(id as u64),
+                Emitter {
                     world_id: 1,
                     index: id,
                     generation: 1,
                 },
-                audio_data: audio,
-                config: SourceConfig::non_spatial(),
-                loop_mode: LoopMode::Infinite,
+                audio,
+                EmitterDesc::non_spatial(),
+                PlayOptions::looping(),
+                None,
                 bus_index,
-                playback_rate: 1.0,
-                detached: false,
-                completion_tag: None,
-                direct_path: crate::domain::DirectPath::default(),
-                environment_send: crate::domain::EnvironmentSend::default(),
-                play_command_id: None,
-                source_extent: crate::domain::SourceExtent::Point,
-                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-                mono_scratch: vec![0.0; 4],
-            });
-            voice.play_from_beginning();
+                4,
+            )
+            .start()
+            .1;
             active.insert(VoiceId::from(id as u64), voice);
         }
 
@@ -270,27 +264,22 @@ mod tests {
                 1,
                 Duration::from_secs_f64(32.0 / 48_000.0),
             ));
-            let mut voice = PlaybackInstance::from_voice(VoiceStart {
-                emitter: Emitter {
+            let voice = prepare_test_voice(
+                VoiceId::from(id as u64),
+                Emitter {
                     world_id: 1,
                     index: id,
                     generation: 1,
                 },
-                audio_data: audio,
-                config: SourceConfig::non_spatial(),
-                loop_mode: LoopMode::Infinite,
+                audio,
+                EmitterDesc::non_spatial(),
+                PlayOptions::looping(),
+                None,
                 bus_index,
-                playback_rate: 1.0,
-                detached: false,
-                completion_tag: None,
-                direct_path: crate::domain::DirectPath::default(),
-                environment_send: crate::domain::EnvironmentSend::default(),
-                play_command_id: None,
-                source_extent: crate::domain::SourceExtent::Point,
-                occlusion_profile: crate::domain::OcclusionProfile::PointExact,
-                mono_scratch: vec![0.0; 4],
-            });
-            voice.play_from_beginning();
+                4,
+            )
+            .start()
+            .1;
             active.insert(VoiceId::from(id as u64), voice);
         }
         let buses = [

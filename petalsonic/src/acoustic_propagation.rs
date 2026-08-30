@@ -4213,6 +4213,84 @@ mod tests {
     }
 
     #[test]
+    fn consumer_disconnect_while_running_remains_a_terminal_acoustics_failure() {
+        let runtime_state = Arc::new(AtomicU8::new(crate::events::RuntimeState::Running as u8));
+        let mut services = RuntimeServices::new(
+            crate::runtime_health::RuntimeFailurePublisher::new(runtime_state.clone()),
+        );
+        let (propagation, worker) = AcousticPropagation::prepare(
+            1.0,
+            Arc::new(AtomicBool::new(true)),
+            0.5,
+            EnvironmentalAcousticsBudget::default(),
+            1,
+            8,
+        );
+        worker.start(&mut services).unwrap();
+        drop(
+            propagation
+                .take_response_consumer()
+                .expect("the runtime consumer starts connected"),
+        );
+        let emitter = Emitter {
+            world_id: 1,
+            index: 0,
+            generation: 1,
+        };
+        propagation.voice_input().activate(AcousticVoice {
+            voice_id: VoiceId::from(1),
+            emitter,
+            emitter_world_pose: Pose::from_position(Vec3::Z),
+            acoustic_priority: 1.0,
+            audibility: 1.0,
+            detached: false,
+            direct_path: DirectPath::default(),
+            environment_send: EnvironmentSend::default(),
+            source_extent: SourceExtent::Point,
+            occlusion_profile: OcclusionProfile::PointExact,
+            routing_generation: 0,
+        });
+        propagation
+            .publish_scene(Arc::new(AcousticSceneSnapshot::new(
+                23,
+                Arc::new(NoGeometry),
+            )))
+            .unwrap();
+        propagation
+            .publish_spatial_frame(Arc::new(SpatialFrame::new(
+                1,
+                0.0,
+                Pose::identity(),
+                vec![EmitterSpatialState::new(
+                    emitter,
+                    Pose::from_position(Vec3::Z),
+                )],
+            )))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::events::RuntimeState::load(&runtime_state)
+            != crate::events::RuntimeState::Failed
+        {
+            assert!(
+                Instant::now() < deadline,
+                "consumer loss did not become a terminal runtime failure"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let close_error = services
+            .close()
+            .expect_err("unexpected consumer loss must remain visible during close");
+        assert!(
+            close_error
+                .to_string()
+                .contains("acoustics: acoustics response consumer disconnected"),
+            "close lost the response publication failure: {close_error}"
+        );
+        propagation.close_publication();
+    }
+
+    #[test]
     fn disabled_worker_waits_for_reenable_before_solving() {
         let (propagation, children) = start_propagation(false, 0.5, 8, 8);
         propagation

@@ -10,6 +10,7 @@ use crate::events::{
     VoiceTelemetryEvent,
 };
 use crate::math::Pose;
+use crate::playback::AcceptedVoice;
 use crate::runtime::{AudioRuntime, RuntimeIntent};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -547,22 +548,15 @@ impl PetalSonicWorld {
                 },
             );
         }
-        let intent = RuntimeIntent::Play {
+        let intent = RuntimeIntent::Play(AcceptedVoice::capture(
             voice_id,
             emitter,
-            source: state.clip.data.clone(),
-            config: state.desc.source_config(options.gain_db),
-            loop_mode: options.loop_mode,
-            detached: options.detached,
+            &state.clip,
+            &state.desc,
+            options,
             completion_tag,
             bus_index,
-            playback_rate: options.playback_rate(),
-            direct_path: options.direct_path(),
-            environment_send: options.environment_send(),
-            play_command_id: options.play_command_id(),
-            source_extent: state.desc.extent().clone(),
-            occlusion_profile: options.occlusion_profile(state.desc.occlusion_profile()),
-        };
+        ));
         if let Err(error) = self.runtime.try_submit(intent) {
             self.runtime.release_reserved_voice();
             if completion_tag.is_some()

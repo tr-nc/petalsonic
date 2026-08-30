@@ -1,11 +1,7 @@
 use crate::acoustic_propagation::{AcousticPropagation, AcousticResponse};
 use crate::acoustics::AcousticSceneSnapshot;
-use crate::audio_data::PetalSonicAudioData;
 use crate::config::{PetalSonicWorldDesc, SourceConfig};
-use crate::domain::{
-    BusParams, DirectPath, Emitter, EnvironmentSend, OcclusionProfile, PlayCommandId, PlaybackTag,
-    SourceExtent, SpatialFrame, VoiceId,
-};
+use crate::domain::{BusParams, Emitter, SpatialFrame, VoiceId};
 use crate::engine::{EngineCommandReceivers, EngineObservability, EngineStartup, PetalSonicEngine};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
@@ -16,7 +12,7 @@ use crate::events::{
 use crate::platform::output::{
     CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
 };
-use crate::playback::{LoopMode, PlaybackCommand};
+use crate::playback::{AcceptedVoice, PlaybackCommand};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,22 +26,7 @@ pub(crate) const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// Queue selection and render-path preparation deliberately remain behind the
 /// runtime seam; callers cannot acquire or route through the underlying endpoints.
 pub(crate) enum RuntimeIntent {
-    Play {
-        voice_id: VoiceId,
-        emitter: Emitter,
-        source: Arc<PetalSonicAudioData>,
-        config: SourceConfig,
-        loop_mode: LoopMode,
-        detached: bool,
-        completion_tag: Option<PlaybackTag>,
-        bus_index: usize,
-        playback_rate: f32,
-        direct_path: DirectPath,
-        environment_send: EnvironmentSend,
-        play_command_id: Option<PlayCommandId>,
-        source_extent: SourceExtent,
-        occlusion_profile: OcclusionProfile,
-    },
+    Play(AcceptedVoice),
     UpdateEmitter(Emitter, SourceConfig, usize),
     DestroyEmitter(Emitter),
     PauseEmitter(Emitter),
@@ -64,38 +45,7 @@ pub(crate) enum RuntimeIntent {
 impl RuntimeIntent {
     fn into_command(self, block_size: usize) -> PlaybackCommand {
         match self {
-            Self::Play {
-                voice_id,
-                emitter,
-                source,
-                config,
-                loop_mode,
-                detached,
-                completion_tag,
-                bus_index,
-                playback_rate,
-                direct_path,
-                environment_send,
-                play_command_id,
-                source_extent,
-                occlusion_profile,
-            } => PlaybackCommand::Play {
-                voice_id,
-                emitter,
-                source,
-                config,
-                loop_mode,
-                detached,
-                completion_tag,
-                bus_index,
-                playback_rate,
-                direct_path,
-                environment_send,
-                play_command_id,
-                source_extent,
-                occlusion_profile,
-                mono_scratch: vec![0.0; block_size],
-            },
+            Self::Play(voice) => PlaybackCommand::Play(voice.prepare(block_size)),
             Self::UpdateEmitter(emitter, config, bus) => {
                 PlaybackCommand::UpdateEmitter(emitter, config, bus)
             }

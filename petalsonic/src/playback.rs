@@ -10,11 +10,12 @@
 //! Most users will interact with playback through [`PetalSonicWorld`](crate::PetalSonicWorld)
 //! methods like `play()`, `pause()`, and `stop()`, rather than using these types directly.
 
+use crate::acoustic_propagation::AcousticVoice;
 use crate::audio_data::PetalSonicAudioData;
 use crate::config::SourceConfig;
 use crate::domain::{
-    BusParams, DirectPath, Emitter, EnvironmentOrigin, EnvironmentSend, OcclusionProfile,
-    PlayCommandId, PlaybackTag, SourceExtent, VoiceId,
+    BusParams, DirectPath, Emitter, EmitterDesc, EnvironmentOrigin, EnvironmentSend,
+    OcclusionProfile, PlayCommandId, PlayOptions, PlaybackTag, ResidentClip, SourceExtent, VoiceId,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -91,6 +92,117 @@ pub(crate) struct VoiceStart {
     pub source_extent: SourceExtent,
     pub occlusion_profile: OcclusionProfile,
     pub mono_scratch: Vec<f32>,
+}
+
+/// One Voice whose caller-facing validation, identity, and immutable routing were accepted.
+///
+/// The World captures this value while it owns the Emitter registry. The runtime can then
+/// prepare render-owned storage without reconstructing or independently interpreting the
+/// accepted Voice facts.
+pub(crate) struct AcceptedVoice {
+    voice_id: VoiceId,
+    emitter: Emitter,
+    audio_data: Arc<PetalSonicAudioData>,
+    config: SourceConfig,
+    loop_mode: LoopMode,
+    bus_index: usize,
+    playback_rate: f32,
+    detached: bool,
+    completion_tag: Option<PlaybackTag>,
+    direct_path: DirectPath,
+    environment_send: EnvironmentSend,
+    play_command_id: Option<PlayCommandId>,
+    source_extent: SourceExtent,
+    occlusion_profile: OcclusionProfile,
+}
+
+impl AcceptedVoice {
+    pub(crate) fn capture(
+        voice_id: VoiceId,
+        emitter: Emitter,
+        clip: &ResidentClip,
+        emitter_desc: &EmitterDesc,
+        options: PlayOptions,
+        completion_tag: Option<PlaybackTag>,
+        bus_index: usize,
+    ) -> Self {
+        Self {
+            voice_id,
+            emitter,
+            audio_data: clip.data.clone(),
+            config: emitter_desc.source_config(options.gain_db),
+            loop_mode: options.loop_mode,
+            bus_index,
+            playback_rate: options.playback_rate(),
+            detached: options.detached,
+            completion_tag,
+            direct_path: options.direct_path(),
+            environment_send: options.environment_send(),
+            play_command_id: options.play_command_id(),
+            source_extent: emitter_desc.extent().clone(),
+            occlusion_profile: options.occlusion_profile(emitter_desc.occlusion_profile()),
+        }
+    }
+
+    /// Performs every allocation required to hand this Voice to the render thread.
+    pub(crate) fn prepare(self, block_size: usize) -> PreparedVoice {
+        PreparedVoice {
+            voice_id: self.voice_id,
+            start: VoiceStart {
+                emitter: self.emitter,
+                audio_data: self.audio_data,
+                config: self.config,
+                loop_mode: self.loop_mode,
+                bus_index: self.bus_index,
+                playback_rate: self.playback_rate,
+                detached: self.detached,
+                completion_tag: self.completion_tag,
+                direct_path: self.direct_path,
+                environment_send: self.environment_send,
+                play_command_id: self.play_command_id,
+                source_extent: self.source_extent,
+                occlusion_profile: self.occlusion_profile,
+                mono_scratch: vec![0.0; block_size],
+            },
+        }
+    }
+}
+
+/// A fully allocated Voice ready for one allocation-free render-quantum admission.
+pub(crate) struct PreparedVoice {
+    voice_id: VoiceId,
+    start: VoiceStart,
+}
+
+impl PreparedVoice {
+    /// Starts the single playback cursor and derives its matching acoustics route from the same
+    /// captured facts. No caller can accidentally prepare the two consumers differently.
+    pub(crate) fn start(self) -> (VoiceId, PlaybackInstance, Option<AcousticVoice>) {
+        let acoustic_voice = match &self.start.config {
+            SourceConfig::Spatial { pose, .. } => Some(AcousticVoice {
+                voice_id: self.voice_id,
+                emitter: self.start.emitter,
+                emitter_world_pose: *pose,
+                acoustic_priority: 1.0,
+                audibility: self.start.config.volume(),
+                detached: self.start.detached,
+                direct_path: self.start.direct_path,
+                environment_send: self.start.environment_send,
+                source_extent: self.start.source_extent.clone(),
+                occlusion_profile: self.start.occlusion_profile,
+                routing_generation: 0,
+            }),
+            SourceConfig::NonSpatial { .. } => None,
+        };
+        let mut playback = PlaybackInstance::from_voice(self.start);
+        playback.play_from_beginning();
+        (self.voice_id, playback, acoustic_voice)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_start(voice_id: VoiceId, start: VoiceStart) -> Self {
+        Self { voice_id, start }
+    }
 }
 
 /// Active playback instance
@@ -495,23 +607,7 @@ impl PlaybackInstance {
 // allocating or freeing an extra command box at a render-quantum boundary.
 #[allow(clippy::large_enum_variant)]
 pub enum PlaybackCommand {
-    Play {
-        voice_id: VoiceId,
-        emitter: Emitter,
-        source: Arc<PetalSonicAudioData>,
-        config: SourceConfig,
-        loop_mode: LoopMode,
-        detached: bool,
-        completion_tag: Option<PlaybackTag>,
-        bus_index: usize,
-        playback_rate: f32,
-        direct_path: DirectPath,
-        environment_send: EnvironmentSend,
-        play_command_id: Option<PlayCommandId>,
-        source_extent: SourceExtent,
-        occlusion_profile: OcclusionProfile,
-        mono_scratch: Vec<f32>,
-    },
+    Play(PreparedVoice),
     PauseVoice(VoiceId),
     StopVoice(VoiceId),
     SeekVoice(VoiceId, f32),
@@ -530,40 +626,7 @@ pub enum PlaybackCommand {
 impl fmt::Debug for PlaybackCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Play {
-                voice_id,
-                emitter,
-                source,
-                config,
-                loop_mode,
-                detached,
-                completion_tag,
-                bus_index,
-                playback_rate,
-                direct_path,
-                environment_send,
-                play_command_id,
-                source_extent,
-                occlusion_profile,
-                mono_scratch,
-            } => f
-                .debug_struct("Play")
-                .field("voice_id", voice_id)
-                .field("emitter", emitter)
-                .field("source", source)
-                .field("config", config)
-                .field("loop_mode", loop_mode)
-                .field("detached", detached)
-                .field("completion_tag", completion_tag)
-                .field("bus_index", bus_index)
-                .field("playback_rate", playback_rate)
-                .field("direct_path", direct_path)
-                .field("environment_send", environment_send)
-                .field("play_command_id", play_command_id)
-                .field("source_extent", source_extent)
-                .field("occlusion_profile", occlusion_profile)
-                .field("mono_scratch_len", &mono_scratch.len())
-                .finish(),
+            Self::Play(_) => f.write_str("Play(PreparedVoice)"),
             Self::PauseVoice(voice_id) => f.debug_tuple("PauseVoice").field(voice_id).finish(),
             Self::StopVoice(voice_id) => f.debug_tuple("StopVoice").field(voice_id).finish(),
             Self::SeekVoice(voice_id, progress) => f
@@ -608,7 +671,89 @@ impl fmt::Debug for PlaybackCommand {
 mod tests {
     use super::*;
     use crate::config::SourceConfig;
+    use crate::domain::{
+        EmitterDesc, ExtentSample, ExtentSampleId, PlayCommandId, PlayOptions, ResidentClip,
+    };
+    use crate::math::{Pose, Vec3};
     use std::time::Duration;
+
+    #[test]
+    fn accepted_voice_prepares_one_playback_cursor_and_matching_acoustic_route() {
+        let emitter = Emitter {
+            world_id: 7,
+            index: 3,
+            generation: 2,
+        };
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; 256],
+            48_000,
+            1,
+            Duration::from_secs_f64(256.0 / 48_000.0),
+        ));
+        let clip = ResidentClip::from_audio_data(audio.clone());
+        let extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(11), Vec3::new(-1.0, 0.0, 0.0), 1.0).unwrap(),
+            ExtentSample::new(ExtentSampleId(12), Vec3::new(1.0, 0.0, 0.0), 3.0).unwrap(),
+        ])
+        .unwrap();
+        let emitter_pose = Pose::from_position(Vec3::new(8.0, 1.0, -2.0));
+        let direct_pose = Pose::from_position(Vec3::new(0.25, 0.0, -0.5));
+        let acoustic_origin = Pose::from_position(Vec3::new(4.0, 2.0, 9.0));
+        let desc = EmitterDesc::spatial(emitter_pose)
+            .with_gain_db(-3.0)
+            .with_extent(extent.clone());
+        let options = PlayOptions::looping()
+            .with_gain_db(-2.0)
+            .with_playback_rate(0.5)
+            .detached()
+            .with_direct_path(DirectPath::listener_relative(direct_pose))
+            .with_environment_send(EnvironmentSend::from_world_pose(acoustic_origin))
+            .with_play_command_id(PlayCommandId(91));
+
+        let prepared = AcceptedVoice::capture(
+            VoiceId::from(23),
+            emitter,
+            &clip,
+            &desc,
+            options,
+            Some(PlaybackTag(5)),
+            4,
+        )
+        .prepare(64);
+        let (voice_id, instance, acoustic_voice) = prepared.start();
+
+        assert_eq!(voice_id, VoiceId::from(23));
+        assert_eq!(instance.emitter, emitter);
+        assert!(Arc::ptr_eq(&instance.audio_data, &audio));
+        assert_eq!(instance.config.pose(), Some(emitter_pose));
+        assert_eq!(instance.config.volume_db(), -5.0);
+        assert!(matches!(instance.loop_mode, LoopMode::Infinite));
+        assert!(instance.detached);
+        assert_eq!(instance.completion_tag, Some(PlaybackTag(5)));
+        assert_eq!(instance.bus_index, 4);
+        assert_eq!(
+            instance.direct_path,
+            DirectPath::listener_relative(direct_pose)
+        );
+        assert_eq!(
+            instance.environment_send,
+            EnvironmentSend::from_world_pose(acoustic_origin)
+        );
+        assert_eq!(instance.source_extent, extent);
+        assert_eq!(instance.play_command_id, Some(PlayCommandId(91)));
+        assert_eq!(instance.mono_scratch.len(), 64);
+        assert!(matches!(instance.info.play_state, PlayState::Playing));
+
+        let acoustic_voice = acoustic_voice.expect("spatial Voice must have an acoustic route");
+        assert_eq!(acoustic_voice.voice_id, VoiceId::from(23));
+        assert_eq!(acoustic_voice.emitter, emitter);
+        assert_eq!(acoustic_voice.emitter_world_pose, emitter_pose);
+        assert!(acoustic_voice.detached);
+        assert_eq!(acoustic_voice.direct_path, instance.direct_path);
+        assert_eq!(acoustic_voice.environment_send, instance.environment_send);
+        assert_eq!(acoustic_voice.source_extent, instance.source_extent);
+        assert_eq!(acoustic_voice.occlusion_profile, instance.occlusion_profile);
+    }
 
     #[test]
     fn resident_clip_fills_stereo_and_seeks() {

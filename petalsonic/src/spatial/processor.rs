@@ -1787,24 +1787,48 @@ mod tests {
         })
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct LookupContractActivity {
+        lookups: usize,
+        memory_operations: usize,
+    }
+
     fn render_lookup_contract_quantum(
         processor: &mut SpatialProcessor,
         voice_id: VoiceId,
         voices: &mut HashMap<VoiceId, PlaybackInstance>,
-    ) -> usize {
+    ) -> LookupContractActivity {
         let mut output = [0.0; 16];
         let mut events = Vec::new();
-        crate::test_support::acoustic_response_lookup_activity(|| {
-            processor
-                .process_spatial_sources_with_metrics(
-                    &[voice_id],
-                    voices,
-                    &mut output,
-                    SpatialRenderContext::default(),
-                    &mut events,
-                )
-                .unwrap();
-        })
+        let mut lookups = 0;
+        let memory_operations = crate::test_support::realtime_memory_activity(|| {
+            lookups = crate::test_support::acoustic_response_lookup_activity(|| {
+                processor
+                    .process_spatial_sources_with_metrics(
+                        &[voice_id],
+                        voices,
+                        &mut output,
+                        SpatialRenderContext::default(),
+                        &mut events,
+                    )
+                    .unwrap();
+            });
+        });
+        LookupContractActivity {
+            lookups,
+            memory_operations,
+        }
+    }
+
+    fn assert_lookup_contract(label: &str, activity: LookupContractActivity) {
+        assert_eq!(
+            activity.lookups, 1,
+            "{label} must resolve exactly one acoustic envelope"
+        );
+        assert_eq!(
+            activity.memory_operations, 0,
+            "{label} allocated, reallocated, or freed on the realtime path"
+        );
     }
 
     #[test]
@@ -1819,6 +1843,13 @@ mod tests {
             missing_voice_id,
             &mut missing_voices,
         );
+        assert!(
+            missing_processor
+                .native_early_reflection_source_states
+                .is_empty(),
+            "a missing response entry must not mint early-reflection state"
+        );
+        assert_eq!(missing_voices[&missing_voice_id].info.current_frame, 8);
 
         let no_tap_voice_id = VoiceId::from(12);
         let mut no_tap_processor = lookup_contract_processor(1);
@@ -1831,6 +1862,13 @@ mod tests {
             no_tap_voice_id,
             &mut no_tap_voices,
         );
+        assert!(
+            no_tap_processor
+                .native_early_reflection_source_states
+                .is_empty(),
+            "a response without taps must not mint early-reflection state"
+        );
+        assert_eq!(no_tap_voices[&no_tap_voice_id].info.current_frame, 8);
 
         let new_state_voice_id = VoiceId::from(13);
         let mut new_state_processor = lookup_contract_processor(1);
@@ -1852,6 +1890,19 @@ mod tests {
             new_state_voice_id,
             &mut new_state_voices,
         );
+        assert!(
+            new_state_processor
+                .native_early_reflection_source_states
+                .contains_key(&new_state_voice_id),
+            "the cold path must mint the Voice's preallocated early-reflection state"
+        );
+        assert!(
+            new_state_processor
+                .free_native_early_reflection_source_states
+                .is_empty(),
+            "the cold path must consume its preallocated state"
+        );
+        assert_eq!(new_state_voices[&new_state_voice_id].info.current_frame, 8);
 
         let retired_voice_id = VoiceId::from(14);
         let reused_voice_id = VoiceId::from(15);
@@ -1874,6 +1925,10 @@ mod tests {
                 .free_native_early_reflection_source_states
                 .is_empty()
         );
+        assert!(
+            reuse_processor.native_early_reflection_source_states[&retired_voice_id].is_released(),
+            "the fixture must expose an in-map released state for transfer"
+        );
         reuse_processor.replace_acoustic_response(lookup_contract_response(
             reused_voice_id,
             vec![EarlyReflectionTap {
@@ -1890,12 +1945,26 @@ mod tests {
             reused_voice_id,
             &mut reused_voices,
         );
-
-        assert_eq!(
-            [missing_entry, no_tap, new_state, pool_reuse],
-            [1, 1, 1, 1],
-            "missing entry, no tap, new state, and pool reuse must each resolve exactly once"
+        assert!(
+            !reuse_processor
+                .native_early_reflection_source_states
+                .contains_key(&retired_voice_id)
+                && reuse_processor
+                    .native_early_reflection_source_states
+                    .contains_key(&reused_voice_id),
+            "the production path must transfer the released state to the new Voice"
         );
+        assert_eq!(
+            reuse_processor.native_early_reflection_source_states.len(),
+            1,
+            "pool transfer must not mint parallel state"
+        );
+        assert_eq!(reused_voices[&reused_voice_id].info.current_frame, 8);
+
+        assert_lookup_contract("missing response entry", missing_entry);
+        assert_lookup_contract("response without early-reflection taps", no_tap);
+        assert_lookup_contract("cold early-reflection state mint", new_state);
+        assert_lookup_contract("released early-reflection pool transfer", pool_reuse);
     }
 
     #[test]

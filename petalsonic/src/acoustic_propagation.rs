@@ -13,9 +13,8 @@ use crate::events::{
 };
 use crate::math::{Pose, Vec3};
 use crate::realtime_latest::{Publisher, RealtimeConsumer, RealtimeLatest};
-use crate::runtime_children::{
-    ChildCancellation, ChildStartup, RuntimeChildFailure, RuntimeChildKind, RuntimeChildResult,
-    RuntimeChildren,
+use crate::runtime_services::{
+    ChildCancellation, ChildStartup, RuntimeChildFailure, RuntimeChildResult, RuntimeServices,
 };
 use crate::spatial::LateReverbParameters;
 use crossbeam_channel::{Receiver, Sender};
@@ -494,10 +493,9 @@ pub(crate) struct AcousticWorker {
 }
 
 impl AcousticWorker {
-    pub(crate) fn start(self, children: &mut RuntimeChildren) -> crate::error::Result<()> {
+    pub(crate) fn start(self, services: &mut RuntimeServices) -> crate::error::Result<()> {
         let cancellation = self.cancellation.clone();
-        children.spawn(
-            RuntimeChildKind::Acoustics,
+        services.start_acoustics(
             "petalsonic-acoustics",
             cancellation,
             move |startup, cancellation| self.run(startup, cancellation),
@@ -2535,10 +2533,10 @@ mod tests {
         quality: f32,
         max_voices: usize,
         telemetry_capacity: usize,
-    ) -> (AcousticPropagation, RuntimeChildren) {
+    ) -> (AcousticPropagation, RuntimeServices) {
         let state = Arc::new(AtomicU8::new(crate::events::RuntimeState::Recovering as u8));
-        let mut children =
-            RuntimeChildren::new(crate::runtime_health::RuntimeFailurePublisher::new(state));
+        let mut services =
+            RuntimeServices::new(crate::runtime_health::RuntimeFailurePublisher::new(state));
         let (propagation, worker) = AcousticPropagation::prepare(
             1.0,
             Arc::new(AtomicBool::new(enabled)),
@@ -2547,8 +2545,8 @@ mod tests {
             max_voices,
             telemetry_capacity,
         );
-        worker.start(&mut children).unwrap();
-        (propagation, children)
+        worker.start(&mut services).unwrap();
+        (propagation, services)
     }
 
     #[test]

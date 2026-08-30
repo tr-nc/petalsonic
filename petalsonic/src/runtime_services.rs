@@ -1,3 +1,5 @@
+//! Typed ownership and ordered shutdown for runtime-level audio services.
+
 use crate::error::{PetalSonicError, Result};
 use crate::runtime_health::RuntimeFailurePublisher;
 use crossbeam_channel::Sender;
@@ -8,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RuntimeChildKind {
+enum RuntimeChildKind {
     Acoustics,
     Output,
 }
@@ -107,40 +109,106 @@ enum ChildCompletion {
 }
 
 struct RuntimeChild {
-    kind: RuntimeChildKind,
     cancellation: ChildCancellation,
     handle: JoinHandle<ChildCompletion>,
 }
 
-/// Owns the runtime-level long-lived services in one audio runtime.
-///
-/// Startup acknowledgement, cancellation, abnormal-exit classification, joining, panic
-/// conversion, and the aggregate close result for the output supervisor and acoustics service stay
-/// behind this interface. Session-scoped render work remains owned by the output session/engine and
-/// shares only [`RuntimeFailurePublisher`], never a task handle.
-pub(crate) struct RuntimeChildren {
-    failure_publisher: RuntimeFailurePublisher,
-    children: Mutex<Vec<RuntimeChild>>,
+struct AcousticsService(RuntimeChild);
+
+struct OutputService(RuntimeChild);
+
+#[derive(Default)]
+struct RunningServices {
+    acoustics: Option<AcousticsService>,
+    output: Option<OutputService>,
 }
 
-impl RuntimeChildren {
+/// Owns the producer-to-consumer topology of one audio runtime.
+///
+/// Startup acknowledgement, cancellation, abnormal-exit classification, joining, panic
+/// conversion, and the aggregate close result stay behind this interface. Acoustics produces
+/// responses consumed by the output-owned render quantum, so shutdown always quiesces and joins
+/// acoustics before it allows output to release that consumer. Session-scoped render work shares
+/// only [`RuntimeFailurePublisher`], never a task handle.
+pub(crate) struct RuntimeServices {
+    failure_publisher: RuntimeFailurePublisher,
+    running: Mutex<RunningServices>,
+}
+
+impl RuntimeServices {
     pub(crate) fn new(failure_publisher: RuntimeFailurePublisher) -> Self {
         Self {
             failure_publisher,
-            children: Mutex::new(Vec::with_capacity(2)),
+            running: Mutex::new(RunningServices::default()),
         }
     }
 
-    pub(crate) fn spawn(
+    pub(crate) fn start_acoustics(
         &mut self,
-        kind: RuntimeChildKind,
         thread_name: &'static str,
         cancellation: ChildCancellation,
         run: impl FnOnce(ChildStartup, ChildCancellation) -> RuntimeChildResult + Send + 'static,
     ) -> Result<()> {
+        let running = self
+            .running
+            .get_mut()
+            .map_err(|_| PetalSonicError::Engine("Runtime services lock is poisoned".into()))?;
+        if running.acoustics.is_some() {
+            return Err(PetalSonicError::Engine(
+                "Acoustics service is already running".into(),
+            ));
+        }
+        let child = Self::start_service(
+            self.failure_publisher.clone(),
+            RuntimeChildKind::Acoustics,
+            thread_name,
+            cancellation,
+            run,
+        )?;
+        running.acoustics = Some(AcousticsService(child));
+        Ok(())
+    }
+
+    pub(crate) fn start_output(
+        &mut self,
+        thread_name: &'static str,
+        cancellation: ChildCancellation,
+        run: impl FnOnce(ChildStartup, ChildCancellation) -> RuntimeChildResult + Send + 'static,
+    ) -> Result<()> {
+        let running = self
+            .running
+            .get_mut()
+            .map_err(|_| PetalSonicError::Engine("Runtime services lock is poisoned".into()))?;
+        if running.acoustics.is_none() {
+            return Err(PetalSonicError::Engine(
+                "Acoustics service must be running before output starts".into(),
+            ));
+        }
+        if running.output.is_some() {
+            return Err(PetalSonicError::Engine(
+                "Output service is already running".into(),
+            ));
+        }
+        let child = Self::start_service(
+            self.failure_publisher.clone(),
+            RuntimeChildKind::Output,
+            thread_name,
+            cancellation,
+            run,
+        )?;
+        running.output = Some(OutputService(child));
+        Ok(())
+    }
+
+    fn start_service(
+        failure_publisher: RuntimeFailurePublisher,
+        kind: RuntimeChildKind,
+        thread_name: &'static str,
+        cancellation: ChildCancellation,
+        run: impl FnOnce(ChildStartup, ChildCancellation) -> RuntimeChildResult + Send + 'static,
+    ) -> Result<RuntimeChild> {
         let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
         let task_cancellation = cancellation.clone();
-        let failure_publisher = self.failure_publisher.clone();
         let handle = std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
@@ -170,19 +238,10 @@ impl RuntimeChildren {
             })?;
 
         match startup_receiver.recv() {
-            Ok(StartupStatus::Ready) => {
-                self.children
-                    .get_mut()
-                    .map_err(|_| {
-                        PetalSonicError::Engine("Runtime children lock is poisoned".into())
-                    })?
-                    .push(RuntimeChild {
-                        kind,
-                        cancellation,
-                        handle,
-                    });
-                Ok(())
-            }
+            Ok(StartupStatus::Ready) => Ok(RuntimeChild {
+                cancellation,
+                handle,
+            }),
             Ok(StartupStatus::Failed(error)) => {
                 let _ = handle.join();
                 Err(error)
@@ -201,25 +260,17 @@ impl RuntimeChildren {
     }
 
     pub(crate) fn close(&self) -> Result<()> {
-        let mut children = self
-            .children
+        let mut running = self
+            .running
             .lock()
-            .map_err(|_| PetalSonicError::Engine("Runtime children lock is poisoned".into()))?;
-        let children = std::mem::take(&mut *children);
-        for child in &children {
-            child.cancellation.request();
-            child.handle.thread().unpark();
-        }
+            .map_err(|_| PetalSonicError::Engine("Runtime services lock is poisoned".into()))?;
 
         let mut failures = Vec::new();
-        for child in children {
-            match child.handle.join() {
-                Ok(ChildCompletion::Stopped) => {}
-                Ok(ChildCompletion::Failed(failure)) => {
-                    failures.push(format!("{}: {failure}", child.kind));
-                }
-                Err(_) => failures.push(format!("{}: join observed a panic", child.kind)),
-            }
+        if let Some(AcousticsService(acoustics)) = running.acoustics.take() {
+            Self::stop_and_join(RuntimeChildKind::Acoustics, acoustics, &mut failures);
+        }
+        if let Some(OutputService(output)) = running.output.take() {
+            Self::stop_and_join(RuntimeChildKind::Output, output, &mut failures);
         }
         if failures.is_empty() {
             Ok(())
@@ -230,9 +281,21 @@ impl RuntimeChildren {
             )))
         }
     }
+
+    fn stop_and_join(kind: RuntimeChildKind, child: RuntimeChild, failures: &mut Vec<String>) {
+        child.cancellation.request();
+        child.handle.thread().unpark();
+        match child.handle.join() {
+            Ok(ChildCompletion::Stopped) => {}
+            Ok(ChildCompletion::Failed(failure)) => {
+                failures.push(format!("{kind}: {failure}"));
+            }
+            Err(_) => failures.push(format!("{kind}: join observed a panic")),
+        }
+    }
 }
 
-impl Drop for RuntimeChildren {
+impl Drop for RuntimeServices {
     fn drop(&mut self) {
         let _ = self.close();
     }

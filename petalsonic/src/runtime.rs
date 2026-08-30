@@ -16,10 +16,8 @@ use crate::platform::output::{
 };
 use crate::playback::{AcceptedVoice, PlaybackCommand};
 use crate::realtime_latest::{Publisher, RealtimeLatest};
-use crate::runtime_children::{
-    ChildCancellation, RuntimeChildFailure, RuntimeChildKind, RuntimeChildren,
-};
 use crate::runtime_health::RuntimeFailurePublisher;
+use crate::runtime_services::{ChildCancellation, RuntimeChildFailure, RuntimeServices};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -136,7 +134,7 @@ pub(crate) struct AudioRuntime {
     timing_receiver: Receiver<RenderTimingEvent>,
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
-    children: RuntimeChildren,
+    services: RuntimeServices,
     #[cfg(test)]
     render_worker_fault: RenderWorkerFaultInjector,
     close_lock: Mutex<()>,
@@ -182,7 +180,7 @@ impl AudioRuntime {
         let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
         let runtime_failure = RuntimeFailurePublisher::new(runtime_state.clone());
         let recovery_attempts = Arc::new(AtomicU64::new(0));
-        let mut children = RuntimeChildren::new(runtime_failure.clone());
+        let mut services = RuntimeServices::new(runtime_failure.clone());
         #[cfg(test)]
         let render_worker_fault = RenderWorkerFaultInjector::default();
         let (acoustic_propagation, acoustic_worker) = AcousticPropagation::prepare(
@@ -193,7 +191,7 @@ impl AudioRuntime {
             config.max_voices,
             config.event_queue_capacity,
         );
-        acoustic_worker.start(&mut children)?;
+        acoustic_worker.start(&mut services)?;
         let acoustic_telemetry_receiver = acoustic_propagation.telemetry_receiver();
         if let Some(scene) = initial_acoustic_scene {
             acoustic_propagation.publish_scene(scene).map_err(|_| {
@@ -233,7 +231,7 @@ impl AudioRuntime {
             counters,
         } = observability;
         Self::start_output_child(
-            &mut children,
+            &mut services,
             startup,
             output,
             EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
@@ -269,7 +267,7 @@ impl AudioRuntime {
             timing_receiver,
             runtime_state,
             recovery_attempts,
-            children,
+            services,
             #[cfg(test)]
             render_worker_fault,
             close_lock: Mutex::new(()),
@@ -591,7 +589,7 @@ impl AudioRuntime {
         }
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
-        let shutdown_result = self.children.close();
+        let shutdown_result = self.services.close();
         self.spatial_frames.close();
         self.acoustic_propagation.close_publication();
         self.active_voice_count.store(0, Ordering::Release);
@@ -688,7 +686,7 @@ impl AudioRuntime {
     }
 
     fn start_output_child(
-        children: &mut RuntimeChildren,
+        services: &mut RuntimeServices,
         startup: EngineStartup,
         output: Box<dyn FnOnce() -> Result<Box<dyn OutputPlatform>> + Send>,
         command_receivers: EngineCommandReceivers,
@@ -698,8 +696,7 @@ impl AudioRuntime {
         runtime_failure: RuntimeFailurePublisher,
         #[cfg(test)] render_worker_fault: RenderWorkerFaultInjector,
     ) -> Result<()> {
-        children.spawn(
-            RuntimeChildKind::Output,
+        services.start_output(
             "petalsonic-output",
             ChildCancellation::passive(),
             move |child_startup, cancellation| {

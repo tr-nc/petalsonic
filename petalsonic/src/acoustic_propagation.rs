@@ -482,6 +482,8 @@ pub(crate) struct AcousticPropagation {
     enabled: Arc<AtomicBool>,
     quality_bits: AtomicU32,
     telemetry_receiver: Receiver<AcousticTelemetryEvent>,
+    #[cfg(test)]
+    worker_fault: Arc<std::sync::atomic::AtomicU8>,
 }
 
 pub(crate) struct AcousticWorker {
@@ -522,6 +524,8 @@ impl AcousticPropagation {
         let latest_response = Arc::new(Mutex::new(None));
         let counters = Arc::new(AcousticPropagationCounters::default());
         let (telemetry_sender, telemetry_receiver) = crossbeam_channel::bounded(telemetry_capacity);
+        #[cfg(test)]
+        let worker_fault = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let cancellation = {
             let input = input.clone();
             ChildCancellation::new(move || input.changed.notify_one())
@@ -535,6 +539,8 @@ impl AcousticPropagation {
                 distance_scaler,
                 environmental_acoustics_budget,
                 telemetry_sender,
+                #[cfg(test)]
+                worker_fault: worker_fault.clone(),
             },
             cancellation,
         };
@@ -546,6 +552,8 @@ impl AcousticPropagation {
                 enabled,
                 quality_bits: AtomicU32::new(environmental_acoustics_quality.to_bits()),
                 telemetry_receiver,
+                #[cfg(test)]
+                worker_fault,
             },
             worker,
         )
@@ -658,18 +666,14 @@ impl AcousticPropagation {
 
     #[cfg(test)]
     pub(crate) fn fail_worker_for_test(&self) {
-        let input = self.input.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = input.state.lock().unwrap();
-            panic!("injected acoustics worker dependency failure");
-        })
-        .join();
+        self.worker_fault.store(1, Ordering::Release);
         self.input.changed.notify_one();
     }
 
     #[cfg(test)]
     pub(crate) fn panic_worker_for_test(&self) {
-        self.fail_worker_for_test();
+        self.worker_fault.store(2, Ordering::Release);
+        self.input.changed.notify_one();
     }
 
     pub(crate) fn clear_published_response(&self) {
@@ -687,6 +691,8 @@ struct PropagationWorkerContext {
     distance_scaler: f32,
     environmental_acoustics_budget: EnvironmentalAcousticsBudget,
     telemetry_sender: Sender<AcousticTelemetryEvent>,
+    #[cfg(test)]
+    worker_fault: Arc<std::sync::atomic::AtomicU8>,
 }
 
 struct AcousticPublisher {
@@ -823,6 +829,8 @@ fn propagation_loop(
         distance_scaler,
         environmental_acoustics_budget,
         telemetry_sender,
+        #[cfg(test)]
+        worker_fault,
     } = context;
     let publisher = AcousticPublisher {
         input: input.clone(),
@@ -840,6 +848,16 @@ fn propagation_loop(
                 .lock()
                 .map_err(|_| RuntimeChildFailure::new("acoustics input state is poisoned"))?;
             loop {
+                #[cfg(test)]
+                match worker_fault.swap(0, Ordering::AcqRel) {
+                    1 => {
+                        return Err(RuntimeChildFailure::new(
+                            "injected acoustics worker failure",
+                        ));
+                    }
+                    2 => panic!("injected acoustics worker panic"),
+                    _ => {}
+                }
                 if cancellation.is_requested() {
                     return Ok(());
                 }

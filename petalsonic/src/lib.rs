@@ -85,6 +85,7 @@ mod mixer;
 mod occlusion;
 mod platform;
 mod playback;
+mod realtime_latest;
 mod render;
 mod runtime;
 mod source_extent;

@@ -12,6 +12,7 @@ use crate::events::{
     EnvironmentResponse as EnvironmentResponseTelemetry,
 };
 use crate::math::{Pose, Vec3};
+use crate::realtime_latest::{Publisher, RealtimeConsumer, RealtimeLatest};
 use crate::spatial::LateReverbParameters;
 use crossbeam_channel::{Receiver, Sender};
 use std::cmp::Ordering as CmpOrdering;
@@ -474,7 +475,8 @@ impl AcousticPropagationCounters {
 
 pub(crate) struct AcousticPropagation {
     input: Arc<SharedInput>,
-    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    response_publication: Publisher<AcousticResponse>,
+    response_consumer: Mutex<Option<RealtimeConsumer<AcousticResponse>>>,
     counters: Arc<AcousticPropagationCounters>,
     enabled: Arc<AtomicBool>,
     quality_bits: AtomicU32,
@@ -496,13 +498,13 @@ impl AcousticPropagation {
             state: Mutex::new(InputState::new(environmental_acoustics_quality, max_voices)),
             changed: Condvar::new(),
         });
-        let latest_response = Arc::new(Mutex::new(None));
+        let (response_publication, response_consumer) = RealtimeLatest::bounded(2);
         let counters = Arc::new(AcousticPropagationCounters::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (telemetry_sender, telemetry_receiver) = crossbeam_channel::bounded(telemetry_capacity);
         let worker = {
             let input = input.clone();
-            let latest_response = latest_response.clone();
+            let response_publication = response_publication.clone();
             let counters = counters.clone();
             let enabled = enabled.clone();
             let stop = stop.clone();
@@ -512,7 +514,7 @@ impl AcousticPropagation {
                 .spawn(move || {
                     propagation_loop(PropagationWorkerContext {
                         input,
-                        latest_response,
+                        response_publication,
                         counters,
                         enabled,
                         stop,
@@ -524,7 +526,8 @@ impl AcousticPropagation {
         };
         Ok(Self {
             input,
-            latest_response,
+            response_publication,
+            response_consumer: Mutex::new(Some(response_consumer)),
             counters,
             enabled,
             quality_bits: AtomicU32::new(environmental_acoustics_quality.to_bits()),
@@ -575,8 +578,12 @@ impl AcousticPropagation {
         Ok(())
     }
 
-    pub(crate) fn latest_response_slot(&self) -> Arc<Mutex<Option<Arc<AcousticResponse>>>> {
-        self.latest_response.clone()
+    pub(crate) fn take_response_consumer(&self) -> Option<RealtimeConsumer<AcousticResponse>> {
+        self.response_consumer.lock().ok()?.take()
+    }
+
+    pub(crate) fn drain_retired_responses(&self) {
+        self.response_publication.drain_retired();
     }
 
     pub(crate) fn voice_input(&self) -> AcousticVoiceInput {
@@ -649,9 +656,7 @@ impl AcousticPropagation {
         {
             let _ = worker.join();
         }
-        if let Ok(mut response) = self.latest_response.lock() {
-            response.take();
-        }
+        self.response_publication.close();
     }
 }
 
@@ -663,7 +668,7 @@ impl Drop for AcousticPropagation {
 
 struct PropagationWorkerContext {
     input: Arc<SharedInput>,
-    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    response_publication: Publisher<AcousticResponse>,
     counters: Arc<AcousticPropagationCounters>,
     enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -674,7 +679,7 @@ struct PropagationWorkerContext {
 
 struct AcousticPublisher {
     input: Arc<SharedInput>,
-    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    response_publication: Publisher<AcousticResponse>,
     counters: Arc<AcousticPropagationCounters>,
     telemetry_sender: Sender<AcousticTelemetryEvent>,
 }
@@ -728,9 +733,9 @@ impl AcousticPublisher {
         let output = completed.into_solve_output(published_at);
         let response_spatial_revision = output.response.spatial_revision;
         let response_geometry_version = output.response.geometry_version;
-        let mut latest = self.latest_response.lock().ok()?;
-        *latest = Some(Arc::new(output.response));
-        drop(latest);
+        self.response_publication
+            .publish(Arc::new(output.response))
+            .ok()?;
         drop(publication_guard);
 
         self.counters
@@ -793,7 +798,7 @@ impl AcousticPublisher {
 fn propagation_loop(context: PropagationWorkerContext) {
     let PropagationWorkerContext {
         input,
-        latest_response,
+        response_publication,
         counters,
         enabled,
         stop,
@@ -803,7 +808,7 @@ fn propagation_loop(context: PropagationWorkerContext) {
     } = context;
     let publisher = AcousticPublisher {
         input: input.clone(),
-        latest_response,
+        response_publication,
         counters,
         telemetry_sender,
     };
@@ -4054,15 +4059,14 @@ mod tests {
                 )))
                 .unwrap();
         }
-        assert!(propagation.latest_response.lock().unwrap().is_none());
+        assert!(propagation.response_publication.latest().is_none());
         query.release();
 
         let deadline = Instant::now() + Duration::from_millis(ONE_SHOT_MILLIS);
         loop {
             let revision = propagation
-                .latest_response
-                .lock()
-                .unwrap()
+                .response_publication
+                .latest()
                 .as_ref()
                 .map(|response| response.spatial_revision);
             if revision == Some(frames_during_solve + 1) {
@@ -4148,9 +4152,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let latest_revision = propagation
-                .latest_response
-                .lock()
-                .unwrap()
+                .response_publication
+                .latest()
                 .as_ref()
                 .map(|response| response.spatial_revision);
             if latest_revision == Some(12) {

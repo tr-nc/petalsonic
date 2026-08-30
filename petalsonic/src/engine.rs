@@ -11,6 +11,7 @@ use crate::platform::output::{
     PreparedOutput,
 };
 use crate::playback::PlaybackCommand;
+use crate::realtime_latest::RealtimeConsumer;
 use crate::render::RenderQuantum;
 use crate::spatial::RetiredSpatialSource;
 use crossbeam_channel::{Receiver, Sender};
@@ -59,10 +60,8 @@ pub(crate) struct EngineStartup {
     pub desc: PetalSonicWorldDesc,
     pub active_voice_count: Arc<AtomicUsize>,
     pub retirement_sender: Sender<VoiceId>,
-    pub latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
-    pub spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
-    pub latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
-    pub acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
+    pub spatial_frames: RealtimeConsumer<SpatialFrame>,
+    pub acoustic_responses: RealtimeConsumer<AcousticResponse>,
     pub acoustic_voice_input: AcousticVoiceInput,
     pub acoustic_scene_version: Arc<std::sync::atomic::AtomicU64>,
     pub environmental_acoustics_enabled: Arc<AtomicBool>,

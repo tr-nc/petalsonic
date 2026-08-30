@@ -448,6 +448,11 @@ impl AudioRuntime {
         self.acoustic_propagation.quality()
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_acoustic_worker_for_test(&self) {
+        self.acoustic_propagation.fail_worker_for_test();
+    }
+
     pub(crate) fn set_bus_params(&self, index: usize, params: BusParams) -> Result<()> {
         let mut current = self
             .bus_params

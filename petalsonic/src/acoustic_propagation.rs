@@ -639,6 +639,17 @@ impl AcousticPropagation {
         f32::from_bits(self.quality_bits.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_worker_for_test(&self) {
+        let input = self.input.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = input.state.lock().unwrap();
+            panic!("injected acoustics worker dependency failure");
+        })
+        .join();
+        self.input.changed.notify_one();
+    }
+
     pub(crate) fn close(&self) {
         let state = self.input.state.lock().ok();
         self.stop.store(true, Ordering::Release);

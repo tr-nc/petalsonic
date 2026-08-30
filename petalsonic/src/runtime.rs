@@ -867,6 +867,50 @@ mod tests {
         fn emit_runtime_state(&self, _state: RuntimeState) {}
     }
 
+    struct ChildFailureDuringOutputRecovery<'a> {
+        runtime_state: &'a AtomicU8,
+    }
+
+    impl OutputRuntimeDriver for ChildFailureDuringOutputRecovery<'_> {
+        fn drain_retired_resources(&mut self) {}
+
+        fn reconcile_output(&mut self, _request: OutputRecoveryRequest) -> OutputRecoveryResult {
+            self.runtime_state
+                .store(RuntimeState::Failed as u8, Ordering::Release);
+            OutputRecoveryResult::Running(OutputDeviceState {
+                diagnostic_name: "A".into(),
+                sample_rate: 48_000,
+                physical_channels: 2,
+            })
+        }
+
+        fn emit_runtime_state(&self, _state: RuntimeState) {}
+    }
+
+    #[test]
+    fn output_recovery_cannot_overwrite_a_concurrent_child_failure() {
+        let runtime_state = AtomicU8::new(RuntimeState::Recovering as u8);
+        let recovery_attempts = AtomicU64::new(0);
+        let now = Instant::now();
+        let mut schedule = SupervisorSchedule::new(now);
+        let mut driver = ChildFailureDuringOutputRecovery {
+            runtime_state: &runtime_state,
+        };
+
+        AudioRuntime::supervisor_tick(
+            &mut driver,
+            &runtime_state,
+            &recovery_attempts,
+            &mut schedule,
+            now,
+        );
+
+        assert_eq!(
+            AudioRuntime::load_runtime_state(&runtime_state),
+            RuntimeState::Failed
+        );
+    }
+
     #[test]
     fn supervisor_publishes_running_after_default_device_recovery() {
         let a = FakeDevice {

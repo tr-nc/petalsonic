@@ -685,16 +685,22 @@ impl AudioRuntime {
         match result {
             OutputRecoveryResult::Stable => {}
             OutputRecoveryResult::Running(_device) => {
-                if state == RuntimeState::Running {
-                    driver.emit_runtime_state(RuntimeState::Recovering);
+                if Self::transition_runtime_state(runtime_state, state, RuntimeState::Running) {
+                    if state == RuntimeState::Running {
+                        driver.emit_runtime_state(RuntimeState::Recovering);
+                    }
+                    schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
+                    driver.emit_runtime_state(RuntimeState::Running);
                 }
-                runtime_state.store(RuntimeState::Running as u8, Ordering::Release);
-                schedule.next_health_probe = now + OUTPUT_RETRY_INTERVAL;
-                driver.emit_runtime_state(RuntimeState::Running);
             }
             OutputRecoveryResult::Recovering(_cause) => {
-                if state == RuntimeState::Running {
-                    runtime_state.store(RuntimeState::Recovering as u8, Ordering::Release);
+                if state == RuntimeState::Running
+                    && Self::transition_runtime_state(
+                        runtime_state,
+                        state,
+                        RuntimeState::Recovering,
+                    )
+                {
                     driver.emit_runtime_state(RuntimeState::Recovering);
                 }
                 if retry_now {
@@ -702,13 +708,29 @@ impl AudioRuntime {
                 }
             }
             OutputRecoveryResult::Failed(_failure) => {
-                if state == RuntimeState::Running {
-                    driver.emit_runtime_state(RuntimeState::Recovering);
+                if Self::transition_runtime_state(runtime_state, state, RuntimeState::Failed) {
+                    if state == RuntimeState::Running {
+                        driver.emit_runtime_state(RuntimeState::Recovering);
+                    }
+                    driver.emit_runtime_state(RuntimeState::Failed);
                 }
-                runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                driver.emit_runtime_state(RuntimeState::Failed);
             }
         }
+    }
+
+    fn transition_runtime_state(
+        runtime_state: &AtomicU8,
+        observed: RuntimeState,
+        next: RuntimeState,
+    ) -> bool {
+        runtime_state
+            .compare_exchange(
+                observed as u8,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     fn start_output_child(

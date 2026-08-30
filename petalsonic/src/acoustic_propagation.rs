@@ -2538,7 +2538,8 @@ mod tests {
         telemetry_capacity: usize,
     ) -> (AcousticPropagation, RuntimeChildren) {
         let state = Arc::new(AtomicU8::new(crate::events::RuntimeState::Recovering as u8));
-        let mut children = RuntimeChildren::new(state);
+        let mut children =
+            RuntimeChildren::new(crate::runtime_health::RuntimeFailurePublisher::new(state));
         let (propagation, worker) = AcousticPropagation::prepare(
             1.0,
             Arc::new(AtomicBool::new(enabled)),

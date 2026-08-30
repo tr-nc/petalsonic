@@ -88,6 +88,7 @@ mod playback;
 mod render;
 mod runtime;
 mod runtime_children;
+mod runtime_health;
 mod source_extent;
 mod spatial;
 mod world;

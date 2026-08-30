@@ -1,9 +1,9 @@
 use crate::error::{PetalSonicError, Result};
-use crate::events::RuntimeState;
+use crate::runtime_health::RuntimeFailurePublisher;
 use crossbeam_channel::Sender;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -112,20 +112,21 @@ struct RuntimeChild {
     handle: JoinHandle<ChildCompletion>,
 }
 
-/// Owns every asynchronous child in one audio runtime.
+/// Owns the runtime-level long-lived services in one audio runtime.
 ///
 /// Startup acknowledgement, cancellation, abnormal-exit classification, joining, panic
-/// conversion, and the aggregate close result all stay behind this one interface. Callers never
-/// receive a thread handle and child implementations never decide runtime health independently.
+/// conversion, and the aggregate close result for the output supervisor and acoustics service stay
+/// behind this interface. Session-scoped render work remains owned by the output session/engine and
+/// shares only [`RuntimeFailurePublisher`], never a task handle.
 pub(crate) struct RuntimeChildren {
-    runtime_state: Arc<AtomicU8>,
+    failure_publisher: RuntimeFailurePublisher,
     children: Mutex<Vec<RuntimeChild>>,
 }
 
 impl RuntimeChildren {
-    pub(crate) fn new(runtime_state: Arc<AtomicU8>) -> Self {
+    pub(crate) fn new(failure_publisher: RuntimeFailurePublisher) -> Self {
         Self {
-            runtime_state,
+            failure_publisher,
             children: Mutex::new(Vec::with_capacity(2)),
         }
     }
@@ -139,7 +140,7 @@ impl RuntimeChildren {
     ) -> Result<()> {
         let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
         let task_cancellation = cancellation.clone();
-        let state = self.runtime_state.clone();
+        let failure_publisher = self.failure_publisher.clone();
         let handle = std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
@@ -159,13 +160,8 @@ impl RuntimeChildren {
                     Ok(Err(failure)) => ChildCompletion::Failed(failure),
                     Err(_) => ChildCompletion::Failed(RuntimeChildFailure::new("panicked")),
                 };
-                if matches!(completion, ChildCompletion::Failed(_))
-                    && !matches!(
-                        load_runtime_state(&state),
-                        RuntimeState::Closing | RuntimeState::Closed
-                    )
-                {
-                    state.store(RuntimeState::Failed as u8, Ordering::Release);
+                if matches!(completion, ChildCompletion::Failed(_)) {
+                    failure_publisher.publish();
                 }
                 completion
             })
@@ -239,15 +235,5 @@ impl RuntimeChildren {
 impl Drop for RuntimeChildren {
     fn drop(&mut self) {
         let _ = self.close();
-    }
-}
-
-fn load_runtime_state(state: &AtomicU8) -> RuntimeState {
-    match state.load(Ordering::Acquire) {
-        value if value == RuntimeState::Running as u8 => RuntimeState::Running,
-        value if value == RuntimeState::Recovering as u8 => RuntimeState::Recovering,
-        value if value == RuntimeState::Failed as u8 => RuntimeState::Failed,
-        value if value == RuntimeState::Closing as u8 => RuntimeState::Closing,
-        _ => RuntimeState::Closed,
     }
 }

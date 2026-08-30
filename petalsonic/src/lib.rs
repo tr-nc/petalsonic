@@ -93,6 +93,8 @@ mod runtime_health;
 mod runtime_services;
 mod source_extent;
 mod spatial;
+#[cfg(test)]
+mod test_support;
 mod world;
 
 pub use acoustics::{

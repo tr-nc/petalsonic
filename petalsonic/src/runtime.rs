@@ -1,8 +1,8 @@
 use crate::acoustic_propagation::AcousticPropagation;
 use crate::acoustics::AcousticSceneSnapshot;
-use crate::config::{PetalSonicWorldDesc, SourceConfig};
+use crate::config::PetalSonicWorldDesc;
 use crate::domain::{BusParams, Emitter, SpatialFrame, VoiceId};
-use crate::engine::{EngineCommandReceivers, EngineObservability, EngineStartup, PetalSonicEngine};
+use crate::engine::{EngineObservability, PetalSonicEngine, PreparedEngine};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
     AcousticTelemetryDiagnostics, AcousticTelemetryEvent, PetalSonicEvent, RenderTimingEvent,
@@ -14,7 +14,7 @@ use crate::output_session::RenderWorkerFaultInjector;
 use crate::platform::output::{
     CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
 };
-use crate::playback::{AcceptedVoice, PlaybackCommand};
+use crate::playback::{AcceptedVoice, EmitterUpdate, PlaybackCommand};
 use crate::realtime_latest::{Publisher, RealtimeLatest};
 use crate::runtime_health::RuntimeFailurePublisher;
 use crate::runtime_services::{ChildCancellation, RuntimeChildFailure, RuntimeServices};
@@ -31,7 +31,7 @@ pub(crate) const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// runtime seam; callers cannot acquire or route through the underlying endpoints.
 pub(crate) enum RuntimeIntent {
     Play(AcceptedVoice),
-    UpdateEmitter(Emitter, SourceConfig, usize),
+    UpdateEmitter(EmitterUpdate),
     DestroyEmitter(Emitter),
     PauseEmitter(Emitter),
     ResumeEmitter(Emitter),
@@ -50,9 +50,7 @@ impl RuntimeIntent {
     fn into_command(self, block_size: usize) -> PlaybackCommand {
         match self {
             Self::Play(voice) => PlaybackCommand::Play(voice.prepare(block_size)),
-            Self::UpdateEmitter(emitter, config, bus) => {
-                PlaybackCommand::UpdateEmitter(emitter, config, bus)
-            }
+            Self::UpdateEmitter(update) => PlaybackCommand::UpdateEmitter(update),
             Self::DestroyEmitter(emitter) => PlaybackCommand::DestroyEmitter(emitter),
             Self::PauseEmitter(emitter) => PlaybackCommand::PauseEmitter(emitter),
             Self::ResumeEmitter(emitter) => PlaybackCommand::ResumeEmitter(emitter),
@@ -124,14 +122,8 @@ pub(crate) struct AudioRuntime {
     environmental_acoustics_enabled: Arc<AtomicBool>,
     command_sender: Sender<PlaybackCommand>,
     lifecycle_sender: Sender<PlaybackCommand>,
-    counters: Arc<RuntimeCounters>,
-    frames_processed: Arc<AtomicUsize>,
-    underrun_count: Arc<AtomicUsize>,
-    active_output_device: Arc<Mutex<Option<String>>>,
-    event_receiver: Receiver<PetalSonicEvent>,
-    voice_telemetry_receiver: Receiver<VoiceTelemetryEvent>,
+    observability: EngineObservability,
     acoustic_telemetry_receiver: Receiver<AcousticTelemetryEvent>,
-    timing_receiver: Receiver<RenderTimingEvent>,
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
     services: RuntimeServices,
@@ -203,38 +195,28 @@ impl AudioRuntime {
                 .chain(config.buses.iter().map(|bus| bus.params()))
                 .collect::<Vec<_>>(),
         ));
-        let (ports, observability) = PetalSonicEngine::create_runtime_ports(config);
-        let startup = EngineStartup {
-            desc: config.clone(),
-            active_voice_count: active_voice_count.clone(),
+        let (startup, observability) = PreparedEngine::new(
+            config.clone(),
+            active_voice_count.clone(),
             retirement_sender,
-            spatial_frames: spatial_frame_consumer,
-            acoustic_responses: acoustic_propagation
+            spatial_frame_consumer,
+            acoustic_propagation
                 .take_response_consumer()
                 .ok_or_else(|| {
                     PetalSonicError::Engine(
                         "Acoustic response consumer is already connected".into(),
                     )
                 })?,
-            acoustic_voice_input: acoustic_propagation.voice_input(),
-            acoustic_scene_version: acoustic_scene_version.clone(),
-            environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
-            ports,
-        };
-        let EngineObservability {
-            frames_processed,
-            underrun_count,
-            active_device_name,
-            event_receiver,
-            voice_telemetry_receiver,
-            timing_receiver,
-            counters,
-        } = observability;
+            acoustic_propagation.voice_input(),
+            acoustic_scene_version.clone(),
+            environmental_acoustics_enabled.clone(),
+            command_receiver,
+            lifecycle_receiver,
+        );
         Self::start_output_child(
             &mut services,
             startup,
             output,
-            EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
             bus_params.clone(),
             runtime_state.clone(),
             recovery_attempts.clone(),
@@ -257,14 +239,8 @@ impl AudioRuntime {
             environmental_acoustics_enabled,
             command_sender,
             lifecycle_sender,
-            counters,
-            frames_processed,
-            underrun_count,
-            active_output_device: active_device_name,
-            event_receiver,
-            voice_telemetry_receiver,
+            observability,
             acoustic_telemetry_receiver,
-            timing_receiver,
             runtime_state,
             recovery_attempts,
             services,
@@ -316,21 +292,23 @@ impl AudioRuntime {
         match sender.try_send(command) {
             Ok(()) => {
                 let high_water = if lifecycle {
-                    &self.counters.lifecycle_queue_high_water
+                    &self.observability.counters().lifecycle_queue_high_water
                 } else {
-                    &self.counters.control_queue_high_water
+                    &self.observability.counters().control_queue_high_water
                 };
                 RuntimeCounters::observe_high_water(high_water, sender.len());
                 Ok(())
             }
             Err(TrySendError::Full(_)) => {
-                self.counters
+                self.observability
+                    .counters()
                     .rejected_commands
                     .fetch_add(1, Ordering::Relaxed);
                 Err(PetalSonicError::QueuePressure)
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.counters
+                self.observability
+                    .counters()
                     .rejected_commands
                     .fetch_add(1, Ordering::Relaxed);
                 Err(PetalSonicError::RuntimeClosed)
@@ -439,15 +417,10 @@ impl AudioRuntime {
     }
 
     pub(crate) fn runtime_status(&self) -> RuntimeStatus {
-        let active_output_device = self
-            .active_output_device
-            .lock()
-            .map(|device| device.clone())
-            .unwrap_or_default();
         RuntimeStatus {
             state: RuntimeState::load(&self.runtime_state),
             recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
-            active_output_device,
+            active_output_device: self.observability.active_device_name(),
         }
     }
 
@@ -462,33 +435,25 @@ impl AudioRuntime {
             render_time_p95_us,
             render_time_p99_us,
             render_time_max_us,
-        ) = self.counters.render_summary();
+        ) = self.observability.counters().render_summary();
+        let counters = self.observability.counters();
         let acoustics = self.acoustic_propagation.diagnostics();
         RuntimeDiagnostics {
-            frames_processed: self.frames_processed.load(Ordering::Relaxed),
-            underrun_count: self.underrun_count.load(Ordering::Relaxed),
+            frames_processed: self.observability.frames_processed(),
+            underrun_count: self.observability.underrun_count(),
             active_emitters,
             active_voices: self.active_voice_count.load(Ordering::Acquire),
             control_queue_depth: self.command_sender.len(),
-            control_queue_high_water: self
-                .counters
-                .control_queue_high_water
-                .load(Ordering::Relaxed),
+            control_queue_high_water: counters.control_queue_high_water.load(Ordering::Relaxed),
             lifecycle_queue_depth: self.lifecycle_sender.len(),
-            lifecycle_queue_high_water: self
-                .counters
-                .lifecycle_queue_high_water
-                .load(Ordering::Relaxed),
-            event_queue_depth: self.event_receiver.len(),
-            event_queue_high_water: self.counters.event_queue_high_water.load(Ordering::Relaxed),
-            timing_queue_depth: self.timing_receiver.len(),
-            timing_queue_high_water: self
-                .counters
-                .timing_queue_high_water
-                .load(Ordering::Relaxed),
-            rejected_commands: self.counters.rejected_commands.load(Ordering::Relaxed),
-            dropped_events: self.counters.dropped_events.load(Ordering::Relaxed),
-            dropped_timing_events: self.counters.dropped_timing_events.load(Ordering::Relaxed),
+            lifecycle_queue_high_water: counters.lifecycle_queue_high_water.load(Ordering::Relaxed),
+            event_queue_depth: self.observability.event_queue_depth(),
+            event_queue_high_water: counters.event_queue_high_water.load(Ordering::Relaxed),
+            timing_queue_depth: self.observability.timing_queue_depth(),
+            timing_queue_high_water: counters.timing_queue_high_water.load(Ordering::Relaxed),
+            rejected_commands: counters.rejected_commands.load(Ordering::Relaxed),
+            dropped_events: counters.dropped_events.load(Ordering::Relaxed),
+            dropped_timing_events: counters.dropped_timing_events.load(Ordering::Relaxed),
             render_iterations,
             render_time_p50_us,
             render_time_p95_us,
@@ -511,14 +476,13 @@ impl AudioRuntime {
             acoustic_lobe_count: acoustics.lobe_count,
             acoustic_retained_response_count: acoustics.retained_response_count,
             acoustic_deferred_response_count: acoustics.deferred_response_count,
-            acoustic_render_rejected_response_count: self
-                .counters
+            acoustic_render_rejected_response_count: counters
                 .acoustic_render_rejected_responses
                 .load(Ordering::Relaxed),
-            device_generation: self.counters.device_generation.load(Ordering::Relaxed),
+            device_generation: counters.device_generation.load(Ordering::Relaxed),
             recovery_attempts: self.recovery_attempts.load(Ordering::Relaxed),
-            output_sample_rate: self.counters.output_sample_rate.load(Ordering::Relaxed) as u32,
-            output_channels: self.counters.output_channels.load(Ordering::Relaxed) as u16,
+            output_sample_rate: counters.output_sample_rate.load(Ordering::Relaxed) as u32,
+            output_channels: counters.output_channels.load(Ordering::Relaxed) as u16,
             spatial_quality: desc.spatial_quality,
             latency_profile: desc.latency_profile,
         }
@@ -529,33 +493,23 @@ impl AudioRuntime {
     }
 
     pub(crate) fn frames_processed(&self) -> usize {
-        self.frames_processed.load(Ordering::Relaxed)
+        self.observability.frames_processed()
     }
 
     pub(crate) fn underrun_count(&self) -> usize {
-        self.underrun_count.load(Ordering::Relaxed)
+        self.observability.underrun_count()
     }
 
     pub(crate) fn drain_events(&self) -> Vec<PetalSonicEvent> {
-        self.event_receiver.try_iter().collect()
+        self.observability.drain_events()
     }
 
     pub(crate) fn drain_voice_telemetry(&self) -> Vec<VoiceTelemetryEvent> {
-        self.voice_telemetry_receiver.try_iter().collect()
+        self.observability.drain_voice_telemetry()
     }
 
     pub(crate) fn voice_telemetry_diagnostics(&self) -> VoiceTelemetryDiagnostics {
-        VoiceTelemetryDiagnostics {
-            queue_depth: self.voice_telemetry_receiver.len(),
-            queue_high_water: self
-                .counters
-                .voice_telemetry_queue_high_water
-                .load(Ordering::Relaxed),
-            dropped_events: self
-                .counters
-                .dropped_voice_telemetry
-                .load(Ordering::Relaxed),
-        }
+        self.observability.voice_telemetry_diagnostics()
     }
 
     pub(crate) fn drain_acoustic_telemetry(&self) -> Vec<AcousticTelemetryEvent> {
@@ -572,7 +526,7 @@ impl AudioRuntime {
     }
 
     pub(crate) fn drain_timing_events(&self) -> Vec<RenderTimingEvent> {
-        self.timing_receiver.try_iter().collect()
+        self.observability.drain_timing_events()
     }
 
     pub(crate) fn drain_retired_voice_ids(&self) -> Vec<VoiceId> {
@@ -687,9 +641,8 @@ impl AudioRuntime {
 
     fn start_output_child(
         services: &mut RuntimeServices,
-        startup: EngineStartup,
+        startup: PreparedEngine,
         output: Box<dyn FnOnce() -> Result<Box<dyn OutputPlatform>> + Send>,
-        command_receivers: EngineCommandReceivers,
         bus_params: Arc<Mutex<Vec<BusParams>>>,
         runtime_state: Arc<AtomicU8>,
         recovery_attempts: Arc<AtomicU64>,
@@ -711,7 +664,6 @@ impl AudioRuntime {
                 let mut engine = match PetalSonicEngine::new_with_output(
                     startup,
                     output,
-                    command_receivers.clone(),
                     initial_buses,
                     runtime_failure,
                     #[cfg(test)]

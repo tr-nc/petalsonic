@@ -122,71 +122,62 @@ pub(crate) struct AcousticResponse {
     pub solve_time_us: u64,
 }
 
+/// One Voice's complete view of an immutable acoustic publication.
+///
+/// The renderer resolves this envelope once per Voice and quantum, then shares its behavior
+/// across direct, environment, reflection, and telemetry processing without another search.
+#[derive(Clone, Copy)]
+pub(crate) struct VoiceAcousticResponse<'a> {
+    frame: &'a AcousticResponse,
+    voice: &'a DirectAcousticResponse,
+}
+
+impl<'a> VoiceAcousticResponse<'a> {
+    #[cfg(test)]
+    pub(crate) fn direct_gain(self) -> [f32; 3] {
+        self.voice.gain
+    }
+
+    pub(crate) fn direct_gain_target(self) -> Option<[f32; 3]> {
+        (self.voice.solve_status != DirectSolveStatus::Deferred).then_some(self.voice.gain)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn environment_gain(self) -> [f32; 3] {
+        self.voice.environment_gain
+    }
+
+    pub(crate) fn environment_gain_target(self) -> Option<[f32; 3]> {
+        (self.voice.solve_status != DirectSolveStatus::Deferred)
+            .then_some(self.voice.environment_gain)
+    }
+
+    pub(crate) fn telemetry(self) -> EnvironmentResponseTelemetry {
+        EnvironmentResponseTelemetry {
+            spatial_revision: self.frame.spatial_revision,
+            geometry_version: self.frame.geometry_version,
+            age: self.frame.published_at.elapsed(),
+        }
+    }
+
+    pub(crate) fn direct_lobes(self) -> Option<&'a [DirectLobeTarget]> {
+        (self.voice.solve_status != DirectSolveStatus::Deferred)
+            .then_some(self.voice.direct_lobes.as_slice())
+    }
+
+    pub(crate) fn early_reflections(self) -> &'a [EarlyReflectionTap] {
+        self.voice.early_reflections.as_slice()
+    }
+}
+
 impl AcousticResponse {
-    #[cfg(test)]
-    pub(crate) fn direct_gain(&self, voice_id: VoiceId) -> [f32; 3] {
+    pub(crate) fn voice_response(&self, voice_id: VoiceId) -> Option<VoiceAcousticResponse<'_>> {
+        #[cfg(test)]
+        crate::test_support::record_acoustic_response_lookup();
         self.direct
             .iter()
             .find(|response| response.voice_id == voice_id)
-            .map(|response| response.gain)
-            .unwrap_or([1.0; 3])
-    }
-
-    pub(crate) fn direct_gain_target(&self, voice_id: VoiceId) -> Option<[f32; 3]> {
-        self.direct
-            .iter()
-            .find(|response| response.voice_id == voice_id)
-            .and_then(|response| {
-                (response.solve_status != DirectSolveStatus::Deferred).then_some(response.gain)
-            })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn environment_gain(&self, voice_id: VoiceId) -> [f32; 3] {
-        self.direct
-            .iter()
-            .find(|response| response.voice_id == voice_id)
-            .map(|response| response.environment_gain)
-            .unwrap_or([1.0; 3])
-    }
-
-    pub(crate) fn environment_gain_target(&self, voice_id: VoiceId) -> Option<[f32; 3]> {
-        self.direct
-            .iter()
-            .find(|response| response.voice_id == voice_id)
-            .and_then(|response| {
-                (response.solve_status != DirectSolveStatus::Deferred)
-                    .then_some(response.environment_gain)
-            })
-    }
-
-    pub(crate) fn early_reflections(&self, voice_id: VoiceId) -> &[EarlyReflectionTap] {
-        self.direct
-            .iter()
-            .find(|response| response.voice_id == voice_id)
-            .map(|response| response.early_reflections.as_slice())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn direct_lobes_target(&self, voice_id: VoiceId) -> Option<&[DirectLobeTarget]> {
-        self.direct
-            .iter()
-            .find(|response| response.voice_id == voice_id)
-            .and_then(|response| {
-                (response.solve_status != DirectSolveStatus::Deferred)
-                    .then_some(response.direct_lobes.as_slice())
-            })
-    }
-
-    pub(crate) fn telemetry(&self, voice_id: VoiceId) -> Option<EnvironmentResponseTelemetry> {
-        self.direct
-            .iter()
-            .any(|response| response.voice_id == voice_id)
-            .then(|| EnvironmentResponseTelemetry {
-                spatial_revision: self.spatial_revision,
-                geometry_version: self.geometry_version,
-                age: self.published_at.elapsed(),
-            })
+            .map(|voice| VoiceAcousticResponse { frame: self, voice })
     }
 }
 
@@ -3848,7 +3839,13 @@ mod tests {
             .find(|response| response.voice_id == VoiceId::from(1))
             .unwrap();
         assert_eq!(voice_a.solve_status, DirectSolveStatus::Deferred);
-        assert_eq!(deferred.response.direct_gain_target(VoiceId::from(1)), None);
+        assert_eq!(
+            deferred
+                .response
+                .voice_response(VoiceId::from(1))
+                .and_then(VoiceAcousticResponse::direct_gain_target),
+            None
+        );
         let deferred_telemetry = deferred
             .telemetry
             .iter()
@@ -3977,10 +3974,12 @@ mod tests {
 
         let response = solve_response(&input, 1.0);
         assert_eq!(response.direct.len(), 2);
-        assert_eq!(response.environment_gain(VoiceId::from(41)), [0.2; 3]);
-        assert_eq!(response.environment_gain(VoiceId::from(42)), [0.8; 3]);
-        assert_eq!(response.direct_gain(VoiceId::from(41)), [1.0; 3]);
-        assert_eq!(response.direct_gain(VoiceId::from(42)), [1.0; 3]);
+        let voice_a = response.voice_response(VoiceId::from(41)).unwrap();
+        let voice_b = response.voice_response(VoiceId::from(42)).unwrap();
+        assert_eq!(voice_a.environment_gain(), [0.2; 3]);
+        assert_eq!(voice_b.environment_gain(), [0.8; 3]);
+        assert_eq!(voice_a.direct_gain(), [1.0; 3]);
+        assert_eq!(voice_b.direct_gain(), [1.0; 3]);
     }
 
     #[test]

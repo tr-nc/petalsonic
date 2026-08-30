@@ -1,5 +1,4 @@
 use crate::audio_data::PetalSonicAudioData;
-use crate::config::SourceConfig;
 use crate::math::Pose;
 pub use crate::occlusion::{DistributedOcclusionProfile, MAX_DIRECT_LOBES, OcclusionProfile};
 use crate::playback::LoopMode;
@@ -668,14 +667,6 @@ impl EmitterDesc {
         match self.placement {
             EmitterPlacement::NonSpatial => None,
             EmitterPlacement::Spatial(pose) => Some(pose),
-        }
-    }
-
-    pub(crate) fn source_config(&self, voice_gain_db: f32) -> SourceConfig {
-        let gain_db = self.gain_db + voice_gain_db;
-        match self.placement {
-            EmitterPlacement::NonSpatial => SourceConfig::non_spatial_with_volume_db(gain_db),
-            EmitterPlacement::Spatial(pose) => SourceConfig::spatial_with_volume_db(pose, gain_db),
         }
     }
 

@@ -1,7 +1,6 @@
 //! Closed physical-output and render-thread lifecycle.
 
 use crate::config::{OutputDevicePolicy, PetalSonicWorldDesc};
-use crate::engine::MASTER_HEADROOM_DB;
 use crate::error::{PetalSonicError, Result};
 use crate::events::RuntimeCounters;
 use crate::platform::output::{
@@ -9,7 +8,7 @@ use crate::platform::output::{
     OutputRecoveryCause, OutputRecoveryReason, OutputRecoveryRequest, OutputRecoveryResult,
     PreparedOutput,
 };
-use crate::render::RenderQuantum;
+use crate::render::{MASTER_HEADROOM_DB, RenderQuantum};
 use crate::runtime_health::RuntimeFailurePublisher;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -558,11 +557,10 @@ mod tests {
     use super::*;
     use crate::acoustic_propagation::AcousticVoiceInput;
     use crate::domain::BusParams;
-    use crate::engine::{EngineCommandReceivers, EngineStartup, PetalSonicEngine};
     use crate::events::RuntimeState;
     use crate::platform::output::fake::{FakeDevice, FakeOutputHandle, FakeOutputPlatform};
     use crate::realtime_latest::RealtimeLatest;
-    use crate::render::RenderQuantum;
+    use crate::render::{PreparedRender, RenderQuantum};
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -585,21 +583,32 @@ mod tests {
         let (backend_retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
         let (_spatial_publisher, spatial_frames) = RealtimeLatest::bounded(1);
         let (_acoustic_publisher, acoustic_responses) = RealtimeLatest::bounded(2);
-        let (ports, observability) = PetalSonicEngine::create_runtime_ports(&desc);
-        let startup = EngineStartup {
-            desc: desc.clone(),
-            active_voice_count: Arc::new(AtomicUsize::new(0)),
+        let frames_processed = Arc::new(AtomicUsize::new(0));
+        let underrun_count = Arc::new(AtomicUsize::new(0));
+        let active_device_name = Arc::new(Mutex::new(None));
+        let counters = Arc::new(RuntimeCounters::default());
+        let (event_sender, _events) = crossbeam_channel::bounded(desc.event_queue_capacity);
+        let (voice_telemetry_sender, _voice_telemetry) =
+            crossbeam_channel::bounded(desc.event_queue_capacity);
+        let (timing_sender, _timing) = crossbeam_channel::bounded(desc.timing_queue_capacity);
+        let startup = PreparedRender::new(
+            desc.clone(),
+            Arc::new(AtomicUsize::new(0)),
             retirement_sender,
             spatial_frames,
             acoustic_responses,
-            acoustic_voice_input: AcousticVoiceInput::isolated(desc.max_voices),
-            acoustic_scene_version: Arc::new(AtomicU64::new(0)),
-            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
-            ports,
-        };
+            AcousticVoiceInput::isolated(desc.max_voices),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            regular,
+            lifecycle,
+            event_sender,
+            voice_telemetry_sender,
+            timing_sender,
+            counters.clone(),
+        );
         let render = RenderQuantum::new(
             startup,
-            EngineCommandReceivers::new(regular, lifecycle),
             vec![BusParams::default()],
             backend_retirement_sender,
         )
@@ -614,10 +623,10 @@ mod tests {
                 desc,
                 Box::new(platform),
                 Arc::new(Mutex::new(render)),
-                observability.frames_processed,
-                observability.underrun_count,
-                observability.active_device_name,
-                observability.counters,
+                frames_processed,
+                underrun_count,
+                active_device_name,
+                counters,
                 RuntimeFailurePublisher::new(runtime_state.clone()),
                 render_worker_fault.clone(),
             ),

@@ -10,7 +10,7 @@ use crate::events::{
     VoiceTelemetryEvent,
 };
 use crate::math::Pose;
-use crate::playback::AcceptedVoice;
+use crate::playback::{AcceptedVoice, EmitterUpdate};
 use crate::runtime::{AudioRuntime, RuntimeIntent};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -373,11 +373,10 @@ impl PetalSonicWorld {
                 reason: "extent changes must be published in a complete SpatialFrame".into(),
             });
         }
-        self.runtime.try_submit(RuntimeIntent::UpdateEmitter(
-            emitter,
-            desc.source_config(0.0),
-            bus_index,
-        ))?;
+        self.runtime
+            .try_submit(RuntimeIntent::UpdateEmitter(EmitterUpdate::capture(
+                emitter, &desc, bus_index,
+            )))?;
         state.desc = desc;
         Ok(())
     }

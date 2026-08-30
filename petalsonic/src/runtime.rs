@@ -1,6 +1,6 @@
 use crate::acoustic_propagation::AcousticPropagation;
 use crate::acoustics::AcousticSceneSnapshot;
-use crate::config::{PetalSonicWorldDesc, SourceConfig};
+use crate::config::PetalSonicWorldDesc;
 use crate::domain::{BusParams, Emitter, SpatialFrame, VoiceId};
 use crate::engine::{EngineObservability, PetalSonicEngine, PreparedEngine};
 use crate::error::{PetalSonicError, Result};
@@ -14,7 +14,7 @@ use crate::output_session::RenderWorkerFaultInjector;
 use crate::platform::output::{
     CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
 };
-use crate::playback::{AcceptedVoice, PlaybackCommand};
+use crate::playback::{AcceptedVoice, EmitterUpdate, PlaybackCommand};
 use crate::realtime_latest::{Publisher, RealtimeLatest};
 use crate::runtime_health::RuntimeFailurePublisher;
 use crate::runtime_services::{ChildCancellation, RuntimeChildFailure, RuntimeServices};
@@ -31,7 +31,7 @@ pub(crate) const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// runtime seam; callers cannot acquire or route through the underlying endpoints.
 pub(crate) enum RuntimeIntent {
     Play(AcceptedVoice),
-    UpdateEmitter(Emitter, SourceConfig, usize),
+    UpdateEmitter(EmitterUpdate),
     DestroyEmitter(Emitter),
     PauseEmitter(Emitter),
     ResumeEmitter(Emitter),
@@ -50,9 +50,7 @@ impl RuntimeIntent {
     fn into_command(self, block_size: usize) -> PlaybackCommand {
         match self {
             Self::Play(voice) => PlaybackCommand::Play(voice.prepare(block_size)),
-            Self::UpdateEmitter(emitter, config, bus) => {
-                PlaybackCommand::UpdateEmitter(emitter, config, bus)
-            }
+            Self::UpdateEmitter(update) => PlaybackCommand::UpdateEmitter(update),
             Self::DestroyEmitter(emitter) => PlaybackCommand::DestroyEmitter(emitter),
             Self::PauseEmitter(emitter) => PlaybackCommand::PauseEmitter(emitter),
             Self::ResumeEmitter(emitter) => PlaybackCommand::ResumeEmitter(emitter),

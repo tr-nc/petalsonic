@@ -667,6 +667,11 @@ impl AcousticPropagation {
         self.input.changed.notify_one();
     }
 
+    #[cfg(test)]
+    pub(crate) fn panic_worker_for_test(&self) {
+        self.fail_worker_for_test();
+    }
+
     pub(crate) fn clear_published_response(&self) {
         if let Ok(mut response) = self.latest_response.lock() {
             response.take();

@@ -1146,6 +1146,28 @@ mod tests {
     }
 
     #[test]
+    fn world_classifies_acoustics_child_panic_during_close() {
+        let device = PlatformFakeDevice::stereo("A", 48_000);
+        let (adapter, _) = FakeOutputPlatform::scripted(vec![device], Some(0));
+        let desc = crate::config::PetalSonicWorldDesc {
+            environmental_acoustics_enabled: true,
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
+
+        world.runtime.panic_acoustic_worker_for_test();
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Failed);
+        let close_error = world
+            .close()
+            .expect_err("an acoustics child panic must remain visible during close");
+        assert!(
+            close_error.to_string().contains("acoustics: panicked"),
+            "close did not classify the child panic: {close_error}"
+        );
+        assert_eq!(world.runtime_status().state, RuntimeState::Closed);
+    }
+
+    #[test]
     fn bus_declarations_are_bounded_unique_and_exclude_master() {
         let mut desc = crate::config::PetalSonicWorldDesc {
             max_buses: 1,

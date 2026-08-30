@@ -762,7 +762,7 @@ impl AudioRuntime {
                     );
                     std::thread::park_timeout(poll_interval);
                 }
-                let _ = engine.stop();
+                let _ = engine.close();
             })
             .map_err(|error| {
                 PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))

@@ -741,6 +741,7 @@ pub(crate) mod fake {
         prepared: Option<(u64, usize)>,
         callback: Option<OutputCallback>,
         stream_failed: bool,
+        fail_next_open: bool,
         captured: Vec<f32>,
         actions: Vec<&'static str>,
         virtual_time: Duration,
@@ -756,6 +757,10 @@ pub(crate) mod fake {
 
         pub(crate) fn fail_stream(&self) {
             self.0.lock().unwrap().stream_failed = true;
+        }
+
+        pub(crate) fn fail_next_open(&self) {
+            self.0.lock().unwrap().fail_next_open = true;
         }
 
         pub(crate) fn advance(&self, frames: usize) {
@@ -859,6 +864,11 @@ pub(crate) mod fake {
             if token != prepared.token {
                 return Err(PetalSonicError::AudioDevice(
                     "Prepared fake output capability is stale".into(),
+                ));
+            }
+            if std::mem::take(&mut state.fail_next_open) {
+                return Err(PetalSonicError::AudioDevice(
+                    "scripted fake output open failure".into(),
                 ));
             }
             if state.devices[selected].sample_format == FakeSampleFormat::Unsupported {

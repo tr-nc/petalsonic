@@ -1015,7 +1015,7 @@ mod tests {
         let mut output = [0.0f32; 8];
         let stream_error = AtomicBool::new(false);
 
-        let activity = crate::engine::tests::callback_memory_activity(|| {
+        let activity = crate::test_support::realtime_memory_activity(|| {
             callback.write(&mut output, 2);
             stream_error.store(true, Ordering::Release);
         });

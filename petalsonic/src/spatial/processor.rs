@@ -1885,7 +1885,7 @@ mod tests {
             )
             .unwrap();
 
-        let memory_activity = crate::engine::tests::callback_memory_activity(|| {
+        let memory_activity = crate::test_support::realtime_memory_activity(|| {
             processor
                 .process_spatial_sources_with_metrics(
                     &[voice_id],

@@ -7,7 +7,6 @@ use crate::acoustic_propagation::{AcousticResponse, AcousticVoiceInput};
 use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::{LatencyProfile, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
-use crate::engine::{EngineCommandReceivers, EngineStartup};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeCounters, VoiceTelemetryEvent};
 use crate::mixer::{self, CompletedPlayback, MixerScratch};
@@ -20,17 +19,76 @@ use crate::spatial::{
     AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
     SpatialRenderContext,
 };
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Observer, Producer, Split},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const LOGICAL_CHANNELS: u16 = 2;
+pub(crate) const MASTER_HEADROOM_DB: f32 = -6.0;
+
+/// The single-consume owner of every endpoint required by one render quantum.
+///
+/// Fields stay private so only the render module can interpret or partially consume the
+/// producer-to-consumer topology assembled by the engine owner.
+pub(crate) struct PreparedRender {
+    desc: crate::config::PetalSonicWorldDesc,
+    active_voice_count: Arc<AtomicUsize>,
+    retirement_sender: Sender<VoiceId>,
+    spatial_frames: RealtimeConsumer<SpatialFrame>,
+    acoustic_responses: RealtimeConsumer<AcousticResponse>,
+    acoustic_voice_input: AcousticVoiceInput,
+    acoustic_scene_version: Arc<AtomicU64>,
+    environmental_acoustics_enabled: Arc<AtomicBool>,
+    regular_commands: Receiver<PlaybackCommand>,
+    lifecycle_commands: Receiver<PlaybackCommand>,
+    event_sender: Sender<PetalSonicEvent>,
+    voice_telemetry_sender: Sender<VoiceTelemetryEvent>,
+    timing_sender: Sender<RenderTimingEvent>,
+    counters: Arc<RuntimeCounters>,
+}
+
+impl PreparedRender {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        desc: crate::config::PetalSonicWorldDesc,
+        active_voice_count: Arc<AtomicUsize>,
+        retirement_sender: Sender<VoiceId>,
+        spatial_frames: RealtimeConsumer<SpatialFrame>,
+        acoustic_responses: RealtimeConsumer<AcousticResponse>,
+        acoustic_voice_input: AcousticVoiceInput,
+        acoustic_scene_version: Arc<AtomicU64>,
+        environmental_acoustics_enabled: Arc<AtomicBool>,
+        regular_commands: Receiver<PlaybackCommand>,
+        lifecycle_commands: Receiver<PlaybackCommand>,
+        event_sender: Sender<PetalSonicEvent>,
+        voice_telemetry_sender: Sender<VoiceTelemetryEvent>,
+        timing_sender: Sender<RenderTimingEvent>,
+        counters: Arc<RuntimeCounters>,
+    ) -> Self {
+        Self {
+            desc,
+            active_voice_count,
+            retirement_sender,
+            spatial_frames,
+            acoustic_responses,
+            acoustic_voice_input,
+            acoustic_scene_version,
+            environmental_acoustics_enabled,
+            regular_commands,
+            lifecycle_commands,
+            event_sender,
+            voice_telemetry_sender,
+            timing_sender,
+            counters,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpatialBackendPlan {
@@ -119,7 +177,8 @@ pub(crate) struct RenderQuantum {
     active_voice_count: Arc<AtomicUsize>,
     processor: SpatialProcessor,
     buses: Vec<BusParams>,
-    command_receivers: EngineCommandReceivers,
+    regular_commands: Receiver<PlaybackCommand>,
+    lifecycle_commands: Receiver<PlaybackCommand>,
     spatial_frames: RealtimeConsumer<SpatialFrame>,
     current_spatial_frame: Option<Arc<SpatialFrame>>,
     acoustic_responses: RealtimeConsumer<AcousticResponse>,
@@ -140,12 +199,11 @@ pub(crate) struct RenderQuantum {
 
 impl RenderQuantum {
     pub(crate) fn new(
-        startup: EngineStartup,
-        command_receivers: EngineCommandReceivers,
+        startup: PreparedRender,
         buses: Vec<BusParams>,
         backend_retirement_sender: Sender<RetiredSpatialSource>,
     ) -> Result<Self> {
-        let EngineStartup {
+        let PreparedRender {
             desc,
             active_voice_count,
             retirement_sender,
@@ -154,7 +212,12 @@ impl RenderQuantum {
             acoustic_voice_input,
             acoustic_scene_version,
             environmental_acoustics_enabled,
-            ports,
+            regular_commands,
+            lifecycle_commands,
+            event_sender,
+            voice_telemetry_sender,
+            timing_sender,
+            counters,
         } = startup;
         let backend_plan = SpatialBackendPlan::for_quality(desc.spatial_quality);
         let processor = SpatialProcessor::new(SpatialProcessorConfig {
@@ -177,22 +240,23 @@ impl RenderQuantum {
             block_size: desc.block_size,
             max_voices,
             schedule: RenderSchedule::for_profile(desc.latency_profile),
-            master_gain_linear: crate::gain::db_to_linear(super::engine::MASTER_HEADROOM_DB),
+            master_gain_linear: crate::gain::db_to_linear(MASTER_HEADROOM_DB),
             active_playback: HashMap::with_capacity(max_voices),
             active_voice_count,
             processor,
             buses,
-            command_receivers,
+            regular_commands,
+            lifecycle_commands,
             spatial_frames,
             current_spatial_frame: None,
             acoustic_responses,
             acoustic_voice_input,
             acoustic_scene_version,
             retirement_sender,
-            event_sender: ports.event_sender,
-            voice_telemetry_sender: ports.voice_telemetry_sender,
-            timing_sender: ports.timing_sender,
-            counters: ports.counters,
+            event_sender,
+            voice_telemetry_sender,
+            timing_sender,
+            counters,
             backend_retirement_sender,
             pending_backend_retirements: Vec::with_capacity(max_voices),
             mixer_scratch: MixerScratch::new(max_voices),
@@ -317,13 +381,13 @@ impl RenderQuantum {
     }
 
     fn process_commands(&mut self) {
-        for _ in 0..self.command_receivers.regular.capacity().unwrap_or(1) {
-            let Ok(command) = self.command_receivers.regular.try_recv() else {
+        for _ in 0..self.regular_commands.capacity().unwrap_or(1) {
+            let Ok(command) = self.regular_commands.try_recv() else {
                 break;
             };
             self.apply_command(command);
         }
-        while let Ok(command) = self.command_receivers.lifecycle.try_recv() {
+        while let Ok(command) = self.lifecycle_commands.try_recv() {
             self.apply_command(command);
         }
     }
@@ -655,7 +719,6 @@ mod tests {
         DirectPath, Emitter, EmitterDesc, EnvironmentSend, OcclusionProfile, PlayOptions,
         SourceExtent,
     };
-    use crate::engine::PetalSonicEngine;
     use crate::playback::prepare_test_voice;
     use crate::realtime_latest::Publisher;
     use crate::spatial::LateReverbParameters;
@@ -699,30 +762,37 @@ mod tests {
         let (_, spatial_frames) = RealtimeLatest::bounded(1);
         let (acoustic_responses, acoustic_response_consumer) = RealtimeLatest::bounded(2);
         let (backend_retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
-        let (ports, observability) = PetalSonicEngine::create_runtime_ports(&desc);
-        let startup = EngineStartup {
+        let (event_sender, events) = crossbeam_channel::bounded(desc.event_queue_capacity);
+        let (voice_telemetry_sender, _voice_telemetry) =
+            crossbeam_channel::bounded(desc.event_queue_capacity);
+        let (timing_sender, timing) = crossbeam_channel::bounded(desc.timing_queue_capacity);
+        let startup = PreparedRender::new(
             desc,
-            active_voice_count: Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
             retirement_sender,
             spatial_frames,
-            acoustic_responses: acoustic_response_consumer,
-            acoustic_voice_input: AcousticVoiceInput::isolated(max_voices.max(1)),
-            acoustic_scene_version: Arc::new(AtomicU64::new(0)),
-            environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
-            ports,
-        };
+            acoustic_response_consumer,
+            AcousticVoiceInput::isolated(max_voices.max(1)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            regular,
+            lifecycle,
+            event_sender,
+            voice_telemetry_sender,
+            timing_sender,
+            Arc::new(RuntimeCounters::default()),
+        );
         Harness {
             quantum: RenderQuantum::new(
                 startup,
-                EngineCommandReceivers::new(regular, lifecycle),
                 vec![BusParams::default()],
                 backend_retirement_sender,
             )
             .unwrap(),
             acoustic_responses,
             commands,
-            events: observability.event_receiver,
-            timing: observability.timing_receiver,
+            events,
+            timing,
         }
     }
 
@@ -978,7 +1048,7 @@ mod tests {
         while consumer.try_pop().is_some() {}
         while harness.timing.try_recv().is_ok() {}
 
-        let activity = crate::engine::tests::callback_memory_activity(|| {
+        let activity = crate::test_support::realtime_memory_activity(|| {
             harness.quantum.render();
         });
 

@@ -87,6 +87,7 @@ mod platform;
 mod playback;
 mod render;
 mod runtime;
+mod runtime_children;
 mod source_extent;
 mod spatial;
 mod world;

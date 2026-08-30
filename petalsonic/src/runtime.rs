@@ -17,10 +17,12 @@ use crate::platform::output::{
     CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
 };
 use crate::playback::{LoopMode, PlaybackCommand};
+use crate::runtime_children::{
+    ChildCancellation, RuntimeChildFailure, RuntimeChildKind, RuntimeChildren,
+};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub(crate) const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
@@ -182,9 +184,8 @@ pub(crate) struct AudioRuntime {
     timing_receiver: Receiver<RenderTimingEvent>,
     runtime_state: Arc<AtomicU8>,
     recovery_attempts: Arc<AtomicU64>,
-    supervisor_stop: Arc<AtomicBool>,
+    children: RuntimeChildren,
     close_lock: Mutex<()>,
-    supervisor_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AudioRuntime {
@@ -226,19 +227,18 @@ impl AudioRuntime {
         ));
         let environmental_acoustics_enabled =
             Arc::new(AtomicBool::new(config.environmental_acoustics_enabled));
-        let acoustic_propagation = AcousticPropagation::new(
+        let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
+        let recovery_attempts = Arc::new(AtomicU64::new(0));
+        let mut children = RuntimeChildren::new(runtime_state.clone());
+        let (acoustic_propagation, acoustic_worker) = AcousticPropagation::prepare(
             config.distance_scaler,
             environmental_acoustics_enabled.clone(),
             config.environmental_acoustics_quality,
             config.environmental_acoustics_budget,
             config.max_voices,
             config.event_queue_capacity,
-        )
-        .map_err(|error| {
-            PetalSonicError::Engine(format!(
-                "Failed to start acoustic propagation worker: {error}"
-            ))
-        })?;
+        );
+        acoustic_worker.start(&mut children)?;
         let acoustic_telemetry_receiver = acoustic_propagation.telemetry_receiver();
         if let Some(scene) = initial_acoustic_scene {
             acoustic_propagation.publish_scene(scene).map_err(|_| {
@@ -275,17 +275,14 @@ impl AudioRuntime {
             timing_receiver,
             counters,
         } = observability;
-        let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
-        let recovery_attempts = Arc::new(AtomicU64::new(0));
-        let supervisor_stop = Arc::new(AtomicBool::new(false));
-        let supervisor_thread = Self::spawn_output_supervisor(
+        Self::start_output_child(
+            &mut children,
             startup,
             output,
             EngineCommandReceivers::new(command_receiver, lifecycle_receiver),
             bus_params.clone(),
             runtime_state.clone(),
             recovery_attempts.clone(),
-            supervisor_stop.clone(),
         )?;
 
         Ok(Self {
@@ -314,9 +311,8 @@ impl AudioRuntime {
             timing_receiver,
             runtime_state,
             recovery_attempts,
-            supervisor_stop,
+            children,
             close_lock: Mutex::new(()),
-            supervisor_thread: Mutex::new(Some(supervisor_thread)),
         })
     }
 
@@ -635,25 +631,14 @@ impl AudioRuntime {
         }
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
-        self.supervisor_stop.store(true, Ordering::Release);
-        let shutdown_error = match self.supervisor_thread.lock() {
-            Ok(mut owner) => owner.take().and_then(|supervisor| {
-                supervisor.thread().unpark();
-                supervisor.join().err().map(|_| {
-                    PetalSonicError::Engine("Output supervisor panicked while shutting down".into())
-                })
-            }),
-            Err(_) => Some(PetalSonicError::Engine(
-                "Output supervisor lock is poisoned".into(),
-            )),
-        };
-        self.acoustic_propagation.close();
+        let shutdown_result = self.children.close();
+        self.acoustic_propagation.clear_published_response();
         self.drain_retired_spatial_frames();
         self.drain_retired_acoustic_responses();
         self.active_voice_count.store(0, Ordering::Release);
         self.runtime_state
             .store(RuntimeState::Closed as u8, Ordering::Release);
-        shutdown_error.map_or(Ok(()), Err)
+        shutdown_result
     }
 
     pub(crate) fn supervisor_tick<D: OutputRuntimeDriver>(
@@ -721,26 +706,23 @@ impl AudioRuntime {
         }
     }
 
-    fn spawn_output_supervisor(
+    fn start_output_child(
+        children: &mut RuntimeChildren,
         startup: EngineStartup,
         output: Box<dyn FnOnce() -> Result<Box<dyn OutputPlatform>> + Send>,
         command_receivers: EngineCommandReceivers,
         bus_params: Arc<Mutex<Vec<BusParams>>>,
         runtime_state: Arc<AtomicU8>,
         recovery_attempts: Arc<AtomicU64>,
-        stop: Arc<AtomicBool>,
-    ) -> Result<JoinHandle<()>> {
-        let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
-        let handle = std::thread::Builder::new()
-            .name("petalsonic-output".into())
-            .spawn(move || {
+    ) -> Result<()> {
+        children.spawn(
+            RuntimeChildKind::Output,
+            "petalsonic-output",
+            ChildCancellation::passive(),
+            move |child_startup, cancellation| {
                 let output = match output() {
                     Ok(output) => output,
-                    Err(error) => {
-                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                        let _ = startup_sender.send(Err(error));
-                        return;
-                    }
+                    Err(error) => return Err(child_startup.failed(error)),
                 };
                 let initial_buses = bus_params
                     .lock()
@@ -753,20 +735,14 @@ impl AudioRuntime {
                     initial_buses,
                 ) {
                     Ok(engine) => engine,
-                    Err(error) => {
-                        runtime_state.store(RuntimeState::Failed as u8, Ordering::Release);
-                        let _ = startup_sender.send(Err(error));
-                        return;
-                    }
+                    Err(error) => return Err(child_startup.failed(error)),
                 };
-                if startup_sender.send(Ok(())).is_err() {
-                    return;
-                }
+                child_startup.ready()?;
                 let poll_interval = Duration::from_millis(20);
                 let mut schedule = SupervisorSchedule::new(Instant::now());
                 engine.emit_runtime_state(RuntimeState::Recovering);
 
-                while !stop.load(Ordering::Acquire) {
+                while !cancellation.is_requested() {
                     Self::supervisor_tick(
                         &mut engine,
                         &runtime_state,
@@ -776,25 +752,11 @@ impl AudioRuntime {
                     );
                     std::thread::park_timeout(poll_interval);
                 }
-                let _ = engine.stop();
-            })
-            .map_err(|error| {
-                PetalSonicError::Engine(format!("Failed to start output supervisor: {error}"))
-            })?;
-
-        match startup_receiver.recv() {
-            Ok(Ok(())) => Ok(handle),
-            Ok(Err(error)) => {
-                let _ = handle.join();
-                Err(error)
-            }
-            Err(_) => {
-                let _ = handle.join();
-                Err(PetalSonicError::Engine(
-                    "Output supervisor exited during initialization".into(),
-                ))
-            }
-        }
+                engine.stop().map_err(|error| {
+                    RuntimeChildFailure::new(format!("failed to stop output engine: {error}"))
+                })
+            },
+        )
     }
 
     pub(crate) fn load_runtime_state(state: &AtomicU8) -> RuntimeState {

@@ -1,62 +1,24 @@
 use crate::acoustic_propagation::{AcousticResponse, AcousticVoiceInput};
 use crate::config::PetalSonicWorldDesc;
 use crate::domain::{BusParams, SpatialFrame, VoiceId};
-use crate::error::{PetalSonicError, Result};
+use crate::error::Result;
 use crate::events::{
     PetalSonicEvent, RenderTimingEvent, RuntimeCounters, RuntimeState, VoiceTelemetryEvent,
 };
-use crate::platform::output::{
-    OutputCallback, OutputDeviceState, OutputFailure, OutputPlatform, OutputPreparation,
-    OutputRecoveryCause, OutputRecoveryReason, OutputRecoveryRequest, OutputRecoveryResult,
-    PreparedOutput,
-};
+use crate::output_session::OutputSession;
+#[cfg(test)]
+use crate::output_session::RenderWorkerFaultInjector;
+use crate::platform::output::{OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult};
 use crate::playback::PlaybackCommand;
+use crate::realtime_latest::RealtimeConsumer;
 use crate::render::RenderQuantum;
 use crate::runtime_health::RuntimeFailurePublisher;
 use crate::spatial::RetiredSpatialSource;
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::{fmt, panic};
 
 pub(crate) const MASTER_HEADROOM_DB: f32 = -6.0;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RenderWorkerFailure {
-    StatePoisoned,
-    UnexpectedExit,
-    Panicked,
-}
-
-impl fmt::Display for RenderWorkerFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StatePoisoned => formatter.write_str("render state was poisoned"),
-            Self::UnexpectedExit => formatter.write_str("render child exited unexpectedly"),
-            Self::Panicked => formatter.write_str("render child panicked"),
-        }
-    }
-}
-
-type RenderThread = JoinHandle<std::result::Result<(), RenderWorkerFailure>>;
-
-#[cfg(test)]
-#[derive(Clone, Default)]
-pub(crate) struct RenderWorkerFaultInjector {
-    fault: Arc<std::sync::atomic::AtomicU8>,
-}
-
-#[cfg(test)]
-impl RenderWorkerFaultInjector {
-    pub(crate) fn panic(&self) {
-        self.fault.store(1, Ordering::Release);
-    }
-
-    fn take_panicking_fault(&self) -> bool {
-        self.fault.swap(0, Ordering::AcqRel) == 1
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct EngineCommandReceivers {
@@ -97,10 +59,8 @@ pub(crate) struct EngineStartup {
     pub desc: PetalSonicWorldDesc,
     pub active_voice_count: Arc<AtomicUsize>,
     pub retirement_sender: Sender<VoiceId>,
-    pub latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
-    pub spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
-    pub latest_acoustic_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
-    pub acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
+    pub spatial_frames: RealtimeConsumer<SpatialFrame>,
+    pub acoustic_responses: RealtimeConsumer<AcousticResponse>,
     pub acoustic_voice_input: AcousticVoiceInput,
     pub acoustic_scene_version: Arc<std::sync::atomic::AtomicU64>,
     pub environmental_acoustics_enabled: Arc<AtomicBool>,
@@ -109,21 +69,9 @@ pub(crate) struct EngineStartup {
 
 /// Schedules logical stereo rendering and delegates physical output lifecycle.
 pub(crate) struct PetalSonicEngine {
-    desc: PetalSonicWorldDesc,
-    output: Box<dyn OutputPlatform>,
-    prepared_output: Option<PreparedOutput>,
-    active_output: Option<OutputDeviceState>,
-    is_running: Arc<AtomicBool>,
-    frames_processed: Arc<AtomicUsize>,
-    underrun_count: Arc<AtomicUsize>,
-    current_device_name: Arc<Mutex<Option<String>>>,
+    output: OutputSession,
     event_sender: Sender<PetalSonicEvent>,
     counters: Arc<RuntimeCounters>,
-    render: Arc<Mutex<RenderQuantum>>,
-    runtime_failure: RuntimeFailurePublisher,
-    render_thread: Option<RenderThread>,
-    #[cfg(test)]
-    render_worker_fault: RenderWorkerFaultInjector,
     backend_retirement_receiver: Receiver<RetiredSpatialSource>,
 }
 
@@ -143,23 +91,27 @@ impl PetalSonicEngine {
         let event_sender = startup.ports.event_sender.clone();
         let counters = startup.ports.counters.clone();
         let (retirement_sender, retirement_receiver) = crossbeam_channel::bounded(desc.max_voices);
-        let render = RenderQuantum::new(startup, command_receivers, buses, retirement_sender)?;
+        let render = Arc::new(Mutex::new(RenderQuantum::new(
+            startup,
+            command_receivers,
+            buses,
+            retirement_sender,
+        )?));
         Ok(Self {
-            desc,
-            output,
-            prepared_output: None,
-            active_output: None,
-            is_running: Arc::new(AtomicBool::new(false)),
-            frames_processed,
-            underrun_count,
-            current_device_name,
+            output: OutputSession::new(
+                desc,
+                output,
+                render,
+                frames_processed,
+                underrun_count,
+                current_device_name,
+                counters.clone(),
+                runtime_failure,
+                #[cfg(test)]
+                render_worker_fault,
+            ),
             event_sender,
             counters,
-            render: Arc::new(Mutex::new(render)),
-            runtime_failure,
-            render_thread: None,
-            #[cfg(test)]
-            render_worker_fault,
             backend_retirement_receiver: retirement_receiver,
         })
     }
@@ -198,236 +150,21 @@ impl PetalSonicEngine {
         )
     }
 
-    pub(crate) fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn start(&mut self) -> Result<()> {
-        if self.is_running() {
-            return Ok(());
-        }
-        let prepared = match self.prepared_output.take() {
-            Some(prepared) => prepared,
-            None => match self.output.prepare(&self.desc.output_device) {
-                OutputPreparation::Ready(prepared) => prepared,
-                OutputPreparation::Unavailable | OutputPreparation::RequiresStop => {
-                    return Err(PetalSonicError::AudioDevice(
-                        "No selected output device is currently available".into(),
-                    ));
-                }
-                OutputPreparation::Failed(_) => {
-                    return Err(PetalSonicError::PermanentDeviceFailure(
-                        "Unsupported sample format".into(),
-                    ));
-                }
-            },
-        };
-        log::info!(
-            "PetalSonic master headroom: {} dB (linear gain {:.3})",
-            MASTER_HEADROOM_DB,
-            crate::gain::db_to_linear(MASTER_HEADROOM_DB)
-        );
-        let consumer = self
-            .render
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("Render state is poisoned".into()))?
-            .connect_output(prepared.device.sample_rate)?;
-        self.is_running.store(true, Ordering::Release);
-        if let Ok(mut render) = self.render.lock() {
-            render.render();
-            render.render();
-        }
-        let callback = OutputCallback::new(
-            self.is_running.clone(),
-            self.frames_processed.clone(),
-            self.underrun_count.clone(),
-            consumer,
-            prepared.device.sample_rate,
-        );
-        let active = match self.output.open(prepared, callback) {
-            Ok(active) => active,
-            Err(error) => {
-                self.is_running.store(false, Ordering::Release);
-                if let Ok(mut render) = self.render.lock() {
-                    render.disconnect_output();
-                }
-                return Err(error);
-            }
-        };
-        let thread = match Self::spawn_render_thread(
-            self.render.clone(),
-            self.is_running.clone(),
-            self.desc.block_size,
-            self.desc.sample_rate,
-            self.runtime_failure.clone(),
-            #[cfg(test)]
-            self.render_worker_fault.clone(),
-        ) {
-            Ok(thread) => thread,
-            Err(error) => {
-                self.is_running.store(false, Ordering::Release);
-                let _ = self.output.stop();
-                if let Ok(mut render) = self.render.lock() {
-                    render.disconnect_output();
-                }
-                return Err(error);
-            }
-        };
-        if let Ok(mut current) = self.current_device_name.lock() {
-            *current = Some(active.diagnostic_name.clone());
-        }
-        self.counters
-            .output_sample_rate
-            .store(active.sample_rate as usize, Ordering::Relaxed);
-        self.counters
-            .output_channels
-            .store(active.physical_channels as usize, Ordering::Relaxed);
-        self.counters
-            .device_generation
-            .fetch_add(1, Ordering::Relaxed);
-        self.active_output = Some(active);
-        self.render_thread = Some(thread);
-        Ok(())
-    }
-
-    fn spawn_render_thread(
-        render: Arc<Mutex<RenderQuantum>>,
-        is_running: Arc<AtomicBool>,
-        block_size: usize,
-        sample_rate: u32,
-        runtime_failure: RuntimeFailurePublisher,
-        #[cfg(test)] render_worker_fault: RenderWorkerFaultInjector,
-    ) -> Result<RenderThread> {
-        let wake_interval = render
-            .lock()
-            .map_err(|_| PetalSonicError::Engine("Render state is poisoned".into()))?
-            .schedule()
-            .wake_interval(block_size, sample_rate);
-        std::thread::Builder::new()
-            .name("petalsonic-render".into())
-            .spawn(move || {
-                let completion = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    while is_running.load(Ordering::Acquire) {
-                        #[cfg(test)]
-                        if render_worker_fault.take_panicking_fault() {
-                            panic!("injected render child panic");
-                        }
-                        let mut render = render
-                            .lock()
-                            .map_err(|_| RenderWorkerFailure::StatePoisoned)?;
-                        render.render();
-                        drop(render);
-                        std::thread::park_timeout(wake_interval);
-                    }
-                    Ok(())
-                }));
-                let completion = match completion {
-                    Ok(Ok(())) if !is_running.load(Ordering::Acquire) => Ok(()),
-                    Ok(Ok(())) => Err(RenderWorkerFailure::UnexpectedExit),
-                    Ok(Err(failure)) => Err(failure),
-                    Err(_) => Err(RenderWorkerFailure::Panicked),
-                };
-                if completion.is_err() {
-                    runtime_failure.publish();
-                }
-                completion
-            })
-            .map_err(|error| {
-                PetalSonicError::Engine(format!("Failed to start render thread: {error}"))
-            })
-    }
-
-    pub(crate) fn stop(&mut self) -> Result<()> {
-        self.is_running.store(false, Ordering::Release);
-        if let Some(thread) = self.render_thread.take() {
-            thread.thread().unpark();
-            match thread.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(failure)) => {
-                    return Err(PetalSonicError::Engine(failure.to_string()));
-                }
-                Err(_) => {
-                    return Err(PetalSonicError::Engine(
-                        "Render child join observed an unclassified panic".into(),
-                    ));
-                }
-            }
-        }
-        self.output.stop()?;
-        if let Ok(mut render) = self.render.lock() {
-            render.disconnect_output();
-        }
-        self.active_output = None;
-        self.drain_retired_backend_resources();
-        if let Ok(mut current) = self.current_device_name.lock() {
-            *current = None;
-        }
-        Ok(())
-    }
-
     pub(crate) fn drain_retired_backend_resources(&mut self) {
         while self.backend_retirement_receiver.try_recv().is_ok() {}
-    }
-
-    pub(crate) fn output_recovery_reason(&self) -> Option<OutputRecoveryReason> {
-        let Some(active) = &self.active_output else {
-            return Some(OutputRecoveryReason::StreamFailure);
-        };
-        self.output
-            .recovery_reason(&self.desc.output_device, active)
-    }
-
-    pub(crate) fn prepare_selected_output(&mut self) -> OutputPreparation {
-        let preparation = self.output.prepare(&self.desc.output_device);
-        if let OutputPreparation::Ready(prepared) = &preparation {
-            self.prepared_output = Some(prepared.clone());
-        }
-        preparation
     }
 
     pub(crate) fn reconcile_output(
         &mut self,
         request: OutputRecoveryRequest,
     ) -> OutputRecoveryResult {
-        if self.is_running() {
-            if !request.probe {
-                return OutputRecoveryResult::Stable;
-            }
-            match self.output_recovery_reason() {
-                None => return OutputRecoveryResult::Stable,
-                Some(OutputRecoveryReason::SelectionChanged) => {
-                    if matches!(
-                        self.prepare_selected_output(),
-                        OutputPreparation::Unavailable
-                    ) {
-                        return OutputRecoveryResult::Stable;
-                    }
-                }
-                Some(OutputRecoveryReason::StreamFailure) => {}
-            }
-            if self.stop().is_err() {
-                return OutputRecoveryResult::Failed(OutputFailure::PlatformLifecycle);
-            }
-        }
-        if let Ok(mut render) = self.render.lock() {
-            render.advance_without_output(request.elapsed_without_output);
-        }
-        if !request.retry_now {
-            return OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable);
-        }
-        match self.start() {
-            Ok(()) => OutputRecoveryResult::Running(
-                self.active_output
-                    .clone()
-                    .expect("successful output start publishes typed device state"),
-            ),
-            Err(
-                PetalSonicError::AudioFormat(_)
-                | PetalSonicError::PermanentDeviceFailure(_)
-                | PetalSonicError::BackendUnavailable { .. },
-            ) => OutputRecoveryResult::Failed(OutputFailure::UnsupportedSampleFormat),
-            Err(_) => OutputRecoveryResult::Recovering(OutputRecoveryCause::DeviceUnavailable),
-        }
+        self.output.reconcile(request)
+    }
+
+    pub(crate) fn close(&mut self) -> Result<()> {
+        self.output.close()?;
+        self.drain_retired_backend_resources();
+        Ok(())
     }
 
     pub(crate) fn emit_runtime_state(&self, state: RuntimeState) {
@@ -448,7 +185,7 @@ impl PetalSonicEngine {
 
 impl Drop for PetalSonicEngine {
     fn drop(&mut self) {
-        let _ = self.stop();
+        let _ = self.close();
     }
 }
 

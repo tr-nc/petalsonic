@@ -12,6 +12,7 @@ use crate::events::{
     EnvironmentResponse as EnvironmentResponseTelemetry,
 };
 use crate::math::{Pose, Vec3};
+use crate::realtime_latest::{Publisher, RealtimeConsumer, RealtimeLatest};
 use crate::runtime_children::{
     ChildCancellation, ChildStartup, RuntimeChildFailure, RuntimeChildKind, RuntimeChildResult,
     RuntimeChildren,
@@ -477,7 +478,8 @@ impl AcousticPropagationCounters {
 
 pub(crate) struct AcousticPropagation {
     input: Arc<SharedInput>,
-    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    response_publication: Publisher<AcousticResponse>,
+    response_consumer: Mutex<Option<RealtimeConsumer<AcousticResponse>>>,
     counters: Arc<AcousticPropagationCounters>,
     enabled: Arc<AtomicBool>,
     quality_bits: AtomicU32,
@@ -521,7 +523,7 @@ impl AcousticPropagation {
             state: Mutex::new(InputState::new(environmental_acoustics_quality, max_voices)),
             changed: Condvar::new(),
         });
-        let latest_response = Arc::new(Mutex::new(None));
+        let (response_publication, response_consumer) = RealtimeLatest::bounded(2);
         let counters = Arc::new(AcousticPropagationCounters::default());
         let (telemetry_sender, telemetry_receiver) = crossbeam_channel::bounded(telemetry_capacity);
         #[cfg(test)]
@@ -533,7 +535,7 @@ impl AcousticPropagation {
         let worker = AcousticWorker {
             context: PropagationWorkerContext {
                 input: input.clone(),
-                latest_response: latest_response.clone(),
+                response_publication: response_publication.clone(),
                 counters: counters.clone(),
                 enabled: enabled.clone(),
                 distance_scaler,
@@ -547,7 +549,8 @@ impl AcousticPropagation {
         (
             Self {
                 input,
-                latest_response,
+                response_publication,
+                response_consumer: Mutex::new(Some(response_consumer)),
                 counters,
                 enabled,
                 quality_bits: AtomicU32::new(environmental_acoustics_quality.to_bits()),
@@ -600,8 +603,8 @@ impl AcousticPropagation {
         Ok(())
     }
 
-    pub(crate) fn latest_response_slot(&self) -> Arc<Mutex<Option<Arc<AcousticResponse>>>> {
-        self.latest_response.clone()
+    pub(crate) fn take_response_consumer(&self) -> Option<RealtimeConsumer<AcousticResponse>> {
+        self.response_consumer.lock().ok()?.take()
     }
 
     pub(crate) fn voice_input(&self) -> AcousticVoiceInput {
@@ -676,16 +679,14 @@ impl AcousticPropagation {
         self.input.changed.notify_one();
     }
 
-    pub(crate) fn clear_published_response(&self) {
-        if let Ok(mut response) = self.latest_response.lock() {
-            response.take();
-        }
+    pub(crate) fn close_publication(&self) {
+        self.response_publication.close();
     }
 }
 
 struct PropagationWorkerContext {
     input: Arc<SharedInput>,
-    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    response_publication: Publisher<AcousticResponse>,
     counters: Arc<AcousticPropagationCounters>,
     enabled: Arc<AtomicBool>,
     distance_scaler: f32,
@@ -697,7 +698,7 @@ struct PropagationWorkerContext {
 
 struct AcousticPublisher {
     input: Arc<SharedInput>,
-    latest_response: Arc<Mutex<Option<Arc<AcousticResponse>>>>,
+    response_publication: Publisher<AcousticResponse>,
     counters: Arc<AcousticPropagationCounters>,
     telemetry_sender: Sender<AcousticTelemetryEvent>,
 }
@@ -753,11 +754,9 @@ impl AcousticPublisher {
         let output = completed.into_solve_output(published_at);
         let response_spatial_revision = output.response.spatial_revision;
         let response_geometry_version = output.response.geometry_version;
-        let mut latest = self.latest_response.lock().map_err(|_| {
-            RuntimeChildFailure::new("acoustics published response state is poisoned")
-        })?;
-        *latest = Some(Arc::new(output.response));
-        drop(latest);
+        self.response_publication
+            .publish_latest(Arc::new(output.response))
+            .map_err(|_| RuntimeChildFailure::new("acoustics response consumer disconnected"))?;
         drop(publication_guard);
 
         self.counters
@@ -823,7 +822,7 @@ fn propagation_loop(
 ) -> RuntimeChildResult {
     let PropagationWorkerContext {
         input,
-        latest_response,
+        response_publication,
         counters,
         enabled,
         distance_scaler,
@@ -834,7 +833,7 @@ fn propagation_loop(
     } = context;
     let publisher = AcousticPublisher {
         input: input.clone(),
-        latest_response,
+        response_publication,
         counters,
         telemetry_sender,
     };
@@ -4106,15 +4105,14 @@ mod tests {
                 )))
                 .unwrap();
         }
-        assert!(propagation.latest_response.lock().unwrap().is_none());
+        assert!(propagation.response_publication.latest().is_none());
         query.release();
 
         let deadline = Instant::now() + Duration::from_millis(ONE_SHOT_MILLIS);
         loop {
             let revision = propagation
-                .latest_response
-                .lock()
-                .unwrap()
+                .response_publication
+                .latest()
                 .as_ref()
                 .map(|response| response.spatial_revision);
             if revision == Some(frames_during_solve + 1) {
@@ -4161,7 +4159,7 @@ mod tests {
             )
         }));
         children.close().unwrap();
-        propagation.clear_published_response();
+        propagation.close_publication();
     }
 
     #[test]
@@ -4193,9 +4191,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let latest_revision = propagation
-                .latest_response
-                .lock()
-                .unwrap()
+                .response_publication
+                .latest()
                 .as_ref()
                 .map(|response| response.spatial_revision);
             if latest_revision == Some(12) {
@@ -4214,7 +4211,7 @@ mod tests {
         assert_eq!(diagnostics.latest_spatial_revision, 12);
         assert_eq!(diagnostics.latest_geometry_version, 17);
         children.close().unwrap();
-        propagation.clear_published_response();
+        propagation.close_publication();
     }
 
     #[test]
@@ -4245,7 +4242,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         children.close().unwrap();
-        propagation.clear_published_response();
+        propagation.close_publication();
     }
 
     #[test]
@@ -4286,6 +4283,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(75));
         assert_eq!(propagation.diagnostics().solve_count, settled_solve_count);
         children.close().unwrap();
-        propagation.clear_published_response();
+        propagation.close_publication();
     }
 }

@@ -1,9 +1,7 @@
-use crate::acoustic_propagation::{AcousticPropagation, AcousticResponse};
+use crate::acoustic_propagation::AcousticPropagation;
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::config::{PetalSonicWorldDesc, SourceConfig};
 use crate::domain::{BusParams, Emitter, SpatialFrame, VoiceId};
-#[cfg(test)]
-use crate::engine::RenderWorkerFaultInjector;
 use crate::engine::{EngineCommandReceivers, EngineObservability, EngineStartup, PetalSonicEngine};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
@@ -11,10 +9,13 @@ use crate::events::{
     RuntimeCounters, RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceTelemetryDiagnostics,
     VoiceTelemetryEvent,
 };
+#[cfg(test)]
+use crate::output_session::RenderWorkerFaultInjector;
 use crate::platform::output::{
     CpalOutputPlatform, OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult,
 };
 use crate::playback::{AcceptedVoice, PlaybackCommand};
+use crate::realtime_latest::{Publisher, RealtimeLatest};
 use crate::runtime_children::{
     ChildCancellation, RuntimeChildFailure, RuntimeChildKind, RuntimeChildren,
 };
@@ -117,12 +118,10 @@ pub(crate) struct AudioRuntime {
     bus_params: Arc<Mutex<Vec<BusParams>>>,
     active_voice_count: Arc<AtomicUsize>,
     retirement_receiver: Receiver<VoiceId>,
-    latest_spatial_frame: Arc<Mutex<Option<Arc<SpatialFrame>>>>,
-    spatial_retirement_receiver: Receiver<Arc<SpatialFrame>>,
+    spatial_frames: Publisher<SpatialFrame>,
     spatial_frame_revision: AtomicU64,
     spatial_sim_time_bits: AtomicU64,
     acoustic_propagation: AcousticPropagation,
-    acoustic_response_retirement_receiver: Receiver<Arc<AcousticResponse>>,
     acoustic_scene_version: Arc<AtomicU64>,
     environmental_acoustics_enabled: Arc<AtomicBool>,
     command_sender: Sender<PlaybackCommand>,
@@ -170,9 +169,7 @@ impl AudioRuntime {
         let active_voice_count = Arc::new(AtomicUsize::new(0));
         let (retirement_sender, retirement_receiver) =
             crossbeam_channel::bounded(config.max_voices);
-        let latest_spatial_frame = Arc::new(Mutex::new(None));
-        let (spatial_retirement_sender, spatial_retirement_receiver) =
-            crossbeam_channel::bounded(1);
+        let (spatial_frames, spatial_frame_consumer) = RealtimeLatest::bounded(1);
         let initial_acoustic_scene = config.acoustic_scene.clone().map(Arc::new);
         let acoustic_scene_version = Arc::new(AtomicU64::new(
             initial_acoustic_scene
@@ -203,8 +200,6 @@ impl AudioRuntime {
                 PetalSonicError::Engine("Failed to publish initial acoustic scene".into())
             })?;
         }
-        let (acoustic_response_retirement_sender, acoustic_response_retirement_receiver) =
-            crossbeam_channel::bounded(2);
         let bus_params = Arc::new(Mutex::new(
             std::iter::once(BusParams::default())
                 .chain(config.buses.iter().map(|bus| bus.params()))
@@ -215,10 +210,14 @@ impl AudioRuntime {
             desc: config.clone(),
             active_voice_count: active_voice_count.clone(),
             retirement_sender,
-            latest_spatial_frame: latest_spatial_frame.clone(),
-            spatial_retirement_sender,
-            latest_acoustic_response: acoustic_propagation.latest_response_slot(),
-            acoustic_response_retirement_sender,
+            spatial_frames: spatial_frame_consumer,
+            acoustic_responses: acoustic_propagation
+                .take_response_consumer()
+                .ok_or_else(|| {
+                    PetalSonicError::Engine(
+                        "Acoustic response consumer is already connected".into(),
+                    )
+                })?,
             acoustic_voice_input: acoustic_propagation.voice_input(),
             acoustic_scene_version: acoustic_scene_version.clone(),
             environmental_acoustics_enabled: environmental_acoustics_enabled.clone(),
@@ -252,12 +251,10 @@ impl AudioRuntime {
             bus_params,
             active_voice_count,
             retirement_receiver,
-            latest_spatial_frame,
-            spatial_retirement_receiver,
+            spatial_frames,
             spatial_frame_revision: AtomicU64::new(0),
             spatial_sim_time_bits: AtomicU64::new(0.0f64.to_bits()),
             acoustic_propagation,
-            acoustic_response_retirement_receiver,
             acoustic_scene_version,
             environmental_acoustics_enabled,
             command_sender,
@@ -352,11 +349,9 @@ impl AudioRuntime {
 
     pub(crate) fn publish_spatial_frame(&self, frame: Arc<SpatialFrame>) -> Result<()> {
         self.ensure_open()?;
-        self.drain_retired_spatial_frames();
-        self.drain_retired_acoustic_responses();
-        let mut latest = self
-            .latest_spatial_frame
-            .try_lock()
+        let publication = self
+            .spatial_frames
+            .prepare_latest(frame.clone())
             .map_err(|_| PetalSonicError::QueuePressure)?;
         self.acoustic_propagation
             .publish_spatial_frame(frame.clone())
@@ -365,17 +360,13 @@ impl AudioRuntime {
             .store(frame.revision(), Ordering::Release);
         self.spatial_sim_time_bits
             .store(frame.sim_time_seconds().to_bits(), Ordering::Release);
-        *latest = Some(frame);
+        publication.commit();
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn with_spatial_publication_blocked<T>(&self, operation: impl FnOnce() -> T) -> T {
-        let _latest = self
-            .latest_spatial_frame
-            .lock()
-            .expect("spatial publication slot is poisoned");
-        operation()
+        self.spatial_frames.with_publication_blocked(operation)
     }
 
     pub(crate) fn acoustic_scene_version(&self) -> u64 {
@@ -387,7 +378,6 @@ impl AudioRuntime {
         snapshot: Arc<AcousticSceneSnapshot>,
     ) -> Result<()> {
         self.ensure_open()?;
-        self.drain_retired_acoustic_responses();
         self.acoustic_propagation
             .publish_scene(snapshot.clone())
             .map_err(|_| PetalSonicError::QueuePressure)?;
@@ -591,18 +581,6 @@ impl AudioRuntime {
         self.retirement_receiver.try_iter().collect()
     }
 
-    fn drain_retired_spatial_frames(&self) {
-        while self.spatial_retirement_receiver.try_recv().is_ok() {}
-    }
-
-    fn drain_retired_acoustic_responses(&self) {
-        while self
-            .acoustic_response_retirement_receiver
-            .try_recv()
-            .is_ok()
-        {}
-    }
-
     pub(crate) fn close(&self) -> Result<()> {
         let _close_guard = self
             .close_lock
@@ -614,9 +592,8 @@ impl AudioRuntime {
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
         let shutdown_result = self.children.close();
-        self.acoustic_propagation.clear_published_response();
-        self.drain_retired_spatial_frames();
-        self.drain_retired_acoustic_responses();
+        self.spatial_frames.close();
+        self.acoustic_propagation.close_publication();
         self.active_voice_count.store(0, Ordering::Release);
         self.runtime_state
             .store(RuntimeState::Closed as u8, Ordering::Release);
@@ -761,8 +738,8 @@ impl AudioRuntime {
                     );
                     std::thread::park_timeout(poll_interval);
                 }
-                engine.stop().map_err(|error| {
-                    RuntimeChildFailure::new(format!("failed to stop output engine: {error}"))
+                engine.close().map_err(|error| {
+                    RuntimeChildFailure::new(format!("failed to close output engine: {error}"))
                 })
             },
         )

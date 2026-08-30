@@ -13,11 +13,14 @@ use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeCounters, VoiceTe
 use crate::mixer::{self, CompletedPlayback, MixerScratch};
 use crate::platform::output::StereoFrame;
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance};
+use crate::realtime_latest::RealtimeConsumer;
+#[cfg(test)]
+use crate::realtime_latest::RealtimeLatest;
 use crate::spatial::{
     AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
     SpatialRenderContext,
 };
-use crossbeam_channel::{Sender, TrySendError};
+use crossbeam_channel::Sender;
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Observer, Producer, Split},
@@ -117,13 +120,9 @@ pub(crate) struct RenderQuantum {
     processor: SpatialProcessor,
     buses: Vec<BusParams>,
     command_receivers: EngineCommandReceivers,
-    latest_spatial_frame: Arc<std::sync::Mutex<Option<Arc<SpatialFrame>>>>,
+    spatial_frames: RealtimeConsumer<SpatialFrame>,
     current_spatial_frame: Option<Arc<SpatialFrame>>,
-    pending_spatial_retirement: Option<Arc<SpatialFrame>>,
-    spatial_retirement_sender: Sender<Arc<SpatialFrame>>,
-    latest_acoustic_response: Arc<std::sync::Mutex<Option<Arc<AcousticResponse>>>>,
-    pending_acoustic_response_retirement: Option<Arc<AcousticResponse>>,
-    acoustic_response_retirement_sender: Sender<Arc<AcousticResponse>>,
+    acoustic_responses: RealtimeConsumer<AcousticResponse>,
     acoustic_voice_input: AcousticVoiceInput,
     acoustic_scene_version: Arc<std::sync::atomic::AtomicU64>,
     retirement_sender: Sender<VoiceId>,
@@ -150,10 +149,8 @@ impl RenderQuantum {
             desc,
             active_voice_count,
             retirement_sender,
-            latest_spatial_frame,
-            spatial_retirement_sender,
-            latest_acoustic_response,
-            acoustic_response_retirement_sender,
+            spatial_frames,
+            acoustic_responses,
             acoustic_voice_input,
             acoustic_scene_version,
             environmental_acoustics_enabled,
@@ -186,13 +183,9 @@ impl RenderQuantum {
             processor,
             buses,
             command_receivers,
-            latest_spatial_frame,
+            spatial_frames,
             current_spatial_frame: None,
-            pending_spatial_retirement: None,
-            spatial_retirement_sender,
-            latest_acoustic_response,
-            pending_acoustic_response_retirement: None,
-            acoustic_response_retirement_sender,
+            acoustic_responses,
             acoustic_voice_input,
             acoustic_scene_version,
             retirement_sender,
@@ -413,26 +406,12 @@ impl RenderQuantum {
     }
 
     fn consume_latest_spatial_frame(&mut self) {
-        if let Some(pending) = self.pending_spatial_retirement.take() {
-            match self.spatial_retirement_sender.try_send(pending) {
-                Ok(()) => {}
-                Err(TrySendError::Full(pending) | TrySendError::Disconnected(pending)) => {
-                    self.pending_spatial_retirement = Some(pending);
-                    return;
-                }
-            }
-        }
-        let next = self
-            .latest_spatial_frame
-            .try_lock()
-            .ok()
-            .and_then(|mut latest| latest.take());
-        let Some(next) = next else { return };
+        let Some(next) = self.spatial_frames.consume() else {
+            return;
+        };
         Self::apply_spatial_frame_to_voices(&next, &mut self.active_playback);
-        if let Some(previous) = self.current_spatial_frame.replace(next)
-            && let Err(error) = self.spatial_retirement_sender.try_send(previous)
-        {
-            self.pending_spatial_retirement = Some(error.into_inner());
+        if let Some(previous) = self.current_spatial_frame.replace(next) {
+            self.spatial_frames.retire(previous);
         }
     }
 
@@ -455,18 +434,9 @@ impl RenderQuantum {
     }
 
     fn consume_latest_acoustic_response(&mut self) {
-        if let Some(pending) = self.pending_acoustic_response_retirement.take()
-            && let Err(error) = self.acoustic_response_retirement_sender.try_send(pending)
-        {
-            self.pending_acoustic_response_retirement = Some(error.into_inner());
+        let Some(next) = self.acoustic_responses.consume() else {
             return;
-        }
-        let next = self
-            .latest_acoustic_response
-            .try_lock()
-            .ok()
-            .and_then(|mut latest| latest.take());
-        let Some(next) = next else { return };
+        };
         let required_geometry_version = self.acoustic_scene_version.load(Ordering::Acquire);
         let retired = match self
             .processor
@@ -480,10 +450,8 @@ impl RenderQuantum {
                 Some(rejected)
             }
         };
-        if let Some(retired) = retired
-            && let Err(error) = self.acoustic_response_retirement_sender.try_send(retired)
-        {
-            self.pending_acoustic_response_retirement = Some(error.into_inner());
+        if let Some(retired) = retired {
+            self.acoustic_responses.retire(retired);
         }
     }
 
@@ -680,13 +648,18 @@ fn apply_master_gain_and_limit(buffer: &mut [f32], frames_out: usize, channels: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acoustic_propagation::AcousticVoice;
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::PetalSonicWorldDesc;
-    use crate::domain::{Emitter, EmitterDesc, PlayOptions, SourceExtent};
+    use crate::domain::{
+        DirectPath, Emitter, EmitterDesc, EnvironmentSend, OcclusionProfile, PlayOptions,
+        SourceExtent,
+    };
     use crate::engine::PetalSonicEngine;
     use crate::playback::prepare_test_voice;
+    use crate::realtime_latest::Publisher;
+    use crate::spatial::LateReverbParameters;
     use ringbuf::traits::Consumer;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     fn release_baseline(key: &str) -> u64 {
@@ -706,6 +679,7 @@ mod tests {
 
     struct Harness {
         quantum: RenderQuantum,
+        acoustic_responses: Publisher<AcousticResponse>,
         commands: Sender<PlaybackCommand>,
         events: crossbeam_channel::Receiver<PetalSonicEvent>,
         timing: crossbeam_channel::Receiver<RenderTimingEvent>,
@@ -722,18 +696,16 @@ mod tests {
         let (commands, regular) = crossbeam_channel::bounded(max_voices.max(1));
         let (_lifecycle, lifecycle) = crossbeam_channel::bounded(max_voices.max(1));
         let (retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
-        let (spatial_retirement_sender, _) = crossbeam_channel::bounded(1);
-        let (response_retirement_sender, _) = crossbeam_channel::bounded(2);
+        let (_, spatial_frames) = RealtimeLatest::bounded(1);
+        let (acoustic_responses, acoustic_response_consumer) = RealtimeLatest::bounded(2);
         let (backend_retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
         let (ports, observability) = PetalSonicEngine::create_runtime_ports(&desc);
         let startup = EngineStartup {
             desc,
             active_voice_count: Arc::new(AtomicUsize::new(0)),
             retirement_sender,
-            latest_spatial_frame: Arc::new(Mutex::new(None)),
-            spatial_retirement_sender,
-            latest_acoustic_response: Arc::new(Mutex::new(None)),
-            acoustic_response_retirement_sender: response_retirement_sender,
+            spatial_frames,
+            acoustic_responses: acoustic_response_consumer,
             acoustic_voice_input: AcousticVoiceInput::isolated(max_voices.max(1)),
             acoustic_scene_version: Arc::new(AtomicU64::new(0)),
             environmental_acoustics_enabled: Arc::new(AtomicBool::new(true)),
@@ -747,9 +719,63 @@ mod tests {
                 backend_retirement_sender,
             )
             .unwrap(),
+            acoustic_responses,
             commands,
             events: observability.event_receiver,
             timing: observability.timing_receiver,
+        }
+    }
+
+    fn empty_acoustic_response(revision: u64) -> Arc<AcousticResponse> {
+        Arc::new(AcousticResponse {
+            spatial_revision: revision,
+            geometry_version: 0,
+            direct: Vec::new(),
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 0,
+        })
+    }
+
+    #[test]
+    fn acoustic_replacements_progress_without_spatial_or_scene_publication() {
+        let mut harness = harness(16, 1);
+        let emitter = Emitter {
+            world_id: 1,
+            index: 0,
+            generation: 1,
+        };
+
+        for revision in 1..=6 {
+            let voice_id = VoiceId::from(revision);
+            harness
+                .quantum
+                .acoustic_voice_input
+                .activate(AcousticVoice {
+                    voice_id,
+                    emitter,
+                    emitter_world_pose: crate::math::Pose::identity(),
+                    acoustic_priority: 1.0,
+                    audibility: 1.0,
+                    detached: false,
+                    direct_path: DirectPath::default(),
+                    environment_send: EnvironmentSend::default(),
+                    source_extent: SourceExtent::Point,
+                    occlusion_profile: OcclusionProfile::PointExact,
+                    routing_generation: 0,
+                });
+            harness
+                .acoustic_responses
+                .publish_latest(empty_acoustic_response(revision))
+                .unwrap();
+
+            harness.quantum.render();
+
+            assert_eq!(
+                harness.quantum.processor.acoustic_response_generation(),
+                Some((revision, 0))
+            );
+            harness.quantum.acoustic_voice_input.retire(voice_id);
         }
     }
 

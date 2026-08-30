@@ -427,12 +427,13 @@ impl RenderQuantum {
             PlaybackCommand::DestroyEmitter(emitter) => {
                 self.for_emitter(emitter, true, PlaybackInstance::begin_fade_out)
             }
-            PlaybackCommand::UpdateEmitter(emitter, config, bus_index) => {
+            PlaybackCommand::UpdateEmitter(update) => {
+                let (emitter, render_state, bus_index) = update.into_parts();
                 self.acoustic_voice_input
-                    .update_emitter_audibility(emitter, config.volume_linear());
+                    .update_emitter_audibility(emitter, render_state.volume_linear());
                 for voice in self.active_playback.values_mut() {
                     if voice.emitter == emitter && !voice.detached {
-                        voice.config = config.clone();
+                        voice.render_state = render_state.clone();
                         voice.bus_index = bus_index;
                     }
                 }
@@ -492,7 +493,7 @@ impl RenderQuantum {
                 .iter()
                 .find(|spatial| spatial.emitter == voice.emitter)
             {
-                voice.config.set_pose(spatial.pose);
+                voice.render_state.set_spatial_pose(spatial.pose);
             }
         }
     }
@@ -997,14 +998,14 @@ mod tests {
 
         assert_eq!(
             harness.quantum.active_playback[&VoiceId::from(1)]
-                .config
-                .pose(),
+                .render_state
+                .spatial_pose(),
             Some(new_pose)
         );
         assert_eq!(
             harness.quantum.active_playback[&VoiceId::from(2)]
-                .config
-                .pose(),
+                .render_state
+                .spatial_pose(),
             Some(old_pose)
         );
         assert_eq!(

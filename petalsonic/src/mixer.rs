@@ -78,7 +78,7 @@ pub fn mix_playback_instances_with_metrics(
             continue;
         }
         instance.set_mix_parameters(bus);
-        let is_spatial = instance.config.is_spatial();
+        let is_spatial = instance.render_state.is_spatial();
         if bus.muted || gain::db_to_linear(bus.gain_db) == 0.0 {
             instance.advance_silently(output_frames);
             if is_spatial {

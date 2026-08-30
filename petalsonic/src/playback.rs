@@ -12,7 +12,6 @@
 
 use crate::acoustic_propagation::AcousticVoice;
 use crate::audio_data::PetalSonicAudioData;
-use crate::config::SourceConfig;
 use crate::domain::{
     BusParams, DirectPath, Emitter, EmitterDesc, EnvironmentOrigin, EnvironmentSend,
     OcclusionProfile, PlayCommandId, PlayOptions, PlaybackTag, ResidentClip, SourceExtent, VoiceId,
@@ -29,6 +28,83 @@ pub enum LoopMode {
     Once,
     /// Loop infinitely
     Infinite,
+}
+
+/// Playback-owned pose and gain state consumed by the mixer and spatial renderer.
+///
+/// Domain values are captured once at Voice admission or Emitter update. Callers outside this
+/// module can query behavior, but cannot assemble a second representation of the same state.
+#[derive(Debug, Clone)]
+pub(crate) enum VoiceRenderState {
+    NonSpatial {
+        volume_db: f32,
+    },
+    Spatial {
+        pose: crate::math::Pose,
+        volume_db: f32,
+    },
+}
+
+impl VoiceRenderState {
+    fn capture(emitter_desc: &EmitterDesc, voice_gain_db: f32) -> Self {
+        let volume_db = emitter_desc.gain_db() + voice_gain_db;
+        match emitter_desc.pose() {
+            Some(pose) => Self::Spatial { pose, volume_db },
+            None => Self::NonSpatial { volume_db },
+        }
+    }
+
+    pub(crate) fn is_spatial(&self) -> bool {
+        matches!(self, Self::Spatial { .. })
+    }
+
+    pub(crate) fn spatial_pose(&self) -> Option<crate::math::Pose> {
+        match self {
+            Self::Spatial { pose, .. } => Some(*pose),
+            Self::NonSpatial { .. } => None,
+        }
+    }
+
+    pub(crate) fn set_spatial_pose(&mut self, next_pose: crate::math::Pose) -> bool {
+        match self {
+            Self::Spatial { pose, .. } => {
+                *pose = next_pose;
+                true
+            }
+            Self::NonSpatial { .. } => false,
+        }
+    }
+
+    pub(crate) fn volume_db(&self) -> f32 {
+        match self {
+            Self::Spatial { volume_db, .. } | Self::NonSpatial { volume_db } => *volume_db,
+        }
+    }
+
+    pub(crate) fn volume_linear(&self) -> f32 {
+        crate::gain::db_to_linear(self.volume_db())
+    }
+}
+
+/// One validated low-frequency Emitter update captured for the render owner.
+pub(crate) struct EmitterUpdate {
+    emitter: Emitter,
+    render_state: VoiceRenderState,
+    bus_index: usize,
+}
+
+impl EmitterUpdate {
+    pub(crate) fn capture(emitter: Emitter, desc: &EmitterDesc, bus_index: usize) -> Self {
+        Self {
+            emitter,
+            render_state: VoiceRenderState::capture(desc, 0.0),
+            bus_index,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Emitter, VoiceRenderState, usize) {
+        (self.emitter, self.render_state, self.bus_index)
+    }
 }
 
 /// Represents the current playback state of an audio source.
@@ -85,7 +161,7 @@ pub(crate) struct AcceptedVoice {
     voice_id: VoiceId,
     emitter: Emitter,
     audio_data: Arc<PetalSonicAudioData>,
-    config: SourceConfig,
+    render_state: VoiceRenderState,
     loop_mode: LoopMode,
     bus_index: usize,
     playback_rate: f32,
@@ -112,7 +188,7 @@ impl AcceptedVoice {
             voice_id,
             emitter,
             audio_data: clip.data.clone(),
-            config: emitter_desc.source_config(options.gain_db),
+            render_state: VoiceRenderState::capture(emitter_desc, options.gain_db),
             loop_mode: options.loop_mode,
             bus_index,
             playback_rate: options.playback_rate(),
@@ -153,7 +229,7 @@ impl PreparedVoice {
             voice_id,
             emitter,
             audio_data,
-            config,
+            render_state,
             loop_mode,
             bus_index,
             playback_rate,
@@ -165,13 +241,13 @@ impl PreparedVoice {
             source_extent,
             occlusion_profile,
         } = accepted;
-        let acoustic_voice = match &config {
-            SourceConfig::Spatial { pose, .. } => Some(AcousticVoice {
+        let acoustic_voice = match render_state.spatial_pose() {
+            Some(pose) => Some(AcousticVoice {
                 voice_id,
                 emitter,
-                emitter_world_pose: *pose,
+                emitter_world_pose: pose,
                 acoustic_priority: 1.0,
-                audibility: config.volume(),
+                audibility: render_state.volume_linear(),
                 detached,
                 direct_path,
                 environment_send,
@@ -179,7 +255,7 @@ impl PreparedVoice {
                 occlusion_profile,
                 routing_generation: 0,
             }),
-            SourceConfig::NonSpatial { .. } => None,
+            None => None,
         };
         let total_frames = audio_data.total_frames();
         let sample_rate = audio_data.sample_rate();
@@ -197,7 +273,7 @@ impl PreparedVoice {
                 && !matches!(environment_send.origin(), EnvironmentOrigin::Disabled),
             audio_data,
             info: PlaybackInfo::new(total_frames),
-            config,
+            render_state,
             loop_mode,
             bus_index,
             reached_end_this_iteration: false,
@@ -264,7 +340,7 @@ pub struct PlaybackInstance {
     /// Current playback information
     pub info: PlaybackInfo,
     /// Source configuration (spatial/non-spatial)
-    pub config: SourceConfig,
+    pub(crate) render_state: VoiceRenderState,
     /// Loop mode for this playback
     pub loop_mode: LoopMode,
     /// Fixed bus route selected when the Voice is created. Zero is Master.
@@ -518,7 +594,7 @@ impl PlaybackInstance {
             scratch.resize(frame_count, 0.0);
         }
 
-        let volume = self.config.volume();
+        let volume = self.render_state.volume_linear();
         let frames_filled = self.fill_mono_buffer(&mut scratch[..frame_count], volume);
 
         for (frame_idx, sample) in scratch.iter().copied().take(frames_filled).enumerate() {
@@ -602,7 +678,7 @@ pub enum PlaybackCommand {
     SeekEmitter(Emitter, f32),
     DestroyEmitter(Emitter),
     StopAll,
-    UpdateEmitter(Emitter, SourceConfig, usize),
+    UpdateEmitter(EmitterUpdate),
     UpdateBus(usize, BusParams),
 }
 
@@ -635,11 +711,10 @@ impl fmt::Debug for PlaybackCommand {
                 f.debug_tuple("DestroyEmitter").field(emitter).finish()
             }
             Self::StopAll => f.write_str("StopAll"),
-            Self::UpdateEmitter(emitter, config, bus_index) => f
+            Self::UpdateEmitter(update) => f
                 .debug_tuple("UpdateEmitter")
-                .field(emitter)
-                .field(config)
-                .field(bus_index)
+                .field(&update.emitter)
+                .field(&update.bus_index)
                 .finish(),
             Self::UpdateBus(index, params) => f
                 .debug_tuple("UpdateBus")
@@ -707,8 +782,8 @@ mod tests {
         assert_eq!(voice_id, VoiceId::from(23));
         assert_eq!(instance.emitter, emitter);
         assert!(Arc::ptr_eq(&instance.audio_data, &audio));
-        assert_eq!(instance.config.pose(), Some(emitter_pose));
-        assert_eq!(instance.config.volume_db(), -5.0);
+        assert_eq!(instance.render_state.spatial_pose(), Some(emitter_pose));
+        assert_eq!(instance.render_state.volume_db(), -5.0);
         assert!(matches!(instance.loop_mode, LoopMode::Infinite));
         assert!(instance.detached);
         assert_eq!(instance.completion_tag, Some(PlaybackTag(5)));

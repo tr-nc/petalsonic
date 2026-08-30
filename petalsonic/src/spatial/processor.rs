@@ -7,7 +7,6 @@ use super::native_hrtf::{
     NativeHrtfRenderMetrics, NativeHrtfRenderer, NativeHrtfSourceState, NativeHrtfTable,
 };
 use crate::acoustic_propagation::{AcousticResponse, DirectLobeTarget, MAX_EARLY_REFLECTION_TAPS};
-use crate::config::SourceConfig;
 use crate::domain::VoiceId;
 use crate::domain::{
     DirectGeometry, DirectPlacement, Emitter, EnvironmentOrigin, MAX_DIRECT_LOBES,
@@ -698,7 +697,7 @@ impl SpatialProcessor {
             let Some(instance) = instances.get(voice_id) else {
                 continue;
             };
-            if !matches!(instance.config, SourceConfig::Spatial { .. }) {
+            if !instance.render_state.is_spatial() {
                 continue;
             }
 
@@ -881,13 +880,13 @@ impl SpatialProcessor {
         events: &mut Vec<VoiceTelemetryEvent>,
     ) -> Result<SourceProcessingMetrics> {
         // Get spatial configuration (position + per-source volume)
-        let emitter_position = match &instance.config {
-            SourceConfig::Spatial { pose, .. } => pose.position,
-            _ => return Ok(SourceProcessingMetrics::default()), // Not a spatial source, skip
+        let emitter_position = match instance.render_state.spatial_pose() {
+            Some(pose) => pose.position,
+            None => return Ok(SourceProcessingMetrics::default()), // Not a spatial source, skip
         };
 
         // Convert dB volume from config to linear gain once per block.
-        let volume = instance.config.volume();
+        let volume = instance.render_state.volume_linear();
 
         // Fill input buffer with audio samples
         let frames_filled = self.fill_input_buffer(instance, volume);
@@ -1204,12 +1203,15 @@ impl SpatialProcessor {
         for sample in weighted.samples() {
             let lobe = sample.id().0 as usize % lobe_count;
             let local_position = match instance.direct_path.placement() {
-                DirectPlacement::World => match &instance.config {
-                    SourceConfig::Spatial { pose, .. } => self.world_to_listener_position(
-                        pose.position + pose.rotation * sample.local_position(),
-                    ),
-                    SourceConfig::NonSpatial { .. } => Vec3::Z,
-                },
+                DirectPlacement::World => instance
+                    .render_state
+                    .spatial_pose()
+                    .map(|pose| {
+                        self.world_to_listener_position(
+                            pose.position + pose.rotation * sample.local_position(),
+                        )
+                    })
+                    .unwrap_or(Vec3::Z),
                 DirectPlacement::ListenerRelative(pose) => {
                     pose.position + pose.rotation * sample.local_position()
                 }

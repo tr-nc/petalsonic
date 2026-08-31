@@ -26,6 +26,14 @@ quality = source[start:end]
 if len(re.findall(r"(?m)^    runs-on: ubuntu-latest\s*$", quality)) != 1:
     raise SystemExit("quality job must run exactly once on ubuntu-latest")
 
+toolchain = re.compile(
+    r"(?m)^      - uses: dtolnay/rust-toolchain@stable\s*$\n"
+    r"^        with:\s*$\n"
+    r"^          components: rustfmt, clippy\s*$"
+)
+if len(toolchain.findall(quality)) != 1:
+    raise SystemExit("quality job must install the rustfmt and clippy components explicitly")
+
 required_commands = [
     "cargo fmt --all -- --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
@@ -33,7 +41,7 @@ required_commands = [
     "tools/tests/publish_realtime_gate_test.sh",
 ]
 for command in required_commands:
-    pattern = rf"(?m)^\s+run:\s*{re.escape(command)}\s*$"
+    pattern = rf"(?m)^[ \t]+run:[ \t]*{re.escape(command)}[ \t]*$"
     in_quality = len(re.findall(pattern, quality))
     in_workflow = len(re.findall(pattern, source))
     if in_quality != 1 or in_workflow != 1:

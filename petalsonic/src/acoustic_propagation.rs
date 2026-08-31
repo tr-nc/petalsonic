@@ -2682,6 +2682,31 @@ mod tests {
     }
 
     #[test]
+    fn render_publication_normalizes_unordered_voice_responses() {
+        let response = AcousticResponse {
+            spatial_revision: 3,
+            geometry_version: 5,
+            direct: [4, 1, 3, 2]
+                .into_iter()
+                .map(|voice| direct_response(voice, voice + 10))
+                .collect(),
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 0,
+        };
+
+        for voice in 1..=4 {
+            assert_eq!(
+                response
+                    .voice_response(VoiceId::from(voice))
+                    .unwrap()
+                    .direct_gain(),
+                [voice as f32; 3]
+            );
+        }
+    }
+
+    #[test]
     fn completed_voice_publication_association_is_bounded_for_4096_voices() {
         const VOICES: usize = 4_096;
         const MAX_LOGARITHMIC_COMPARISONS_PER_VOICE: usize = 40;

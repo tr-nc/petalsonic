@@ -8,6 +8,8 @@ thread_local! {
     static PROBE_ACTIVITY: Cell<usize> = const { Cell::new(0) };
     static ACOUSTIC_LOOKUP_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static ACOUSTIC_LOOKUP_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ACOUSTIC_COMPARISON_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static ACOUSTIC_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[global_allocator]
@@ -64,4 +66,20 @@ pub(crate) fn acoustic_response_lookup_activity(operation: impl FnOnce()) -> usi
     operation();
     ACOUSTIC_LOOKUP_PROBE_ACTIVE.with(|active| active.set(false));
     ACOUSTIC_LOOKUP_COUNT.with(Cell::get)
+}
+
+pub(crate) fn record_acoustic_publication_comparison() {
+    ACOUSTIC_COMPARISON_PROBE_ACTIVE.with(|active| {
+        if active.get() {
+            ACOUSTIC_COMPARISON_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+pub(crate) fn acoustic_publication_comparison_activity(operation: impl FnOnce()) -> usize {
+    ACOUSTIC_COMPARISON_COUNT.with(|count| count.set(0));
+    ACOUSTIC_COMPARISON_PROBE_ACTIVE.with(|active| active.set(true));
+    operation();
+    ACOUSTIC_COMPARISON_PROBE_ACTIVE.with(|active| active.set(false));
+    ACOUSTIC_COMPARISON_COUNT.with(Cell::get)
 }

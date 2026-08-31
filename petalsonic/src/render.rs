@@ -801,7 +801,7 @@ mod tests {
         Arc::new(AcousticResponse {
             spatial_revision: revision,
             geometry_version: 0,
-            direct: Vec::new(),
+            direct: Vec::new().into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 0,

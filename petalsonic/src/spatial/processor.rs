@@ -1715,7 +1715,7 @@ mod tests {
         Arc::new(AcousticResponse {
             spatial_revision,
             geometry_version,
-            direct: Vec::new(),
+            direct: Vec::new().into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 0,
@@ -1780,7 +1780,8 @@ mod tests {
                 solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
                 cache_age_seconds: 0.0,
                 early_reflections,
-            }],
+            }]
+            .into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 1,
@@ -1879,7 +1880,8 @@ mod tests {
                 arrival_direction: Vec3::Z,
                 delay_seconds: 0.01,
                 gain: [0.1; 3],
-            }],
+            }]
+            .into(),
         ));
         let mut new_state_voices = HashMap::from([(
             new_state_voice_id,
@@ -1914,7 +1916,8 @@ mod tests {
                 arrival_direction: Vec3::Z,
                 delay_seconds: 0.01,
                 gain: [0.1; 3],
-            }],
+            }]
+            .into(),
         ));
         let mut retired_voices =
             HashMap::from([(retired_voice_id, lookup_contract_voice(retired_voice_id))]);
@@ -1936,7 +1939,8 @@ mod tests {
                 arrival_direction: Vec3::Z,
                 delay_seconds: 0.01,
                 gain: [0.1; 3],
-            }],
+            }]
+            .into(),
         ));
         let mut reused_voices =
             HashMap::from([(reused_voice_id, lookup_contract_voice(reused_voice_id))]);
@@ -2115,7 +2119,8 @@ mod tests {
                 early_reflections: Vec::new(),
                 solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
                 cache_age_seconds: 0.0,
-            }],
+            }]
+            .into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 1,
@@ -2397,7 +2402,8 @@ mod tests {
                 solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
                 cache_age_seconds: 0.0,
                 early_reflections: Vec::new(),
-            }],
+            }]
+            .into(),
             late_reverb: LateReverbParameters {
                 pre_delay_seconds: 0.02,
                 rt60_seconds: [0.7, 0.9, 1.1],
@@ -2508,7 +2514,8 @@ mod tests {
                 solve_status: crate::acoustic_propagation::DirectSolveStatus::Solved,
                 cache_age_seconds: 0.0,
                 early_reflections: Vec::new(),
-            }],
+            }]
+            .into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 1,
@@ -2588,7 +2595,8 @@ mod tests {
                     delay_seconds: 4.0 / 48_000.0,
                     gain: [0.5, 0.25, 0.1],
                 }],
-            }],
+            }]
+            .into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 1,
@@ -2666,7 +2674,8 @@ mod tests {
                     delay_seconds: 0.03,
                     gain: [0.8; 3],
                 }],
-            }],
+            }]
+            .into(),
             late_reverb: LateReverbParameters {
                 pre_delay_seconds: 0.0,
                 rt60_seconds: [0.2; 3],

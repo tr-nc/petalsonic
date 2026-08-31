@@ -112,11 +112,45 @@ pub(crate) enum DirectSolveStatus {
     Deferred,
 }
 
+/// Immutable VoiceId-sorted render lookup table for one acoustic publication.
+///
+/// Construction owns ordering and uniqueness; rendering receives slice-like read access but
+/// cannot mutate the index out from under binary lookup.
+#[derive(Debug)]
+pub(crate) struct AcousticVoiceResponses(Vec<DirectAcousticResponse>);
+
+impl From<Vec<DirectAcousticResponse>> for AcousticVoiceResponses {
+    fn from(mut responses: Vec<DirectAcousticResponse>) -> Self {
+        responses.sort_by(|left, right| compare_voice_ids(left.voice_id, right.voice_id));
+        assert!(
+            responses.windows(2).all(|pair| {
+                compare_voice_ids(pair[0].voice_id, pair[1].voice_id) == CmpOrdering::Less
+            }),
+            "one acoustic render publication cannot contain duplicate Voice identities"
+        );
+        Self(responses)
+    }
+}
+
+impl FromIterator<DirectAcousticResponse> for AcousticVoiceResponses {
+    fn from_iter<T: IntoIterator<Item = DirectAcousticResponse>>(iter: T) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl std::ops::Deref for AcousticVoiceResponses {
+    type Target = [DirectAcousticResponse];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AcousticResponse {
     pub spatial_revision: u64,
     pub geometry_version: u64,
-    pub direct: Vec<DirectAcousticResponse>,
+    pub direct: AcousticVoiceResponses,
     pub late_reverb: LateReverbParameters,
     pub published_at: Instant,
     pub solve_time_us: u64,
@@ -175,10 +209,26 @@ impl AcousticResponse {
         #[cfg(test)]
         crate::test_support::record_acoustic_response_lookup();
         self.direct
-            .iter()
-            .find(|response| response.voice_id == voice_id)
+            .binary_search_by(|response| compare_voice_ids(response.voice_id, voice_id))
+            .ok()
+            .map(|index| &self.direct[index])
             .map(|voice| VoiceAcousticResponse { frame: self, voice })
     }
+}
+
+fn compare_voice_ids(left: VoiceId, right: VoiceId) -> CmpOrdering {
+    #[cfg(test)]
+    crate::test_support::record_acoustic_publication_comparison();
+    left.value().cmp(&right.value())
+}
+
+fn compare_voice_routes(left: VoiceRouteKey, right: VoiceRouteKey) -> CmpOrdering {
+    #[cfg(test)]
+    crate::test_support::record_acoustic_publication_comparison();
+    left.voice_id
+        .value()
+        .cmp(&right.voice_id.value())
+        .then_with(|| left.routing_generation.cmp(&right.routing_generation))
 }
 
 /// Immutable routing and the latest compatible emitter state for one active Voice.
@@ -259,12 +309,6 @@ impl InputState {
     fn assign_routing_generation(&mut self, voice: &mut AcousticVoice) {
         self.next_routing_generation = self.next_routing_generation.wrapping_add(1).max(1);
         voice.routing_generation = self.next_routing_generation;
-    }
-
-    fn voice_route_is_current(&self, route: VoiceRouteKey) -> bool {
-        self.voices.iter().any(|voice| {
-            voice.voice_id == route.voice_id && voice.routing_generation == route.routing_generation
-        })
     }
 }
 
@@ -693,36 +737,20 @@ struct AcousticPublisher {
 }
 
 impl AcousticPublisher {
-    /// Applies the ADR 0003 compatibility barrier to one completed frame.
-    ///
-    /// Scene replacement rejects the whole frame. Ordinary pose revisions are deliberately
-    /// absent, while retirement or rerouting removes one complete Voice envelope.
-    fn retain_compatible(
-        current: &InputState,
-        mut completed: CompletedAcousticFrame,
-    ) -> Option<CompletedAcousticFrame> {
-        if current.scene.as_ref().map(|scene| scene.version()) != Some(completed.geometry_version) {
-            return None;
-        }
-        completed
-            .voices
-            .retain(|voice| current.voice_route_is_current(voice.route));
-        Some(completed)
-    }
-
     fn commit(
         &self,
         captured_wake_generation: u64,
         completed: CompletedAcousticFrame,
     ) -> std::result::Result<bool, RuntimeChildFailure> {
-        self.counters.record_solve(completed.solve_time_us);
+        let completed_solve_time_us = completed.solve_time_us;
+        self.counters.record_solve(completed_solve_time_us);
         let publication_guard = self.input.state.lock().map_err(|_| {
             RuntimeChildFailure::new("acoustics publication input state is poisoned")
         })?;
         let newer_input_pending = publication_guard.wake_generation != captured_wake_generation;
         let discarded_spatial_revision = completed.spatial_revision;
         let discarded_geometry_version = completed.geometry_version;
-        let Some(completed) = Self::retain_compatible(&publication_guard, completed) else {
+        let Some(completed) = completed.retain_compatible(&publication_guard) else {
             drop(publication_guard);
             self.counters
                 .superseded_solve_count
@@ -741,6 +769,7 @@ impl AcousticPublisher {
 
         let published_at = Instant::now();
         let output = completed.into_solve_output(published_at);
+        debug_assert_eq!(output.response.solve_time_us, completed_solve_time_us);
         let response_spatial_revision = output.response.spatial_revision;
         let response_geometry_version = output.response.geometry_version;
         self.response_publication
@@ -885,10 +914,12 @@ fn propagation_loop(
         let started = Instant::now();
         let plan = AcousticSolvePlan::for_quality(captured.environmental_acoustics_quality)
             .bounded_by(environmental_acoustics_budget);
-        let mut output = solver.solve_with_telemetry(&captured, distance_scaler, plan);
+        let completed = solver.solve_completed(&captured, distance_scaler, plan);
         let elapsed_us = started.elapsed().as_micros() as u64;
-        output.response.solve_time_us = elapsed_us;
-        let newer_input_pending = publisher.commit(captured.wake_generation, output.into())?;
+        let newer_input_pending = publisher.commit(
+            captured.wake_generation,
+            completed.with_solve_time(elapsed_us),
+        )?;
         if newer_input_pending {
             next_solve = Instant::now();
         }
@@ -904,9 +935,10 @@ fn propagation_loop(
 #[cfg(test)]
 fn retain_compatible_completed_results(
     current: &InputState,
-    output: AcousticSolveOutput,
+    completed: CompletedAcousticFrame,
 ) -> Option<AcousticSolveOutput> {
-    AcousticPublisher::retain_compatible(current, output.into())
+    completed
+        .retain_compatible(current)
         .map(|completed| completed.into_solve_output(Instant::now()))
 }
 
@@ -965,54 +997,236 @@ struct CompletedVoice {
     conclusion: AcousticVoiceConclusionTelemetry,
 }
 
-impl From<AcousticSolveOutput> for CompletedAcousticFrame {
-    fn from(output: AcousticSolveOutput) -> Self {
-        let AcousticSolveOutput {
-            response,
-            mut telemetry,
-            conclusions,
-        } = output;
-        let AcousticResponse {
-            spatial_revision,
-            geometry_version,
-            mut direct,
-            late_reverb,
-            solve_time_us,
-            ..
-        } = response;
-        let voices = conclusions
-            .into_iter()
-            .map(|completed| {
-                let response = direct
-                    .iter()
-                    .position(|response| response.route_key() == completed.route)
-                    .map(|index| direct.swap_remove(index));
-                let telemetry = telemetry
-                    .iter()
-                    .position(|telemetry| telemetry.voice_id == completed.telemetry.voice_id)
-                    .map(|index| telemetry.swap_remove(index));
-                debug_assert_eq!(response.is_some(), telemetry.is_some());
-                CompletedVoice {
-                    route: completed.route,
-                    response,
-                    telemetry,
-                    conclusion: completed.telemetry,
-                }
-            })
-            .collect();
-        debug_assert!(direct.is_empty());
-        debug_assert!(telemetry.is_empty());
-        Self {
-            spatial_revision,
-            geometry_version,
-            late_reverb,
-            solve_time_us,
-            voices,
-        }
-    }
+struct VoiceAdmission {
+    route: VoiceRouteKey,
+    candidate_rank: usize,
+    selected: bool,
+}
+
+struct SolvedVoiceOutput {
+    route: VoiceRouteKey,
+    response: DirectAcousticResponse,
+    telemetry: AcousticExtentTelemetry,
 }
 
 impl CompletedAcousticFrame {
+    /// Seals one solve into route-sorted, indivisible Voice envelopes.
+    ///
+    /// Candidate admission, response data, extent telemetry, and conclusion telemetry cross this
+    /// interface together. Sorting and association stay behind the seam; consumers never have to
+    /// correlate parallel arrays.
+    fn finish_solve(
+        input: &SolveInput,
+        candidates: &[RankedVoice],
+        selected: &[RankedVoice],
+        mut responses: Vec<DirectAcousticResponse>,
+        mut telemetry: Vec<AcousticExtentTelemetry>,
+        late_reverb: LateReverbParameters,
+        plan: AcousticSolvePlan,
+    ) -> Self {
+        let selected_routes = selected
+            .iter()
+            .map(|candidate| candidate.voice.route_key())
+            .collect::<HashSet<_>>();
+        let mut admissions = candidates
+            .iter()
+            .map(|candidate| VoiceAdmission {
+                route: candidate.voice.route_key(),
+                candidate_rank: candidate.candidate_rank,
+                selected: selected_routes.contains(&candidate.voice.route_key()),
+            })
+            .collect::<Vec<_>>();
+        admissions.sort_by(|left, right| compare_voice_routes(left.route, right.route));
+        assert!(
+            admissions.windows(2).all(|pair| {
+                compare_voice_routes(pair[0].route, pair[1].route) == CmpOrdering::Less
+            }),
+            "one Voice route must have exactly one admission record"
+        );
+
+        responses.sort_by(|left, right| compare_voice_routes(left.route_key(), right.route_key()));
+        telemetry.sort_by(|left, right| {
+            compare_voice_ids(VoiceId::from(left.voice_id), VoiceId::from(right.voice_id))
+        });
+        assert_eq!(
+            responses.len(),
+            telemetry.len(),
+            "one solved response must have exactly one extent telemetry record"
+        );
+        let mut outputs = responses
+            .into_iter()
+            .zip(telemetry)
+            .map(|(response, telemetry)| {
+                assert_eq!(
+                    response.voice_id.value(),
+                    telemetry.voice_id,
+                    "response and extent telemetry must belong to the same Voice"
+                );
+                SolvedVoiceOutput {
+                    route: response.route_key(),
+                    response,
+                    telemetry,
+                }
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_by(|left, right| compare_voice_routes(left.route, right.route));
+        assert!(
+            outputs.windows(2).all(|pair| {
+                compare_voice_routes(pair[0].route, pair[1].route) == CmpOrdering::Less
+            }),
+            "one Voice route must have exactly one solved output"
+        );
+
+        let mut active_voices = input.voices.iter().collect::<Vec<_>>();
+        active_voices
+            .sort_by(|left, right| compare_voice_routes(left.route_key(), right.route_key()));
+        assert!(
+            active_voices.windows(2).all(|pair| {
+                compare_voice_ids(pair[0].voice_id, pair[1].voice_id) == CmpOrdering::Less
+            }),
+            "one acoustic publication cannot contain duplicate Voice identities"
+        );
+
+        let mut admissions = admissions.into_iter().peekable();
+        let mut outputs = outputs.into_iter().peekable();
+        let mut voices = Vec::with_capacity(active_voices.len());
+        for voice in active_voices {
+            let route = voice.route_key();
+            let admission = match admissions.peek() {
+                Some(candidate)
+                    if compare_voice_routes(candidate.route, route) == CmpOrdering::Equal =>
+                {
+                    admissions.next()
+                }
+                Some(candidate)
+                    if compare_voice_routes(candidate.route, route) == CmpOrdering::Less =>
+                {
+                    panic!("candidate admission does not belong to an active Voice")
+                }
+                _ => None,
+            };
+            let output = match outputs.peek() {
+                Some(solved) if compare_voice_routes(solved.route, route) == CmpOrdering::Equal => {
+                    outputs.next()
+                }
+                Some(solved) if compare_voice_routes(solved.route, route) == CmpOrdering::Less => {
+                    panic!("solved output does not belong to an active Voice")
+                }
+                _ => None,
+            };
+            assert_eq!(
+                admission.is_some(),
+                output.is_some(),
+                "every candidate must produce one complete response envelope"
+            );
+
+            let direct_enabled =
+                matches!(
+                    voice.direct_path.geometry(),
+                    DirectGeometry::SimulatedTransmission
+                ) && !matches!(voice.direct_path.placement(), DirectPlacement::Disabled);
+            let environment_enabled =
+                !matches!(voice.environment_send.origin(), EnvironmentOrigin::Disabled);
+            let selected = admission
+                .as_ref()
+                .is_some_and(|candidate| candidate.selected);
+            let active_outcome = if selected {
+                AcousticRouteOutcome::Applied
+            } else {
+                AcousticRouteOutcome::ExcludedByBudget
+            };
+            let response = output.as_ref().map(|solved| &solved.response);
+            let extent = output.as_ref().map(|solved| &solved.telemetry);
+            let conclusion = AcousticVoiceConclusionTelemetry {
+                voice_id: voice.voice_id.value(),
+                emitter: voice.emitter,
+                spatial_revision: input.spatial.revision(),
+                geometry_version: input.scene.version(),
+                candidate_rank: admission.as_ref().map(|candidate| candidate.candidate_rank),
+                candidate_limit: plan.max_direct_sources,
+                direct: if direct_enabled {
+                    active_outcome
+                } else {
+                    AcousticRouteOutcome::Disabled
+                },
+                environment: if environment_enabled {
+                    active_outcome
+                } else {
+                    AcousticRouteOutcome::Disabled
+                },
+                environment_transmission_gain: response
+                    .map_or([1.0; 3], |response| response.environment_gain),
+                early_tap_count: response.map_or(0, |response| response.early_reflections.len()),
+                solve_status: extent.map(|event| event.solve_status),
+            };
+            let (response, telemetry) = output.map_or((None, None), |solved| {
+                (Some(solved.response), Some(solved.telemetry))
+            });
+            voices.push(CompletedVoice {
+                route,
+                response,
+                telemetry,
+                conclusion,
+            });
+        }
+        assert!(admissions.next().is_none(), "orphaned candidate admission");
+        assert!(outputs.next().is_none(), "orphaned solved output");
+
+        Self {
+            spatial_revision: input.spatial.revision(),
+            geometry_version: input.scene.version(),
+            late_reverb,
+            solve_time_us: 0,
+            voices,
+        }
+    }
+
+    fn with_solve_time(mut self, solve_time_us: u64) -> Self {
+        self.solve_time_us = solve_time_us;
+        self
+    }
+
+    /// Applies the ADR 0003 compatibility barrier as one consuming publication transition.
+    ///
+    /// Scene replacement rejects the whole frame. Ordinary pose revisions are deliberately
+    /// absent, while retirement or rerouting removes the complete grouped Voice envelope. Both
+    /// route sets are sorted once and then compared with a linear merge-join.
+    fn retain_compatible(mut self, current: &InputState) -> Option<Self> {
+        if current.scene.as_ref().map(|scene| scene.version()) != Some(self.geometry_version) {
+            return None;
+        }
+        let mut current_routes = current
+            .voices
+            .iter()
+            .map(AcousticVoice::route_key)
+            .collect::<Vec<_>>();
+        current_routes.sort_by(|left, right| compare_voice_routes(*left, *right));
+        assert!(
+            current_routes.windows(2).all(|pair| {
+                compare_voice_ids(pair[0].voice_id, pair[1].voice_id) == CmpOrdering::Less
+            }),
+            "active acoustic Voice identities must be unique"
+        );
+
+        let mut current_index = 0;
+        self.voices.retain(|completed| {
+            loop {
+                let Some(current_route) = current_routes.get(current_index).copied() else {
+                    return false;
+                };
+                match compare_voice_routes(current_route, completed.route) {
+                    CmpOrdering::Less => current_index += 1,
+                    CmpOrdering::Equal => {
+                        current_index += 1;
+                        return true;
+                    }
+                    CmpOrdering::Greater => return false,
+                }
+            }
+        });
+        Some(self)
+    }
+
     fn into_solve_output(self, published_at: Instant) -> AcousticSolveOutput {
         let mut direct = Vec::with_capacity(self.voices.len());
         let mut telemetry = Vec::with_capacity(self.voices.len());
@@ -1025,17 +1239,14 @@ impl CompletedAcousticFrame {
                 telemetry.push(event);
             }
             conclusions.push(CompletedVoiceConclusion {
-                route: voice.route,
                 telemetry: voice.conclusion,
             });
         }
-        direct.sort_by_key(|response| response.voice_id.value());
-        telemetry.sort_by_key(|event| event.voice_id);
         AcousticSolveOutput {
             response: AcousticResponse {
                 spatial_revision: self.spatial_revision,
                 geometry_version: self.geometry_version,
-                direct,
+                direct: direct.into(),
                 late_reverb: self.late_reverb,
                 published_at,
                 solve_time_us: self.solve_time_us,
@@ -1047,7 +1258,6 @@ impl CompletedAcousticFrame {
 }
 
 struct CompletedVoiceConclusion {
-    route: VoiceRouteKey,
     telemetry: AcousticVoiceConclusionTelemetry,
 }
 
@@ -1107,12 +1317,23 @@ impl AcousticSolver {
             .response
     }
 
+    #[cfg(test)]
     fn solve_with_telemetry(
         &mut self,
         input: &SolveInput,
         distance_scaler: f32,
         plan: AcousticSolvePlan,
     ) -> AcousticSolveOutput {
+        self.solve_completed(input, distance_scaler, plan)
+            .into_solve_output(Instant::now())
+    }
+
+    fn solve_completed(
+        &mut self,
+        input: &SolveInput,
+        distance_scaler: f32,
+        plan: AcousticSolvePlan,
+    ) -> CompletedAcousticFrame {
         let candidates = ranked_voices(input, &self.previous_budget_membership);
         let (selected, skipped) = select_budgeted_candidates(&candidates, plan);
         let (mut direct, mut telemetry) = solve_direct(
@@ -1171,11 +1392,6 @@ impl AcousticSolver {
             direct.push(response);
             telemetry.push(event);
         }
-        direct.sort_by_key(|response| response.voice_id.value());
-        telemetry.sort_by_key(|event| event.voice_id);
-        let conclusions =
-            voice_conclusions(input, &candidates, &selected, &direct, &telemetry, plan);
-
         self.previous_budget_membership.clear();
         self.previous_budget_membership
             .extend(selected.iter().map(|candidate| candidate.voice.route_key()));
@@ -1196,88 +1412,16 @@ impl AcousticSolver {
                 && key.geometry_version == input.scene.version()
         });
 
-        AcousticSolveOutput {
-            response: AcousticResponse {
-                spatial_revision: input.spatial.revision(),
-                geometry_version: input.scene.version(),
-                direct,
-                late_reverb: solve_late_reverb(input, distance_scaler, plan),
-                published_at: Instant::now(),
-                solve_time_us: 0,
-            },
+        CompletedAcousticFrame::finish_solve(
+            input,
+            &candidates,
+            &selected,
+            direct,
             telemetry,
-            conclusions,
-        }
+            solve_late_reverb(input, distance_scaler, plan),
+            plan,
+        )
     }
-}
-
-fn voice_conclusions(
-    input: &SolveInput,
-    candidates: &[RankedVoice],
-    selected: &[RankedVoice],
-    responses: &[DirectAcousticResponse],
-    telemetry: &[AcousticExtentTelemetry],
-    plan: AcousticSolvePlan,
-) -> Vec<CompletedVoiceConclusion> {
-    let selected_routes = selected
-        .iter()
-        .map(|candidate| candidate.voice.route_key())
-        .collect::<HashSet<_>>();
-    input
-        .voices
-        .iter()
-        .map(|voice| {
-            let route = voice.route_key();
-            let candidate = candidates
-                .iter()
-                .find(|candidate| candidate.voice.route_key() == route);
-            let selected = selected_routes.contains(&route);
-            let direct_enabled =
-                matches!(
-                    voice.direct_path.geometry(),
-                    DirectGeometry::SimulatedTransmission
-                ) && !matches!(voice.direct_path.placement(), DirectPlacement::Disabled);
-            let environment_enabled =
-                !matches!(voice.environment_send.origin(), EnvironmentOrigin::Disabled);
-            let response = responses
-                .iter()
-                .find(|response| response.route_key() == route);
-            let extent = telemetry
-                .iter()
-                .find(|event| event.voice_id == voice.voice_id.value());
-            let active_outcome = if selected {
-                AcousticRouteOutcome::Applied
-            } else {
-                AcousticRouteOutcome::ExcludedByBudget
-            };
-            CompletedVoiceConclusion {
-                route,
-                telemetry: AcousticVoiceConclusionTelemetry {
-                    voice_id: voice.voice_id.value(),
-                    emitter: voice.emitter,
-                    spatial_revision: input.spatial.revision(),
-                    geometry_version: input.scene.version(),
-                    candidate_rank: candidate.map(|candidate| candidate.candidate_rank),
-                    candidate_limit: plan.max_direct_sources,
-                    direct: if direct_enabled {
-                        active_outcome
-                    } else {
-                        AcousticRouteOutcome::Disabled
-                    },
-                    environment: if environment_enabled {
-                        active_outcome
-                    } else {
-                        AcousticRouteOutcome::Disabled
-                    },
-                    environment_transmission_gain: response
-                        .map_or([1.0; 3], |response| response.environment_gain),
-                    early_tap_count: response
-                        .map_or(0, |response| response.early_reflections.len()),
-                    solve_status: extent.map(|event| event.solve_status),
-                },
-            }
-        })
-        .collect()
 }
 
 fn deferred_response(voice: &AcousticVoice) -> DirectAcousticResponse {
@@ -2147,19 +2291,23 @@ fn solve_early_reflections(
         &mut surface_hits,
     );
 
-    for candidate in candidates.iter().take(plan.max_early_reflection_sources) {
-        let Some((representatives, aggregate_environment_gain)) = responses
-            .iter()
-            .find(|response| response.voice_id == candidate.voice.voice_id)
-            .map(|response| {
-                (
-                    response.environment_representatives.clone(),
-                    response.environment_gain,
-                )
-            })
-        else {
-            continue;
-        };
+    assert_eq!(
+        candidates.len(),
+        responses.len(),
+        "each selected acoustic candidate must own one response"
+    );
+    for (candidate, response) in candidates
+        .iter()
+        .zip(responses.iter_mut())
+        .take(plan.max_early_reflection_sources)
+    {
+        assert_eq!(
+            compare_voice_ids(response.voice_id, candidate.voice.voice_id),
+            CmpOrdering::Equal,
+            "selected candidate and response order diverged"
+        );
+        let representatives = response.environment_representatives.clone();
+        let aggregate_environment_gain = response.environment_gain;
         if representatives.is_empty() {
             continue;
         }
@@ -2275,12 +2423,7 @@ fn solve_early_reflections(
         });
         taps.truncate(plan.early_reflection_taps);
         taps.sort_by_key(|tap| tap.path_id);
-        if let Some(response) = responses
-            .iter_mut()
-            .find(|response| response.voice_id == candidate.voice.voice_id)
-        {
-            response.early_reflections = taps;
-        }
+        response.early_reflections = taps;
     }
 }
 
@@ -2518,6 +2661,295 @@ mod tests {
     use crate::domain::EmitterSpatialState;
     use crate::math::Pose;
     use std::sync::atomic::{AtomicU8, AtomicUsize};
+
+    fn direct_response(voice_id: u64, routing_generation: u64) -> DirectAcousticResponse {
+        DirectAcousticResponse {
+            voice_id: VoiceId::from(voice_id),
+            routing_generation,
+            gain: [voice_id as f32; 3],
+            environment_gain: [1.0; 3],
+            direct_lobes: Vec::new(),
+            environment_representatives: Vec::new(),
+            early_reflections: Vec::new(),
+            solve_status: DirectSolveStatus::Solved,
+            cache_age_seconds: 0.0,
+        }
+    }
+
+    #[test]
+    fn render_publication_lookup_is_bounded_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        const MAX_BINARY_COMPARISONS_PER_LOOKUP: usize = 13;
+        let response = AcousticResponse {
+            spatial_revision: 3,
+            geometry_version: 5,
+            direct: (0..VOICES)
+                .map(|voice| direct_response(voice as u64, voice as u64 + 1))
+                .collect::<Vec<_>>()
+                .into(),
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 0,
+        };
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            for voice in (0..VOICES).rev() {
+                assert_eq!(
+                    response
+                        .voice_response(VoiceId::from(voice as u64))
+                        .unwrap()
+                        .direct_gain(),
+                    [voice as f32; 3]
+                );
+            }
+            assert!(
+                response
+                    .voice_response(VoiceId::from(VOICES as u64))
+                    .is_none()
+            );
+        });
+
+        assert!(
+            comparisons <= (VOICES + 1) * MAX_BINARY_COMPARISONS_PER_LOOKUP,
+            "4096-Voice render publication performed {comparisons} comparisons"
+        );
+    }
+
+    #[test]
+    fn render_publication_normalizes_unordered_voice_responses() {
+        let response = AcousticResponse {
+            spatial_revision: 3,
+            geometry_version: 5,
+            direct: [4, 1, 3, 2]
+                .into_iter()
+                .map(|voice| direct_response(voice, voice + 10))
+                .collect::<Vec<_>>()
+                .into(),
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 0,
+        };
+
+        for voice in 1..=4 {
+            assert_eq!(
+                response
+                    .voice_response(VoiceId::from(voice))
+                    .unwrap()
+                    .direct_gain(),
+                [voice as f32; 3]
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "one acoustic render publication cannot contain duplicate Voice identities"
+    )]
+    fn render_publication_rejects_duplicate_voice_identity() {
+        let _: AcousticVoiceResponses = vec![direct_response(7, 1), direct_response(7, 2)].into();
+    }
+
+    #[test]
+    #[should_panic(expected = "one acoustic publication cannot contain duplicate Voice identities")]
+    fn completed_publication_rejects_duplicate_active_voice_identity() {
+        let mut workload = input(Arc::new(NoGeometry));
+        let mut duplicate = workload.voices[0].clone();
+        duplicate.routing_generation += 1;
+        workload.voices.push(duplicate);
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 0,
+            max_direct_rays: 0,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+
+        let _ = AcousticSolver::new(2).solve_completed(&workload, 1.0, plan);
+    }
+
+    #[test]
+    fn completed_voice_publication_association_is_bounded_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        const MAX_LOGARITHMIC_COMPARISONS_PER_VOICE: usize = 40;
+        let mut workload = input(Arc::new(NoGeometry));
+        let template = workload.voices[0].clone();
+        workload.voices = (0..VOICES)
+            .map(|voice| {
+                let mut voice_input = template.clone();
+                voice_input.voice_id = VoiceId::from(voice as u64 + 1);
+                voice_input.routing_generation = voice as u64 + 11;
+                voice_input.emitter.index = voice as u32;
+                voice_input
+            })
+            .collect();
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 0,
+            max_direct_rays: 0,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let mut output = None;
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            output = Some(AcousticSolver::new(VOICES).solve_with_telemetry(&workload, 1.0, plan));
+        });
+        let output = output.unwrap();
+
+        assert_eq!(output.response.direct.len(), VOICES);
+        assert_eq!(output.telemetry.len(), VOICES);
+        assert_eq!(output.conclusions.len(), VOICES);
+        for voice in [1, VOICES as u64 / 2, VOICES as u64] {
+            let response = output
+                .response
+                .voice_response(VoiceId::from(voice))
+                .unwrap();
+            assert_eq!(response.direct_gain_target(), None);
+            let telemetry = &output.telemetry[voice as usize - 1];
+            assert_eq!(telemetry.voice_id, voice);
+            assert_eq!(telemetry.solve_status, AcousticSolveStatus::Deferred);
+            let conclusion = &output.conclusions[voice as usize - 1].telemetry;
+            assert_eq!(conclusion.voice_id, voice);
+            assert_eq!(conclusion.solve_status, Some(AcousticSolveStatus::Deferred));
+        }
+        assert!(
+            comparisons <= VOICES * MAX_LOGARITHMIC_COMPARISONS_PER_VOICE,
+            "4096-Voice completion association performed {comparisons} comparisons"
+        );
+    }
+
+    #[test]
+    fn early_reflection_response_association_is_bounded_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        const MAX_SOLVE_COMPARISONS_PER_VOICE: usize = 64;
+        let mut workload = input(Arc::new(NoGeometry));
+        let template = workload.voices[0].clone();
+        workload.voices = (0..VOICES)
+            .map(|voice| {
+                let mut voice_input = template.clone();
+                voice_input.voice_id = VoiceId::from(voice as u64 + 1);
+                voice_input.routing_generation = voice as u64 + 11;
+                voice_input.emitter.index = voice as u32;
+                voice_input
+            })
+            .collect();
+        let plan = AcousticSolvePlan {
+            max_direct_sources: VOICES,
+            max_direct_rays: VOICES * 2,
+            max_early_reflection_sources: VOICES,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let mut completed = None;
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            completed = Some(AcousticSolver::new(VOICES).solve_completed(&workload, 1.0, plan));
+        });
+
+        assert_eq!(completed.unwrap().voices.len(), VOICES);
+        assert!(
+            comparisons <= VOICES * MAX_SOLVE_COMPARISONS_PER_VOICE,
+            "4096-Voice early-reflection association performed {comparisons} comparisons"
+        );
+    }
+
+    #[test]
+    fn compatibility_retain_is_bounded_and_keeps_voice_envelopes_grouped() {
+        const VOICES: usize = 4_096;
+        const REROUTED: usize = 16;
+        const RETIRED: usize = 16;
+        const MAX_LOGARITHMIC_COMPARISONS_PER_VOICE: usize = 32;
+        let mut captured = input(Arc::new(NoGeometry));
+        let template = captured.voices[0].clone();
+        captured.voices = (0..VOICES)
+            .map(|voice| {
+                let mut voice_input = template.clone();
+                voice_input.voice_id = VoiceId::from(voice as u64 + 1);
+                voice_input.routing_generation = voice as u64 + 11;
+                voice_input.emitter.index = voice as u32;
+                voice_input
+            })
+            .collect();
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 0,
+            max_direct_rays: 0,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let completed = AcousticSolver::new(VOICES).solve_completed(&captured, 1.0, plan);
+        let mut current = InputState::new(0.5, VOICES);
+        current.scene = Some(captured.scene.clone());
+        current.spatial = Some(Arc::new(SpatialFrame::new(
+            captured.spatial.revision() + 99,
+            captured.spatial.sim_time_seconds() + 1.0,
+            Pose::from_position(Vec3::X),
+            Vec::new(),
+        )));
+        current.voices = captured.voices.clone();
+        for voice in current
+            .voices
+            .iter_mut()
+            .filter(|voice| voice.voice_id.value() <= REROUTED as u64)
+        {
+            voice.routing_generation += 10_000;
+        }
+        current
+            .voices
+            .retain(|voice| voice.voice_id.value() <= (VOICES - RETIRED) as u64);
+        current.voices.reverse();
+        let mut retained = None;
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            retained = completed.retain_compatible(&current);
+        });
+        let retained = retained.unwrap().into_solve_output(Instant::now());
+        let expected = VOICES - REROUTED - RETIRED;
+
+        assert_eq!(retained.response.direct.len(), expected);
+        assert_eq!(retained.telemetry.len(), expected);
+        assert_eq!(retained.conclusions.len(), expected);
+        assert_eq!(
+            retained.response.spatial_revision,
+            captured.spatial.revision()
+        );
+        assert!(
+            retained
+                .response
+                .voice_response(VoiceId::from(REROUTED as u64))
+                .is_none()
+        );
+        assert_eq!(
+            retained.response.direct.first().unwrap().voice_id,
+            VoiceId::from(REROUTED as u64 + 1)
+        );
+        assert_eq!(
+            retained.response.direct.last().unwrap().voice_id,
+            VoiceId::from((VOICES - RETIRED) as u64)
+        );
+        for index in [0, expected / 2, expected - 1] {
+            assert_eq!(
+                retained.response.direct[index].voice_id.value(),
+                retained.telemetry[index].voice_id
+            );
+            assert_eq!(
+                retained.response.direct[index].voice_id.value(),
+                retained.conclusions[index].telemetry.voice_id
+            );
+        }
+        assert!(
+            comparisons <= VOICES * MAX_LOGARITHMIC_COMPARISONS_PER_VOICE,
+            "4096-Voice compatibility retain performed {comparisons} comparisons"
+        );
+    }
 
     fn start_propagation(
         enabled: bool,
@@ -3041,7 +3473,7 @@ mod tests {
             voice.routing_generation = routing_generation;
             captured.voices.push(voice);
         }
-        let output = AcousticSolver::new(3).solve_with_telemetry(
+        let completed = AcousticSolver::new(3).solve_completed(
             &captured,
             1.0,
             AcousticSolvePlan::for_quality(0.5),
@@ -3066,7 +3498,7 @@ mod tests {
         rerouted.routing_generation = 20;
         rerouted.environment_send = EnvironmentSend::from_world_pose(Pose::from_position(-Vec3::Z));
 
-        let filtered = retain_compatible_completed_results(&current, output).unwrap();
+        let filtered = retain_compatible_completed_results(&current, completed).unwrap();
 
         assert_eq!(
             filtered.response.spatial_revision,
@@ -3107,7 +3539,7 @@ mod tests {
     #[test]
     fn scene_change_rejects_completed_publication() {
         let captured = input(Arc::new(NoGeometry));
-        let output = AcousticSolver::new(1).solve_with_telemetry(
+        let completed = AcousticSolver::new(1).solve_completed(
             &captured,
             1.0,
             AcousticSolvePlan::for_quality(0.5),
@@ -3120,7 +3552,7 @@ mod tests {
             Arc::new(NoGeometry),
         )));
 
-        assert!(retain_compatible_completed_results(&current, output).is_none());
+        assert!(retain_compatible_completed_results(&current, completed).is_none());
     }
 
     #[test]

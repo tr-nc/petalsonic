@@ -311,6 +311,7 @@ impl PreparedVoice {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_test_voice(
     voice_id: VoiceId,
     emitter: Emitter,

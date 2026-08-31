@@ -1885,8 +1885,7 @@ mod tests {
                 arrival_direction: Vec3::Z,
                 delay_seconds: 0.01,
                 gain: [0.1; 3],
-            }]
-            .into(),
+            }],
         ));
         let mut new_state_voices = HashMap::from([(
             new_state_voice_id,
@@ -1921,8 +1920,7 @@ mod tests {
                 arrival_direction: Vec3::Z,
                 delay_seconds: 0.01,
                 gain: [0.1; 3],
-            }]
-            .into(),
+            }],
         ));
         let mut retired_voices =
             HashMap::from([(retired_voice_id, lookup_contract_voice(retired_voice_id))]);
@@ -1944,8 +1942,7 @@ mod tests {
                 arrival_direction: Vec3::Z,
                 delay_seconds: 0.01,
                 gain: [0.1; 3],
-            }]
-            .into(),
+            }],
         ));
         let mut reused_voices =
             HashMap::from([(reused_voice_id, lookup_contract_voice(reused_voice_id))]);
@@ -2102,7 +2099,7 @@ mod tests {
             spatial_revision: 1,
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
-                voice_id: voice_id,
+                voice_id,
                 routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
@@ -2398,7 +2395,7 @@ mod tests {
             spatial_revision: 24,
             geometry_version: 8,
             direct: vec![DirectAcousticResponse {
-                voice_id: voice_id,
+                voice_id,
                 routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
@@ -2510,7 +2507,7 @@ mod tests {
             spatial_revision: 1,
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
-                voice_id: voice_id,
+                voice_id,
                 routing_generation: 0,
                 gain: [0.0; 3],
                 environment_gain: [0.0; 3],
@@ -2586,7 +2583,7 @@ mod tests {
             spatial_revision: 1,
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
-                voice_id: voice_id,
+                voice_id,
                 routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],
@@ -2665,7 +2662,7 @@ mod tests {
             spatial_revision: 1,
             geometry_version: 1,
             direct: vec![DirectAcousticResponse {
-                voice_id: voice_id,
+                voice_id,
                 routing_generation: 0,
                 gain: [1.0; 3],
                 environment_gain: [1.0; 3],

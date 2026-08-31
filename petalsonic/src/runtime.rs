@@ -29,6 +29,9 @@ pub(crate) const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 ///
 /// Queue selection and render-path preparation deliberately remain behind the
 /// runtime seam; callers cannot acquire or route through the underlying endpoints.
+// RuntimeIntent is converted immediately and is never stored. Boxing Play would add a control-
+// path allocation solely to shrink this transient enum.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RuntimeIntent {
     Play(AcceptedVoice),
     UpdateEmitter(EmitterUpdate),
@@ -639,6 +642,9 @@ impl AudioRuntime {
             .is_ok()
     }
 
+    // The closure captures these linear startup capabilities exactly once. A generic dependency
+    // bag would weaken that ownership boundary and is not reused anywhere else.
+    #[allow(clippy::too_many_arguments)]
     fn start_output_child(
         services: &mut RuntimeServices,
         startup: PreparedEngine,

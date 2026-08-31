@@ -170,6 +170,10 @@ impl OutputSession {
         while consumer.try_pop().is_some() {}
     }
 
+    // This is the single assembly boundary for independently owned platform, render, telemetry,
+    // and failure capabilities. Hiding them in an untyped parameter bag would make ownership less
+    // explicit without reducing the session's responsibilities.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         desc: PetalSonicWorldDesc,
         platform: Box<dyn OutputPlatform>,

@@ -454,13 +454,13 @@ impl AcousticVoiceRegistry {
         }
     }
 
-    pub(crate) fn activate(
-        &mut self,
-        mut voice: AcousticVoice,
-        spatial: Option<&SpatialFrame>,
-    ) -> std::result::Result<(), AcousticVoice> {
+    pub(crate) fn activate(&mut self, mut voice: AcousticVoice, spatial: Option<&SpatialFrame>) {
         #[cfg(test)]
         crate::test_support::record_acoustic_input_comparison();
+        assert!(
+            !self.indices.contains_key(&voice.voice_id),
+            "one acoustic Voice identity cannot be activated twice"
+        );
         if let Some(emitter) = (!voice.detached)
             .then(|| spatial.and_then(|frame| frame.emitter_state(voice.emitter)))
             .flatten()
@@ -471,24 +471,20 @@ impl AcousticVoiceRegistry {
         self.next_routing_generation = self.next_routing_generation.wrapping_add(1).max(1);
         voice.routing_generation = self.next_routing_generation;
 
-        if let Some(index) = self.indices.get(&voice.voice_id).copied() {
-            self.voices[index] = Some(voice);
-            self.dirty = true;
-            return Ok(());
-        }
         let index = if let Some(index) = self.free_slots.pop() {
             index
-        } else if self.voices.len() < self.voices.capacity() {
+        } else {
+            assert!(
+                self.voices.len() < self.voices.capacity(),
+                "acoustic Voice registry exceeded the configured world capacity"
+            );
             let index = self.voices.len();
             self.voices.push(None);
             index
-        } else {
-            return Err(voice);
         };
-        self.indices.insert(voice.voice_id, index);
+        assert!(self.indices.insert(voice.voice_id, index).is_none());
         self.voices[index] = Some(voice);
         self.dirty = true;
-        Ok(())
     }
 
     pub(crate) fn retire(&mut self, voice_id: VoiceId) -> Option<AcousticVoice> {
@@ -3074,7 +3070,7 @@ mod tests {
             )
             .unwrap(),
         ));
-        current.voices = captured.voices.iter().cloned().collect();
+        current.voices = captured.voices.to_vec();
         for voice in current
             .voices
             .iter_mut()
@@ -3675,7 +3671,7 @@ mod tests {
             )
             .unwrap(),
         ));
-        current.voices = captured.voices.iter().cloned().collect();
+        current.voices = captured.voices.to_vec();
         current
             .voices
             .retain(|voice| voice.voice_id != VoiceId::from(3));
@@ -3734,7 +3730,7 @@ mod tests {
             AcousticSolvePlan::for_quality(0.5),
         );
         let mut current = InputState::new(0.5, 1);
-        current.voices = captured.voices.iter().cloned().collect();
+        current.voices = captured.voices.to_vec();
         current.spatial = Some(captured.spatial.clone());
         current.scene = Some(Arc::new(AcousticSceneSnapshot::new(
             captured.scene.version() + 1,
@@ -4566,8 +4562,8 @@ mod tests {
         detached.voice_id = VoiceId::from(2);
         detached.detached = true;
         let emitter = attached.emitter;
-        registry.activate(attached, None).unwrap();
-        registry.activate(detached, None).unwrap();
+        registry.activate(attached, None);
+        registry.activate(detached, None);
 
         registry.update_emitter_audibility(emitter, 0.25);
         assert!(input_port.try_publish(&mut registry));
@@ -4592,25 +4588,23 @@ mod tests {
         let memory_activity = crate::test_support::realtime_memory_activity(|| {
             comparisons = crate::test_support::acoustic_input_comparison_activity(|| {
                 for voice in 0..VOICES {
-                    registry
-                        .activate(
-                            AcousticVoice {
-                                voice_id: VoiceId::from(voice as u64 + 1),
-                                emitter: emitter(voice),
-                                emitter_world_pose: Pose::identity(),
-                                acoustic_priority: 1.0,
-                                audibility: 1.0,
-                                detached: false,
-                                direct_path: DirectPath::default(),
-                                environment_send: EnvironmentSend::default(),
-                                source_extent: SourceExtent::Point,
-                                occlusion_profile: OcclusionProfile::PointExact,
-                                routing_generation: 0,
-                                _retirement_witness: None,
-                            },
-                            None,
-                        )
-                        .unwrap();
+                    registry.activate(
+                        AcousticVoice {
+                            voice_id: VoiceId::from(voice as u64 + 1),
+                            emitter: emitter(voice),
+                            emitter_world_pose: Pose::identity(),
+                            acoustic_priority: 1.0,
+                            audibility: 1.0,
+                            detached: false,
+                            direct_path: DirectPath::default(),
+                            environment_send: EnvironmentSend::default(),
+                            source_extent: SourceExtent::Point,
+                            occlusion_profile: OcclusionProfile::PointExact,
+                            routing_generation: 0,
+                            _retirement_witness: None,
+                        },
+                        None,
+                    );
                 }
                 assert!(input_port.try_publish(&mut registry));
                 for voice in 0..VOICES {
@@ -4639,29 +4633,27 @@ mod tests {
     fn render_voice_input_never_waits_for_the_worker_mutex() {
         let input_port = AcousticVoiceInput::isolated(1);
         let mut registry = AcousticVoiceRegistry::new(1);
-        registry
-            .activate(
-                AcousticVoice {
-                    voice_id: VoiceId::from(1),
-                    emitter: Emitter {
-                        world_id: 1,
-                        index: 0,
-                        generation: 1,
-                    },
-                    emitter_world_pose: Pose::identity(),
-                    acoustic_priority: 1.0,
-                    audibility: 1.0,
-                    detached: false,
-                    direct_path: DirectPath::default(),
-                    environment_send: EnvironmentSend::default(),
-                    source_extent: SourceExtent::Point,
-                    occlusion_profile: OcclusionProfile::PointExact,
-                    routing_generation: 0,
-                    _retirement_witness: None,
+        registry.activate(
+            AcousticVoice {
+                voice_id: VoiceId::from(1),
+                emitter: Emitter {
+                    world_id: 1,
+                    index: 0,
+                    generation: 1,
                 },
-                None,
-            )
-            .unwrap();
+                emitter_world_pose: Pose::identity(),
+                acoustic_priority: 1.0,
+                audibility: 1.0,
+                detached: false,
+                direct_path: DirectPath::default(),
+                environment_send: EnvironmentSend::default(),
+                source_extent: SourceExtent::Point,
+                occlusion_profile: OcclusionProfile::PointExact,
+                routing_generation: 0,
+                _retirement_witness: None,
+            },
+            None,
+        );
         let guard = input_port.input.state.lock().unwrap();
         assert!(!input_port.try_publish(&mut registry));
         assert_eq!(registry.len(), 1, "busy publication lost the Voice owner");
@@ -4685,15 +4677,13 @@ mod tests {
         assert!(input_port.input.state.is_poisoned());
 
         let mut registry = AcousticVoiceRegistry::new(1);
-        registry
-            .activate(
-                input(Arc::new(NoGeometry))
-                    .voices
-                    .remove(0)
-                    .active_for_test(),
-                None,
-            )
-            .unwrap();
+        registry.activate(
+            input(Arc::new(NoGeometry))
+                .voices
+                .remove(0)
+                .active_for_test(),
+            None,
+        );
 
         assert!(input_port.try_publish(&mut registry));
         assert!(!input_port.input.state.is_poisoned());
@@ -4739,7 +4729,7 @@ mod tests {
         activated.emitter = emitter(EMITTERS - 1);
         activated.emitter_world_pose = Pose::from_position(-Vec3::Y);
         let activation_comparisons = crate::test_support::spatial_frame_comparison_activity(|| {
-            registry.activate(activated, None).unwrap();
+            registry.activate(activated, None);
             assert!(input_port.try_publish(&mut registry));
         });
         assert!(activation_comparisons > 0);
@@ -4769,7 +4759,7 @@ mod tests {
             voice.emitter = emitter(voice_index * 2);
             voice.emitter_world_pose = Pose::from_position(-Vec3::Y);
             voice.detached = voice_index == 0;
-            registry.activate(voice, None).unwrap();
+            registry.activate(voice, None);
         }
         assert!(voice_input.try_publish(&mut registry));
 
@@ -4911,25 +4901,23 @@ mod tests {
         };
         let voice_input = propagation.voice_input();
         let mut voice_registry = AcousticVoiceRegistry::new(1);
-        voice_registry
-            .activate(
-                AcousticVoice {
-                    voice_id: VoiceId::from(1),
-                    emitter,
-                    emitter_world_pose: Pose::from_position(Vec3::Z),
-                    acoustic_priority: 1.0,
-                    audibility: 1.0,
-                    detached: false,
-                    direct_path: DirectPath::default(),
-                    environment_send: EnvironmentSend::default(),
-                    source_extent: SourceExtent::Point,
-                    occlusion_profile: OcclusionProfile::PointExact,
-                    routing_generation: 0,
-                    _retirement_witness: None,
-                },
-                None,
-            )
-            .unwrap();
+        voice_registry.activate(
+            AcousticVoice {
+                voice_id: VoiceId::from(1),
+                emitter,
+                emitter_world_pose: Pose::from_position(Vec3::Z),
+                acoustic_priority: 1.0,
+                audibility: 1.0,
+                detached: false,
+                direct_path: DirectPath::default(),
+                environment_send: EnvironmentSend::default(),
+                source_extent: SourceExtent::Point,
+                occlusion_profile: OcclusionProfile::PointExact,
+                routing_generation: 0,
+                _retirement_witness: None,
+            },
+            None,
+        );
         assert!(voice_input.try_publish(&mut voice_registry));
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(7, query.clone())))
@@ -5109,25 +5097,23 @@ mod tests {
         };
         let voice_input = propagation.voice_input();
         let mut voice_registry = AcousticVoiceRegistry::new(1);
-        voice_registry
-            .activate(
-                AcousticVoice {
-                    voice_id: VoiceId::from(1),
-                    emitter,
-                    emitter_world_pose: Pose::from_position(Vec3::Z),
-                    acoustic_priority: 1.0,
-                    audibility: 1.0,
-                    detached: false,
-                    direct_path: DirectPath::default(),
-                    environment_send: EnvironmentSend::default(),
-                    source_extent: SourceExtent::Point,
-                    occlusion_profile: OcclusionProfile::PointExact,
-                    routing_generation: 0,
-                    _retirement_witness: None,
-                },
-                None,
-            )
-            .unwrap();
+        voice_registry.activate(
+            AcousticVoice {
+                voice_id: VoiceId::from(1),
+                emitter,
+                emitter_world_pose: Pose::from_position(Vec3::Z),
+                acoustic_priority: 1.0,
+                audibility: 1.0,
+                detached: false,
+                direct_path: DirectPath::default(),
+                environment_send: EnvironmentSend::default(),
+                source_extent: SourceExtent::Point,
+                occlusion_profile: OcclusionProfile::PointExact,
+                routing_generation: 0,
+                _retirement_witness: None,
+            },
+            None,
+        );
         assert!(voice_input.try_publish(&mut voice_registry));
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(

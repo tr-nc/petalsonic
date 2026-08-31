@@ -460,8 +460,7 @@ impl RenderQuantum {
                     self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
                 }
                 if let Some(acoustic_voice) = acoustic_voice {
-                    let _ = self
-                        .acoustic_voices
+                    self.acoustic_voices
                         .activate(acoustic_voice, self.current_spatial_frame.as_deref());
                 }
             }
@@ -1062,27 +1061,23 @@ mod tests {
 
         for revision in 1..=6 {
             let voice_id = VoiceId::from(revision);
-            harness
-                .quantum
-                .acoustic_voices
-                .activate(
-                    AcousticVoice {
-                        voice_id,
-                        emitter,
-                        emitter_world_pose: crate::math::Pose::identity(),
-                        acoustic_priority: 1.0,
-                        audibility: 1.0,
-                        detached: false,
-                        direct_path: DirectPath::default(),
-                        environment_send: EnvironmentSend::default(),
-                        source_extent: SourceExtent::Point,
-                        occlusion_profile: OcclusionProfile::PointExact,
-                        routing_generation: 0,
-                        _retirement_witness: None,
-                    },
-                    None,
-                )
-                .unwrap();
+            harness.quantum.acoustic_voices.activate(
+                AcousticVoice {
+                    voice_id,
+                    emitter,
+                    emitter_world_pose: crate::math::Pose::identity(),
+                    acoustic_priority: 1.0,
+                    audibility: 1.0,
+                    detached: false,
+                    direct_path: DirectPath::default(),
+                    environment_send: EnvironmentSend::default(),
+                    source_extent: SourceExtent::Point,
+                    occlusion_profile: OcclusionProfile::PointExact,
+                    routing_generation: 0,
+                    _retirement_witness: None,
+                },
+                None,
+            );
             harness
                 .acoustic_responses
                 .publish_latest(empty_acoustic_response(revision))

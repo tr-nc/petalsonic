@@ -3,21 +3,20 @@
 //! The output engine schedules this module; it does not reach through the seam to
 //! coordinate Voices, DSP processors, buffers, telemetry, or retirement.
 
-use crate::acoustic_propagation::{AcousticResponse, AcousticVoiceInput};
+use crate::acoustic_propagation::{AcousticResponse, AcousticVoice, AcousticVoiceInput};
 use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::{LatencyProfile, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeCounters, VoiceTelemetryEvent};
-use crate::mixer::{self, CompletedPlayback, MixerScratch};
 use crate::platform::output::StereoFrame;
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance};
 use crate::realtime_latest::RealtimeConsumer;
 #[cfg(test)]
 use crate::realtime_latest::RealtimeLatest;
 use crate::spatial::{
-    AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
-    SpatialRenderContext,
+    AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessingMetrics, SpatialProcessor,
+    SpatialProcessorConfig, SpatialRenderContext,
 };
 use crossbeam_channel::{Receiver, Sender};
 use ringbuf::{
@@ -162,6 +161,46 @@ struct LogicalStereoOutput {
     resampled_buffer: Vec<f32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompletedPlayback {
+    voice_id: VoiceId,
+    emitter: crate::domain::Emitter,
+    completion_tag: Option<crate::domain::PlaybackTag>,
+}
+
+/// Preallocated identity and telemetry storage reused by the render owner every quantum.
+struct VoiceMixScratch {
+    spatial_voice_ids: Vec<VoiceId>,
+    muted_spatial_voice_ids: Vec<VoiceId>,
+    non_spatial_voice_ids: Vec<VoiceId>,
+    voice_telemetry: Vec<VoiceTelemetryEvent>,
+}
+
+impl VoiceMixScratch {
+    fn new(max_voices: usize) -> Self {
+        Self {
+            spatial_voice_ids: Vec::with_capacity(max_voices),
+            muted_spatial_voice_ids: Vec::with_capacity(max_voices),
+            non_spatial_voice_ids: Vec::with_capacity(max_voices),
+            voice_telemetry: Vec::with_capacity(max_voices.saturating_mul(4)),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.spatial_voice_ids.clear();
+        self.muted_spatial_voice_ids.clear();
+        self.non_spatial_voice_ids.clear();
+        self.voice_telemetry.clear();
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MixProfilingSummary {
+    direct_mix_time_us: u64,
+    spatial_mix_time_us: u64,
+    spatial_metrics: Option<SpatialProcessingMetrics>,
+}
+
 /// The concrete, crate-private render module.
 ///
 /// Every field mutated by a quantum lives here without an inner lock. The sole
@@ -189,19 +228,30 @@ pub(crate) struct RenderQuantum {
     voice_telemetry_sender: Sender<VoiceTelemetryEvent>,
     timing_sender: Sender<RenderTimingEvent>,
     counters: Arc<RuntimeCounters>,
-    backend_retirement_sender: Sender<RetiredSpatialSource>,
-    pending_backend_retirements: Vec<(VoiceId, RetiredSpatialSource)>,
-    mixer_scratch: MixerScratch,
+    voice_retirement_sender: Sender<VoiceRetirement>,
+    pending_voice_retirements: Vec<VoiceRetirement>,
+    mixer_scratch: VoiceMixScratch,
     completed_playbacks: Vec<CompletedPlayback>,
     render_block_index: u64,
     output: Option<LogicalStereoOutput>,
+}
+
+/// One complete Voice lifetime removed from active rendering and transferred linearly to the
+/// output supervisor. The payload is intentionally not cloneable: render code may only move it
+/// into the bounded retirement path, and destruction happens when the non-realtime owner drains
+/// that path.
+pub(crate) struct VoiceRetirement {
+    _voice_id: VoiceId,
+    _playback: PlaybackInstance,
+    _acoustic: Option<AcousticVoice>,
+    _spatial: Option<RetiredSpatialSource>,
 }
 
 impl RenderQuantum {
     pub(crate) fn new(
         startup: PreparedRender,
         buses: Vec<BusParams>,
-        backend_retirement_sender: Sender<RetiredSpatialSource>,
+        voice_retirement_sender: Sender<VoiceRetirement>,
     ) -> Result<Self> {
         let PreparedRender {
             desc,
@@ -257,9 +307,9 @@ impl RenderQuantum {
             voice_telemetry_sender,
             timing_sender,
             counters,
-            backend_retirement_sender,
-            pending_backend_retirements: Vec::with_capacity(max_voices),
-            mixer_scratch: MixerScratch::new(max_voices),
+            voice_retirement_sender,
+            pending_voice_retirements: Vec::with_capacity(max_voices),
+            mixer_scratch: VoiceMixScratch::new(max_voices),
             completed_playbacks: Vec::with_capacity(max_voices),
             render_block_index: 0,
             output: None,
@@ -303,7 +353,7 @@ impl RenderQuantum {
     }
 
     pub(crate) fn render(&mut self) {
-        self.flush_backend_retirements();
+        self.flush_voice_retirements();
         self.consume_latest_spatial_frame();
         self.consume_latest_acoustic_response();
         let listener = self
@@ -349,7 +399,7 @@ impl RenderQuantum {
     }
 
     pub(crate) fn advance_without_output(&mut self, elapsed: Duration) {
-        self.flush_backend_retirements();
+        self.flush_voice_retirements();
         self.process_commands();
         let frames = (elapsed.as_secs_f64() * self.sample_rate as f64).floor() as usize;
         if frames == 0 {
@@ -360,7 +410,7 @@ impl RenderQuantum {
             if !matches!(instance.info.play_state, PlayState::Playing) {
                 continue;
             }
-            let bus = mixer::effective_bus_params(instance.bus_index, &self.buses);
+            let bus = effective_bus_params(instance.bus_index, &self.buses);
             if bus.paused {
                 continue;
             }
@@ -375,8 +425,6 @@ impl RenderQuantum {
                 });
             }
         }
-        self.active_playback
-            .retain(|_, instance| !instance.should_reclaim());
         self.retire_completed_voices();
     }
 
@@ -542,28 +590,19 @@ impl RenderQuantum {
             .map_or(0, |frame| frame.revision());
         let mut total_generated = 0;
         while total_generated < samples_needed {
-            let output = self
-                .output
+            self.output
                 .as_mut()
-                .expect("output checked before rendering");
+                .expect("output checked before rendering")
+                .world_buffer
+                .fill(0.0);
             let generated_before = total_generated;
-            output.world_buffer.fill(0.0);
             let mixing_start = Instant::now();
-            let profiling = mixer::mix_playback_instances_with_metrics(
-                &mut output.world_buffer,
-                LOGICAL_CHANNELS,
-                &mut self.active_playback,
-                Some(&mut self.processor),
-                &self.buses,
-                SpatialRenderContext {
-                    render_block_index: self.render_block_index,
-                    spatial_revision,
-                },
-                &mut self.mixer_scratch,
-                &mut self.completed_playbacks,
-            );
+            let profiling = self.mix_output_block(SpatialRenderContext {
+                render_block_index: self.render_block_index,
+                spatial_revision,
+            });
             self.render_block_index = self.render_block_index.wrapping_add(1);
-            for event in self.mixer_scratch.drain_voice_telemetry() {
+            for event in self.mixer_scratch.voice_telemetry.drain(..) {
                 Self::try_send_voice_telemetry(&self.voice_telemetry_sender, &self.counters, event);
             }
             timing.mixing_time_us += mixing_start.elapsed().as_micros() as u64;
@@ -582,6 +621,10 @@ impl RenderQuantum {
                     metrics.native_hrtf_direction_lookup_time_us;
                 timing.native_hrtf_convolution_time_us += metrics.native_hrtf_convolution_time_us;
             }
+            let output = self
+                .output
+                .as_mut()
+                .expect("output checked before rendering");
             let resampling_start = Instant::now();
             if let Ok((frames_out, _)) = output
                 .resampler
@@ -623,24 +666,108 @@ impl RenderQuantum {
         timing
     }
 
-    fn retire_completed_voices(&mut self) {
-        let mut deferred = 0;
-        for completed in &self.completed_playbacks {
-            if let Some(retired) = self.processor.retire_voice(completed.voice_id)
-                && let Err(error) = self.backend_retirement_sender.try_send(retired)
-            {
-                assert!(self.pending_backend_retirements.len() < self.max_voices);
-                self.pending_backend_retirements
-                    .push((completed.voice_id, error.into_inner()));
-                deferred += 1;
+    /// Advances every audible Voice for one logical output block. All mutable mixing state is
+    /// owned here, so callers supply only the immutable frame context rather than coordinating
+    /// eight borrowed implementation details.
+    fn mix_output_block(&mut self, render_context: SpatialRenderContext) -> MixProfilingSummary {
+        self.mixer_scratch.clear();
+        let output_frames = self
+            .output
+            .as_ref()
+            .expect("output checked before mixing")
+            .world_buffer
+            .len()
+            / LOGICAL_CHANNELS as usize;
+        for (voice_id, instance) in &mut self.active_playback {
+            if !matches!(instance.info.play_state, PlayState::Playing) {
+                continue;
             }
-            self.acoustic_voice_input.retire(completed.voice_id);
+            let bus = effective_bus_params(instance.bus_index, &self.buses);
+            if bus.paused {
+                continue;
+            }
+            instance.set_mix_parameters(bus);
+            let is_spatial = instance.render_state.is_spatial();
+            if bus.muted || crate::gain::db_to_linear(bus.gain_db) == 0.0 {
+                instance.advance_silently(output_frames);
+                if is_spatial {
+                    self.mixer_scratch.muted_spatial_voice_ids.push(*voice_id);
+                }
+                continue;
+            }
+            if is_spatial {
+                self.mixer_scratch.spatial_voice_ids.push(*voice_id);
+            } else {
+                self.mixer_scratch.non_spatial_voice_ids.push(*voice_id);
+            }
         }
-        self.active_voice_count.fetch_sub(
-            self.completed_playbacks.len().saturating_sub(deferred),
-            Ordering::AcqRel,
-        );
-        for completed in self.completed_playbacks.drain(..) {
+
+        let mut profiling = MixProfilingSummary::default();
+        let direct_start = Instant::now();
+        for voice_id in &self.mixer_scratch.non_spatial_voice_ids {
+            if let Some(instance) = self.active_playback.get_mut(voice_id) {
+                instance.fill_buffer(
+                    &mut self
+                        .output
+                        .as_mut()
+                        .expect("output checked before mixing")
+                        .world_buffer,
+                    LOGICAL_CHANNELS,
+                );
+            }
+        }
+        profiling.direct_mix_time_us = direct_start.elapsed().as_micros() as u64;
+
+        for voice_id in &self.mixer_scratch.muted_spatial_voice_ids {
+            self.processor.silence_voice_state(*voice_id);
+        }
+        if !self.mixer_scratch.spatial_voice_ids.is_empty()
+            || self.processor.has_environment_tail()
+            || self.processor.has_pending_voice_telemetry()
+        {
+            let spatial_start = Instant::now();
+            if let Ok(metrics) = self.processor.process_spatial_sources_with_metrics(
+                &self.mixer_scratch.spatial_voice_ids,
+                &mut self.active_playback,
+                &mut self
+                    .output
+                    .as_mut()
+                    .expect("output checked before mixing")
+                    .world_buffer,
+                render_context,
+                &mut self.mixer_scratch.voice_telemetry,
+            ) {
+                profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
+                profiling.spatial_metrics = Some(metrics);
+            }
+        }
+
+        for (voice_id, instance) in &mut self.active_playback {
+            let _ = instance.check_and_clear_end_flag();
+            if instance.should_reclaim()
+                && !self
+                    .completed_playbacks
+                    .iter()
+                    .any(|completed| completed.voice_id == *voice_id)
+            {
+                self.completed_playbacks.push(CompletedPlayback {
+                    voice_id: *voice_id,
+                    emitter: instance.emitter,
+                    completion_tag: instance.completion_tag,
+                });
+            }
+        }
+        profiling
+    }
+
+    fn retire_completed_voices(&mut self) {
+        while let Some(completed) = self.completed_playbacks.pop() {
+            let playback = self
+                .active_playback
+                .remove(&completed.voice_id)
+                .expect("mixer completion must still name one active Voice");
+            let spatial = self.processor.retire_voice(completed.voice_id);
+            let acoustic = self.acoustic_voice_input.retire(completed.voice_id);
             if let Some(tag) = completed.completion_tag {
                 let _ = self.retirement_sender.try_send(completed.voice_id);
                 Self::try_send_event(
@@ -656,18 +783,47 @@ impl RenderQuantum {
                     },
                 );
             }
+            self.enqueue_voice_retirement(VoiceRetirement {
+                _voice_id: completed.voice_id,
+                _playback: playback,
+                _acoustic: acoustic,
+                _spatial: spatial,
+            });
         }
     }
 
-    fn flush_backend_retirements(&mut self) {
-        while let Some((voice_id, retired)) = self.pending_backend_retirements.pop() {
-            if let Err(error) = self.backend_retirement_sender.try_send(retired) {
-                self.pending_backend_retirements
-                    .push((voice_id, error.into_inner()));
+    fn enqueue_voice_retirement(&mut self, retirement: VoiceRetirement) {
+        if let Err(error) = self.voice_retirement_sender.try_send(retirement) {
+            assert!(self.pending_voice_retirements.len() < self.max_voices);
+            self.pending_voice_retirements.push(error.into_inner());
+            return;
+        }
+        self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn flush_voice_retirements(&mut self) {
+        while let Some(retirement) = self.pending_voice_retirements.pop() {
+            if let Err(error) = self.voice_retirement_sender.try_send(retirement) {
+                self.pending_voice_retirements.push(error.into_inner());
                 break;
             }
             self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    /// Transfers render-owned overflow only after its scheduling owner has quiesced output.
+    /// Replacing the buffer preserves the no-allocation contract if cleanup is retried and the
+    /// engine is subsequently reconciled again.
+    pub(crate) fn take_quiesced_voice_retirements(&mut self) -> Vec<VoiceRetirement> {
+        let retirements = std::mem::replace(
+            &mut self.pending_voice_retirements,
+            Vec::with_capacity(self.max_voices),
+        );
+        if !retirements.is_empty() {
+            self.active_voice_count
+                .fetch_sub(retirements.len(), Ordering::AcqRel);
+        }
+        retirements
     }
 
     fn try_send_event(
@@ -697,6 +853,20 @@ impl RenderQuantum {
                 .dropped_voice_telemetry
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusParams {
+    let master = buses.first().copied().unwrap_or_default();
+    let selected = buses.get(index).copied().unwrap_or(master);
+    if index == 0 {
+        return master;
+    }
+    BusParams {
+        gain_db: master.gain_db + selected.gain_db,
+        muted: master.muted || selected.muted,
+        paused: master.paused || selected.paused,
+        playback_rate: master.playback_rate * selected.playback_rate,
     }
 }
 
@@ -743,9 +913,14 @@ mod tests {
         commands: Sender<PlaybackCommand>,
         events: crossbeam_channel::Receiver<PetalSonicEvent>,
         timing: crossbeam_channel::Receiver<RenderTimingEvent>,
+        _voice_retirement_owner: crossbeam_channel::Receiver<VoiceRetirement>,
     }
 
     fn harness(block_size: usize, max_voices: usize) -> Harness {
+        harness_with_buses(block_size, max_voices, vec![BusParams::default()])
+    }
+
+    fn harness_with_buses(block_size: usize, max_voices: usize, buses: Vec<BusParams>) -> Harness {
         let desc = PetalSonicWorldDesc {
             block_size,
             max_voices,
@@ -758,7 +933,8 @@ mod tests {
         let (retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
         let (_, spatial_frames) = RealtimeLatest::bounded(1);
         let (acoustic_responses, acoustic_response_consumer) = RealtimeLatest::bounded(2);
-        let (backend_retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
+        let (voice_retirement_sender, voice_retirement_owner) =
+            crossbeam_channel::bounded(max_voices.max(1));
         let (event_sender, events) = crossbeam_channel::bounded(desc.event_queue_capacity);
         let (voice_telemetry_sender, _voice_telemetry) =
             crossbeam_channel::bounded(desc.event_queue_capacity);
@@ -780,16 +956,12 @@ mod tests {
             Arc::new(RuntimeCounters::default()),
         );
         Harness {
-            quantum: RenderQuantum::new(
-                startup,
-                vec![BusParams::default()],
-                backend_retirement_sender,
-            )
-            .unwrap(),
+            quantum: RenderQuantum::new(startup, buses, voice_retirement_sender).unwrap(),
             acoustic_responses,
             commands,
             events,
             timing,
+            _voice_retirement_owner: voice_retirement_owner,
         }
     }
 
@@ -830,6 +1002,7 @@ mod tests {
                     source_extent: SourceExtent::Point,
                     occlusion_profile: OcclusionProfile::PointExact,
                     routing_generation: 0,
+                    _retirement_witness: None,
                 });
             harness
                 .acoustic_responses
@@ -862,6 +1035,39 @@ mod tests {
             0,
             block_size,
         ))
+    }
+
+    fn bus_play_command(
+        voice_id: VoiceId,
+        emitter: Emitter,
+        sample: f32,
+        bus_index: usize,
+        block_size: usize,
+    ) -> PlaybackCommand {
+        let clip = Arc::new(PetalSonicAudioData::new(
+            vec![sample; block_size * 16],
+            48_000,
+            1,
+            Duration::from_secs_f64((block_size * 16) as f64 / 48_000.0),
+        ));
+        PlaybackCommand::Play(prepare_test_voice(
+            voice_id,
+            emitter,
+            clip,
+            EmitterDesc::non_spatial(),
+            PlayOptions::looping(),
+            None,
+            bus_index,
+            block_size,
+        ))
+    }
+
+    fn retirement_emitter(index: u32) -> Emitter {
+        Emitter {
+            world_id: 1,
+            index,
+            generation: 1,
+        }
     }
 
     #[test]
@@ -898,6 +1104,108 @@ mod tests {
                 .info
                 .current_frame,
             block_size * 2
+        );
+    }
+
+    #[test]
+    fn named_bus_pause_freezes_only_its_voice_through_the_render_owner() {
+        let block_size = 4;
+        let mut harness = harness_with_buses(
+            block_size,
+            2,
+            vec![
+                BusParams::default(),
+                BusParams {
+                    paused: true,
+                    ..BusParams::default()
+                },
+                BusParams::default(),
+            ],
+        );
+        harness
+            .quantum
+            .active_voice_count
+            .store(2, Ordering::Release);
+        for (voice, bus, sample) in [(61, 1, 1.0), (62, 2, 0.5)] {
+            harness
+                .commands
+                .try_send(bus_play_command(
+                    VoiceId::from(voice),
+                    retirement_emitter(voice as u32),
+                    sample,
+                    bus,
+                    block_size,
+                ))
+                .unwrap();
+        }
+        let mut consumer = harness.quantum.connect_output(48_000).unwrap();
+
+        harness.quantum.render();
+
+        assert!(consumer.try_pop().is_some());
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(61)]
+                .info
+                .current_frame,
+            0
+        );
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(62)]
+                .info
+                .current_frame,
+            block_size * 2
+        );
+    }
+
+    #[test]
+    fn master_and_named_bus_rates_compose_through_the_render_owner() {
+        let block_size = 4;
+        let mut harness = harness_with_buses(
+            block_size,
+            2,
+            vec![
+                BusParams {
+                    playback_rate: 0.5,
+                    ..BusParams::default()
+                },
+                BusParams {
+                    playback_rate: 2.0,
+                    ..BusParams::default()
+                },
+                BusParams::default(),
+            ],
+        );
+        harness
+            .quantum
+            .active_voice_count
+            .store(2, Ordering::Release);
+        for (voice, bus) in [(63, 1), (64, 2)] {
+            harness
+                .commands
+                .try_send(bus_play_command(
+                    VoiceId::from(voice),
+                    retirement_emitter(voice as u32),
+                    0.25,
+                    bus,
+                    block_size,
+                ))
+                .unwrap();
+        }
+        let _consumer = harness.quantum.connect_output(48_000).unwrap();
+
+        harness.quantum.render();
+
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(63)]
+                .info
+                .current_frame,
+            block_size * 2
+        );
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(64)]
+                .info
+                .current_frame,
+            block_size
         );
     }
 
@@ -1144,6 +1452,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-mode near-capacity render performance gate"]
     fn warmed_near_capacity_quantum_meets_release_budget() {
         const VOICES: usize = 32;
         const SAMPLES: usize = 1_024;

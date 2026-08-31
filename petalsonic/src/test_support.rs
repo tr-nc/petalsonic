@@ -54,6 +54,10 @@ pub(crate) fn realtime_memory_activity(operation: impl FnOnce()) -> usize {
     PROBE_ACTIVITY.with(Cell::get)
 }
 
+pub(crate) fn realtime_probe_is_active() -> bool {
+    PROBE_ACTIVE.with(Cell::get)
+}
+
 pub(crate) fn record_acoustic_response_lookup() {
     ACOUSTIC_LOOKUP_PROBE_ACTIVE.with(|active| {
         if active.get() {

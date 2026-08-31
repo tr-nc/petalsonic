@@ -12,9 +12,8 @@ use crate::output_session::RenderWorkerFaultInjector;
 use crate::platform::output::{OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult};
 use crate::playback::PlaybackCommand;
 use crate::realtime_latest::RealtimeConsumer;
-use crate::render::{PreparedRender, RenderQuantum};
+use crate::render::{PreparedRender, RenderQuantum, VoiceRetirement};
 use crate::runtime_health::RuntimeFailurePublisher;
-use crate::spatial::RetiredSpatialSource;
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -166,10 +165,69 @@ pub(crate) struct PetalSonicEngine {
     output: OutputSession,
     event_sender: Sender<PetalSonicEvent>,
     counters: Arc<RuntimeCounters>,
-    backend_retirement_receiver: Receiver<RetiredSpatialSource>,
+    voice_retirements: VoiceRetirementSupervisor,
+}
+
+/// The only non-realtime owner allowed to destroy a complete retired Voice.
+///
+/// Ordinary render completion crosses the bounded channel. If that channel is full or gone,
+/// `RenderQuantum` retains the same linear payload until output is quiesced, then this owner takes
+/// it directly. Platform cleanup failure cannot bypass either path.
+struct VoiceRetirementSupervisor {
+    receiver: Option<Receiver<VoiceRetirement>>,
+}
+
+impl VoiceRetirementSupervisor {
+    fn new(receiver: Receiver<VoiceRetirement>) -> Self {
+        Self {
+            receiver: Some(receiver),
+        }
+    }
+
+    fn drain(&mut self) {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return;
+        };
+        while receiver.try_recv().is_ok() {}
+    }
+
+    fn reclaim_after_output_quiesces(&mut self, output: &mut OutputSession) {
+        self.drain();
+        drop(output.take_quiesced_voice_retirements());
+    }
+
+    #[cfg(test)]
+    fn disconnect(&mut self) {
+        self.receiver = None;
+    }
 }
 
 impl PetalSonicEngine {
+    #[cfg(test)]
+    pub(crate) fn advance_without_output_for_test(&mut self, elapsed: std::time::Duration) {
+        self.output.advance_without_output_for_test(elapsed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_logical_output_for_test(&mut self) -> Result<()> {
+        self.output.prepare_logical_output_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_once_for_test(&mut self) {
+        self.output.render_once_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_logical_output_for_test(&mut self) {
+        self.output.drain_logical_output_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_voice_retirement_receiver_for_test(&mut self) {
+        self.voice_retirements.disconnect();
+    }
+
     pub(crate) fn new_with_output(
         startup: PreparedEngine,
         output: Box<dyn OutputPlatform>,
@@ -207,12 +265,12 @@ impl PetalSonicEngine {
             ),
             event_sender,
             counters,
-            backend_retirement_receiver: retirement_receiver,
+            voice_retirements: VoiceRetirementSupervisor::new(retirement_receiver),
         })
     }
 
-    pub(crate) fn drain_retired_backend_resources(&mut self) {
-        while self.backend_retirement_receiver.try_recv().is_ok() {}
+    pub(crate) fn drain_retired_voice_resources(&mut self) {
+        self.voice_retirements.drain();
     }
 
     pub(crate) fn reconcile_output(
@@ -223,9 +281,10 @@ impl PetalSonicEngine {
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
-        self.output.close()?;
-        self.drain_retired_backend_resources();
-        Ok(())
+        let close_result = self.output.close();
+        self.voice_retirements
+            .reclaim_after_output_quiesces(&mut self.output);
+        close_result
     }
 
     pub(crate) fn emit_runtime_state(&self, state: RuntimeState) {

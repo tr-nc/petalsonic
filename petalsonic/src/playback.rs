@@ -207,6 +207,8 @@ impl AcceptedVoice {
         PreparedVoice {
             accepted: self,
             mono_scratch: vec![0.0; block_size],
+            #[cfg(test)]
+            acoustic_retirement_witness: None,
         }
     }
 }
@@ -215,6 +217,9 @@ impl AcceptedVoice {
 pub(crate) struct PreparedVoice {
     accepted: AcceptedVoice,
     mono_scratch: Vec<f32>,
+    #[cfg(test)]
+    acoustic_retirement_witness:
+        Option<crate::acoustic_propagation::AcousticVoiceRetirementWitness>,
 }
 
 impl PreparedVoice {
@@ -224,6 +229,8 @@ impl PreparedVoice {
         let Self {
             accepted,
             mono_scratch,
+            #[cfg(test)]
+            acoustic_retirement_witness,
         } = self;
         let AcceptedVoice {
             voice_id,
@@ -253,6 +260,8 @@ impl PreparedVoice {
             source_extent: source_extent.clone(),
             occlusion_profile,
             routing_generation: 0,
+            #[cfg(test)]
+            _retirement_witness: acoustic_retirement_witness,
         });
         let total_frames = audio_data.total_frames();
         let sample_rate = audio_data.sample_rate();
@@ -286,6 +295,17 @@ impl PreparedVoice {
         };
         playback.play_from_beginning();
         (voice_id, playback, acoustic_voice)
+    }
+}
+
+#[cfg(test)]
+impl PreparedVoice {
+    pub(crate) fn with_acoustic_retirement_witness(
+        mut self,
+        witness: crate::acoustic_propagation::AcousticVoiceRetirementWitness,
+    ) -> Self {
+        self.acoustic_retirement_witness = Some(witness);
+        self
     }
 }
 

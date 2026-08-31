@@ -3,6 +3,8 @@
 use crate::config::{OutputDevicePolicy, PetalSonicWorldDesc};
 use crate::error::{PetalSonicError, Result};
 use crate::events::RuntimeCounters;
+#[cfg(test)]
+use crate::platform::output::StereoFrame;
 use crate::platform::output::{
     OutputCallback, OutputDeviceState, OutputFailure, OutputPlatform, OutputPreparation,
     OutputRecoveryCause, OutputRecoveryReason, OutputRecoveryRequest, OutputRecoveryResult,
@@ -10,6 +12,8 @@ use crate::platform::output::{
 };
 use crate::render::{MASTER_HEADROOM_DB, RenderQuantum};
 use crate::runtime_health::RuntimeFailurePublisher;
+#[cfg(test)]
+use ringbuf::{HeapCons, traits::Consumer};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -125,10 +129,47 @@ pub(crate) struct OutputSession {
     runtime_failure: RuntimeFailurePublisher,
     #[cfg(test)]
     render_worker_fault: RenderWorkerFaultInjector,
+    #[cfg(test)]
+    test_output_consumer: Option<HeapCons<StereoFrame>>,
     state: SessionState,
 }
 
 impl OutputSession {
+    #[cfg(test)]
+    pub(crate) fn advance_without_output_for_test(&mut self, elapsed: std::time::Duration) {
+        self.render
+            .lock()
+            .expect("test render state must not be poisoned")
+            .advance_without_output(elapsed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_logical_output_for_test(&mut self) -> Result<()> {
+        let consumer = self
+            .render
+            .lock()
+            .expect("test render state must not be poisoned")
+            .connect_output(self.sample_rate)?;
+        self.test_output_consumer = Some(consumer);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_once_for_test(&mut self) {
+        self.render
+            .lock()
+            .expect("test render state must not be poisoned")
+            .render();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_logical_output_for_test(&mut self) {
+        let Some(consumer) = self.test_output_consumer.as_mut() else {
+            return;
+        };
+        while consumer.try_pop().is_some() {}
+    }
+
     pub(crate) fn new(
         desc: PetalSonicWorldDesc,
         platform: Box<dyn OutputPlatform>,
@@ -153,6 +194,8 @@ impl OutputSession {
             runtime_failure,
             #[cfg(test)]
             render_worker_fault,
+            #[cfg(test)]
+            test_output_consumer: None,
             state: SessionState::Stopped,
         }
     }
@@ -271,6 +314,22 @@ impl OutputSession {
                 self.retry_pending_cleanup()
             }
         }
+    }
+
+    /// Moves overflow out of render ownership after `close` has stopped or joined every render
+    /// thread. A poisoned render mutex still owns valid retirement payloads, so shutdown recovers
+    /// the inner state instead of abandoning it.
+    pub(crate) fn take_quiesced_voice_retirements(
+        &mut self,
+    ) -> Vec<crate::render::VoiceRetirement> {
+        assert!(
+            !matches!(self.state, SessionState::Running { .. }),
+            "Voice retirements may leave render ownership only after output is quiesced"
+        );
+        self.render
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_quiesced_voice_retirements()
     }
 
     fn start_prepared(&mut self) -> Result<OutputDeviceState> {
@@ -580,7 +639,7 @@ mod tests {
         let (lifecycle_sender, lifecycle) =
             crossbeam_channel::bounded(desc.lifecycle_queue_capacity);
         let (retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
-        let (backend_retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
+        let (voice_retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
         let (_spatial_publisher, spatial_frames) = RealtimeLatest::bounded(1);
         let (_acoustic_publisher, acoustic_responses) = RealtimeLatest::bounded(2);
         let frames_processed = Arc::new(AtomicUsize::new(0));
@@ -607,12 +666,9 @@ mod tests {
             timing_sender,
             counters.clone(),
         );
-        let render = RenderQuantum::new(
-            startup,
-            vec![BusParams::default()],
-            backend_retirement_sender,
-        )
-        .unwrap();
+        let render =
+            RenderQuantum::new(startup, vec![BusParams::default()], voice_retirement_sender)
+                .unwrap();
         // The render quantum owns the receiving endpoints for the fixture's
         // lifetime; senders only keep command channels connected.
         let _command_owners = (regular_sender, lifecycle_sender);

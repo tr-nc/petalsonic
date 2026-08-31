@@ -1640,6 +1640,97 @@ mod tests {
     }
 
     #[test]
+    fn world_spatial_publication_updates_acoustics_once_before_render_observes_the_frame() {
+        let (adapter, _) = FakeOutputPlatform::scripted(
+            vec![PlatformFakeDevice::stereo(
+                "spatial-production-gate",
+                48_000,
+            )],
+            Some(0),
+        );
+        let world = PetalSonicWorld::new_with_output(
+            crate::config::PetalSonicWorldDesc {
+                max_emitters: 1,
+                max_voices: 2,
+                environmental_acoustics_enabled: false,
+                ..Default::default()
+            },
+            move || Ok(Box::new(adapter)),
+        )
+        .unwrap();
+        let old_pose = Pose::from_position(-crate::math::Vec3::Y);
+        let new_pose = Pose::from_position(crate::math::Vec3::new(4.0, 2.0, 1.0));
+        let emitter = world
+            .create_emitter(clip(), EmitterDesc::spatial(old_pose))
+            .unwrap();
+        let attached = world
+            .play_controlled(emitter, PlayOptions::looping(), PlaybackTag(81))
+            .unwrap();
+        let detached = world
+            .play_controlled(emitter, PlayOptions::looping().detached(), PlaybackTag(82))
+            .unwrap();
+
+        wait_for_async_observation(|| {
+            world
+                .runtime
+                .acoustic_voice_spatial_for_test(attached.voice_id)
+                .is_some()
+                && world
+                    .runtime
+                    .acoustic_voice_spatial_for_test(detached.voice_id)
+                    .is_some()
+        });
+        let wake_before = world.runtime.acoustic_wake_generation_for_test();
+
+        world
+            .publish_spatial_frame(
+                SpatialFrame::new(
+                    1,
+                    0.1,
+                    Pose::identity(),
+                    vec![
+                        crate::domain::EmitterSpatialState::new(emitter, new_pose)
+                            .with_acoustic_priority(7.25),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        wait_for_async_observation(|| world.runtime.rendered_spatial_revision_for_test() == 1);
+
+        assert_eq!(
+            world
+                .runtime
+                .acoustic_voice_spatial_for_test(attached.voice_id),
+            Some((new_pose, 7.25, false))
+        );
+        assert_eq!(
+            world
+                .runtime
+                .acoustic_voice_spatial_for_test(detached.voice_id),
+            Some((old_pose, 1.0, true)),
+            "a detached acoustic origin belongs to its Voice lifetime"
+        );
+        let expected_wake = wake_before + 1;
+        assert_eq!(
+            world.runtime.acoustic_wake_generation_for_test(),
+            expected_wake,
+            "one World publication must wake its acoustic worker exactly once"
+        );
+        let stability_deadline = Instant::now() + Duration::from_millis(20);
+        while Instant::now() < stability_deadline {
+            assert_eq!(
+                world.runtime.acoustic_wake_generation_for_test(),
+                expected_wake,
+                "render consumption produced a delayed second acoustic wake"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+
+        world.close().unwrap();
+    }
+
+    #[test]
     fn failed_runtime_spatial_publication_preserves_the_pose_and_extent_for_the_next_voice() {
         let (adapter, _) = FakeOutputPlatform::scripted(
             vec![PlatformFakeDevice::stereo("spatial-transaction", 48_000)],

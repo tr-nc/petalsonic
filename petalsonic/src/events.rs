@@ -105,6 +105,8 @@ pub(crate) struct RuntimeCounters {
     pub(crate) device_generation: AtomicU64,
     pub(crate) output_sample_rate: AtomicUsize,
     pub(crate) output_channels: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) rendered_spatial_revision: AtomicU64,
     render_time_max_us: AtomicU64,
     render_histogram: [AtomicU64; 64],
 }
@@ -125,6 +127,8 @@ impl Default for RuntimeCounters {
             device_generation: AtomicU64::new(0),
             output_sample_rate: AtomicUsize::new(0),
             output_channels: AtomicUsize::new(0),
+            #[cfg(test)]
+            rendered_spatial_revision: AtomicU64::new(0),
             render_time_max_us: AtomicU64::new(0),
             render_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
         }

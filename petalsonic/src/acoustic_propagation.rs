@@ -824,6 +824,16 @@ impl AcousticPropagation {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn wake_generation_for_test(&self) -> u64 {
+        self.input.state.lock().unwrap().wake_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn voice_spatial_for_test(&self, voice_id: VoiceId) -> Option<(Pose, f32, bool)> {
+        self.voice_input().voice_spatial_for_test(voice_id)
+    }
+
     pub(crate) fn diagnostics(&self) -> AcousticPropagationDiagnostics {
         self.counters.snapshot()
     }

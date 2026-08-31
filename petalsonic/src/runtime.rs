@@ -377,6 +377,27 @@ impl AudioRuntime {
         self.spatial_frames.with_publication_blocked(operation)
     }
 
+    #[cfg(test)]
+    pub(crate) fn acoustic_wake_generation_for_test(&self) -> u64 {
+        self.acoustic_propagation.wake_generation_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acoustic_voice_spatial_for_test(
+        &self,
+        voice_id: VoiceId,
+    ) -> Option<(crate::math::Pose, f32, bool)> {
+        self.acoustic_propagation.voice_spatial_for_test(voice_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rendered_spatial_revision_for_test(&self) -> u64 {
+        self.observability
+            .counters()
+            .rendered_spatial_revision
+            .load(Ordering::Acquire)
+    }
+
     pub(crate) fn acoustic_scene_version(&self) -> u64 {
         self.acoustic_scene_version.load(Ordering::Acquire)
     }

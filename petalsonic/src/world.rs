@@ -2068,6 +2068,38 @@ mod tests {
     }
 
     #[test]
+    fn validated_spatial_frame_needs_no_second_membership_allocation() {
+        const EMITTERS: usize = 2_048;
+        let mut registry = EmitterRegistry::new(EMITTERS, 1);
+        let resident_clip = clip();
+        let mut spatial_emitters = Vec::with_capacity(EMITTERS);
+        for index in 0..EMITTERS {
+            let pose = Pose::from_position(crate::math::Vec3::new(index as f32, 0.0, 0.0));
+            let emitter = registry
+                .insert(EmitterState {
+                    clip: resident_clip.clone(),
+                    desc: EmitterDesc::spatial(pose),
+                })
+                .unwrap();
+            spatial_emitters.push(crate::domain::EmitterSpatialState::new(emitter, pose));
+        }
+        let frame = Arc::new(SpatialFrame::new(
+            1,
+            0.0,
+            Pose::identity(),
+            spatial_emitters,
+        ));
+        let mut update = None;
+
+        let memory_activity = crate::test_support::realtime_memory_activity(|| {
+            update = Some(registry.prepare_spatial_update(frame.clone()).unwrap());
+        });
+
+        assert_eq!(memory_activity, 0);
+        assert_eq!(update.unwrap().frame.emitters().len(), EMITTERS);
+    }
+
+    #[test]
     fn spatial_frame_must_be_complete_before_any_pose_is_updated() {
         let mut registry = EmitterRegistry::new(2, 1);
         let first = registry

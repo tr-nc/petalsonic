@@ -10,7 +10,7 @@ use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeCounters, VoiceTelemetryEvent};
 use crate::platform::output::StereoFrame;
-use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance};
+use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance, PlaybackReclaim};
 use crate::realtime_latest::RealtimeConsumer;
 #[cfg(test)]
 use crate::realtime_latest::RealtimeLatest;
@@ -166,6 +166,16 @@ struct CompletedPlayback {
     voice_id: VoiceId,
     emitter: crate::domain::Emitter,
     completion_tag: Option<crate::domain::PlaybackTag>,
+}
+
+impl CompletedPlayback {
+    fn from_reclaim(voice_id: VoiceId, reclaim: PlaybackReclaim) -> Self {
+        Self {
+            voice_id,
+            emitter: reclaim.emitter,
+            completion_tag: reclaim.completion_tag,
+        }
+    }
 }
 
 /// Preallocated identity and telemetry storage reused by the render owner every quantum.
@@ -417,12 +427,9 @@ impl RenderQuantum {
             instance.set_mix_parameters(bus);
             instance.advance_silently(frames);
             let _ = instance.check_and_clear_end_flag();
-            if instance.should_reclaim() {
-                self.completed_playbacks.push(CompletedPlayback {
-                    voice_id: *voice_id,
-                    emitter: instance.emitter,
-                    completion_tag: instance.completion_tag,
-                });
+            if let Some(reclaim) = instance.take_reclaim() {
+                self.completed_playbacks
+                    .push(CompletedPlayback::from_reclaim(*voice_id, reclaim));
             }
         }
         self.retire_completed_voices();
@@ -744,18 +751,9 @@ impl RenderQuantum {
 
         for (voice_id, instance) in &mut self.active_playback {
             let _ = instance.check_and_clear_end_flag();
-            if instance.should_reclaim()
-                && !self.completed_playbacks.iter().any(|completed| {
-                    #[cfg(test)]
-                    crate::test_support::record_render_completion_comparison();
-                    completed.voice_id == *voice_id
-                })
-            {
-                self.completed_playbacks.push(CompletedPlayback {
-                    voice_id: *voice_id,
-                    emitter: instance.emitter,
-                    completion_tag: instance.completion_tag,
-                });
+            if let Some(reclaim) = instance.take_reclaim() {
+                self.completed_playbacks
+                    .push(CompletedPlayback::from_reclaim(*voice_id, reclaim));
             }
         }
         profiling
@@ -1016,17 +1014,25 @@ mod tests {
         }
         let _consumer = harness.quantum.connect_output(48_000).unwrap();
 
-        let comparisons = crate::test_support::render_completion_comparison_activity(|| {
-            harness.quantum.mix_output_block(SpatialRenderContext {
-                render_block_index: 0,
-                spatial_revision: 0,
+        let mut memory_activity = 0;
+        let steps = crate::test_support::render_completion_step_activity(|| {
+            memory_activity = crate::test_support::realtime_memory_activity(|| {
+                harness.quantum.mix_output_block(SpatialRenderContext {
+                    render_block_index: 0,
+                    spatial_revision: 0,
+                });
+                harness.quantum.mix_output_block(SpatialRenderContext {
+                    render_block_index: 1,
+                    spatial_revision: 0,
+                });
             });
         });
 
         assert_eq!(harness.quantum.completed_playbacks.len(), VOICES);
+        assert_eq!(memory_activity, 0);
         assert!(
-            comparisons <= VOICES,
-            "4096-Voice render completion association performed {comparisons} comparisons"
+            steps <= VOICES * 2,
+            "two 4096-Voice render blocks performed {steps} completion association steps"
         );
     }
 

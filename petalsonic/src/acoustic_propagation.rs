@@ -176,7 +176,11 @@ impl AcousticResponse {
         crate::test_support::record_acoustic_response_lookup();
         self.direct
             .iter()
-            .find(|response| response.voice_id == voice_id)
+            .find(|response| {
+                #[cfg(test)]
+                crate::test_support::record_acoustic_publication_comparison();
+                response.voice_id == voice_id
+            })
             .map(|voice| VoiceAcousticResponse { frame: self, voice })
     }
 }
@@ -2518,6 +2522,58 @@ mod tests {
     use crate::domain::EmitterSpatialState;
     use crate::math::Pose;
     use std::sync::atomic::{AtomicU8, AtomicUsize};
+
+    fn direct_response(voice_id: u64, routing_generation: u64) -> DirectAcousticResponse {
+        DirectAcousticResponse {
+            voice_id: VoiceId::from(voice_id),
+            routing_generation,
+            gain: [voice_id as f32; 3],
+            environment_gain: [1.0; 3],
+            direct_lobes: Vec::new(),
+            environment_representatives: Vec::new(),
+            early_reflections: Vec::new(),
+            solve_status: DirectSolveStatus::Solved,
+            cache_age_seconds: 0.0,
+        }
+    }
+
+    #[test]
+    fn render_publication_lookup_is_bounded_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        const MAX_BINARY_COMPARISONS_PER_LOOKUP: usize = 13;
+        let response = AcousticResponse {
+            spatial_revision: 3,
+            geometry_version: 5,
+            direct: (0..VOICES)
+                .map(|voice| direct_response(voice as u64, voice as u64 + 1))
+                .collect(),
+            late_reverb: LateReverbParameters::SILENT,
+            published_at: Instant::now(),
+            solve_time_us: 0,
+        };
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            for voice in (0..VOICES).rev() {
+                assert_eq!(
+                    response
+                        .voice_response(VoiceId::from(voice as u64))
+                        .unwrap()
+                        .direct_gain(),
+                    [voice as f32; 3]
+                );
+            }
+            assert!(
+                response
+                    .voice_response(VoiceId::from(VOICES as u64))
+                    .is_none()
+            );
+        });
+
+        assert!(
+            comparisons <= (VOICES + 1) * MAX_BINARY_COMPARISONS_PER_LOOKUP,
+            "4096-Voice render publication performed {comparisons} comparisons"
+        );
+    }
 
     fn start_propagation(
         enabled: bool,

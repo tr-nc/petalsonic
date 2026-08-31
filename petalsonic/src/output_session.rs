@@ -316,6 +316,22 @@ impl OutputSession {
         }
     }
 
+    /// Moves overflow out of render ownership after `close` has stopped or joined every render
+    /// thread. A poisoned render mutex still owns valid retirement payloads, so shutdown recovers
+    /// the inner state instead of abandoning it.
+    pub(crate) fn take_quiesced_voice_retirements(
+        &mut self,
+    ) -> Vec<crate::render::VoiceRetirement> {
+        assert!(
+            !matches!(self.state, SessionState::Running { .. }),
+            "Voice retirements may leave render ownership only after output is quiesced"
+        );
+        self.render
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_quiesced_voice_retirements()
+    }
+
     fn start_prepared(&mut self) -> Result<OutputDeviceState> {
         let prepared = match std::mem::replace(&mut self.state, SessionState::Stopped) {
             SessionState::Prepared(prepared) => prepared,

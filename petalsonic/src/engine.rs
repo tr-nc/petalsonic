@@ -165,7 +165,41 @@ pub(crate) struct PetalSonicEngine {
     output: OutputSession,
     event_sender: Sender<PetalSonicEvent>,
     counters: Arc<RuntimeCounters>,
-    voice_retirement_receiver: Option<Receiver<VoiceRetirement>>,
+    voice_retirements: VoiceRetirementSupervisor,
+}
+
+/// The only non-realtime owner allowed to destroy a complete retired Voice.
+///
+/// Ordinary render completion crosses the bounded channel. If that channel is full or gone,
+/// `RenderQuantum` retains the same linear payload until output is quiesced, then this owner takes
+/// it directly. Platform cleanup failure cannot bypass either path.
+struct VoiceRetirementSupervisor {
+    receiver: Option<Receiver<VoiceRetirement>>,
+}
+
+impl VoiceRetirementSupervisor {
+    fn new(receiver: Receiver<VoiceRetirement>) -> Self {
+        Self {
+            receiver: Some(receiver),
+        }
+    }
+
+    fn drain(&mut self) {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return;
+        };
+        while receiver.try_recv().is_ok() {}
+    }
+
+    fn reclaim_after_output_quiesces(&mut self, output: &mut OutputSession) {
+        self.drain();
+        drop(output.take_quiesced_voice_retirements());
+    }
+
+    #[cfg(test)]
+    fn disconnect(&mut self) {
+        self.receiver = None;
+    }
 }
 
 impl PetalSonicEngine {
@@ -191,7 +225,7 @@ impl PetalSonicEngine {
 
     #[cfg(test)]
     pub(crate) fn disconnect_voice_retirement_receiver_for_test(&mut self) {
-        self.voice_retirement_receiver = None;
+        self.voice_retirements.disconnect();
     }
 
     pub(crate) fn new_with_output(
@@ -231,15 +265,12 @@ impl PetalSonicEngine {
             ),
             event_sender,
             counters,
-            voice_retirement_receiver: Some(retirement_receiver),
+            voice_retirements: VoiceRetirementSupervisor::new(retirement_receiver),
         })
     }
 
     pub(crate) fn drain_retired_voice_resources(&mut self) {
-        let Some(receiver) = self.voice_retirement_receiver.as_ref() else {
-            return;
-        };
-        while receiver.try_recv().is_ok() {}
+        self.voice_retirements.drain();
     }
 
     pub(crate) fn reconcile_output(
@@ -250,9 +281,10 @@ impl PetalSonicEngine {
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {
-        self.output.close()?;
-        self.drain_retired_voice_resources();
-        Ok(())
+        let close_result = self.output.close();
+        self.voice_retirements
+            .reclaim_after_output_quiesces(&mut self.output);
+        close_result
     }
 
     pub(crate) fn emit_runtime_state(&self, state: RuntimeState) {

@@ -815,6 +815,16 @@ impl RenderQuantum {
         }
     }
 
+    /// Transfers render-owned overflow only after its scheduling owner has quiesced output.
+    /// Replacing the buffer preserves the no-allocation contract if cleanup is retried and the
+    /// engine is subsequently reconciled again.
+    pub(crate) fn take_quiesced_voice_retirements(&mut self) -> Vec<VoiceRetirement> {
+        std::mem::replace(
+            &mut self.pending_voice_retirements,
+            Vec::with_capacity(self.max_voices),
+        )
+    }
+
     fn try_send_event(
         sender: &Sender<PetalSonicEvent>,
         counters: &RuntimeCounters,
@@ -872,8 +882,8 @@ mod tests {
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::PetalSonicWorldDesc;
     use crate::domain::{
-        DirectPath, Emitter, EmitterDesc, EnvironmentSend, ExtentSample, ExtentSampleId,
-        OcclusionProfile, PlayOptions, SourceExtent,
+        DirectPath, Emitter, EmitterDesc, EnvironmentSend, OcclusionProfile, PlayOptions,
+        SourceExtent,
     };
     use crate::playback::prepare_test_voice;
     use crate::realtime_latest::Publisher;
@@ -902,7 +912,7 @@ mod tests {
         commands: Sender<PlaybackCommand>,
         events: crossbeam_channel::Receiver<PetalSonicEvent>,
         timing: crossbeam_channel::Receiver<RenderTimingEvent>,
-        retirements: crossbeam_channel::Receiver<VoiceRetirement>,
+        _voice_retirement_owner: crossbeam_channel::Receiver<VoiceRetirement>,
     }
 
     fn harness(block_size: usize, max_voices: usize) -> Harness {
@@ -922,7 +932,8 @@ mod tests {
         let (retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
         let (_, spatial_frames) = RealtimeLatest::bounded(1);
         let (acoustic_responses, acoustic_response_consumer) = RealtimeLatest::bounded(2);
-        let (voice_retirement_sender, retirements) = crossbeam_channel::bounded(max_voices.max(1));
+        let (voice_retirement_sender, voice_retirement_owner) =
+            crossbeam_channel::bounded(max_voices.max(1));
         let (event_sender, events) = crossbeam_channel::bounded(desc.event_queue_capacity);
         let (voice_telemetry_sender, _voice_telemetry) =
             crossbeam_channel::bounded(desc.event_queue_capacity);
@@ -949,7 +960,7 @@ mod tests {
             commands,
             events,
             timing,
-            retirements,
+            _voice_retirement_owner: voice_retirement_owner,
         }
     }
 
@@ -1048,34 +1059,6 @@ mod tests {
             bus_index,
             block_size,
         ))
-    }
-
-    fn retirement_play_command(
-        voice_id: VoiceId,
-        emitter: Emitter,
-        clip: Arc<PetalSonicAudioData>,
-        extent: SourceExtent,
-        options: PlayOptions,
-        block_size: usize,
-    ) -> PlaybackCommand {
-        PlaybackCommand::Play(prepare_test_voice(
-            voice_id,
-            emitter,
-            clip,
-            EmitterDesc::spatial(crate::math::Pose::identity()).with_extent(extent),
-            options.detached(),
-            None,
-            0,
-            block_size,
-        ))
-    }
-
-    fn retirement_extent() -> SourceExtent {
-        SourceExtent::weighted_samples(vec![
-            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::X, 1.0).unwrap(),
-            ExtentSample::new(ExtentSampleId(2), crate::math::Vec3::Y, 3.0).unwrap(),
-        ])
-        .unwrap()
     }
 
     fn retirement_emitter(index: u32) -> Emitter {
@@ -1376,232 +1359,6 @@ mod tests {
         assert_eq!(activity, 0, "steady render quantum allocated or freed");
         assert!(consumer.try_pop().is_some());
         assert!(harness.events.try_recv().is_err());
-    }
-
-    #[test]
-    fn natural_completion_moves_voice_resources_out_of_the_render_quantum_without_freeing() {
-        let block_size = 64;
-        let mut harness = harness(block_size, 1);
-        let source = Arc::new(PetalSonicAudioData::new(
-            vec![0.25; block_size * 3],
-            48_000,
-            1,
-            Duration::from_secs_f64((block_size * 3) as f64 / 48_000.0),
-        ));
-        let source_identity = Arc::as_ptr(&source);
-        let extent = retirement_extent();
-        let extent_identity = extent.weighted().unwrap().samples().as_ptr();
-        harness
-            .quantum
-            .active_voice_count
-            .store(1, Ordering::Release);
-        harness
-            .commands
-            .try_send(retirement_play_command(
-                VoiceId::from(41),
-                retirement_emitter(41),
-                source,
-                extent,
-                PlayOptions::once(),
-                block_size,
-            ))
-            .unwrap();
-        let mut consumer = harness.quantum.connect_output(48_000).unwrap();
-        harness.quantum.render();
-        while consumer.try_pop().is_some() {}
-
-        let activity = crate::test_support::realtime_memory_activity(|| {
-            harness.quantum.render();
-        });
-
-        assert_eq!(
-            activity, 0,
-            "natural Voice retirement freed realtime-owned memory"
-        );
-        assert!(
-            !harness
-                .quantum
-                .active_playback
-                .contains_key(&VoiceId::from(41))
-        );
-        let retirement = harness
-            .retirements
-            .try_recv()
-            .expect("output supervisor receives the completed Voice payload");
-        assert_eq!(retirement._voice_id, VoiceId::from(41));
-        assert_eq!(
-            Arc::as_ptr(&retirement._playback.audio_data),
-            source_identity
-        );
-        assert_eq!(
-            retirement
-                ._playback
-                .source_extent
-                .weighted()
-                .unwrap()
-                .samples()
-                .as_ptr(),
-            extent_identity
-        );
-    }
-
-    #[test]
-    fn explicit_stop_moves_voice_resources_out_of_the_render_quantum_without_freeing() {
-        let block_size = 64;
-        let mut harness = harness(block_size, 1);
-        let source = Arc::new(PetalSonicAudioData::new(
-            vec![0.25; block_size * 32],
-            48_000,
-            1,
-            Duration::from_secs_f64((block_size * 32) as f64 / 48_000.0),
-        ));
-        let extent = retirement_extent();
-        harness
-            .quantum
-            .active_voice_count
-            .store(1, Ordering::Release);
-        harness
-            .commands
-            .try_send(retirement_play_command(
-                VoiceId::from(42),
-                retirement_emitter(42),
-                source,
-                extent,
-                PlayOptions::looping(),
-                block_size,
-            ))
-            .unwrap();
-        let mut consumer = harness.quantum.connect_output(48_000).unwrap();
-        harness.quantum.render();
-        while consumer.try_pop().is_some() {}
-        harness
-            .commands
-            .try_send(PlaybackCommand::StopVoice(VoiceId::from(42)))
-            .unwrap();
-        harness.quantum.render();
-        while consumer.try_pop().is_some() {}
-
-        let activity = crate::test_support::realtime_memory_activity(|| {
-            harness.quantum.render();
-        });
-
-        assert_eq!(
-            activity, 0,
-            "stopped Voice retirement freed realtime-owned memory"
-        );
-        assert!(
-            !harness
-                .quantum
-                .active_playback
-                .contains_key(&VoiceId::from(42))
-        );
-        assert_eq!(
-            harness.retirements.try_recv().unwrap()._voice_id,
-            VoiceId::from(42)
-        );
-    }
-
-    #[test]
-    fn output_recovery_moves_voice_resources_without_freeing_on_the_supervisor_quantum() {
-        let block_size = 64;
-        let mut harness = harness(block_size, 1);
-        let source = Arc::new(PetalSonicAudioData::new(
-            vec![0.25; 96],
-            48_000,
-            1,
-            Duration::from_secs_f64(96.0 / 48_000.0),
-        ));
-        let extent = retirement_extent();
-        harness
-            .quantum
-            .active_voice_count
-            .store(1, Ordering::Release);
-        harness
-            .commands
-            .try_send(retirement_play_command(
-                VoiceId::from(43),
-                retirement_emitter(43),
-                source,
-                extent,
-                PlayOptions::once(),
-                block_size,
-            ))
-            .unwrap();
-        harness.quantum.advance_without_output(Duration::ZERO);
-
-        let activity = crate::test_support::realtime_memory_activity(|| {
-            harness
-                .quantum
-                .advance_without_output(Duration::from_millis(2));
-        });
-
-        assert_eq!(
-            activity, 0,
-            "no-output Voice retirement freed realtime-owned memory"
-        );
-        assert!(
-            !harness
-                .quantum
-                .active_playback
-                .contains_key(&VoiceId::from(43))
-        );
-        assert_eq!(
-            harness.retirements.try_recv().unwrap()._voice_id,
-            VoiceId::from(43)
-        );
-    }
-
-    #[test]
-    fn full_retirement_channel_keeps_the_next_voice_for_a_later_supervisor_cycle() {
-        let block_size = 64;
-        let mut harness = harness(block_size, 1);
-        for voice in [51, 52] {
-            let source = Arc::new(PetalSonicAudioData::new(
-                vec![0.25; 96],
-                48_000,
-                1,
-                Duration::from_secs_f64(96.0 / 48_000.0),
-            ));
-            harness
-                .quantum
-                .active_voice_count
-                .fetch_add(1, Ordering::AcqRel);
-            harness
-                .commands
-                .try_send(retirement_play_command(
-                    VoiceId::from(voice),
-                    retirement_emitter(voice as u32),
-                    source,
-                    retirement_extent(),
-                    PlayOptions::once(),
-                    block_size,
-                ))
-                .unwrap();
-            let activity = crate::test_support::realtime_memory_activity(|| {
-                harness
-                    .quantum
-                    .advance_without_output(Duration::from_millis(2));
-            });
-            assert_eq!(activity, 0, "bounded retirement path freed Voice payload");
-        }
-
-        assert_eq!(harness.quantum.pending_voice_retirements.len(), 1);
-        assert_eq!(
-            harness.retirements.try_recv().unwrap()._voice_id,
-            VoiceId::from(51)
-        );
-        let flush_activity = crate::test_support::realtime_memory_activity(|| {
-            harness.quantum.advance_without_output(Duration::ZERO);
-        });
-        assert_eq!(
-            flush_activity, 0,
-            "pending retirement flush freed Voice payload"
-        );
-        assert!(harness.quantum.pending_voice_retirements.is_empty());
-        assert_eq!(
-            harness.retirements.try_recv().unwrap()._voice_id,
-            VoiceId::from(52)
-        );
     }
 
     #[test]

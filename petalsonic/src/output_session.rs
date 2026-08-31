@@ -129,6 +129,14 @@ pub(crate) struct OutputSession {
 }
 
 impl OutputSession {
+    #[cfg(test)]
+    pub(crate) fn advance_without_output_for_test(&mut self, elapsed: std::time::Duration) {
+        self.render
+            .lock()
+            .expect("test render state must not be poisoned")
+            .advance_without_output(elapsed);
+    }
+
     pub(crate) fn new(
         desc: PetalSonicWorldDesc,
         platform: Box<dyn OutputPlatform>,

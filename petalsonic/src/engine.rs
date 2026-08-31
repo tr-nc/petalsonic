@@ -169,6 +169,11 @@ pub(crate) struct PetalSonicEngine {
 }
 
 impl PetalSonicEngine {
+    #[cfg(test)]
+    pub(crate) fn advance_without_output_for_test(&mut self, elapsed: std::time::Duration) {
+        self.output.advance_without_output_for_test(elapsed);
+    }
+
     pub(crate) fn new_with_output(
         startup: PreparedEngine,
         output: Box<dyn OutputPlatform>,

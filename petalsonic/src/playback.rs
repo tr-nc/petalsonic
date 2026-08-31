@@ -261,7 +261,7 @@ impl PreparedVoice {
             occlusion_profile,
             routing_generation: 0,
             #[cfg(test)]
-            retirement_witness: acoustic_retirement_witness,
+            _retirement_witness: acoustic_retirement_witness,
         });
         let total_frames = audio_data.total_frames();
         let sample_rate = audio_data.sample_rate();

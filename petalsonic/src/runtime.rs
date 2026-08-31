@@ -836,23 +836,19 @@ mod tests {
             .unwrap();
 
         let render_activity = crate::test_support::realtime_memory_activity(|| {
-            AudioRuntime::supervisor_tick(
-                &mut fixture.engine,
-                &fixture.runtime_state,
-                &fixture.recovery_attempts,
-                &mut fixture.schedule,
-                fixture.now + Duration::from_millis(2),
-            );
+            fixture
+                .engine
+                .advance_without_output_for_test(Duration::from_millis(2));
         });
 
-        assert_eq!(render_activity, 0);
         assert_eq!(observation.observed(), (0, 0, 0));
+        assert_eq!(render_activity, 0);
         AudioRuntime::supervisor_tick(
             &mut fixture.engine,
             &fixture.runtime_state,
             &fixture.recovery_attempts,
             &mut fixture.schedule,
-            fixture.now + Duration::from_millis(3),
+            fixture.now,
         );
         assert_eq!(observation.observed(), (901, 1, 0));
     }

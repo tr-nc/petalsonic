@@ -3,7 +3,7 @@
 //! The output engine schedules this module; it does not reach through the seam to
 //! coordinate Voices, DSP processors, buffers, telemetry, or retirement.
 
-use crate::acoustic_propagation::{AcousticResponse, AcousticVoiceInput};
+use crate::acoustic_propagation::{AcousticResponse, AcousticVoice, AcousticVoiceInput};
 use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::{LatencyProfile, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
@@ -243,6 +243,7 @@ pub(crate) struct RenderQuantum {
 pub(crate) struct VoiceRetirement {
     _voice_id: VoiceId,
     _playback: PlaybackInstance,
+    _acoustic: Option<AcousticVoice>,
     _spatial: Option<RetiredSpatialSource>,
 }
 
@@ -770,7 +771,7 @@ impl RenderQuantum {
                 .remove(&completed.voice_id)
                 .expect("mixer completion must still name one active Voice");
             let spatial = self.processor.retire_voice(completed.voice_id);
-            self.acoustic_voice_input.retire(completed.voice_id);
+            let acoustic = self.acoustic_voice_input.retire(completed.voice_id);
             if let Some(tag) = completed.completion_tag {
                 let _ = self.retirement_sender.try_send(completed.voice_id);
                 Self::try_send_event(
@@ -789,6 +790,7 @@ impl RenderQuantum {
             self.enqueue_voice_retirement(VoiceRetirement {
                 _voice_id: completed.voice_id,
                 _playback: playback,
+                _acoustic: acoustic,
                 _spatial: spatial,
             });
         }
@@ -988,7 +990,7 @@ mod tests {
                     source_extent: SourceExtent::Point,
                     occlusion_profile: OcclusionProfile::PointExact,
                     routing_generation: 0,
-                    retirement_witness: None,
+                    _retirement_witness: None,
                 });
             harness
                 .acoustic_responses

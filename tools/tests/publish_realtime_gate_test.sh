@@ -46,9 +46,9 @@ FAKE_TEST_LIST=$'render::tests::warmed_near_capacity_quantum_meets_release_budge
     PETALSONIC_CARGO="$fake_cargo" \
     "$gate"
 
-expected="test --release -p petalsonic --lib $target -- --exact --nocapture"
+expected="test --release -p petalsonic --lib $target -- --include-ignored --exact --nocapture"
 if [[ $(<"$execution_log") != "$expected" ]]; then
-    echo "gate did not execute the unique fully qualified target with --exact" >&2
+    echo "gate did not execute the unique ignored target with --include-ignored --exact" >&2
     printf 'expected: %s\nactual:   %s\n' "$expected" "$(<"$execution_log")" >&2
     exit 1
 fi

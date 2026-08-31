@@ -112,11 +112,45 @@ pub(crate) enum DirectSolveStatus {
     Deferred,
 }
 
+/// Immutable VoiceId-sorted render lookup table for one acoustic publication.
+///
+/// Construction owns ordering and uniqueness; rendering receives slice-like read access but
+/// cannot mutate the index out from under binary lookup.
+#[derive(Debug)]
+pub(crate) struct AcousticVoiceResponses(Vec<DirectAcousticResponse>);
+
+impl From<Vec<DirectAcousticResponse>> for AcousticVoiceResponses {
+    fn from(mut responses: Vec<DirectAcousticResponse>) -> Self {
+        responses.sort_by(|left, right| compare_voice_ids(left.voice_id, right.voice_id));
+        assert!(
+            responses.windows(2).all(|pair| {
+                compare_voice_ids(pair[0].voice_id, pair[1].voice_id) == CmpOrdering::Less
+            }),
+            "one acoustic render publication cannot contain duplicate Voice identities"
+        );
+        Self(responses)
+    }
+}
+
+impl FromIterator<DirectAcousticResponse> for AcousticVoiceResponses {
+    fn from_iter<T: IntoIterator<Item = DirectAcousticResponse>>(iter: T) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl std::ops::Deref for AcousticVoiceResponses {
+    type Target = [DirectAcousticResponse];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AcousticResponse {
     pub spatial_revision: u64,
     pub geometry_version: u64,
-    pub direct: Vec<DirectAcousticResponse>,
+    pub direct: AcousticVoiceResponses,
     pub late_reverb: LateReverbParameters,
     pub published_at: Instant,
     pub solve_time_us: u64,
@@ -1212,7 +1246,7 @@ impl CompletedAcousticFrame {
             response: AcousticResponse {
                 spatial_revision: self.spatial_revision,
                 geometry_version: self.geometry_version,
-                direct,
+                direct: direct.into(),
                 late_reverb: self.late_reverb,
                 published_at,
                 solve_time_us: self.solve_time_us,
@@ -2652,7 +2686,8 @@ mod tests {
             geometry_version: 5,
             direct: (0..VOICES)
                 .map(|voice| direct_response(voice as u64, voice as u64 + 1))
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 0,
@@ -2689,7 +2724,8 @@ mod tests {
             direct: [4, 1, 3, 2]
                 .into_iter()
                 .map(|voice| direct_response(voice, voice + 10))
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             late_reverb: LateReverbParameters::SILENT,
             published_at: Instant::now(),
             solve_time_us: 0,
@@ -2704,6 +2740,34 @@ mod tests {
                 [voice as f32; 3]
             );
         }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "one acoustic render publication cannot contain duplicate Voice identities"
+    )]
+    fn render_publication_rejects_duplicate_voice_identity() {
+        let _: AcousticVoiceResponses = vec![direct_response(7, 1), direct_response(7, 2)].into();
+    }
+
+    #[test]
+    #[should_panic(expected = "one acoustic publication cannot contain duplicate Voice identities")]
+    fn completed_publication_rejects_duplicate_active_voice_identity() {
+        let mut workload = input(Arc::new(NoGeometry));
+        let mut duplicate = workload.voices[0].clone();
+        duplicate.routing_generation += 1;
+        workload.voices.push(duplicate);
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 0,
+            max_direct_rays: 0,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+
+        let _ = AcousticSolver::new(2).solve_completed(&workload, 1.0, plan);
     }
 
     #[test]

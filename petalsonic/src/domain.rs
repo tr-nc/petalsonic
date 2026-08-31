@@ -1,4 +1,4 @@
-use crate::audio_data::PetalSonicAudioData;
+use crate::audio_data::{PetalSonicAudioData, decode_file};
 use crate::math::Pose;
 pub use crate::occlusion::{DistributedOcclusionProfile, MAX_DIRECT_LOBES, OcclusionProfile};
 use crate::playback::LoopMode;
@@ -21,12 +21,19 @@ impl ResidentClip {
             crate::error::PetalSonicError::AudioLoading("Audio path is not valid UTF-8".to_string())
         })?;
         Ok(Self {
-            data: PetalSonicAudioData::from_path(path)?,
+            data: Arc::new(decode_file(path)?),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_audio_data(data: Arc<PetalSonicAudioData>) -> Self {
         Self { data }
+    }
+
+    pub(crate) fn resampled_to(self, sample_rate: u32) -> crate::error::Result<Self> {
+        Ok(Self {
+            data: self.data.resample(sample_rate)?,
+        })
     }
 
     /// Take ownership of predecoded interleaved PCM without copying its sample buffer.
@@ -107,6 +114,128 @@ mod tests {
         assert!(ResidentClip::from_interleaved_pcm(vec![0.0], 48_000, 2).is_err());
         assert!(ResidentClip::from_mono_pcm(vec![f32::NAN], 48_000).is_err());
         assert!(ResidentClip::from_mono_pcm(vec![0.0], 0).is_err());
+    }
+
+    #[test]
+    fn resident_clip_owns_noop_and_converting_resampling() {
+        let clip = ResidentClip::from_interleaved_pcm(
+            (0..4_096)
+                .flat_map(|frame| {
+                    let sample = frame as f32 / 4_096.0;
+                    [sample, -sample]
+                })
+                .collect(),
+            24_000,
+            2,
+        )
+        .unwrap();
+
+        let unchanged = clip.clone().resampled_to(24_000).unwrap();
+        assert_eq!(unchanged.sample_rate(), 24_000);
+        assert_eq!(unchanged.channels(), 2);
+        assert_eq!(unchanged.total_frames(), 4_096);
+
+        let converted = clip.resampled_to(48_000).unwrap();
+        assert_eq!(converted.sample_rate(), 48_000);
+        assert_eq!(converted.channels(), 2);
+        assert!(converted.total_frames() > 4_096);
+    }
+
+    #[test]
+    fn resident_clip_preserves_missing_file_error_kind() {
+        let path = std::env::temp_dir().join(format!(
+            "petalsonic-definitely-missing-{}-resident-clip.wav",
+            std::process::id()
+        ));
+        let error = ResidentClip::from_path(path).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::PetalSonicError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn resident_clip_decodes_supported_file_through_public_constructor() {
+        let path = std::env::temp_dir().join(format!(
+            "petalsonic-resident-clip-{}-mono.wav",
+            std::process::id()
+        ));
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&40_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&4_u32.to_le_bytes());
+        wav.extend_from_slice(&0_i16.to_le_bytes());
+        wav.extend_from_slice(&i16::MAX.to_le_bytes());
+        std::fs::write(&path, wav).unwrap();
+
+        let decoded = ResidentClip::from_path(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(decoded.sample_rate(), 8_000);
+        assert_eq!(decoded.channels(), 1);
+        assert_eq!(decoded.total_frames(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_clip_preserves_non_utf8_path_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        let error = ResidentClip::from_path(path).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::PetalSonicError::AudioLoading(ref reason)
+                if reason == "Audio path is not valid UTF-8"
+        ));
+    }
+
+    #[test]
+    fn spatial_frame_indexes_the_complete_emitter_generation() {
+        let old_generation = Emitter {
+            world_id: 7,
+            index: 2,
+            generation: 1,
+        };
+        let current_generation = Emitter {
+            generation: 2,
+            ..old_generation
+        };
+        let other_world = Emitter {
+            world_id: 3,
+            index: 99,
+            generation: 4,
+        };
+        let current_pose = Pose::from_position(crate::math::Vec3::Y);
+        let frame = SpatialFrame::new(
+            11,
+            1.25,
+            Pose::identity(),
+            vec![
+                EmitterSpatialState::new(current_generation, current_pose),
+                EmitterSpatialState::new(other_world, Pose::identity()),
+            ],
+        );
+
+        assert_eq!(
+            frame
+                .emitter_state(current_generation)
+                .map(|state| state.pose),
+            Some(current_pose)
+        );
+        assert!(frame.emitter_state(old_generation).is_none());
+        assert_eq!(frame.emitters()[0].emitter, other_world);
+        assert_eq!(frame.emitters()[1].emitter, current_generation);
     }
 
     #[test]
@@ -875,8 +1004,9 @@ impl SpatialFrame {
         revision: u64,
         sim_time_seconds: f64,
         listener: Pose,
-        emitters: Vec<EmitterSpatialState>,
+        mut emitters: Vec<EmitterSpatialState>,
     ) -> Self {
+        emitters.sort_unstable_by(|left, right| compare_emitter_key(left.emitter, right.emitter));
         Self {
             revision,
             sim_time_seconds,
@@ -900,4 +1030,21 @@ impl SpatialFrame {
     pub fn emitters(&self) -> &[EmitterSpatialState] {
         &self.emitters
     }
+
+    pub(crate) fn emitter_state(&self, emitter: Emitter) -> Option<&EmitterSpatialState> {
+        self.emitters
+            .binary_search_by(|candidate| compare_emitter_key(candidate.emitter, emitter))
+            .ok()
+            .map(|index| &self.emitters[index])
+    }
+}
+
+fn compare_emitter_key(left: Emitter, right: Emitter) -> std::cmp::Ordering {
+    #[cfg(test)]
+    crate::test_support::record_spatial_frame_comparison();
+    (left.world_id, left.index, left.generation).cmp(&(
+        right.world_id,
+        right.index,
+        right.generation,
+    ))
 }

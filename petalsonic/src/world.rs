@@ -336,20 +336,11 @@ impl PetalSonicWorld {
         self.runtime.ensure_open()?;
         Self::validate_emitter_desc(&desc)?;
         self.validate_optional_bus(desc.bus())?;
-        let clip = self.prepare_clip(clip)?;
+        let clip = clip.resampled_to(self.desc.sample_rate)?;
         self.emitters
             .lock()
             .map_err(|_| PetalSonicError::Engine("Emitter registry is poisoned".into()))?
             .insert(EmitterState { clip, desc })
-    }
-
-    fn prepare_clip(&self, clip: ResidentClip) -> Result<ResidentClip> {
-        if clip.sample_rate() == self.desc.sample_rate {
-            return Ok(clip);
-        }
-        Ok(ResidentClip::from_audio_data(Arc::new(
-            clip.data.resample(self.desc.sample_rate)?,
-        )))
     }
 
     pub fn update_emitter(&self, emitter: Emitter, desc: EmitterDesc) -> Result<()> {

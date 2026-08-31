@@ -488,11 +488,7 @@ impl RenderQuantum {
             if voice.detached {
                 continue;
             }
-            if let Some(spatial) = frame
-                .emitters()
-                .iter()
-                .find(|spatial| spatial.emitter == voice.emitter)
-            {
+            if let Some(spatial) = frame.emitter_state(voice.emitter) {
                 voice.render_state.set_spatial_pose(spatial.pose);
             }
         }
@@ -717,8 +713,8 @@ mod tests {
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::PetalSonicWorldDesc;
     use crate::domain::{
-        DirectPath, Emitter, EmitterDesc, EnvironmentSend, OcclusionProfile, PlayOptions,
-        SourceExtent,
+        DirectPath, Emitter, EmitterDesc, EmitterSpatialState, EnvironmentSend, ExtentSample,
+        ExtentSampleId, OcclusionProfile, PlayOptions, SourceExtent,
     };
     use crate::playback::prepare_test_voice;
     use crate::realtime_latest::Publisher;
@@ -965,6 +961,10 @@ mod tests {
             1,
             Duration::from_secs_f64(64.0 / 48_000.0),
         ));
+        let captured_extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(17), crate::math::Vec3::X, 1.0).unwrap(),
+        ])
+        .unwrap();
         for (id, detached) in [(1, false), (2, true)] {
             let mut options = PlayOptions::looping();
             if detached {
@@ -974,7 +974,7 @@ mod tests {
                 VoiceId::from(id),
                 emitter,
                 clip.clone(),
-                EmitterDesc::spatial(old_pose),
+                EmitterDesc::spatial(old_pose).with_extent(captured_extent.clone()),
                 options,
                 None,
                 0,
@@ -991,7 +991,7 @@ mod tests {
             1,
             0.0,
             crate::math::Pose::default(),
-            vec![crate::domain::EmitterSpatialState::new(emitter, new_pose)],
+            vec![EmitterSpatialState::new(emitter, new_pose).with_extent(SourceExtent::Point)],
         );
 
         RenderQuantum::apply_spatial_frame_to_voices(&frame, &mut harness.quantum.active_playback);
@@ -1010,7 +1010,77 @@ mod tests {
         );
         assert_eq!(
             harness.quantum.active_playback[&VoiceId::from(1)].source_extent,
-            SourceExtent::Point
+            captured_extent
+        );
+    }
+
+    #[test]
+    fn spatial_frame_updates_2048_voices_with_bounded_comparisons_and_no_realtime_allocation() {
+        const EMITTERS: usize = 4_096;
+        const VOICES: usize = 2_048;
+        const MAX_BINARY_COMPARISONS: usize = 13;
+        let block_size = 8;
+        let old_pose = crate::math::Pose::from_position(-crate::math::Vec3::Y);
+        let source = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; block_size * 2],
+            48_000,
+            1,
+            Duration::from_secs_f64((block_size * 2) as f64 / 48_000.0),
+        ));
+        let emitter = |index: usize| Emitter {
+            world_id: 9,
+            index: index as u32,
+            generation: 3,
+        };
+        let mut voices = HashMap::with_capacity(VOICES);
+        for voice_index in 0..VOICES {
+            let instance = prepare_test_voice(
+                VoiceId::from(voice_index as u64 + 1),
+                emitter(voice_index * 2),
+                source.clone(),
+                EmitterDesc::spatial(old_pose),
+                PlayOptions::looping(),
+                None,
+                0,
+                block_size,
+            )
+            .start()
+            .1;
+            voices.insert(VoiceId::from(voice_index as u64 + 1), instance);
+        }
+        let frame = SpatialFrame::new(
+            41,
+            3.0,
+            crate::math::Pose::identity(),
+            (0..EMITTERS)
+                .rev()
+                .map(|index| {
+                    EmitterSpatialState::new(
+                        emitter(index),
+                        crate::math::Pose::from_position(crate::math::Vec3::new(
+                            index as f32,
+                            2.0,
+                            0.0,
+                        )),
+                    )
+                })
+                .collect(),
+        );
+        let mut comparisons = 0;
+
+        let memory_activity = crate::test_support::realtime_memory_activity(|| {
+            comparisons = crate::test_support::spatial_frame_comparison_activity(|| {
+                RenderQuantum::apply_spatial_frame_to_voices(&frame, &mut voices);
+            });
+        });
+
+        assert_eq!(memory_activity, 0);
+        assert!(comparisons >= VOICES);
+        assert!(comparisons <= VOICES * MAX_BINARY_COMPARISONS);
+        let last = &voices[&VoiceId::from(VOICES as u64)];
+        assert_eq!(
+            last.render_state.spatial_pose().unwrap().position,
+            crate::math::Vec3::new(((VOICES - 1) * 2) as f32, 2.0, 0.0)
         );
     }
 

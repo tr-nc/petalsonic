@@ -717,8 +717,8 @@ mod tests {
     use crate::audio_data::PetalSonicAudioData;
     use crate::config::PetalSonicWorldDesc;
     use crate::domain::{
-        DirectPath, Emitter, EmitterDesc, EnvironmentSend, OcclusionProfile, PlayOptions,
-        SourceExtent,
+        DirectPath, Emitter, EmitterDesc, EnvironmentSend, ExtentSample, ExtentSampleId,
+        OcclusionProfile, PlayOptions, SourceExtent,
     };
     use crate::playback::prepare_test_voice;
     use crate::realtime_latest::Publisher;
@@ -866,6 +866,38 @@ mod tests {
             0,
             block_size,
         ))
+    }
+
+    fn retirement_play_command(
+        voice_id: VoiceId,
+        emitter: Emitter,
+        clip: Arc<PetalSonicAudioData>,
+        options: PlayOptions,
+        block_size: usize,
+    ) -> PlaybackCommand {
+        let extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::X, 1.0).unwrap(),
+            ExtentSample::new(ExtentSampleId(2), crate::math::Vec3::Y, 3.0).unwrap(),
+        ])
+        .unwrap();
+        PlaybackCommand::Play(prepare_test_voice(
+            voice_id,
+            emitter,
+            clip,
+            EmitterDesc::spatial(crate::math::Pose::identity()).with_extent(extent),
+            options.detached(),
+            None,
+            0,
+            block_size,
+        ))
+    }
+
+    fn retirement_emitter(index: u32) -> Emitter {
+        Emitter {
+            world_id: 1,
+            index,
+            generation: 1,
+        }
     }
 
     #[test]
@@ -1056,6 +1088,144 @@ mod tests {
         assert_eq!(activity, 0, "steady render quantum allocated or freed");
         assert!(consumer.try_pop().is_some());
         assert!(harness.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn natural_completion_moves_voice_resources_out_of_the_render_quantum_without_freeing() {
+        let block_size = 64;
+        let mut harness = harness(block_size, 1);
+        let source = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; block_size * 3],
+            48_000,
+            1,
+            Duration::from_secs_f64((block_size * 3) as f64 / 48_000.0),
+        ));
+        harness
+            .quantum
+            .active_voice_count
+            .store(1, Ordering::Release);
+        harness
+            .commands
+            .try_send(retirement_play_command(
+                VoiceId::from(41),
+                retirement_emitter(41),
+                source,
+                PlayOptions::once(),
+                block_size,
+            ))
+            .unwrap();
+        let mut consumer = harness.quantum.connect_output(48_000).unwrap();
+        harness.quantum.render();
+        while consumer.try_pop().is_some() {}
+
+        let activity = crate::test_support::realtime_memory_activity(|| {
+            harness.quantum.render();
+        });
+
+        assert_eq!(
+            activity, 0,
+            "natural Voice retirement freed realtime-owned memory"
+        );
+        assert!(
+            !harness
+                .quantum
+                .active_playback
+                .contains_key(&VoiceId::from(41))
+        );
+    }
+
+    #[test]
+    fn explicit_stop_moves_voice_resources_out_of_the_render_quantum_without_freeing() {
+        let block_size = 64;
+        let mut harness = harness(block_size, 1);
+        let source = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; block_size * 32],
+            48_000,
+            1,
+            Duration::from_secs_f64((block_size * 32) as f64 / 48_000.0),
+        ));
+        harness
+            .quantum
+            .active_voice_count
+            .store(1, Ordering::Release);
+        harness
+            .commands
+            .try_send(retirement_play_command(
+                VoiceId::from(42),
+                retirement_emitter(42),
+                source,
+                PlayOptions::looping(),
+                block_size,
+            ))
+            .unwrap();
+        let mut consumer = harness.quantum.connect_output(48_000).unwrap();
+        harness.quantum.render();
+        while consumer.try_pop().is_some() {}
+        harness
+            .commands
+            .try_send(PlaybackCommand::StopVoice(VoiceId::from(42)))
+            .unwrap();
+        harness.quantum.render();
+        while consumer.try_pop().is_some() {}
+
+        let activity = crate::test_support::realtime_memory_activity(|| {
+            harness.quantum.render();
+        });
+
+        assert_eq!(
+            activity, 0,
+            "stopped Voice retirement freed realtime-owned memory"
+        );
+        assert!(
+            !harness
+                .quantum
+                .active_playback
+                .contains_key(&VoiceId::from(42))
+        );
+    }
+
+    #[test]
+    fn output_recovery_moves_voice_resources_without_freeing_on_the_supervisor_quantum() {
+        let block_size = 64;
+        let mut harness = harness(block_size, 1);
+        let source = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; 96],
+            48_000,
+            1,
+            Duration::from_secs_f64(96.0 / 48_000.0),
+        ));
+        harness
+            .quantum
+            .active_voice_count
+            .store(1, Ordering::Release);
+        harness
+            .commands
+            .try_send(retirement_play_command(
+                VoiceId::from(43),
+                retirement_emitter(43),
+                source,
+                PlayOptions::once(),
+                block_size,
+            ))
+            .unwrap();
+        harness.quantum.advance_without_output(Duration::ZERO);
+
+        let activity = crate::test_support::realtime_memory_activity(|| {
+            harness
+                .quantum
+                .advance_without_output(Duration::from_millis(2));
+        });
+
+        assert_eq!(
+            activity, 0,
+            "no-output Voice retirement freed realtime-owned memory"
+        );
+        assert!(
+            !harness
+                .quantum
+                .active_playback
+                .contains_key(&VoiceId::from(43))
+        );
     }
 
     #[test]

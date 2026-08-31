@@ -244,6 +244,7 @@ pub(crate) struct RetiredSpatialSource {
     _native_hrtf: Option<NativeHrtfSourceState>,
     _native_direct: Option<NativeDirectSourceState>,
     _native_direct_lobes: Option<NativeDirectLobeSourceState>,
+    _native_environment: Option<NativeDirectSourceState>,
 }
 
 pub(crate) struct SpatialProcessorConfig {
@@ -567,7 +568,7 @@ impl SpatialProcessor {
         let native_hrtf = self.native_hrtf_source_states.remove(&voice_id);
         let native_direct = self.native_direct_source_states.remove(&voice_id);
         let native_direct_lobes = self.native_direct_lobe_source_states.remove(&voice_id);
-        self.native_environment_source_states.remove(&voice_id);
+        let native_environment = self.native_environment_source_states.remove(&voice_id);
         let release_early_state = self
             .native_early_reflection_source_states
             .get(&voice_id)
@@ -588,12 +589,16 @@ impl SpatialProcessor {
         if !early_tail_draining {
             self.finish_voice_energy(voice_id);
         }
-        (native_hrtf.is_some() || native_direct.is_some() || native_direct_lobes.is_some())
-            .then_some(RetiredSpatialSource {
-                _native_hrtf: native_hrtf,
-                _native_direct: native_direct,
-                _native_direct_lobes: native_direct_lobes,
-            })
+        (native_hrtf.is_some()
+            || native_direct.is_some()
+            || native_direct_lobes.is_some()
+            || native_environment.is_some())
+        .then_some(RetiredSpatialSource {
+            _native_hrtf: native_hrtf,
+            _native_direct: native_direct,
+            _native_direct_lobes: native_direct_lobes,
+            _native_environment: native_environment,
+        })
     }
 
     fn ensure_native_hrtf_state_for_voice(&mut self, voice_id: VoiceId) -> Result<()> {

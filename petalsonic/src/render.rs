@@ -189,19 +189,29 @@ pub(crate) struct RenderQuantum {
     voice_telemetry_sender: Sender<VoiceTelemetryEvent>,
     timing_sender: Sender<RenderTimingEvent>,
     counters: Arc<RuntimeCounters>,
-    backend_retirement_sender: Sender<RetiredSpatialSource>,
-    pending_backend_retirements: Vec<(VoiceId, RetiredSpatialSource)>,
+    voice_retirement_sender: Sender<VoiceRetirement>,
+    pending_voice_retirements: Vec<VoiceRetirement>,
     mixer_scratch: MixerScratch,
     completed_playbacks: Vec<CompletedPlayback>,
     render_block_index: u64,
     output: Option<LogicalStereoOutput>,
 }
 
+/// One complete Voice lifetime removed from active rendering and transferred linearly to the
+/// output supervisor. The payload is intentionally not cloneable: render code may only move it
+/// into the bounded retirement path, and destruction happens when the non-realtime owner drains
+/// that path.
+pub(crate) struct VoiceRetirement {
+    _voice_id: VoiceId,
+    _playback: PlaybackInstance,
+    _spatial: Option<RetiredSpatialSource>,
+}
+
 impl RenderQuantum {
     pub(crate) fn new(
         startup: PreparedRender,
         buses: Vec<BusParams>,
-        backend_retirement_sender: Sender<RetiredSpatialSource>,
+        voice_retirement_sender: Sender<VoiceRetirement>,
     ) -> Result<Self> {
         let PreparedRender {
             desc,
@@ -257,8 +267,8 @@ impl RenderQuantum {
             voice_telemetry_sender,
             timing_sender,
             counters,
-            backend_retirement_sender,
-            pending_backend_retirements: Vec::with_capacity(max_voices),
+            voice_retirement_sender,
+            pending_voice_retirements: Vec::with_capacity(max_voices),
             mixer_scratch: MixerScratch::new(max_voices),
             completed_playbacks: Vec::with_capacity(max_voices),
             render_block_index: 0,
@@ -303,7 +313,7 @@ impl RenderQuantum {
     }
 
     pub(crate) fn render(&mut self) {
-        self.flush_backend_retirements();
+        self.flush_voice_retirements();
         self.consume_latest_spatial_frame();
         self.consume_latest_acoustic_response();
         let listener = self
@@ -349,7 +359,7 @@ impl RenderQuantum {
     }
 
     pub(crate) fn advance_without_output(&mut self, elapsed: Duration) {
-        self.flush_backend_retirements();
+        self.flush_voice_retirements();
         self.process_commands();
         let frames = (elapsed.as_secs_f64() * self.sample_rate as f64).floor() as usize;
         if frames == 0 {
@@ -375,8 +385,6 @@ impl RenderQuantum {
                 });
             }
         }
-        self.active_playback
-            .retain(|_, instance| !instance.should_reclaim());
         self.retire_completed_voices();
     }
 
@@ -628,23 +636,13 @@ impl RenderQuantum {
     }
 
     fn retire_completed_voices(&mut self) {
-        let mut deferred = 0;
-        for completed in &self.completed_playbacks {
-            if let Some(retired) = self.processor.retire_voice(completed.voice_id)
-                && let Err(error) = self.backend_retirement_sender.try_send(retired)
-            {
-                assert!(self.pending_backend_retirements.len() < self.max_voices);
-                self.pending_backend_retirements
-                    .push((completed.voice_id, error.into_inner()));
-                deferred += 1;
-            }
+        while let Some(completed) = self.completed_playbacks.pop() {
+            let playback = self
+                .active_playback
+                .remove(&completed.voice_id)
+                .expect("mixer completion must still name one active Voice");
+            let spatial = self.processor.retire_voice(completed.voice_id);
             self.acoustic_voice_input.retire(completed.voice_id);
-        }
-        self.active_voice_count.fetch_sub(
-            self.completed_playbacks.len().saturating_sub(deferred),
-            Ordering::AcqRel,
-        );
-        for completed in self.completed_playbacks.drain(..) {
             if let Some(tag) = completed.completion_tag {
                 let _ = self.retirement_sender.try_send(completed.voice_id);
                 Self::try_send_event(
@@ -660,14 +658,27 @@ impl RenderQuantum {
                     },
                 );
             }
+            self.enqueue_voice_retirement(VoiceRetirement {
+                _voice_id: completed.voice_id,
+                _playback: playback,
+                _spatial: spatial,
+            });
         }
     }
 
-    fn flush_backend_retirements(&mut self) {
-        while let Some((voice_id, retired)) = self.pending_backend_retirements.pop() {
-            if let Err(error) = self.backend_retirement_sender.try_send(retired) {
-                self.pending_backend_retirements
-                    .push((voice_id, error.into_inner()));
+    fn enqueue_voice_retirement(&mut self, retirement: VoiceRetirement) {
+        if let Err(error) = self.voice_retirement_sender.try_send(retirement) {
+            assert!(self.pending_voice_retirements.len() < self.max_voices);
+            self.pending_voice_retirements.push(error.into_inner());
+            return;
+        }
+        self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn flush_voice_retirements(&mut self) {
+        while let Some(retirement) = self.pending_voice_retirements.pop() {
+            if let Err(error) = self.voice_retirement_sender.try_send(retirement) {
+                self.pending_voice_retirements.push(error.into_inner());
                 break;
             }
             self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
@@ -747,6 +758,7 @@ mod tests {
         commands: Sender<PlaybackCommand>,
         events: crossbeam_channel::Receiver<PetalSonicEvent>,
         timing: crossbeam_channel::Receiver<RenderTimingEvent>,
+        retirements: crossbeam_channel::Receiver<VoiceRetirement>,
     }
 
     fn harness(block_size: usize, max_voices: usize) -> Harness {
@@ -762,7 +774,7 @@ mod tests {
         let (retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
         let (_, spatial_frames) = RealtimeLatest::bounded(1);
         let (acoustic_responses, acoustic_response_consumer) = RealtimeLatest::bounded(2);
-        let (backend_retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
+        let (voice_retirement_sender, retirements) = crossbeam_channel::bounded(max_voices.max(1));
         let (event_sender, events) = crossbeam_channel::bounded(desc.event_queue_capacity);
         let (voice_telemetry_sender, _voice_telemetry) =
             crossbeam_channel::bounded(desc.event_queue_capacity);
@@ -787,13 +799,14 @@ mod tests {
             quantum: RenderQuantum::new(
                 startup,
                 vec![BusParams::default()],
-                backend_retirement_sender,
+                voice_retirement_sender,
             )
             .unwrap(),
             acoustic_responses,
             commands,
             events,
             timing,
+            retirements,
         }
     }
 
@@ -872,14 +885,10 @@ mod tests {
         voice_id: VoiceId,
         emitter: Emitter,
         clip: Arc<PetalSonicAudioData>,
+        extent: SourceExtent,
         options: PlayOptions,
         block_size: usize,
     ) -> PlaybackCommand {
-        let extent = SourceExtent::weighted_samples(vec![
-            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::X, 1.0).unwrap(),
-            ExtentSample::new(ExtentSampleId(2), crate::math::Vec3::Y, 3.0).unwrap(),
-        ])
-        .unwrap();
         PlaybackCommand::Play(prepare_test_voice(
             voice_id,
             emitter,
@@ -890,6 +899,14 @@ mod tests {
             0,
             block_size,
         ))
+    }
+
+    fn retirement_extent() -> SourceExtent {
+        SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::X, 1.0).unwrap(),
+            ExtentSample::new(ExtentSampleId(2), crate::math::Vec3::Y, 3.0).unwrap(),
+        ])
+        .unwrap()
     }
 
     fn retirement_emitter(index: u32) -> Emitter {
@@ -1100,6 +1117,9 @@ mod tests {
             1,
             Duration::from_secs_f64((block_size * 3) as f64 / 48_000.0),
         ));
+        let source_identity = Arc::as_ptr(&source);
+        let extent = retirement_extent();
+        let extent_identity = extent.weighted().unwrap().samples().as_ptr();
         harness
             .quantum
             .active_voice_count
@@ -1110,6 +1130,7 @@ mod tests {
                 VoiceId::from(41),
                 retirement_emitter(41),
                 source,
+                extent,
                 PlayOptions::once(),
                 block_size,
             ))
@@ -1132,6 +1153,25 @@ mod tests {
                 .active_playback
                 .contains_key(&VoiceId::from(41))
         );
+        let retirement = harness
+            .retirements
+            .try_recv()
+            .expect("output supervisor receives the completed Voice payload");
+        assert_eq!(retirement._voice_id, VoiceId::from(41));
+        assert_eq!(
+            Arc::as_ptr(&retirement._playback.audio_data),
+            source_identity
+        );
+        assert_eq!(
+            retirement
+                ._playback
+                .source_extent
+                .weighted()
+                .unwrap()
+                .samples()
+                .as_ptr(),
+            extent_identity
+        );
     }
 
     #[test]
@@ -1144,6 +1184,7 @@ mod tests {
             1,
             Duration::from_secs_f64((block_size * 32) as f64 / 48_000.0),
         ));
+        let extent = retirement_extent();
         harness
             .quantum
             .active_voice_count
@@ -1154,6 +1195,7 @@ mod tests {
                 VoiceId::from(42),
                 retirement_emitter(42),
                 source,
+                extent,
                 PlayOptions::looping(),
                 block_size,
             ))
@@ -1182,6 +1224,10 @@ mod tests {
                 .active_playback
                 .contains_key(&VoiceId::from(42))
         );
+        assert_eq!(
+            harness.retirements.try_recv().unwrap()._voice_id,
+            VoiceId::from(42)
+        );
     }
 
     #[test]
@@ -1194,6 +1240,7 @@ mod tests {
             1,
             Duration::from_secs_f64(96.0 / 48_000.0),
         ));
+        let extent = retirement_extent();
         harness
             .quantum
             .active_voice_count
@@ -1204,6 +1251,7 @@ mod tests {
                 VoiceId::from(43),
                 retirement_emitter(43),
                 source,
+                extent,
                 PlayOptions::once(),
                 block_size,
             ))
@@ -1225,6 +1273,63 @@ mod tests {
                 .quantum
                 .active_playback
                 .contains_key(&VoiceId::from(43))
+        );
+        assert_eq!(
+            harness.retirements.try_recv().unwrap()._voice_id,
+            VoiceId::from(43)
+        );
+    }
+
+    #[test]
+    fn full_retirement_channel_keeps_the_next_voice_for_a_later_supervisor_cycle() {
+        let block_size = 64;
+        let mut harness = harness(block_size, 1);
+        for voice in [51, 52] {
+            let source = Arc::new(PetalSonicAudioData::new(
+                vec![0.25; 96],
+                48_000,
+                1,
+                Duration::from_secs_f64(96.0 / 48_000.0),
+            ));
+            harness
+                .quantum
+                .active_voice_count
+                .fetch_add(1, Ordering::AcqRel);
+            harness
+                .commands
+                .try_send(retirement_play_command(
+                    VoiceId::from(voice),
+                    retirement_emitter(voice as u32),
+                    source,
+                    retirement_extent(),
+                    PlayOptions::once(),
+                    block_size,
+                ))
+                .unwrap();
+            let activity = crate::test_support::realtime_memory_activity(|| {
+                harness
+                    .quantum
+                    .advance_without_output(Duration::from_millis(2));
+            });
+            assert_eq!(activity, 0, "bounded retirement path freed Voice payload");
+        }
+
+        assert_eq!(harness.quantum.pending_voice_retirements.len(), 1);
+        assert_eq!(
+            harness.retirements.try_recv().unwrap()._voice_id,
+            VoiceId::from(51)
+        );
+        let flush_activity = crate::test_support::realtime_memory_activity(|| {
+            harness.quantum.advance_without_output(Duration::ZERO);
+        });
+        assert_eq!(
+            flush_activity, 0,
+            "pending retirement flush freed Voice payload"
+        );
+        assert!(harness.quantum.pending_voice_retirements.is_empty());
+        assert_eq!(
+            harness.retirements.try_recv().unwrap()._voice_id,
+            VoiceId::from(52)
         );
     }
 

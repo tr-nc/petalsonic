@@ -12,9 +12,8 @@ use crate::output_session::RenderWorkerFaultInjector;
 use crate::platform::output::{OutputPlatform, OutputRecoveryRequest, OutputRecoveryResult};
 use crate::playback::PlaybackCommand;
 use crate::realtime_latest::RealtimeConsumer;
-use crate::render::{PreparedRender, RenderQuantum};
+use crate::render::{PreparedRender, RenderQuantum, VoiceRetirement};
 use crate::runtime_health::RuntimeFailurePublisher;
-use crate::spatial::RetiredSpatialSource;
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -166,7 +165,7 @@ pub(crate) struct PetalSonicEngine {
     output: OutputSession,
     event_sender: Sender<PetalSonicEvent>,
     counters: Arc<RuntimeCounters>,
-    backend_retirement_receiver: Receiver<RetiredSpatialSource>,
+    voice_retirement_receiver: Receiver<VoiceRetirement>,
 }
 
 impl PetalSonicEngine {
@@ -207,12 +206,12 @@ impl PetalSonicEngine {
             ),
             event_sender,
             counters,
-            backend_retirement_receiver: retirement_receiver,
+            voice_retirement_receiver: retirement_receiver,
         })
     }
 
     pub(crate) fn drain_retired_backend_resources(&mut self) {
-        while self.backend_retirement_receiver.try_recv().is_ok() {}
+        while self.voice_retirement_receiver.try_recv().is_ok() {}
     }
 
     pub(crate) fn reconcile_output(

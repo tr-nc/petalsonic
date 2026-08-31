@@ -138,7 +138,11 @@ pub fn mix_playback_instances_with_metrics(
     // clear their completion tag before entering the de-click ramp.
     for (voice_id, instance) in active_playback.iter_mut() {
         let _ = instance.check_and_clear_end_flag();
-        if instance.should_reclaim() {
+        if instance.should_reclaim()
+            && !completed_playbacks
+                .iter()
+                .any(|completed| completed.voice_id == *voice_id)
+        {
             completed_playbacks.push(CompletedPlayback {
                 voice_id: *voice_id,
                 emitter: instance.emitter,
@@ -146,8 +150,6 @@ pub fn mix_playback_instances_with_metrics(
             });
         }
     }
-
-    active_playback.retain(|_, instance| !instance.should_reclaim());
 
     profiling
 }

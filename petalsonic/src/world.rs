@@ -1,7 +1,7 @@
 use crate::acoustics::AcousticSceneSnapshot;
 use crate::domain::{
     Bus, BusParams, Emitter, EmitterDesc, PlayOptions, PlaybackControl, PlaybackTag, ResidentClip,
-    SpatialFrame, VoiceId,
+    SpatialFrame, VoiceId, validate_extent_pose, validate_pose,
 };
 use crate::error::{PetalSonicError, Result};
 use crate::events::{
@@ -9,6 +9,7 @@ use crate::events::{
     RuntimeDiagnostics, RuntimeState, RuntimeStatus, VoiceTelemetryDiagnostics,
     VoiceTelemetryEvent,
 };
+#[cfg(test)]
 use crate::math::Pose;
 use crate::playback::{AcceptedVoice, EmitterUpdate};
 use crate::runtime::{AudioRuntime, RuntimeIntent};
@@ -165,14 +166,7 @@ impl EmitterRegistry {
             });
         }
 
-        let mut seen = HashSet::with_capacity(frame.emitters().len());
         for spatial in frame.emitters() {
-            if !seen.insert(spatial.emitter) {
-                return Err(PetalSonicError::InvalidConfiguration {
-                    field: "spatial_frame",
-                    reason: format!("contains duplicate {}", spatial.emitter),
-                });
-            }
             let state = self.get(spatial.emitter)?;
             if !state.desc.is_spatial() {
                 return Err(PetalSonicError::InvalidConfiguration {
@@ -378,29 +372,6 @@ impl PetalSonicWorld {
     /// observes only complete frame generations and never accumulates stale movement.
     pub fn publish_spatial_frame(&self, frame: SpatialFrame) -> Result<()> {
         self.runtime.ensure_open()?;
-        if !frame.sim_time_seconds().is_finite() {
-            return Err(PetalSonicError::InvalidConfiguration {
-                field: "spatial_frame.sim_time_seconds",
-                reason: "must be finite".into(),
-            });
-        }
-        if frame.emitters().iter().any(|emitter| {
-            !emitter.acoustic_priority().is_finite() || emitter.acoustic_priority() < 0.0
-        }) {
-            return Err(PetalSonicError::InvalidConfiguration {
-                field: "spatial_frame.emitters.acoustic_priority",
-                reason: "must be finite and non-negative".into(),
-            });
-        }
-        Self::validate_route_pose("spatial_frame.listener", frame.listener())?;
-        for emitter in frame.emitters() {
-            Self::validate_route_pose("spatial_frame.emitters.pose", emitter.pose)?;
-            Self::validate_extent_pose(
-                "spatial_frame.emitters.extent",
-                emitter.pose,
-                emitter.extent(),
-            )?;
-        }
         let mut emitters = self
             .emitters
             .try_lock()
@@ -525,22 +496,20 @@ impl PetalSonicWorld {
             });
         }
         match options.direct_path().placement() {
-            crate::domain::DirectPlacement::ListenerRelative(pose) => Self::validate_extent_pose(
+            crate::domain::DirectPlacement::ListenerRelative(pose) => validate_extent_pose(
                 "play_options.direct_path.listener_relative",
                 pose,
                 state.desc.extent(),
             )?,
-            crate::domain::DirectPlacement::ListenerPositionRelative(pose) => {
-                Self::validate_extent_pose(
-                    "play_options.direct_path.listener_position_relative",
-                    pose,
-                    state.desc.extent(),
-                )?
-            }
+            crate::domain::DirectPlacement::ListenerPositionRelative(pose) => validate_extent_pose(
+                "play_options.direct_path.listener_position_relative",
+                pose,
+                state.desc.extent(),
+            )?,
             _ => {}
         }
         if let crate::domain::EnvironmentOrigin::World(pose) = options.environment_send().origin() {
-            Self::validate_extent_pose(
+            validate_extent_pose(
                 "play_options.environment_send.origin",
                 pose,
                 state.desc.extent(),
@@ -748,13 +717,10 @@ impl PetalSonicWorld {
         let direct_path = options.direct_path();
         match direct_path.placement() {
             crate::domain::DirectPlacement::ListenerRelative(pose) => {
-                Self::validate_route_pose("play_options.direct_path.listener_relative", pose)?
+                validate_pose("play_options.direct_path.listener_relative", pose)?
             }
             crate::domain::DirectPlacement::ListenerPositionRelative(pose) => {
-                Self::validate_route_pose(
-                    "play_options.direct_path.listener_position_relative",
-                    pose,
-                )?
+                validate_pose("play_options.direct_path.listener_position_relative", pose)?
             }
             _ => {}
         }
@@ -780,7 +746,7 @@ impl PetalSonicWorld {
         }
         match environment_send.origin() {
             crate::domain::EnvironmentOrigin::World(pose) => {
-                Self::validate_route_pose("play_options.environment_send.origin", pose)?;
+                validate_pose("play_options.environment_send.origin", pose)?;
             }
             crate::domain::EnvironmentOrigin::Disabled
                 if environment_send.gain_db().to_bits() != 0.0f32.to_bits() =>
@@ -804,8 +770,8 @@ impl PetalSonicWorld {
         }
         match desc.pose() {
             Some(pose) => {
-                Self::validate_route_pose("emitter_desc.pose", pose)?;
-                Self::validate_extent_pose("emitter_desc.extent", pose, desc.extent())
+                validate_pose("emitter_desc.pose", pose)?;
+                validate_extent_pose("emitter_desc.extent", pose, desc.extent())
             }
             None if !matches!(desc.extent(), crate::domain::SourceExtent::Point)
                 || !matches!(
@@ -820,39 +786,6 @@ impl PetalSonicWorld {
             }
             None => Ok(()),
         }
-    }
-
-    fn validate_route_pose(field: &'static str, pose: Pose) -> Result<()> {
-        let rotation_length_squared = pose.rotation.length_squared();
-        if !pose.position.is_finite()
-            || !pose.rotation.is_finite()
-            || !rotation_length_squared.is_finite()
-            || rotation_length_squared <= f32::EPSILON
-        {
-            return Err(PetalSonicError::InvalidConfiguration {
-                field,
-                reason: "position and rotation must be finite, with a non-zero rotation".into(),
-            });
-        }
-        Ok(())
-    }
-
-    fn validate_extent_pose(
-        field: &'static str,
-        pose: Pose,
-        extent: &crate::domain::SourceExtent,
-    ) -> Result<()> {
-        if let Some(weighted) = extent.weighted()
-            && weighted.samples().iter().any(|sample| {
-                !(pose.position + pose.rotation * sample.local_position()).is_finite()
-            })
-        {
-            return Err(PetalSonicError::InvalidConfiguration {
-                field,
-                reason: "extent samples must remain finite after pose transformation".into(),
-            });
-        }
-        Ok(())
     }
 
     fn emitter_state(&self, emitter: Emitter) -> Result<EmitterState> {
@@ -1279,15 +1212,18 @@ mod tests {
             .unwrap();
         world.play(emitter, PlayOptions::looping()).unwrap();
         world
-            .publish_spatial_frame(SpatialFrame::new(
-                1,
-                0.0,
-                Pose::identity(),
-                vec![crate::domain::EmitterSpatialState::new(
-                    emitter,
+            .publish_spatial_frame(
+                SpatialFrame::new(
+                    1,
+                    0.0,
                     Pose::identity(),
-                )],
-            ))
+                    vec![crate::domain::EmitterSpatialState::new(
+                        emitter,
+                        Pose::identity(),
+                    )],
+                )
+                .unwrap(),
+            )
             .unwrap();
         acoustics.wait_until_entered();
 
@@ -1521,12 +1457,15 @@ mod tests {
                 })
                 .collect();
             world
-                .publish_spatial_frame(SpatialFrame::new(
-                    generation as u64 + 1,
-                    generation as f64 * 0.001,
-                    Pose::default(),
-                    states,
-                ))
+                .publish_spatial_frame(
+                    SpatialFrame::new(
+                        generation as u64 + 1,
+                        generation as f64 * 0.001,
+                        Pose::default(),
+                        states,
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
 
             let params = BusParams {
@@ -1608,38 +1547,47 @@ mod tests {
         let second_emitter = Pose::from_position(crate::math::Vec3::new(20.0, 0.0, 0.0));
 
         world
-            .publish_spatial_frame(SpatialFrame::new(
-                1,
-                0.0,
-                first_listener,
-                vec![crate::domain::EmitterSpatialState::new(
-                    emitter,
-                    first_emitter,
-                )],
-            ))
+            .publish_spatial_frame(
+                SpatialFrame::new(
+                    1,
+                    0.0,
+                    first_listener,
+                    vec![crate::domain::EmitterSpatialState::new(
+                        emitter,
+                        first_emitter,
+                    )],
+                )
+                .unwrap(),
+            )
             .unwrap();
         world
-            .publish_spatial_frame(SpatialFrame::new(
-                2,
-                0.1,
-                second_listener,
-                vec![crate::domain::EmitterSpatialState::new(
-                    emitter,
-                    second_emitter,
-                )],
-            ))
+            .publish_spatial_frame(
+                SpatialFrame::new(
+                    2,
+                    0.1,
+                    second_listener,
+                    vec![crate::domain::EmitterSpatialState::new(
+                        emitter,
+                        second_emitter,
+                    )],
+                )
+                .unwrap(),
+            )
             .unwrap();
 
         assert!(matches!(
-            world.publish_spatial_frame(SpatialFrame::new(
-                1,
-                0.2,
-                second_listener,
-                vec![crate::domain::EmitterSpatialState::new(
-                    emitter,
-                    second_emitter,
-                )],
-            )),
+            world.publish_spatial_frame(
+                SpatialFrame::new(
+                    1,
+                    0.2,
+                    second_listener,
+                    vec![crate::domain::EmitterSpatialState::new(
+                        emitter,
+                        second_emitter,
+                    )],
+                )
+                .unwrap()
+            ),
             Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame.revision",
                 ..
@@ -1693,27 +1641,33 @@ mod tests {
             )
             .unwrap();
         world
-            .publish_spatial_frame(SpatialFrame::new(
-                1,
-                1.0,
-                Pose::identity(),
-                vec![
-                    crate::domain::EmitterSpatialState::new(emitter, old_pose)
-                        .with_extent(old_extent),
-                ],
-            ))
+            .publish_spatial_frame(
+                SpatialFrame::new(
+                    1,
+                    1.0,
+                    Pose::identity(),
+                    vec![
+                        crate::domain::EmitterSpatialState::new(emitter, old_pose)
+                            .with_extent(old_extent),
+                    ],
+                )
+                .unwrap(),
+            )
             .unwrap();
 
         let failed = world.runtime.with_spatial_publication_blocked(|| {
-            world.publish_spatial_frame(SpatialFrame::new(
-                2,
-                2.0,
-                Pose::identity(),
-                vec![
-                    crate::domain::EmitterSpatialState::new(emitter, new_pose)
-                        .with_extent(new_extent.clone()),
-                ],
-            ))
+            world.publish_spatial_frame(
+                SpatialFrame::new(
+                    2,
+                    2.0,
+                    Pose::identity(),
+                    vec![
+                        crate::domain::EmitterSpatialState::new(emitter, new_pose)
+                            .with_extent(new_extent.clone()),
+                    ],
+                )
+                .unwrap(),
+            )
         });
         assert!(matches!(failed, Err(PetalSonicError::QueuePressure)));
 
@@ -1784,15 +1738,18 @@ mod tests {
         );
 
         world
-            .publish_spatial_frame(SpatialFrame::new(
-                2,
-                2.0,
-                Pose::identity(),
-                vec![
-                    crate::domain::EmitterSpatialState::new(emitter, new_pose)
-                        .with_extent(new_extent),
-                ],
-            ))
+            .publish_spatial_frame(
+                SpatialFrame::new(
+                    2,
+                    2.0,
+                    Pose::identity(),
+                    vec![
+                        crate::domain::EmitterSpatialState::new(emitter, new_pose)
+                            .with_extent(new_extent),
+                    ],
+                )
+                .unwrap(),
+            )
             .expect("the failed revision and time must remain available for retry");
         world.close().unwrap();
     }
@@ -1825,15 +1782,18 @@ mod tests {
             )
             .unwrap();
         world
-            .publish_spatial_frame(SpatialFrame::new(
-                1,
-                0.0,
-                Pose::identity(),
-                vec![crate::domain::EmitterSpatialState::new(
-                    emitter,
-                    emitter_pose,
-                )],
-            ))
+            .publish_spatial_frame(
+                SpatialFrame::new(
+                    1,
+                    0.0,
+                    Pose::identity(),
+                    vec![crate::domain::EmitterSpatialState::new(
+                        emitter,
+                        emitter_pose,
+                    )],
+                )
+                .unwrap(),
+            )
             .unwrap();
         let direct_pose = Pose::from_position(crate::math::Vec3::new(0.2, -0.1, 0.5));
         let acoustic_origin = Pose::from_position(crate::math::Vec3::new(9.0, 3.0, -7.0));
@@ -1939,29 +1899,33 @@ mod tests {
             )
         };
 
-        world.publish_spatial_frame(frame(1, 1.0, 1.0)).unwrap();
+        world
+            .publish_spatial_frame(frame(1, 1.0, 1.0).unwrap())
+            .unwrap();
         assert!(matches!(
-            world.publish_spatial_frame(frame(1, 2.0, 1.0)),
+            world.publish_spatial_frame(frame(1, 2.0, 1.0).unwrap()),
             Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame.revision",
                 ..
             })
         ));
         assert!(matches!(
-            world.publish_spatial_frame(frame(2, 0.5, 1.0)),
+            world.publish_spatial_frame(frame(2, 0.5, 1.0).unwrap()),
             Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame.sim_time_seconds",
                 ..
             })
         ));
         assert!(matches!(
-            world.publish_spatial_frame(frame(2, 1.0, f32::NAN)),
+            frame(2, 1.0, f32::NAN),
             Err(PetalSonicError::InvalidConfiguration {
                 field: "spatial_frame.emitters.acoustic_priority",
                 ..
             })
         ));
-        world.publish_spatial_frame(frame(2, 1.0, 0.0)).unwrap();
+        world
+            .publish_spatial_frame(frame(2, 1.0, 0.0).unwrap())
+            .unwrap();
         world.close().unwrap();
     }
 
@@ -2068,6 +2032,34 @@ mod tests {
     }
 
     #[test]
+    fn validated_spatial_frame_needs_no_second_membership_allocation() {
+        const EMITTERS: usize = 2_048;
+        let mut registry = EmitterRegistry::new(EMITTERS, 1);
+        let resident_clip = clip();
+        let mut spatial_emitters = Vec::with_capacity(EMITTERS);
+        for index in 0..EMITTERS {
+            let pose = Pose::from_position(crate::math::Vec3::new(index as f32, 0.0, 0.0));
+            let emitter = registry
+                .insert(EmitterState {
+                    clip: resident_clip.clone(),
+                    desc: EmitterDesc::spatial(pose),
+                })
+                .unwrap();
+            spatial_emitters.push(crate::domain::EmitterSpatialState::new(emitter, pose));
+        }
+        let frame =
+            Arc::new(SpatialFrame::new(1, 0.0, Pose::identity(), spatial_emitters).unwrap());
+        let mut update = None;
+
+        let memory_activity = crate::test_support::realtime_memory_activity(|| {
+            update = Some(registry.prepare_spatial_update(frame.clone()).unwrap());
+        });
+
+        assert_eq!(memory_activity, 0);
+        assert_eq!(update.unwrap().frame.emitters().len(), EMITTERS);
+    }
+
+    #[test]
     fn spatial_frame_must_be_complete_before_any_pose_is_updated() {
         let mut registry = EmitterRegistry::new(2, 1);
         let first = registry
@@ -2089,7 +2081,8 @@ mod tests {
             0.0,
             Pose::default(),
             vec![crate::domain::EmitterSpatialState::new(first, moved)],
-        );
+        )
+        .unwrap();
         assert!(matches!(
             registry.prepare_spatial_update(Arc::new(incomplete)),
             Err(PetalSonicError::InvalidConfiguration {
@@ -2110,7 +2103,8 @@ mod tests {
                 crate::domain::EmitterSpatialState::new(first, moved),
                 crate::domain::EmitterSpatialState::new(second, Pose::default()),
             ],
-        );
+        )
+        .unwrap();
         let update = registry.prepare_spatial_update(Arc::new(complete)).unwrap();
         registry.commit_spatial_update(update);
         assert_eq!(registry.get(first).unwrap().desc.pose(), Some(moved));
@@ -2126,13 +2120,18 @@ mod tests {
             )))
             .is_err()
         );
-        assert!(
-            PetalSonicWorld::validate_route_pose(
-                "spatial_frame.listener",
+        assert!(matches!(
+            SpatialFrame::new(
+                1,
+                0.0,
                 Pose::from_rotation(Quat::from_xyzw(0.0, 0.0, 0.0, 0.0)),
-            )
-            .is_err()
-        );
+                Vec::new(),
+            ),
+            Err(PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.listener",
+                ..
+            })
+        ));
     }
 
     #[test]

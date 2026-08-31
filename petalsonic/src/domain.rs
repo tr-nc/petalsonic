@@ -225,7 +225,8 @@ mod tests {
                 EmitterSpatialState::new(current_generation, current_pose),
                 EmitterSpatialState::new(other_world, Pose::identity()),
             ],
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             frame
@@ -236,6 +237,58 @@ mod tests {
         assert!(frame.emitter_state(old_generation).is_none());
         assert_eq!(frame.emitters()[0].emitter, other_world);
         assert_eq!(frame.emitters()[1].emitter, current_generation);
+    }
+
+    #[test]
+    fn spatial_frame_rejects_invalid_intrinsic_state_at_construction() {
+        let emitter = Emitter {
+            world_id: 7,
+            index: 2,
+            generation: 1,
+        };
+        let duplicate = EmitterSpatialState::new(emitter, Pose::identity());
+        let error = SpatialFrame::new(1, 0.0, Pose::identity(), vec![duplicate.clone(), duplicate])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.emitters",
+                ..
+            }
+        ));
+
+        let error = SpatialFrame::new(
+            2,
+            0.1,
+            Pose::identity(),
+            vec![
+                EmitterSpatialState::new(emitter, Pose::identity())
+                    .with_acoustic_priority(f32::NAN),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.emitters.acoustic_priority",
+                ..
+            }
+        ));
+
+        let error = SpatialFrame::new(
+            3,
+            f64::NAN,
+            Pose::identity(),
+            vec![EmitterSpatialState::new(emitter, Pose::identity())],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.sim_time_seconds",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -965,7 +1018,7 @@ impl EmitterSpatialState {
     }
 
     /// Sets relative priority for bounded acoustics solves. Non-finite and negative values are
-    /// rejected when the complete spatial frame is published.
+    /// rejected when the complete spatial frame is constructed.
     pub fn with_acoustic_priority(mut self, acoustic_priority: f32) -> Self {
         self.acoustic_priority = acoustic_priority;
         self
@@ -999,20 +1052,58 @@ pub struct SpatialFrame {
 }
 
 impl SpatialFrame {
-    /// Creates one complete, versioned spatial state generation.
+    /// Creates one complete, versioned spatial state generation. Intrinsic validity is established
+    /// once here; publication only checks the frame against its World's current registry and
+    /// monotonic cursor.
     pub fn new(
         revision: u64,
         sim_time_seconds: f64,
         listener: Pose,
         mut emitters: Vec<EmitterSpatialState>,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
+        if revision == 0 {
+            return Err(crate::error::PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.revision",
+                reason: "must be greater than zero".into(),
+            });
+        }
+        if !sim_time_seconds.is_finite() {
+            return Err(crate::error::PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.sim_time_seconds",
+                reason: "must be finite".into(),
+            });
+        }
+        validate_pose("spatial_frame.listener", listener)?;
+        for emitter in &emitters {
+            if !emitter.acoustic_priority.is_finite() || emitter.acoustic_priority < 0.0 {
+                return Err(crate::error::PetalSonicError::InvalidConfiguration {
+                    field: "spatial_frame.emitters.acoustic_priority",
+                    reason: "must be finite and non-negative".into(),
+                });
+            }
+            validate_pose("spatial_frame.emitters.pose", emitter.pose)?;
+            validate_extent_pose(
+                "spatial_frame.emitters.extent",
+                emitter.pose,
+                &emitter.extent,
+            )?;
+        }
         emitters.sort_unstable_by(|left, right| compare_emitter_key(left.emitter, right.emitter));
-        Self {
+        if emitters
+            .windows(2)
+            .any(|pair| pair[0].emitter == pair[1].emitter)
+        {
+            return Err(crate::error::PetalSonicError::InvalidConfiguration {
+                field: "spatial_frame.emitters",
+                reason: "must contain each Emitter generation exactly once".into(),
+            });
+        }
+        Ok(Self {
             revision,
             sim_time_seconds,
             listener,
             emitters,
-        }
+        })
     }
 
     pub fn revision(&self) -> u64 {
@@ -1037,6 +1128,40 @@ impl SpatialFrame {
             .ok()
             .map(|index| &self.emitters[index])
     }
+}
+
+pub(crate) fn validate_pose(field: &'static str, pose: Pose) -> crate::error::Result<()> {
+    let rotation_length_squared = pose.rotation.length_squared();
+    if !pose.position.is_finite()
+        || !pose.rotation.is_finite()
+        || !rotation_length_squared.is_finite()
+        || rotation_length_squared <= f32::EPSILON
+    {
+        return Err(crate::error::PetalSonicError::InvalidConfiguration {
+            field,
+            reason: "position and rotation must be finite, with a non-zero rotation".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_extent_pose(
+    field: &'static str,
+    pose: Pose,
+    extent: &SourceExtent,
+) -> crate::error::Result<()> {
+    if let Some(weighted) = extent.weighted()
+        && weighted
+            .samples()
+            .iter()
+            .any(|sample| !(pose.position + pose.rotation * sample.local_position()).is_finite())
+    {
+        return Err(crate::error::PetalSonicError::InvalidConfiguration {
+            field,
+            reason: "extent samples must remain finite after pose transformation".into(),
+        });
+    }
+    Ok(())
 }
 
 fn compare_emitter_key(left: Emitter, right: Emitter) -> std::cmp::Ordering {

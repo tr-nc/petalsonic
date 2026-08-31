@@ -3,7 +3,9 @@
 //! The output engine schedules this module; it does not reach through the seam to
 //! coordinate Voices, DSP processors, buffers, telemetry, or retirement.
 
-use crate::acoustic_propagation::{AcousticResponse, AcousticVoice, AcousticVoiceInput};
+use crate::acoustic_propagation::{
+    AcousticResponse, AcousticVoice, AcousticVoiceInput, AcousticVoiceRegistry,
+};
 use crate::audio_data::{ResamplerType, StreamingResampler};
 use crate::config::{LatencyProfile, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
@@ -232,6 +234,7 @@ pub(crate) struct RenderQuantum {
     current_spatial_frame: Option<Arc<SpatialFrame>>,
     acoustic_responses: RealtimeConsumer<AcousticResponse>,
     acoustic_voice_input: AcousticVoiceInput,
+    acoustic_voices: AcousticVoiceRegistry,
     acoustic_scene_version: Arc<std::sync::atomic::AtomicU64>,
     retirement_sender: Sender<VoiceId>,
     event_sender: Sender<PetalSonicEvent>,
@@ -311,6 +314,7 @@ impl RenderQuantum {
             current_spatial_frame: None,
             acoustic_responses,
             acoustic_voice_input,
+            acoustic_voices: AcousticVoiceRegistry::new(max_voices),
             acoustic_scene_version,
             retirement_sender,
             event_sender,
@@ -445,6 +449,7 @@ impl RenderQuantum {
         while let Ok(command) = self.lifecycle_commands.try_recv() {
             self.apply_command(command);
         }
+        self.publish_acoustic_voices();
     }
 
     fn apply_command(&mut self, command: PlaybackCommand) {
@@ -455,7 +460,9 @@ impl RenderQuantum {
                     self.active_voice_count.fetch_sub(1, Ordering::AcqRel);
                 }
                 if let Some(acoustic_voice) = acoustic_voice {
-                    self.acoustic_voice_input.activate(acoustic_voice);
+                    let _ = self
+                        .acoustic_voices
+                        .activate(acoustic_voice, self.current_spatial_frame.as_deref());
                 }
             }
             PlaybackCommand::PauseVoice(id) => self.with_voice(id, PlaybackInstance::pause),
@@ -484,7 +491,7 @@ impl RenderQuantum {
             }
             PlaybackCommand::UpdateEmitter(update) => {
                 let (emitter, render_state, bus_index) = update.into_parts();
-                self.acoustic_voice_input
+                self.acoustic_voices
                     .update_emitter_audibility(emitter, render_state.volume_linear());
                 for voice in self.active_playback.values_mut() {
                     if voice.emitter == emitter && !voice.detached {
@@ -530,6 +537,7 @@ impl RenderQuantum {
             return;
         };
         Self::apply_spatial_frame_to_voices(&next, &mut self.active_playback);
+        self.acoustic_voices.apply_spatial_frame(&next);
         if let Some(previous) = self.current_spatial_frame.replace(next) {
             self.spatial_frames.retire(previous);
         }
@@ -766,7 +774,7 @@ impl RenderQuantum {
                 .remove(&completed.voice_id)
                 .expect("mixer completion must still name one active Voice");
             let spatial = self.processor.retire_voice(completed.voice_id);
-            let acoustic = self.acoustic_voice_input.retire(completed.voice_id);
+            let acoustic = self.acoustic_voices.retire(completed.voice_id);
             if let Some(tag) = completed.completion_tag {
                 let _ = self.retirement_sender.try_send(completed.voice_id);
                 Self::try_send_event(
@@ -789,6 +797,13 @@ impl RenderQuantum {
                 _spatial: spatial,
             });
         }
+        self.publish_acoustic_voices();
+    }
+
+    fn publish_acoustic_voices(&mut self) {
+        let _ = self
+            .acoustic_voice_input
+            .try_publish(&mut self.acoustic_voices);
     }
 
     fn enqueue_voice_retirement(&mut self, retirement: VoiceRetirement) {
@@ -1049,21 +1064,25 @@ mod tests {
             let voice_id = VoiceId::from(revision);
             harness
                 .quantum
-                .acoustic_voice_input
-                .activate(AcousticVoice {
-                    voice_id,
-                    emitter,
-                    emitter_world_pose: crate::math::Pose::identity(),
-                    acoustic_priority: 1.0,
-                    audibility: 1.0,
-                    detached: false,
-                    direct_path: DirectPath::default(),
-                    environment_send: EnvironmentSend::default(),
-                    source_extent: SourceExtent::Point,
-                    occlusion_profile: OcclusionProfile::PointExact,
-                    routing_generation: 0,
-                    _retirement_witness: None,
-                });
+                .acoustic_voices
+                .activate(
+                    AcousticVoice {
+                        voice_id,
+                        emitter,
+                        emitter_world_pose: crate::math::Pose::identity(),
+                        acoustic_priority: 1.0,
+                        audibility: 1.0,
+                        detached: false,
+                        direct_path: DirectPath::default(),
+                        environment_send: EnvironmentSend::default(),
+                        source_extent: SourceExtent::Point,
+                        occlusion_profile: OcclusionProfile::PointExact,
+                        routing_generation: 0,
+                        _retirement_witness: None,
+                    },
+                    None,
+                )
+                .unwrap();
             harness
                 .acoustic_responses
                 .publish_latest(empty_acoustic_response(revision))
@@ -1075,7 +1094,7 @@ mod tests {
                 harness.quantum.processor.acoustic_response_generation(),
                 Some((revision, 0))
             );
-            harness.quantum.acoustic_voice_input.retire(voice_id);
+            harness.quantum.acoustic_voices.retire(voice_id);
         }
     }
 
@@ -1360,7 +1379,8 @@ mod tests {
             0.0,
             crate::math::Pose::default(),
             vec![EmitterSpatialState::new(emitter, new_pose).with_extent(SourceExtent::Point)],
-        );
+        )
+        .unwrap();
 
         RenderQuantum::apply_spatial_frame_to_voices(&frame, &mut harness.quantum.active_playback);
 
@@ -1433,7 +1453,8 @@ mod tests {
                     )
                 })
                 .collect(),
-        );
+        )
+        .unwrap();
         let mut comparisons = 0;
 
         let memory_activity = crate::test_support::realtime_memory_activity(|| {

@@ -63,7 +63,7 @@ fn main() -> Result<(), PetalSonicError> {
             emitter,
             Pose::from_position(Vec3::new(5.0, 0.0, 0.0)),
         )],
-    ))?;
+    )?)?;
 
     // This can be changed live. HRTF, distance, and playback remain active.
     world.set_environmental_acoustics_enabled(false)?;

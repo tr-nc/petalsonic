@@ -14,6 +14,8 @@ thread_local! {
     static SPATIAL_FRAME_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
     static RENDER_COMPLETION_STEP_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static RENDER_COMPLETION_STEP_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ACOUSTIC_INPUT_COMPARISON_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static ACOUSTIC_INPUT_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[global_allocator]
@@ -122,4 +124,20 @@ pub(crate) fn render_completion_step_activity(operation: impl FnOnce()) -> usize
     operation();
     RENDER_COMPLETION_STEP_PROBE_ACTIVE.with(|active| active.set(false));
     RENDER_COMPLETION_STEP_COUNT.with(Cell::get)
+}
+
+pub(crate) fn record_acoustic_input_comparison() {
+    ACOUSTIC_INPUT_COMPARISON_PROBE_ACTIVE.with(|active| {
+        if active.get() {
+            ACOUSTIC_INPUT_COMPARISON_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+pub(crate) fn acoustic_input_comparison_activity(operation: impl FnOnce()) -> usize {
+    ACOUSTIC_INPUT_COMPARISON_COUNT.with(|count| count.set(0));
+    ACOUSTIC_INPUT_COMPARISON_PROBE_ACTIVE.with(|active| active.set(true));
+    operation();
+    ACOUSTIC_INPUT_COMPARISON_PROBE_ACTIVE.with(|active| active.set(false));
+    ACOUSTIC_INPUT_COMPARISON_COUNT.with(Cell::get)
 }

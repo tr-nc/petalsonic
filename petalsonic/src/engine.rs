@@ -165,13 +165,33 @@ pub(crate) struct PetalSonicEngine {
     output: OutputSession,
     event_sender: Sender<PetalSonicEvent>,
     counters: Arc<RuntimeCounters>,
-    voice_retirement_receiver: Receiver<VoiceRetirement>,
+    voice_retirement_receiver: Option<Receiver<VoiceRetirement>>,
 }
 
 impl PetalSonicEngine {
     #[cfg(test)]
     pub(crate) fn advance_without_output_for_test(&mut self, elapsed: std::time::Duration) {
         self.output.advance_without_output_for_test(elapsed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_logical_output_for_test(&mut self) -> Result<()> {
+        self.output.prepare_logical_output_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_once_for_test(&mut self) {
+        self.output.render_once_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_logical_output_for_test(&mut self) {
+        self.output.drain_logical_output_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_voice_retirement_receiver_for_test(&mut self) {
+        self.voice_retirement_receiver = None;
     }
 
     pub(crate) fn new_with_output(
@@ -211,12 +231,15 @@ impl PetalSonicEngine {
             ),
             event_sender,
             counters,
-            voice_retirement_receiver: retirement_receiver,
+            voice_retirement_receiver: Some(retirement_receiver),
         })
     }
 
     pub(crate) fn drain_retired_voice_resources(&mut self) {
-        while self.voice_retirement_receiver.try_recv().is_ok() {}
+        let Some(receiver) = self.voice_retirement_receiver.as_ref() else {
+            return;
+        };
+        while receiver.try_recv().is_ok() {}
     }
 
     pub(crate) fn reconcile_output(

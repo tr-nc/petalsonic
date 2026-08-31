@@ -713,7 +713,7 @@ mod tests {
     };
     use crate::platform::output::{
         OutputDeviceState, OutputRecoveryCause, OutputRecoveryRequest, OutputRecoveryResult,
-        fake::FakeOutputPlatform,
+        fake::{FakeDevice as PlatformFakeDevice, FakeOutputHandle, FakeOutputPlatform},
     };
     use crate::playback::prepare_test_voice;
     use crate::realtime_latest::RealtimeLatest;
@@ -734,9 +734,18 @@ mod tests {
         recovery_attempts: Arc<AtomicU64>,
         schedule: SupervisorSchedule,
         now: Instant,
+        output: FakeOutputHandle,
     }
 
     fn retirement_engine_fixture(max_voices: usize) -> RetirementEngineFixture {
+        retirement_engine_fixture_with_output(max_voices, Vec::new(), None)
+    }
+
+    fn retirement_engine_fixture_with_output(
+        max_voices: usize,
+        devices: Vec<PlatformFakeDevice>,
+        selected: Option<usize>,
+    ) -> RetirementEngineFixture {
         let desc = PetalSonicWorldDesc {
             block_size: 64,
             max_voices,
@@ -765,7 +774,7 @@ mod tests {
             regular_commands,
             lifecycle_commands,
         );
-        let (platform, _) = FakeOutputPlatform::scripted(Vec::new(), None);
+        let (platform, output) = FakeOutputPlatform::scripted(devices, selected);
         let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
         let recovery_attempts = Arc::new(AtomicU64::new(0));
         let now = Instant::now();
@@ -784,12 +793,15 @@ mod tests {
             recovery_attempts,
             schedule: SupervisorSchedule::new(now),
             now,
+            output,
         }
     }
 
-    fn witnessed_once_voice(
+    fn witnessed_voice(
         identity: u64,
         observation: Arc<AcousticVoiceRetirementObservation>,
+        options: PlayOptions,
+        audio_frames: usize,
     ) -> PlaybackCommand {
         let extent = SourceExtent::weighted_samples(vec![
             ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::X, 1.0).unwrap(),
@@ -802,10 +814,10 @@ mod tests {
             generation: 1,
         };
         let audio = Arc::new(PetalSonicAudioData::new(
-            vec![0.25; 96],
+            vec![0.25; audio_frames],
             48_000,
             1,
-            Duration::from_millis(2),
+            Duration::from_secs_f64(audio_frames as f64 / 48_000.0),
         ));
         PlaybackCommand::Play(
             prepare_test_voice(
@@ -813,7 +825,7 @@ mod tests {
                 emitter,
                 audio,
                 EmitterDesc::spatial(crate::math::Pose::identity()).with_extent(extent),
-                PlayOptions::once().detached(),
+                options.detached(),
                 None,
                 0,
                 64,
@@ -825,20 +837,50 @@ mod tests {
         )
     }
 
+    fn witnessed_once_voice(
+        identity: u64,
+        observation: Arc<AcousticVoiceRetirementObservation>,
+    ) -> PlaybackCommand {
+        witnessed_voice(identity, observation, PlayOptions::once(), 96)
+    }
+
+    fn retire_once_without_output(
+        fixture: &mut RetirementEngineFixture,
+        identity: u64,
+        observation: Arc<AcousticVoiceRetirementObservation>,
+    ) -> usize {
+        fixture.active_voice_count.fetch_add(1, Ordering::AcqRel);
+        fixture
+            .commands
+            .try_send(witnessed_once_voice(identity, observation))
+            .unwrap();
+        crate::test_support::realtime_memory_activity(|| {
+            fixture
+                .engine
+                .advance_without_output_for_test(Duration::from_millis(2));
+        })
+    }
+
     #[test]
     fn supervisor_receives_the_original_acoustic_voice_before_dropping_it_off_realtime() {
         let mut fixture = retirement_engine_fixture(1);
         let observation = Arc::new(AcousticVoiceRetirementObservation::default());
-        fixture.active_voice_count.store(1, Ordering::Release);
+        fixture.engine.prepare_logical_output_for_test().unwrap();
+        fixture.active_voice_count.fetch_add(1, Ordering::AcqRel);
         fixture
             .commands
-            .try_send(witnessed_once_voice(901, observation.clone()))
+            .try_send(witnessed_voice(
+                901,
+                observation.clone(),
+                PlayOptions::once(),
+                64 * 3,
+            ))
             .unwrap();
+        fixture.engine.render_once_for_test();
+        fixture.engine.drain_logical_output_for_test();
 
         let render_activity = crate::test_support::realtime_memory_activity(|| {
-            fixture
-                .engine
-                .advance_without_output_for_test(Duration::from_millis(2));
+            fixture.engine.render_once_for_test();
         });
 
         assert_eq!(observation.observed(), (0, 0, 0));
@@ -851,6 +893,141 @@ mod tests {
             fixture.now,
         );
         assert_eq!(observation.observed(), (901, 1, 0));
+    }
+
+    #[test]
+    fn explicit_stop_retires_the_complete_voice_through_the_supervisor() {
+        let mut fixture = retirement_engine_fixture(1);
+        let observation = Arc::new(AcousticVoiceRetirementObservation::default());
+        fixture.active_voice_count.fetch_add(1, Ordering::AcqRel);
+        fixture
+            .commands
+            .try_send(witnessed_voice(
+                902,
+                observation.clone(),
+                PlayOptions::looping(),
+                4_096,
+            ))
+            .unwrap();
+        fixture
+            .engine
+            .advance_without_output_for_test(Duration::ZERO);
+        fixture
+            .commands
+            .try_send(PlaybackCommand::StopVoice(VoiceId::from(902)))
+            .unwrap();
+
+        let render_activity = crate::test_support::realtime_memory_activity(|| {
+            fixture
+                .engine
+                .advance_without_output_for_test(Duration::from_millis(10));
+        });
+
+        assert_eq!(observation.observed(), (0, 0, 0));
+        assert_eq!(render_activity, 0);
+        AudioRuntime::supervisor_tick(
+            &mut fixture.engine,
+            &fixture.runtime_state,
+            &fixture.recovery_attempts,
+            &mut fixture.schedule,
+            fixture.now,
+        );
+        assert_eq!(observation.observed(), (902, 1, 0));
+    }
+
+    #[test]
+    fn full_retirement_queue_drains_pending_payloads_on_later_supervisor_ticks() {
+        let mut fixture = retirement_engine_fixture(1);
+        let first = Arc::new(AcousticVoiceRetirementObservation::default());
+        let second = Arc::new(AcousticVoiceRetirementObservation::default());
+
+        assert_eq!(
+            retire_once_without_output(&mut fixture, 911, first.clone()),
+            0
+        );
+        assert_eq!(
+            retire_once_without_output(&mut fixture, 912, second.clone()),
+            0
+        );
+        assert_eq!(first.observed(), (0, 0, 0));
+        assert_eq!(second.observed(), (0, 0, 0));
+
+        AudioRuntime::supervisor_tick(
+            &mut fixture.engine,
+            &fixture.runtime_state,
+            &fixture.recovery_attempts,
+            &mut fixture.schedule,
+            fixture.now,
+        );
+        assert_eq!(first.observed(), (911, 1, 0));
+        assert_eq!(second.observed(), (0, 0, 0));
+
+        AudioRuntime::supervisor_tick(
+            &mut fixture.engine,
+            &fixture.runtime_state,
+            &fixture.recovery_attempts,
+            &mut fixture.schedule,
+            fixture.now,
+        );
+        assert_eq!(second.observed(), (912, 1, 0));
+    }
+
+    #[test]
+    fn disconnected_retirement_channel_is_reclaimed_after_render_quiesces() {
+        let mut fixture = retirement_engine_fixture(1);
+        let observation = Arc::new(AcousticVoiceRetirementObservation::default());
+        fixture
+            .engine
+            .disconnect_voice_retirement_receiver_for_test();
+
+        assert_eq!(
+            retire_once_without_output(&mut fixture, 921, observation.clone()),
+            0
+        );
+        assert_eq!(observation.observed(), (0, 0, 0));
+        AudioRuntime::supervisor_tick(
+            &mut fixture.engine,
+            &fixture.runtime_state,
+            &fixture.recovery_attempts,
+            &mut fixture.schedule,
+            fixture.now,
+        );
+        assert_eq!(observation.observed(), (0, 0, 0));
+
+        fixture.engine.close().unwrap();
+        assert_eq!(observation.observed(), (921, 1, 0));
+    }
+
+    #[test]
+    fn persistent_output_cleanup_failure_still_reclaims_retirements_once() {
+        let mut fixture = retirement_engine_fixture_with_output(
+            1,
+            vec![PlatformFakeDevice::stereo("A", 48_000)],
+            Some(0),
+        );
+        let observation = Arc::new(AcousticVoiceRetirementObservation::default());
+        assert_eq!(
+            retire_once_without_output(&mut fixture, 931, observation.clone()),
+            0
+        );
+        assert!(matches!(
+            fixture.engine.reconcile_output(OutputRecoveryRequest {
+                probe: false,
+                retry_now: true,
+                elapsed_without_output: Duration::ZERO,
+            }),
+            OutputRecoveryResult::Running(_)
+        ));
+        fixture.output.fail_all_stops();
+
+        assert!(fixture.engine.close().is_err());
+        assert_eq!(observation.observed(), (931, 1, 0));
+        assert!(fixture.engine.close().is_err());
+        assert_eq!(observation.observed(), (931, 1, 0));
+
+        fixture.output.allow_stops();
+        fixture.engine.close().unwrap();
+        assert_eq!(observation.observed(), (931, 1, 0));
     }
 
     struct SupervisorFakeDriver {

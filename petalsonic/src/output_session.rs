@@ -3,6 +3,8 @@
 use crate::config::{OutputDevicePolicy, PetalSonicWorldDesc};
 use crate::error::{PetalSonicError, Result};
 use crate::events::RuntimeCounters;
+#[cfg(test)]
+use crate::platform::output::StereoFrame;
 use crate::platform::output::{
     OutputCallback, OutputDeviceState, OutputFailure, OutputPlatform, OutputPreparation,
     OutputRecoveryCause, OutputRecoveryReason, OutputRecoveryRequest, OutputRecoveryResult,
@@ -10,6 +12,8 @@ use crate::platform::output::{
 };
 use crate::render::{MASTER_HEADROOM_DB, RenderQuantum};
 use crate::runtime_health::RuntimeFailurePublisher;
+#[cfg(test)]
+use ringbuf::{HeapCons, traits::Consumer};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -125,6 +129,8 @@ pub(crate) struct OutputSession {
     runtime_failure: RuntimeFailurePublisher,
     #[cfg(test)]
     render_worker_fault: RenderWorkerFaultInjector,
+    #[cfg(test)]
+    test_output_consumer: Option<HeapCons<StereoFrame>>,
     state: SessionState,
 }
 
@@ -135,6 +141,33 @@ impl OutputSession {
             .lock()
             .expect("test render state must not be poisoned")
             .advance_without_output(elapsed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_logical_output_for_test(&mut self) -> Result<()> {
+        let consumer = self
+            .render
+            .lock()
+            .expect("test render state must not be poisoned")
+            .connect_output(self.sample_rate)?;
+        self.test_output_consumer = Some(consumer);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_once_for_test(&mut self) {
+        self.render
+            .lock()
+            .expect("test render state must not be poisoned")
+            .render();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_logical_output_for_test(&mut self) {
+        let Some(consumer) = self.test_output_consumer.as_mut() else {
+            return;
+        };
+        while consumer.try_pop().is_some() {}
     }
 
     pub(crate) fn new(
@@ -161,6 +194,8 @@ impl OutputSession {
             runtime_failure,
             #[cfg(test)]
             render_worker_fault,
+            #[cfg(test)]
+            test_output_consumer: None,
             state: SessionState::Stopped,
         }
     }

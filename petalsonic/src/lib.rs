@@ -81,7 +81,6 @@ mod error;
 mod events;
 mod gain;
 mod math;
-mod mixer;
 mod occlusion;
 mod output_session;
 mod platform;

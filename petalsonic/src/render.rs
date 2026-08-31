@@ -9,15 +9,14 @@ use crate::config::{LatencyProfile, SpatialQuality};
 use crate::domain::{BusParams, PlaybackControl, SpatialFrame, VoiceId};
 use crate::error::{PetalSonicError, Result};
 use crate::events::{PetalSonicEvent, RenderTimingEvent, RuntimeCounters, VoiceTelemetryEvent};
-use crate::mixer::{self, CompletedPlayback, MixerScratch};
 use crate::platform::output::StereoFrame;
 use crate::playback::{PlayState, PlaybackCommand, PlaybackInstance};
 use crate::realtime_latest::RealtimeConsumer;
 #[cfg(test)]
 use crate::realtime_latest::RealtimeLatest;
 use crate::spatial::{
-    AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessor, SpatialProcessorConfig,
-    SpatialRenderContext,
+    AcousticResponseReplacement, RetiredSpatialSource, SpatialProcessingMetrics, SpatialProcessor,
+    SpatialProcessorConfig, SpatialRenderContext,
 };
 use crossbeam_channel::{Receiver, Sender};
 use ringbuf::{
@@ -162,6 +161,46 @@ struct LogicalStereoOutput {
     resampled_buffer: Vec<f32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompletedPlayback {
+    voice_id: VoiceId,
+    emitter: crate::domain::Emitter,
+    completion_tag: Option<crate::domain::PlaybackTag>,
+}
+
+/// Preallocated identity and telemetry storage reused by the render owner every quantum.
+struct VoiceMixScratch {
+    spatial_voice_ids: Vec<VoiceId>,
+    muted_spatial_voice_ids: Vec<VoiceId>,
+    non_spatial_voice_ids: Vec<VoiceId>,
+    voice_telemetry: Vec<VoiceTelemetryEvent>,
+}
+
+impl VoiceMixScratch {
+    fn new(max_voices: usize) -> Self {
+        Self {
+            spatial_voice_ids: Vec::with_capacity(max_voices),
+            muted_spatial_voice_ids: Vec::with_capacity(max_voices),
+            non_spatial_voice_ids: Vec::with_capacity(max_voices),
+            voice_telemetry: Vec::with_capacity(max_voices.saturating_mul(4)),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.spatial_voice_ids.clear();
+        self.muted_spatial_voice_ids.clear();
+        self.non_spatial_voice_ids.clear();
+        self.voice_telemetry.clear();
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MixProfilingSummary {
+    direct_mix_time_us: u64,
+    spatial_mix_time_us: u64,
+    spatial_metrics: Option<SpatialProcessingMetrics>,
+}
+
 /// The concrete, crate-private render module.
 ///
 /// Every field mutated by a quantum lives here without an inner lock. The sole
@@ -191,7 +230,7 @@ pub(crate) struct RenderQuantum {
     counters: Arc<RuntimeCounters>,
     voice_retirement_sender: Sender<VoiceRetirement>,
     pending_voice_retirements: Vec<VoiceRetirement>,
-    mixer_scratch: MixerScratch,
+    mixer_scratch: VoiceMixScratch,
     completed_playbacks: Vec<CompletedPlayback>,
     render_block_index: u64,
     output: Option<LogicalStereoOutput>,
@@ -269,7 +308,7 @@ impl RenderQuantum {
             counters,
             voice_retirement_sender,
             pending_voice_retirements: Vec::with_capacity(max_voices),
-            mixer_scratch: MixerScratch::new(max_voices),
+            mixer_scratch: VoiceMixScratch::new(max_voices),
             completed_playbacks: Vec::with_capacity(max_voices),
             render_block_index: 0,
             output: None,
@@ -370,7 +409,7 @@ impl RenderQuantum {
             if !matches!(instance.info.play_state, PlayState::Playing) {
                 continue;
             }
-            let bus = mixer::effective_bus_params(instance.bus_index, &self.buses);
+            let bus = effective_bus_params(instance.bus_index, &self.buses);
             if bus.paused {
                 continue;
             }
@@ -554,28 +593,19 @@ impl RenderQuantum {
             .map_or(0, |frame| frame.revision());
         let mut total_generated = 0;
         while total_generated < samples_needed {
-            let output = self
-                .output
+            self.output
                 .as_mut()
-                .expect("output checked before rendering");
+                .expect("output checked before rendering")
+                .world_buffer
+                .fill(0.0);
             let generated_before = total_generated;
-            output.world_buffer.fill(0.0);
             let mixing_start = Instant::now();
-            let profiling = mixer::mix_playback_instances_with_metrics(
-                &mut output.world_buffer,
-                LOGICAL_CHANNELS,
-                &mut self.active_playback,
-                Some(&mut self.processor),
-                &self.buses,
-                SpatialRenderContext {
-                    render_block_index: self.render_block_index,
-                    spatial_revision,
-                },
-                &mut self.mixer_scratch,
-                &mut self.completed_playbacks,
-            );
+            let profiling = self.mix_output_block(SpatialRenderContext {
+                render_block_index: self.render_block_index,
+                spatial_revision,
+            });
             self.render_block_index = self.render_block_index.wrapping_add(1);
-            for event in self.mixer_scratch.drain_voice_telemetry() {
+            for event in self.mixer_scratch.voice_telemetry.drain(..) {
                 Self::try_send_voice_telemetry(&self.voice_telemetry_sender, &self.counters, event);
             }
             timing.mixing_time_us += mixing_start.elapsed().as_micros() as u64;
@@ -594,6 +624,10 @@ impl RenderQuantum {
                     metrics.native_hrtf_direction_lookup_time_us;
                 timing.native_hrtf_convolution_time_us += metrics.native_hrtf_convolution_time_us;
             }
+            let output = self
+                .output
+                .as_mut()
+                .expect("output checked before rendering");
             let resampling_start = Instant::now();
             if let Ok((frames_out, _)) = output
                 .resampler
@@ -633,6 +667,100 @@ impl RenderQuantum {
         }
         timing.total_time_us = total_start.elapsed().as_micros() as u64;
         timing
+    }
+
+    /// Advances every audible Voice for one logical output block. All mutable mixing state is
+    /// owned here, so callers supply only the immutable frame context rather than coordinating
+    /// eight borrowed implementation details.
+    fn mix_output_block(&mut self, render_context: SpatialRenderContext) -> MixProfilingSummary {
+        self.mixer_scratch.clear();
+        let output_frames = self
+            .output
+            .as_ref()
+            .expect("output checked before mixing")
+            .world_buffer
+            .len()
+            / LOGICAL_CHANNELS as usize;
+        for (voice_id, instance) in &mut self.active_playback {
+            if !matches!(instance.info.play_state, PlayState::Playing) {
+                continue;
+            }
+            let bus = effective_bus_params(instance.bus_index, &self.buses);
+            if bus.paused {
+                continue;
+            }
+            instance.set_mix_parameters(bus);
+            let is_spatial = instance.render_state.is_spatial();
+            if bus.muted || crate::gain::db_to_linear(bus.gain_db) == 0.0 {
+                instance.advance_silently(output_frames);
+                if is_spatial {
+                    self.mixer_scratch.muted_spatial_voice_ids.push(*voice_id);
+                }
+                continue;
+            }
+            if is_spatial {
+                self.mixer_scratch.spatial_voice_ids.push(*voice_id);
+            } else {
+                self.mixer_scratch.non_spatial_voice_ids.push(*voice_id);
+            }
+        }
+
+        let mut profiling = MixProfilingSummary::default();
+        let direct_start = Instant::now();
+        for voice_id in &self.mixer_scratch.non_spatial_voice_ids {
+            if let Some(instance) = self.active_playback.get_mut(voice_id) {
+                instance.fill_buffer(
+                    &mut self
+                        .output
+                        .as_mut()
+                        .expect("output checked before mixing")
+                        .world_buffer,
+                    LOGICAL_CHANNELS,
+                );
+            }
+        }
+        profiling.direct_mix_time_us = direct_start.elapsed().as_micros() as u64;
+
+        for voice_id in &self.mixer_scratch.muted_spatial_voice_ids {
+            self.processor.silence_voice_state(*voice_id);
+        }
+        if !self.mixer_scratch.spatial_voice_ids.is_empty()
+            || self.processor.has_environment_tail()
+            || self.processor.has_pending_voice_telemetry()
+        {
+            let spatial_start = Instant::now();
+            if let Ok(metrics) = self.processor.process_spatial_sources_with_metrics(
+                &self.mixer_scratch.spatial_voice_ids,
+                &mut self.active_playback,
+                &mut self
+                    .output
+                    .as_mut()
+                    .expect("output checked before mixing")
+                    .world_buffer,
+                render_context,
+                &mut self.mixer_scratch.voice_telemetry,
+            ) {
+                profiling.spatial_mix_time_us = spatial_start.elapsed().as_micros() as u64;
+                profiling.spatial_metrics = Some(metrics);
+            }
+        }
+
+        for (voice_id, instance) in &mut self.active_playback {
+            let _ = instance.check_and_clear_end_flag();
+            if instance.should_reclaim()
+                && !self
+                    .completed_playbacks
+                    .iter()
+                    .any(|completed| completed.voice_id == *voice_id)
+            {
+                self.completed_playbacks.push(CompletedPlayback {
+                    voice_id: *voice_id,
+                    emitter: instance.emitter,
+                    completion_tag: instance.completion_tag,
+                });
+            }
+        }
+        profiling
     }
 
     fn retire_completed_voices(&mut self) {
@@ -712,6 +840,20 @@ impl RenderQuantum {
                 .dropped_voice_telemetry
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusParams {
+    let master = buses.first().copied().unwrap_or_default();
+    let selected = buses.get(index).copied().unwrap_or(master);
+    if index == 0 {
+        return master;
+    }
+    BusParams {
+        gain_db: master.gain_db + selected.gain_db,
+        muted: master.muted || selected.muted,
+        paused: master.paused || selected.paused,
+        playback_rate: master.playback_rate * selected.playback_rate,
     }
 }
 

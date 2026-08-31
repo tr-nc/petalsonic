@@ -2294,7 +2294,9 @@ fn solve_early_reflections(
     for candidate in candidates.iter().take(plan.max_early_reflection_sources) {
         let Some((representatives, aggregate_environment_gain)) = responses
             .iter()
-            .find(|response| response.voice_id == candidate.voice.voice_id)
+            .find(|response| {
+                compare_voice_ids(response.voice_id, candidate.voice.voice_id) == CmpOrdering::Equal
+            })
             .map(|response| {
                 (
                     response.environment_representatives.clone(),
@@ -2419,10 +2421,9 @@ fn solve_early_reflections(
         });
         taps.truncate(plan.early_reflection_taps);
         taps.sort_by_key(|tap| tap.path_id);
-        if let Some(response) = responses
-            .iter_mut()
-            .find(|response| response.voice_id == candidate.voice.voice_id)
-        {
+        if let Some(response) = responses.iter_mut().find(|response| {
+            compare_voice_ids(response.voice_id, candidate.voice.voice_id) == CmpOrdering::Equal
+        }) {
             response.early_reflections = taps;
         }
     }
@@ -2820,6 +2821,43 @@ mod tests {
         assert!(
             comparisons <= VOICES * MAX_LOGARITHMIC_COMPARISONS_PER_VOICE,
             "4096-Voice completion association performed {comparisons} comparisons"
+        );
+    }
+
+    #[test]
+    fn early_reflection_response_association_is_bounded_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        const MAX_SOLVE_COMPARISONS_PER_VOICE: usize = 64;
+        let mut workload = input(Arc::new(NoGeometry));
+        let template = workload.voices[0].clone();
+        workload.voices = (0..VOICES)
+            .map(|voice| {
+                let mut voice_input = template.clone();
+                voice_input.voice_id = VoiceId::from(voice as u64 + 1);
+                voice_input.routing_generation = voice as u64 + 11;
+                voice_input.emitter.index = voice as u32;
+                voice_input
+            })
+            .collect();
+        let plan = AcousticSolvePlan {
+            max_direct_sources: VOICES,
+            max_direct_rays: VOICES * 2,
+            max_early_reflection_sources: VOICES,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let mut completed = None;
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            completed = Some(AcousticSolver::new(VOICES).solve_completed(&workload, 1.0, plan));
+        });
+
+        assert_eq!(completed.unwrap().voices.len(), VOICES);
+        assert!(
+            comparisons <= VOICES * MAX_SOLVE_COMPARISONS_PER_VOICE,
+            "4096-Voice early-reflection association performed {comparisons} comparisons"
         );
     }
 

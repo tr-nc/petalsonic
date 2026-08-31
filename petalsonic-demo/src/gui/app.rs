@@ -184,7 +184,10 @@ impl SpatialAudioDemo {
         // Set up listener pose at origin (0, 0, 0) with identity rotation
         let listener_pose = Pose::new(Vec3::new(0.0, 0.0, 0.0), Quat::IDENTITY);
         world
-            .publish_spatial_frame(SpatialFrame::new(1, 0.0, listener_pose, Vec::new()))
+            .publish_spatial_frame(
+                SpatialFrame::new(1, 0.0, listener_pose, Vec::new())
+                    .expect("Failed to build initial spatial frame"),
+            )
             .expect("Failed to publish initial spatial frame");
 
         // Calculate maximum frame time constraint (block_size / sample_rate)
@@ -632,12 +635,14 @@ impl SpatialAudioDemo {
             .iter()
             .map(|source| EmitterSpatialState::new(source.id, Pose::from_position(source.position)))
             .collect();
-        if let Err(error) = self.world.publish_spatial_frame(SpatialFrame::new(
+        let publication = SpatialFrame::new(
             self.spatial_frame_revision,
             self.started_at.elapsed().as_secs_f64(),
             listener,
             emitters,
-        )) {
+        )
+        .and_then(|frame| self.world.publish_spatial_frame(frame));
+        if let Err(error) = publication {
             log::debug!("Spatial frame publication deferred: {error}");
         }
     }

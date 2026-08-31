@@ -50,7 +50,7 @@ world.publish_spatial_frame(SpatialFrame::new(
     sim_time_seconds,
     listener_pose,
     vec![EmitterSpatialState::new(emitter, emitter_pose).with_extent(extent)],
-))?;
+)?)?;
 # Ok::<(), petalsonic::PetalSonicError>(())
 ```
 

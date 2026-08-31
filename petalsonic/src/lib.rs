@@ -37,7 +37,7 @@
 //!         emitter,
 //!         Pose::from_position(Vec3::new(5.0, 0.0, 0.0)),
 //!     )],
-//! ))?;
+//! )?)?;
 //!
 //! // Pull events on the caller thread when controlled playback is used.
 //! let _events = world.drain_events();

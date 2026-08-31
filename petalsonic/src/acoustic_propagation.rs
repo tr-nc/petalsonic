@@ -2998,12 +2998,15 @@ mod tests {
         let completed = AcousticSolver::new(VOICES).solve_completed(&captured, 1.0, plan);
         let mut current = InputState::new(0.5, VOICES);
         current.scene = Some(captured.scene.clone());
-        current.spatial = Some(Arc::new(SpatialFrame::new(
-            captured.spatial.revision() + 99,
-            captured.spatial.sim_time_seconds() + 1.0,
-            Pose::from_position(Vec3::X),
-            Vec::new(),
-        )));
+        current.spatial = Some(Arc::new(
+            SpatialFrame::new(
+                captured.spatial.revision() + 99,
+                captured.spatial.sim_time_seconds() + 1.0,
+                Pose::from_position(Vec3::X),
+                Vec::new(),
+            )
+            .unwrap(),
+        ));
         current.voices = captured
             .voices
             .iter()
@@ -3435,15 +3438,18 @@ mod tests {
         };
         SolveInput {
             wake_generation: 1,
-            spatial: Arc::new(SpatialFrame::new(
-                11,
-                1.5,
-                Pose::from_position(Vec3::ZERO),
-                vec![EmitterSpatialState::new(
-                    emitter,
-                    Pose::from_position(Vec3::Z),
-                )],
-            )),
+            spatial: Arc::new(
+                SpatialFrame::new(
+                    11,
+                    1.5,
+                    Pose::from_position(Vec3::ZERO),
+                    vec![EmitterSpatialState::new(
+                        emitter,
+                        Pose::from_position(Vec3::Z),
+                    )],
+                )
+                .unwrap(),
+            ),
             scene: Arc::new(AcousticSceneSnapshot::new(17, query)),
             voices: vec![AcousticVoiceSnapshot {
                 voice_id: VoiceId::from(1),
@@ -3479,15 +3485,18 @@ mod tests {
 
     fn fixture_gain_at_listener(listener_x: f32, revision: u64) -> f32 {
         let mut fixture = input(Arc::new(NegativeXWood));
-        fixture.spatial = Arc::new(SpatialFrame::new(
-            revision,
-            revision as f64 * 0.1,
-            Pose::from_position(Vec3::new(listener_x, 0.0, 0.0)),
-            vec![EmitterSpatialState::new(
-                fixture.voices[0].emitter,
-                Pose::identity(),
-            )],
-        ));
+        fixture.spatial = Arc::new(
+            SpatialFrame::new(
+                revision,
+                revision as f64 * 0.1,
+                Pose::from_position(Vec3::new(listener_x, 0.0, 0.0)),
+                vec![EmitterSpatialState::new(
+                    fixture.voices[0].emitter,
+                    Pose::identity(),
+                )],
+            )
+            .unwrap(),
+        );
         fixture.voices[0].emitter_world_pose = Pose::identity();
         fixture.voices[0].source_extent = eight_sample_extent();
         fixture.voices[0].environment_send = EnvironmentSend::disabled();
@@ -3593,12 +3602,15 @@ mod tests {
         );
         let mut current = InputState::new(0.5, 3);
         current.scene = Some(captured.scene.clone());
-        current.spatial = Some(Arc::new(SpatialFrame::new(
-            captured.spatial.revision() + 12,
-            captured.spatial.sim_time_seconds() + 0.05,
-            Pose::from_position(Vec3::X),
-            Vec::new(),
-        )));
+        current.spatial = Some(Arc::new(
+            SpatialFrame::new(
+                captured.spatial.revision() + 12,
+                captured.spatial.sim_time_seconds() + 0.05,
+                Pose::from_position(Vec3::X),
+                Vec::new(),
+            )
+            .unwrap(),
+        ));
         current.voices = captured
             .voices
             .iter()
@@ -3717,12 +3729,15 @@ mod tests {
         let mut elapsed_us = Vec::with_capacity(ITERATIONS);
         let mut observed_rays = 0usize;
         for iteration in 0..ITERATIONS {
-            workload.spatial = Arc::new(SpatialFrame::new(
-                iteration as u64 + 100,
-                iteration as f64 / 60.0,
-                Pose::from_position(Vec3::new((iteration as f32 * 0.01).sin(), 0.0, 0.0)),
-                Vec::new(),
-            ));
+            workload.spatial = Arc::new(
+                SpatialFrame::new(
+                    iteration as u64 + 100,
+                    iteration as f64 / 60.0,
+                    Pose::from_position(Vec3::new((iteration as f32 * 0.01).sin(), 0.0, 0.0)),
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
             let started = Instant::now();
             let output = solver.solve_with_telemetry(black_box(&workload), 1.0, plan);
             elapsed_us.push(started.elapsed().as_micros() as u64);
@@ -4285,15 +4300,18 @@ mod tests {
         voice_b.emitter_world_pose = Pose::from_position(-Vec3::X);
         voice_b.acoustic_priority = 1.0;
         input.voices.push(voice_b);
-        input.spatial = Arc::new(SpatialFrame::new(
-            20,
-            0.0,
-            Pose::identity(),
-            vec![
-                EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
-                EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
-            ],
-        ));
+        input.spatial = Arc::new(
+            SpatialFrame::new(
+                20,
+                0.0,
+                Pose::identity(),
+                vec![
+                    EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
+                    EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
+                ],
+            )
+            .unwrap(),
+        );
         let plan = AcousticSolvePlan {
             max_direct_sources: 1,
             max_direct_rays: 4,
@@ -4320,15 +4338,18 @@ mod tests {
 
         input.voices[0].acoustic_priority = 1.0;
         input.voices[1].acoustic_priority = 3.0;
-        input.spatial = Arc::new(SpatialFrame::new(
-            21,
-            0.1,
-            Pose::identity(),
-            vec![
-                EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
-                EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
-            ],
-        ));
+        input.spatial = Arc::new(
+            SpatialFrame::new(
+                21,
+                0.1,
+                Pose::identity(),
+                vec![
+                    EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
+                    EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
+                ],
+            )
+            .unwrap(),
+        );
         let retained = solver.solve_with_telemetry(&input, 1.0, plan);
         let voice_a = retained
             .response
@@ -4375,15 +4396,18 @@ mod tests {
             Some(AcousticSolveStatus::Retained)
         );
 
-        input.spatial = Arc::new(SpatialFrame::new(
-            22,
-            0.4,
-            Pose::identity(),
-            vec![
-                EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
-                EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
-            ],
-        ));
+        input.spatial = Arc::new(
+            SpatialFrame::new(
+                22,
+                0.4,
+                Pose::identity(),
+                vec![
+                    EmitterSpatialState::new(input.voices[0].emitter, Pose::from_position(Vec3::X)),
+                    EmitterSpatialState::new(emitter_b, Pose::from_position(-Vec3::X)),
+                ],
+            )
+            .unwrap(),
+        );
         let deferred = solver.solve_with_telemetry(&input, 1.0, plan);
         let voice_a = deferred
             .response
@@ -4436,15 +4460,18 @@ mod tests {
             "identical immutable solve input should reuse per-route sample results"
         );
 
-        input.spatial = Arc::new(SpatialFrame::new(
-            12,
-            1.6,
-            Pose::identity(),
-            vec![EmitterSpatialState::new(
-                input.voices[0].emitter,
-                Pose::from_position(Vec3::Z),
-            )],
-        ));
+        input.spatial = Arc::new(
+            SpatialFrame::new(
+                12,
+                1.6,
+                Pose::identity(),
+                vec![EmitterSpatialState::new(
+                    input.voices[0].emitter,
+                    Pose::from_position(Vec3::Z),
+                )],
+            )
+            .unwrap(),
+        );
         solver.solve_with_plan(&input, 1.0, plan);
         assert_eq!(query.traced_closest_rays.load(Ordering::Relaxed), 4);
 
@@ -4502,21 +4529,24 @@ mod tests {
             index: index as u32,
             generation: 1,
         };
-        let frame = Arc::new(SpatialFrame::new(
-            23,
-            2.0,
-            Pose::identity(),
-            (0..EMITTERS)
-                .rev()
-                .map(|index| {
-                    EmitterSpatialState::new(
-                        emitter(index),
-                        Pose::from_position(Vec3::new(index as f32, 1.0, 0.0)),
-                    )
-                    .with_acoustic_priority(index as f32 + 1.0)
-                })
-                .collect(),
-        ));
+        let frame = Arc::new(
+            SpatialFrame::new(
+                23,
+                2.0,
+                Pose::identity(),
+                (0..EMITTERS)
+                    .rev()
+                    .map(|index| {
+                        EmitterSpatialState::new(
+                            emitter(index),
+                            Pose::from_position(Vec3::new(index as f32, 1.0, 0.0)),
+                        )
+                        .with_acoustic_priority(index as f32 + 1.0)
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
         let input_port = AcousticVoiceInput::isolated(1);
         input_port.input.state.lock().unwrap().spatial = Some(frame.clone());
         let mut activated = input(Arc::new(NoGeometry))
@@ -4709,15 +4739,18 @@ mod tests {
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(7, query.clone())))
             .unwrap();
         propagation
-            .publish_spatial_frame(Arc::new(SpatialFrame::new(
-                1,
-                0.0,
-                Pose::identity(),
-                vec![EmitterSpatialState::new(
-                    emitter,
-                    Pose::from_position(Vec3::Z),
-                )],
-            )))
+            .publish_spatial_frame(Arc::new(
+                SpatialFrame::new(
+                    1,
+                    0.0,
+                    Pose::identity(),
+                    vec![EmitterSpatialState::new(
+                        emitter,
+                        Pose::from_position(Vec3::Z),
+                    )],
+                )
+                .unwrap(),
+            ))
             .unwrap();
         query.wait_until_entered();
 
@@ -4727,15 +4760,18 @@ mod tests {
         let frames_during_solve = SOLVE_TIME_MILLIS * FRAME_HZ / 1_000;
         for revision in 2..=frames_during_solve + 1 {
             propagation
-                .publish_spatial_frame(Arc::new(SpatialFrame::new(
-                    revision,
-                    revision as f64 / FRAME_HZ as f64,
-                    Pose::identity(),
-                    vec![EmitterSpatialState::new(
-                        emitter,
-                        Pose::from_position(Vec3::new(0.0, 0.0, revision as f32)),
-                    )],
-                )))
+                .publish_spatial_frame(Arc::new(
+                    SpatialFrame::new(
+                        revision,
+                        revision as f64 / FRAME_HZ as f64,
+                        Pose::identity(),
+                        vec![EmitterSpatialState::new(
+                            emitter,
+                            Pose::from_position(Vec3::new(0.0, 0.0, revision as f32)),
+                        )],
+                    )
+                    .unwrap(),
+                ))
                 .unwrap();
         }
         assert!(propagation.response_publication.latest().is_none());
@@ -4809,15 +4845,18 @@ mod tests {
 
         for revision in [11, 12] {
             propagation
-                .publish_spatial_frame(Arc::new(SpatialFrame::new(
-                    revision,
-                    revision as f64 * 0.01,
-                    Pose::from_position(Vec3::ZERO),
-                    vec![EmitterSpatialState::new(
-                        emitter,
-                        Pose::from_position(Vec3::Z),
-                    )],
-                )))
+                .publish_spatial_frame(Arc::new(
+                    SpatialFrame::new(
+                        revision,
+                        revision as f64 * 0.01,
+                        Pose::from_position(Vec3::ZERO),
+                        vec![EmitterSpatialState::new(
+                            emitter,
+                            Pose::from_position(Vec3::Z),
+                        )],
+                    )
+                    .unwrap(),
+                ))
                 .unwrap();
         }
 
@@ -4893,15 +4932,18 @@ mod tests {
             )))
             .unwrap();
         propagation
-            .publish_spatial_frame(Arc::new(SpatialFrame::new(
-                1,
-                0.0,
-                Pose::identity(),
-                vec![EmitterSpatialState::new(
-                    emitter,
-                    Pose::from_position(Vec3::Z),
-                )],
-            )))
+            .publish_spatial_frame(Arc::new(
+                SpatialFrame::new(
+                    1,
+                    0.0,
+                    Pose::identity(),
+                    vec![EmitterSpatialState::new(
+                        emitter,
+                        Pose::from_position(Vec3::Z),
+                    )],
+                )
+                .unwrap(),
+            ))
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -4933,12 +4975,9 @@ mod tests {
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();
         propagation
-            .publish_spatial_frame(Arc::new(SpatialFrame::new(
-                4,
-                0.04,
-                Pose::from_position(Vec3::ZERO),
-                Vec::new(),
-            )))
+            .publish_spatial_frame(Arc::new(
+                SpatialFrame::new(4, 0.04, Pose::from_position(Vec3::ZERO), Vec::new()).unwrap(),
+            ))
             .unwrap();
 
         std::thread::sleep(Duration::from_millis(75));
@@ -4964,12 +5003,9 @@ mod tests {
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(3, Arc::new(UnitRoom))))
             .unwrap();
         propagation
-            .publish_spatial_frame(Arc::new(SpatialFrame::new(
-                4,
-                0.04,
-                Pose::from_position(Vec3::ZERO),
-                Vec::new(),
-            )))
+            .publish_spatial_frame(Arc::new(
+                SpatialFrame::new(4, 0.04, Pose::from_position(Vec3::ZERO), Vec::new()).unwrap(),
+            ))
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);

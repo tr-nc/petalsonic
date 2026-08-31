@@ -1300,7 +1300,8 @@ mod tests {
             0.0,
             crate::math::Pose::default(),
             vec![EmitterSpatialState::new(emitter, new_pose).with_extent(SourceExtent::Point)],
-        );
+        )
+        .unwrap();
 
         RenderQuantum::apply_spatial_frame_to_voices(&frame, &mut harness.quantum.active_playback);
 
@@ -1373,7 +1374,8 @@ mod tests {
                     )
                 })
                 .collect(),
-        );
+        )
+        .unwrap();
         let mut comparisons = 0;
 
         let memory_activity = crate::test_support::realtime_memory_activity(|| {

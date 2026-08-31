@@ -42,7 +42,7 @@ fn main() -> Result<(), PetalSonicError> {
             emitter,
             Pose::from_position(Vec3::new(5.0, 0.0, 0.0)),
         )],
-    ))?;
+    )?)?;
 
     Ok(())
 }

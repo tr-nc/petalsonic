@@ -1382,6 +1382,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-mode near-capacity render performance gate"]
     fn warmed_near_capacity_quantum_meets_release_budget() {
         const VOICES: usize = 32;
         const SAMPLES: usize = 1_024;

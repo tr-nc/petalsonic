@@ -16,4 +16,4 @@ if [[ "$match_count" -ne 1 ]]; then
     exit 1
 fi
 
-"$cargo_bin" test --release -p petalsonic --lib "$target" -- --exact --nocapture
+"$cargo_bin" test --release -p petalsonic --lib "$target" -- --include-ignored --exact --nocapture

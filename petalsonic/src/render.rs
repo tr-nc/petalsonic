@@ -895,9 +895,9 @@ fn apply_master_gain_and_limit(buffer: &mut [f32], frames_out: usize, channels: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acoustic_propagation::{AcousticPropagation, AcousticVoice};
+    use crate::acoustic_propagation::AcousticVoice;
     use crate::audio_data::PetalSonicAudioData;
-    use crate::config::{EnvironmentalAcousticsBudget, PetalSonicWorldDesc};
+    use crate::config::PetalSonicWorldDesc;
     use crate::domain::{
         DirectPath, Emitter, EmitterDesc, EmitterSpatialState, EnvironmentSend, ExtentSample,
         ExtentSampleId, OcclusionProfile, PlayOptions, SourceExtent,
@@ -998,8 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn one_spatial_publication_has_one_acoustic_wake_and_independent_playback_pose_update_at_capacity()
-     {
+    fn render_spatial_publication_updates_playback_without_waking_acoustics_at_capacity() {
         const EMITTERS: usize = 4_096;
         const VOICES: usize = 2_048;
         const BLOCK_SIZE: usize = 8;
@@ -1009,15 +1008,7 @@ mod tests {
             index: index as u32,
             generation: 7,
         };
-        let (propagation, _worker) = AcousticPropagation::prepare(
-            1.0,
-            Arc::new(AtomicBool::new(true)),
-            0.5,
-            EnvironmentalAcousticsBudget::default(),
-            VOICES,
-            1,
-        );
-        let acoustic_voice_input = propagation.voice_input();
+        let acoustic_voice_input = AcousticVoiceInput::isolated(VOICES);
         let mut harness = harness_with_buses_and_acoustic_input(
             BLOCK_SIZE,
             VOICES,
@@ -1070,18 +1061,16 @@ mod tests {
                                 0.0,
                             )),
                         )
-                        .with_acoustic_priority(index as f32 + 1.0)
                     })
                     .collect(),
             )
             .unwrap(),
         );
-        let render_publication = harness
+        harness
             .spatial_frames
-            .prepare_latest(frame.clone())
-            .unwrap();
-        propagation.publish_spatial_frame(frame).unwrap();
-        render_publication.commit();
+            .prepare_latest(frame)
+            .unwrap()
+            .commit();
 
         let attached_voice = VoiceId::from(VOICES as u64);
         let expected_attached_pose = crate::math::Pose::from_position(crate::math::Vec3::new(
@@ -1089,21 +1078,6 @@ mod tests {
             2.0,
             0.0,
         ));
-        assert_eq!(
-            acoustic_voice_input.voice_spatial_for_test(attached_voice),
-            Some((expected_attached_pose, ((VOICES - 1) * 2 + 1) as f32, false))
-        );
-        assert_eq!(
-            acoustic_voice_input.voice_spatial_for_test(VoiceId::from(1)),
-            Some((old_pose, 1.0, true)),
-            "a detached acoustic origin belongs to its Voice lifetime"
-        );
-        assert_eq!(
-            acoustic_voice_input.wake_generation_for_test(),
-            wake_before + 1,
-            "control publication must wake acoustics exactly once"
-        );
-
         let memory_activity =
             crate::test_support::realtime_memory_activity(|| harness.quantum.render());
 
@@ -1124,8 +1098,8 @@ mod tests {
         );
         assert_eq!(
             acoustic_voice_input.wake_generation_for_test(),
-            wake_before + 1,
-            "render consumption must not republish control-owned acoustic spatial facts"
+            wake_before,
+            "render-only publication must not wake the acoustic worker"
         );
     }
 

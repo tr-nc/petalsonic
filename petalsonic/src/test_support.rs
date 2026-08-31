@@ -12,6 +12,8 @@ thread_local! {
     static ACOUSTIC_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
     static SPATIAL_FRAME_COMPARISON_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static SPATIAL_FRAME_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
+    static RENDER_COMPLETION_COMPARISON_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static RENDER_COMPLETION_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[global_allocator]
@@ -104,4 +106,20 @@ pub(crate) fn spatial_frame_comparison_activity(operation: impl FnOnce()) -> usi
     operation();
     SPATIAL_FRAME_COMPARISON_PROBE_ACTIVE.with(|active| active.set(false));
     SPATIAL_FRAME_COMPARISON_COUNT.with(Cell::get)
+}
+
+pub(crate) fn record_render_completion_comparison() {
+    RENDER_COMPLETION_COMPARISON_PROBE_ACTIVE.with(|active| {
+        if active.get() {
+            RENDER_COMPLETION_COMPARISON_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+pub(crate) fn render_completion_comparison_activity(operation: impl FnOnce()) -> usize {
+    RENDER_COMPLETION_COMPARISON_COUNT.with(|count| count.set(0));
+    RENDER_COMPLETION_COMPARISON_PROBE_ACTIVE.with(|active| active.set(true));
+    operation();
+    RENDER_COMPLETION_COMPARISON_PROBE_ACTIVE.with(|active| active.set(false));
+    RENDER_COMPLETION_COMPARISON_COUNT.with(Cell::get)
 }

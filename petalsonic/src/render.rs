@@ -745,10 +745,11 @@ impl RenderQuantum {
         for (voice_id, instance) in &mut self.active_playback {
             let _ = instance.check_and_clear_end_flag();
             if instance.should_reclaim()
-                && !self
-                    .completed_playbacks
-                    .iter()
-                    .any(|completed| completed.voice_id == *voice_id)
+                && !self.completed_playbacks.iter().any(|completed| {
+                    #[cfg(test)]
+                    crate::test_support::record_render_completion_comparison();
+                    completed.voice_id == *voice_id
+                })
             {
                 self.completed_playbacks.push(CompletedPlayback {
                     voice_id: *voice_id,
@@ -974,6 +975,59 @@ mod tests {
             published_at: Instant::now(),
             solve_time_us: 0,
         })
+    }
+
+    #[test]
+    fn completion_reclaim_association_is_linear_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        let mut harness = harness(1, VOICES);
+        let clip = Arc::new(PetalSonicAudioData::new(
+            vec![0.25],
+            48_000,
+            1,
+            Duration::from_secs_f64(1.0 / 48_000.0),
+        ));
+        for voice in 0..VOICES {
+            let voice_id = VoiceId::from(voice as u64 + 1);
+            let emitter = Emitter {
+                world_id: 1,
+                index: voice as u32,
+                generation: 1,
+            };
+            let (_, playback, acoustic) = prepare_test_voice(
+                voice_id,
+                emitter,
+                clip.clone(),
+                EmitterDesc::non_spatial(),
+                PlayOptions::once(),
+                None,
+                0,
+                1,
+            )
+            .start();
+            assert!(acoustic.is_none());
+            assert!(
+                harness
+                    .quantum
+                    .active_playback
+                    .insert(voice_id, playback)
+                    .is_none()
+            );
+        }
+        let _consumer = harness.quantum.connect_output(48_000).unwrap();
+
+        let comparisons = crate::test_support::render_completion_comparison_activity(|| {
+            harness.quantum.mix_output_block(SpatialRenderContext {
+                render_block_index: 0,
+                spatial_revision: 0,
+            });
+        });
+
+        assert_eq!(harness.quantum.completed_playbacks.len(), VOICES);
+        assert!(
+            comparisons <= VOICES,
+            "4096-Voice render completion association performed {comparisons} comparisons"
+        );
     }
 
     #[test]

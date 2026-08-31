@@ -536,7 +536,6 @@ impl RenderQuantum {
             return;
         };
         Self::apply_spatial_frame_to_voices(&next, &mut self.active_playback);
-        self.acoustic_voices.apply_spatial_frame(&next);
         if let Some(previous) = self.current_spatial_frame.replace(next) {
             self.spatial_frames.retire(previous);
         }
@@ -892,9 +891,9 @@ fn apply_master_gain_and_limit(buffer: &mut [f32], frames_out: usize, channels: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acoustic_propagation::AcousticVoice;
+    use crate::acoustic_propagation::{AcousticPropagation, AcousticVoice};
     use crate::audio_data::PetalSonicAudioData;
-    use crate::config::PetalSonicWorldDesc;
+    use crate::config::{EnvironmentalAcousticsBudget, PetalSonicWorldDesc};
     use crate::domain::{
         DirectPath, Emitter, EmitterDesc, EmitterSpatialState, EnvironmentSend, ExtentSample,
         ExtentSampleId, OcclusionProfile, PlayOptions, SourceExtent,
@@ -922,6 +921,7 @@ mod tests {
 
     struct Harness {
         quantum: RenderQuantum,
+        spatial_frames: Publisher<SpatialFrame>,
         acoustic_responses: Publisher<AcousticResponse>,
         commands: Sender<PlaybackCommand>,
         events: crossbeam_channel::Receiver<PetalSonicEvent>,
@@ -934,6 +934,20 @@ mod tests {
     }
 
     fn harness_with_buses(block_size: usize, max_voices: usize, buses: Vec<BusParams>) -> Harness {
+        harness_with_buses_and_acoustic_input(
+            block_size,
+            max_voices,
+            buses,
+            AcousticVoiceInput::isolated(max_voices.max(1)),
+        )
+    }
+
+    fn harness_with_buses_and_acoustic_input(
+        block_size: usize,
+        max_voices: usize,
+        buses: Vec<BusParams>,
+        acoustic_voice_input: AcousticVoiceInput,
+    ) -> Harness {
         let desc = PetalSonicWorldDesc {
             block_size,
             max_voices,
@@ -944,7 +958,7 @@ mod tests {
         let (commands, regular) = crossbeam_channel::bounded(max_voices.max(1));
         let (_lifecycle, lifecycle) = crossbeam_channel::bounded(max_voices.max(1));
         let (retirement_sender, _) = crossbeam_channel::bounded(max_voices.max(1));
-        let (_, spatial_frames) = RealtimeLatest::bounded(1);
+        let (spatial_frames, spatial_frame_consumer) = RealtimeLatest::bounded(1);
         let (acoustic_responses, acoustic_response_consumer) = RealtimeLatest::bounded(2);
         let (voice_retirement_sender, voice_retirement_owner) =
             crossbeam_channel::bounded(max_voices.max(1));
@@ -956,9 +970,9 @@ mod tests {
             desc,
             Arc::new(AtomicUsize::new(0)),
             retirement_sender,
-            spatial_frames,
+            spatial_frame_consumer,
             acoustic_response_consumer,
-            AcousticVoiceInput::isolated(max_voices.max(1)),
+            acoustic_voice_input,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(true)),
             regular,
@@ -970,12 +984,145 @@ mod tests {
         );
         Harness {
             quantum: RenderQuantum::new(startup, buses, voice_retirement_sender).unwrap(),
+            spatial_frames,
             acoustic_responses,
             commands,
             events,
             timing,
             _voice_retirement_owner: voice_retirement_owner,
         }
+    }
+
+    #[test]
+    fn one_spatial_publication_has_one_acoustic_wake_and_independent_playback_pose_update_at_capacity()
+     {
+        const EMITTERS: usize = 4_096;
+        const VOICES: usize = 2_048;
+        const BLOCK_SIZE: usize = 8;
+        let old_pose = crate::math::Pose::from_position(-crate::math::Vec3::Y);
+        let emitter = |index: usize| Emitter {
+            world_id: 19,
+            index: index as u32,
+            generation: 7,
+        };
+        let (propagation, _worker) = AcousticPropagation::prepare(
+            1.0,
+            Arc::new(AtomicBool::new(true)),
+            0.5,
+            EnvironmentalAcousticsBudget::default(),
+            VOICES,
+            1,
+        );
+        let acoustic_voice_input = propagation.voice_input();
+        let mut harness = harness_with_buses_and_acoustic_input(
+            BLOCK_SIZE,
+            VOICES,
+            vec![BusParams::default()],
+            acoustic_voice_input.clone(),
+        );
+        let source = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; BLOCK_SIZE * 2],
+            48_000,
+            1,
+            Duration::from_secs_f64((BLOCK_SIZE * 2) as f64 / 48_000.0),
+        ));
+        for voice_index in 0..VOICES {
+            let options = if voice_index == 0 {
+                PlayOptions::looping().detached()
+            } else {
+                PlayOptions::looping()
+            };
+            harness
+                .commands
+                .try_send(PlaybackCommand::Play(prepare_test_voice(
+                    VoiceId::from(voice_index as u64 + 1),
+                    emitter(voice_index * 2),
+                    source.clone(),
+                    EmitterDesc::spatial(old_pose),
+                    options,
+                    None,
+                    0,
+                    BLOCK_SIZE,
+                )))
+                .unwrap();
+        }
+        harness.quantum.render();
+        let wake_before = acoustic_voice_input.wake_generation_for_test();
+        assert_eq!(wake_before, 1, "Voice activation must publish one baseline");
+
+        let frame = Arc::new(
+            SpatialFrame::new(
+                71,
+                4.0,
+                crate::math::Pose::identity(),
+                (0..EMITTERS)
+                    .rev()
+                    .map(|index| {
+                        EmitterSpatialState::new(
+                            emitter(index),
+                            crate::math::Pose::from_position(crate::math::Vec3::new(
+                                index as f32,
+                                2.0,
+                                0.0,
+                            )),
+                        )
+                        .with_acoustic_priority(index as f32 + 1.0)
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let render_publication = harness
+            .spatial_frames
+            .prepare_latest(frame.clone())
+            .unwrap();
+        propagation.publish_spatial_frame(frame).unwrap();
+        render_publication.commit();
+
+        let attached_voice = VoiceId::from(VOICES as u64);
+        let expected_attached_pose = crate::math::Pose::from_position(crate::math::Vec3::new(
+            ((VOICES - 1) * 2) as f32,
+            2.0,
+            0.0,
+        ));
+        assert_eq!(
+            acoustic_voice_input.voice_spatial_for_test(attached_voice),
+            Some((expected_attached_pose, ((VOICES - 1) * 2 + 1) as f32, false))
+        );
+        assert_eq!(
+            acoustic_voice_input.voice_spatial_for_test(VoiceId::from(1)),
+            Some((old_pose, 1.0, true)),
+            "a detached acoustic origin belongs to its Voice lifetime"
+        );
+        assert_eq!(
+            acoustic_voice_input.wake_generation_for_test(),
+            wake_before + 1,
+            "control publication must wake acoustics exactly once"
+        );
+
+        let memory_activity =
+            crate::test_support::realtime_memory_activity(|| harness.quantum.render());
+
+        assert_eq!(memory_activity, 0, "render spatial consumption allocated");
+        assert_eq!(
+            harness.quantum.active_playback[&attached_voice]
+                .render_state
+                .spatial_pose(),
+            Some(expected_attached_pose),
+            "playback pose must still follow the render-side SpatialFrame"
+        );
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(1)]
+                .render_state
+                .spatial_pose(),
+            Some(old_pose),
+            "detached playback keeps its independently captured pose"
+        );
+        assert_eq!(
+            acoustic_voice_input.wake_generation_for_test(),
+            wake_before + 1,
+            "render consumption must not republish control-owned acoustic spatial facts"
+        );
     }
 
     fn empty_acoustic_response(revision: u64) -> Arc<AcousticResponse> {

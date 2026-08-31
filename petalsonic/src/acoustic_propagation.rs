@@ -508,21 +508,6 @@ impl AcousticVoiceRegistry {
         self.dirty |= changed;
     }
 
-    pub(crate) fn apply_spatial_frame(&mut self, frame: &SpatialFrame) {
-        let mut changed = false;
-        for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
-            if voice.detached {
-                continue;
-            }
-            if let Some(emitter) = frame.emitter_state(voice.emitter) {
-                voice.emitter_world_pose = emitter.pose;
-                voice.acoustic_priority = emitter.acoustic_priority();
-                changed = true;
-            }
-        }
-        self.dirty |= changed;
-    }
-
     #[cfg(test)]
     fn len(&self) -> usize {
         self.indices.len()
@@ -538,6 +523,29 @@ impl AcousticVoiceInput {
                 changed: Condvar::new(),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wake_generation_for_test(&self) -> u64 {
+        self.input.state.lock().unwrap().wake_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn voice_spatial_for_test(&self, voice_id: VoiceId) -> Option<(Pose, f32, bool)> {
+        self.input
+            .state
+            .lock()
+            .unwrap()
+            .voices
+            .iter()
+            .find(|voice| voice.voice_id == voice_id)
+            .map(|voice| {
+                (
+                    voice.emitter_world_pose,
+                    voice.acoustic_priority,
+                    voice.detached,
+                )
+            })
     }
 
     /// Attempts one complete render-to-worker synchronization without ever waiting.

@@ -731,7 +731,8 @@ impl AcousticPublisher {
         captured_wake_generation: u64,
         completed: CompletedAcousticFrame,
     ) -> std::result::Result<bool, RuntimeChildFailure> {
-        self.counters.record_solve(completed.solve_time_us);
+        let completed_solve_time_us = completed.solve_time_us;
+        self.counters.record_solve(completed_solve_time_us);
         let publication_guard = self.input.state.lock().map_err(|_| {
             RuntimeChildFailure::new("acoustics publication input state is poisoned")
         })?;
@@ -757,6 +758,7 @@ impl AcousticPublisher {
 
         let published_at = Instant::now();
         let output = completed.into_solve_output(published_at);
+        debug_assert_eq!(output.response.solve_time_us, completed_solve_time_us);
         let response_spatial_revision = output.response.spatial_revision;
         let response_geometry_version = output.response.geometry_version;
         self.response_publication
@@ -901,10 +903,12 @@ fn propagation_loop(
         let started = Instant::now();
         let plan = AcousticSolvePlan::for_quality(captured.environmental_acoustics_quality)
             .bounded_by(environmental_acoustics_budget);
-        let mut output = solver.solve_with_telemetry(&captured, distance_scaler, plan);
+        let completed = solver.solve_completed(&captured, distance_scaler, plan);
         let elapsed_us = started.elapsed().as_micros() as u64;
-        output.response.solve_time_us = elapsed_us;
-        let newer_input_pending = publisher.commit(captured.wake_generation, output.into())?;
+        let newer_input_pending = publisher.commit(
+            captured.wake_generation,
+            completed.with_solve_time(elapsed_us),
+        )?;
         if newer_input_pending {
             next_solve = Instant::now();
         }
@@ -920,9 +924,9 @@ fn propagation_loop(
 #[cfg(test)]
 fn retain_compatible_completed_results(
     current: &InputState,
-    output: AcousticSolveOutput,
+    completed: CompletedAcousticFrame,
 ) -> Option<AcousticSolveOutput> {
-    AcousticPublisher::retain_compatible(current, output.into())
+    AcousticPublisher::retain_compatible(current, completed)
         .map(|completed| completed.into_solve_output(Instant::now()))
 }
 
@@ -981,54 +985,195 @@ struct CompletedVoice {
     conclusion: AcousticVoiceConclusionTelemetry,
 }
 
-impl From<AcousticSolveOutput> for CompletedAcousticFrame {
-    fn from(output: AcousticSolveOutput) -> Self {
-        let AcousticSolveOutput {
-            response,
-            mut telemetry,
-            conclusions,
-        } = output;
-        let AcousticResponse {
-            spatial_revision,
-            geometry_version,
-            mut direct,
-            late_reverb,
-            solve_time_us,
-            ..
-        } = response;
-        let voices = conclusions
-            .into_iter()
-            .map(|completed| {
-                let response = direct
-                    .iter()
-                    .position(|response| response.route_key() == completed.route)
-                    .map(|index| direct.swap_remove(index));
-                let telemetry = telemetry
-                    .iter()
-                    .position(|telemetry| telemetry.voice_id == completed.telemetry.voice_id)
-                    .map(|index| telemetry.swap_remove(index));
-                debug_assert_eq!(response.is_some(), telemetry.is_some());
-                CompletedVoice {
-                    route: completed.route,
-                    response,
-                    telemetry,
-                    conclusion: completed.telemetry,
-                }
-            })
-            .collect();
-        debug_assert!(direct.is_empty());
-        debug_assert!(telemetry.is_empty());
-        Self {
-            spatial_revision,
-            geometry_version,
-            late_reverb,
-            solve_time_us,
-            voices,
-        }
-    }
+struct VoiceAdmission {
+    route: VoiceRouteKey,
+    candidate_rank: usize,
+    selected: bool,
+}
+
+struct SolvedVoiceOutput {
+    route: VoiceRouteKey,
+    response: DirectAcousticResponse,
+    telemetry: AcousticExtentTelemetry,
 }
 
 impl CompletedAcousticFrame {
+    /// Seals one solve into route-sorted, indivisible Voice envelopes.
+    ///
+    /// Candidate admission, response data, extent telemetry, and conclusion telemetry cross this
+    /// interface together. Sorting and association stay behind the seam; consumers never have to
+    /// correlate parallel arrays.
+    fn finish_solve(
+        input: &SolveInput,
+        candidates: &[RankedVoice],
+        selected: &[RankedVoice],
+        mut responses: Vec<DirectAcousticResponse>,
+        mut telemetry: Vec<AcousticExtentTelemetry>,
+        late_reverb: LateReverbParameters,
+        plan: AcousticSolvePlan,
+    ) -> Self {
+        let selected_routes = selected
+            .iter()
+            .map(|candidate| candidate.voice.route_key())
+            .collect::<HashSet<_>>();
+        let mut admissions = candidates
+            .iter()
+            .map(|candidate| VoiceAdmission {
+                route: candidate.voice.route_key(),
+                candidate_rank: candidate.candidate_rank,
+                selected: selected_routes.contains(&candidate.voice.route_key()),
+            })
+            .collect::<Vec<_>>();
+        admissions.sort_by(|left, right| compare_voice_routes(left.route, right.route));
+        assert!(
+            admissions.windows(2).all(|pair| {
+                compare_voice_routes(pair[0].route, pair[1].route) == CmpOrdering::Less
+            }),
+            "one Voice route must have exactly one admission record"
+        );
+
+        responses.sort_by(|left, right| compare_voice_routes(left.route_key(), right.route_key()));
+        telemetry.sort_by(|left, right| {
+            compare_voice_ids(VoiceId::from(left.voice_id), VoiceId::from(right.voice_id))
+        });
+        assert_eq!(
+            responses.len(),
+            telemetry.len(),
+            "one solved response must have exactly one extent telemetry record"
+        );
+        let mut outputs = responses
+            .into_iter()
+            .zip(telemetry)
+            .map(|(response, telemetry)| {
+                assert_eq!(
+                    response.voice_id.value(),
+                    telemetry.voice_id,
+                    "response and extent telemetry must belong to the same Voice"
+                );
+                SolvedVoiceOutput {
+                    route: response.route_key(),
+                    response,
+                    telemetry,
+                }
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_by(|left, right| compare_voice_routes(left.route, right.route));
+        assert!(
+            outputs.windows(2).all(|pair| {
+                compare_voice_routes(pair[0].route, pair[1].route) == CmpOrdering::Less
+            }),
+            "one Voice route must have exactly one solved output"
+        );
+
+        let mut active_voices = input.voices.iter().collect::<Vec<_>>();
+        active_voices
+            .sort_by(|left, right| compare_voice_routes(left.route_key(), right.route_key()));
+        assert!(
+            active_voices.windows(2).all(|pair| {
+                compare_voice_ids(pair[0].voice_id, pair[1].voice_id) == CmpOrdering::Less
+            }),
+            "one acoustic publication cannot contain duplicate Voice identities"
+        );
+
+        let mut admissions = admissions.into_iter().peekable();
+        let mut outputs = outputs.into_iter().peekable();
+        let mut voices = Vec::with_capacity(active_voices.len());
+        for voice in active_voices {
+            let route = voice.route_key();
+            let admission = match admissions.peek() {
+                Some(candidate)
+                    if compare_voice_routes(candidate.route, route) == CmpOrdering::Equal =>
+                {
+                    admissions.next()
+                }
+                Some(candidate)
+                    if compare_voice_routes(candidate.route, route) == CmpOrdering::Less =>
+                {
+                    panic!("candidate admission does not belong to an active Voice")
+                }
+                _ => None,
+            };
+            let output = match outputs.peek() {
+                Some(solved) if compare_voice_routes(solved.route, route) == CmpOrdering::Equal => {
+                    outputs.next()
+                }
+                Some(solved) if compare_voice_routes(solved.route, route) == CmpOrdering::Less => {
+                    panic!("solved output does not belong to an active Voice")
+                }
+                _ => None,
+            };
+            assert_eq!(
+                admission.is_some(),
+                output.is_some(),
+                "every candidate must produce one complete response envelope"
+            );
+
+            let direct_enabled =
+                matches!(
+                    voice.direct_path.geometry(),
+                    DirectGeometry::SimulatedTransmission
+                ) && !matches!(voice.direct_path.placement(), DirectPlacement::Disabled);
+            let environment_enabled =
+                !matches!(voice.environment_send.origin(), EnvironmentOrigin::Disabled);
+            let selected = admission
+                .as_ref()
+                .is_some_and(|candidate| candidate.selected);
+            let active_outcome = if selected {
+                AcousticRouteOutcome::Applied
+            } else {
+                AcousticRouteOutcome::ExcludedByBudget
+            };
+            let response = output.as_ref().map(|solved| &solved.response);
+            let extent = output.as_ref().map(|solved| &solved.telemetry);
+            let conclusion = AcousticVoiceConclusionTelemetry {
+                voice_id: voice.voice_id.value(),
+                emitter: voice.emitter,
+                spatial_revision: input.spatial.revision(),
+                geometry_version: input.scene.version(),
+                candidate_rank: admission.as_ref().map(|candidate| candidate.candidate_rank),
+                candidate_limit: plan.max_direct_sources,
+                direct: if direct_enabled {
+                    active_outcome
+                } else {
+                    AcousticRouteOutcome::Disabled
+                },
+                environment: if environment_enabled {
+                    active_outcome
+                } else {
+                    AcousticRouteOutcome::Disabled
+                },
+                environment_transmission_gain: response
+                    .map_or([1.0; 3], |response| response.environment_gain),
+                early_tap_count: response.map_or(0, |response| response.early_reflections.len()),
+                solve_status: extent.map(|event| event.solve_status),
+            };
+            let (response, telemetry) = output.map_or((None, None), |solved| {
+                (Some(solved.response), Some(solved.telemetry))
+            });
+            voices.push(CompletedVoice {
+                route,
+                response,
+                telemetry,
+                conclusion,
+            });
+        }
+        assert!(admissions.next().is_none(), "orphaned candidate admission");
+        assert!(outputs.next().is_none(), "orphaned solved output");
+
+        Self {
+            spatial_revision: input.spatial.revision(),
+            geometry_version: input.scene.version(),
+            late_reverb,
+            solve_time_us: 0,
+            voices,
+        }
+    }
+
+    fn with_solve_time(mut self, solve_time_us: u64) -> Self {
+        self.solve_time_us = solve_time_us;
+        self
+    }
+
     fn into_solve_output(self, published_at: Instant) -> AcousticSolveOutput {
         let mut direct = Vec::with_capacity(self.voices.len());
         let mut telemetry = Vec::with_capacity(self.voices.len());
@@ -1041,12 +1186,9 @@ impl CompletedAcousticFrame {
                 telemetry.push(event);
             }
             conclusions.push(CompletedVoiceConclusion {
-                route: voice.route,
                 telemetry: voice.conclusion,
             });
         }
-        direct.sort_by_key(|response| response.voice_id.value());
-        telemetry.sort_by_key(|event| event.voice_id);
         AcousticSolveOutput {
             response: AcousticResponse {
                 spatial_revision: self.spatial_revision,
@@ -1063,7 +1205,6 @@ impl CompletedAcousticFrame {
 }
 
 struct CompletedVoiceConclusion {
-    route: VoiceRouteKey,
     telemetry: AcousticVoiceConclusionTelemetry,
 }
 
@@ -1123,12 +1264,23 @@ impl AcousticSolver {
             .response
     }
 
+    #[cfg(test)]
     fn solve_with_telemetry(
         &mut self,
         input: &SolveInput,
         distance_scaler: f32,
         plan: AcousticSolvePlan,
     ) -> AcousticSolveOutput {
+        self.solve_completed(input, distance_scaler, plan)
+            .into_solve_output(Instant::now())
+    }
+
+    fn solve_completed(
+        &mut self,
+        input: &SolveInput,
+        distance_scaler: f32,
+        plan: AcousticSolvePlan,
+    ) -> CompletedAcousticFrame {
         let candidates = ranked_voices(input, &self.previous_budget_membership);
         let (selected, skipped) = select_budgeted_candidates(&candidates, plan);
         let (mut direct, mut telemetry) = solve_direct(
@@ -1187,11 +1339,6 @@ impl AcousticSolver {
             direct.push(response);
             telemetry.push(event);
         }
-        direct.sort_by_key(|response| response.voice_id.value());
-        telemetry.sort_by_key(|event| event.voice_id);
-        let conclusions =
-            voice_conclusions(input, &candidates, &selected, &direct, &telemetry, plan);
-
         self.previous_budget_membership.clear();
         self.previous_budget_membership
             .extend(selected.iter().map(|candidate| candidate.voice.route_key()));
@@ -1212,89 +1359,16 @@ impl AcousticSolver {
                 && key.geometry_version == input.scene.version()
         });
 
-        AcousticSolveOutput {
-            response: AcousticResponse {
-                spatial_revision: input.spatial.revision(),
-                geometry_version: input.scene.version(),
-                direct,
-                late_reverb: solve_late_reverb(input, distance_scaler, plan),
-                published_at: Instant::now(),
-                solve_time_us: 0,
-            },
+        CompletedAcousticFrame::finish_solve(
+            input,
+            &candidates,
+            &selected,
+            direct,
             telemetry,
-            conclusions,
-        }
+            solve_late_reverb(input, distance_scaler, plan),
+            plan,
+        )
     }
-}
-
-fn voice_conclusions(
-    input: &SolveInput,
-    candidates: &[RankedVoice],
-    selected: &[RankedVoice],
-    responses: &[DirectAcousticResponse],
-    telemetry: &[AcousticExtentTelemetry],
-    plan: AcousticSolvePlan,
-) -> Vec<CompletedVoiceConclusion> {
-    let selected_routes = selected
-        .iter()
-        .map(|candidate| candidate.voice.route_key())
-        .collect::<HashSet<_>>();
-    input
-        .voices
-        .iter()
-        .map(|voice| {
-            let route = voice.route_key();
-            let candidate = candidates.iter().find(|candidate| {
-                compare_voice_routes(candidate.voice.route_key(), route) == CmpOrdering::Equal
-            });
-            let selected = selected_routes.contains(&route);
-            let direct_enabled =
-                matches!(
-                    voice.direct_path.geometry(),
-                    DirectGeometry::SimulatedTransmission
-                ) && !matches!(voice.direct_path.placement(), DirectPlacement::Disabled);
-            let environment_enabled =
-                !matches!(voice.environment_send.origin(), EnvironmentOrigin::Disabled);
-            let response = responses.iter().find(|response| {
-                compare_voice_routes(response.route_key(), route) == CmpOrdering::Equal
-            });
-            let extent = telemetry.iter().find(|event| {
-                compare_voice_ids(VoiceId::from(event.voice_id), voice.voice_id)
-                    == CmpOrdering::Equal
-            });
-            let active_outcome = if selected {
-                AcousticRouteOutcome::Applied
-            } else {
-                AcousticRouteOutcome::ExcludedByBudget
-            };
-            CompletedVoiceConclusion {
-                route,
-                telemetry: AcousticVoiceConclusionTelemetry {
-                    voice_id: voice.voice_id.value(),
-                    emitter: voice.emitter,
-                    spatial_revision: input.spatial.revision(),
-                    geometry_version: input.scene.version(),
-                    candidate_rank: candidate.map(|candidate| candidate.candidate_rank),
-                    candidate_limit: plan.max_direct_sources,
-                    direct: if direct_enabled {
-                        active_outcome
-                    } else {
-                        AcousticRouteOutcome::Disabled
-                    },
-                    environment: if environment_enabled {
-                        active_outcome
-                    } else {
-                        AcousticRouteOutcome::Disabled
-                    },
-                    environment_transmission_gain: response
-                        .map_or([1.0; 3], |response| response.environment_gain),
-                    early_tap_count: response
-                        .map_or(0, |response| response.early_reflections.len()),
-                    solve_status: extent.map(|event| event.solve_status),
-                },
-            }
-        })
-        .collect()
 }
 
 fn deferred_response(voice: &AcousticVoice) -> DirectAcousticResponse {
@@ -3163,7 +3237,7 @@ mod tests {
             voice.routing_generation = routing_generation;
             captured.voices.push(voice);
         }
-        let output = AcousticSolver::new(3).solve_with_telemetry(
+        let completed = AcousticSolver::new(3).solve_completed(
             &captured,
             1.0,
             AcousticSolvePlan::for_quality(0.5),
@@ -3188,7 +3262,7 @@ mod tests {
         rerouted.routing_generation = 20;
         rerouted.environment_send = EnvironmentSend::from_world_pose(Pose::from_position(-Vec3::Z));
 
-        let filtered = retain_compatible_completed_results(&current, output).unwrap();
+        let filtered = retain_compatible_completed_results(&current, completed).unwrap();
 
         assert_eq!(
             filtered.response.spatial_revision,
@@ -3229,7 +3303,7 @@ mod tests {
     #[test]
     fn scene_change_rejects_completed_publication() {
         let captured = input(Arc::new(NoGeometry));
-        let output = AcousticSolver::new(1).solve_with_telemetry(
+        let completed = AcousticSolver::new(1).solve_completed(
             &captured,
             1.0,
             AcousticSolvePlan::for_quality(0.5),
@@ -3242,7 +3316,7 @@ mod tests {
             Arc::new(NoGeometry),
         )));
 
-        assert!(retain_compatible_completed_results(&current, output).is_none());
+        assert!(retain_compatible_completed_results(&current, completed).is_none());
     }
 
     #[test]

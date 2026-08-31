@@ -210,7 +210,7 @@ impl PetalSonicEngine {
         })
     }
 
-    pub(crate) fn drain_retired_backend_resources(&mut self) {
+    pub(crate) fn drain_retired_voice_resources(&mut self) {
         while self.voice_retirement_receiver.try_recv().is_ok() {}
     }
 
@@ -223,7 +223,7 @@ impl PetalSonicEngine {
 
     pub(crate) fn close(&mut self) -> Result<()> {
         self.output.close()?;
-        self.drain_retired_backend_resources();
+        self.drain_retired_voice_resources();
         Ok(())
     }
 

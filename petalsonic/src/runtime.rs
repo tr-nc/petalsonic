@@ -75,7 +75,7 @@ pub(crate) trait OutputRuntimeDriver {
 
 impl OutputRuntimeDriver for PetalSonicEngine {
     fn drain_retired_resources(&mut self) {
-        PetalSonicEngine::drain_retired_backend_resources(self);
+        PetalSonicEngine::drain_retired_voice_resources(self);
     }
 
     fn reconcile_output(&mut self, request: OutputRecoveryRequest) -> OutputRecoveryResult {

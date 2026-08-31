@@ -580,7 +580,7 @@ mod tests {
         let (lifecycle_sender, lifecycle) =
             crossbeam_channel::bounded(desc.lifecycle_queue_capacity);
         let (retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
-        let (backend_retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
+        let (voice_retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
         let (_spatial_publisher, spatial_frames) = RealtimeLatest::bounded(1);
         let (_acoustic_publisher, acoustic_responses) = RealtimeLatest::bounded(2);
         let frames_processed = Arc::new(AtomicUsize::new(0));
@@ -607,12 +607,9 @@ mod tests {
             timing_sender,
             counters.clone(),
         );
-        let render = RenderQuantum::new(
-            startup,
-            vec![BusParams::default()],
-            backend_retirement_sender,
-        )
-        .unwrap();
+        let render =
+            RenderQuantum::new(startup, vec![BusParams::default()], voice_retirement_sender)
+                .unwrap();
         // The render quantum owns the receiving endpoints for the fixture's
         // lifetime; senders only keep command channels connected.
         let _command_owners = (regular_sender, lifecycle_sender);

@@ -175,15 +175,26 @@ impl AcousticResponse {
         #[cfg(test)]
         crate::test_support::record_acoustic_response_lookup();
         self.direct
-            .binary_search_by(|response| {
-                #[cfg(test)]
-                crate::test_support::record_acoustic_publication_comparison();
-                response.voice_id.value().cmp(&voice_id.value())
-            })
+            .binary_search_by(|response| compare_voice_ids(response.voice_id, voice_id))
             .ok()
             .map(|index| &self.direct[index])
             .map(|voice| VoiceAcousticResponse { frame: self, voice })
     }
+}
+
+fn compare_voice_ids(left: VoiceId, right: VoiceId) -> CmpOrdering {
+    #[cfg(test)]
+    crate::test_support::record_acoustic_publication_comparison();
+    left.value().cmp(&right.value())
+}
+
+fn compare_voice_routes(left: VoiceRouteKey, right: VoiceRouteKey) -> CmpOrdering {
+    #[cfg(test)]
+    crate::test_support::record_acoustic_publication_comparison();
+    left.voice_id
+        .value()
+        .cmp(&right.voice_id.value())
+        .then_with(|| left.routing_generation.cmp(&right.routing_generation))
 }
 
 /// Immutable routing and the latest compatible emitter state for one active Voice.
@@ -1233,9 +1244,9 @@ fn voice_conclusions(
         .iter()
         .map(|voice| {
             let route = voice.route_key();
-            let candidate = candidates
-                .iter()
-                .find(|candidate| candidate.voice.route_key() == route);
+            let candidate = candidates.iter().find(|candidate| {
+                compare_voice_routes(candidate.voice.route_key(), route) == CmpOrdering::Equal
+            });
             let selected = selected_routes.contains(&route);
             let direct_enabled =
                 matches!(
@@ -1244,12 +1255,13 @@ fn voice_conclusions(
                 ) && !matches!(voice.direct_path.placement(), DirectPlacement::Disabled);
             let environment_enabled =
                 !matches!(voice.environment_send.origin(), EnvironmentOrigin::Disabled);
-            let response = responses
-                .iter()
-                .find(|response| response.route_key() == route);
-            let extent = telemetry
-                .iter()
-                .find(|event| event.voice_id == voice.voice_id.value());
+            let response = responses.iter().find(|response| {
+                compare_voice_routes(response.route_key(), route) == CmpOrdering::Equal
+            });
+            let extent = telemetry.iter().find(|event| {
+                compare_voice_ids(VoiceId::from(event.voice_id), voice.voice_id)
+                    == CmpOrdering::Equal
+            });
             let active_outcome = if selected {
                 AcousticRouteOutcome::Applied
             } else {
@@ -2573,6 +2585,59 @@ mod tests {
         assert!(
             comparisons <= (VOICES + 1) * MAX_BINARY_COMPARISONS_PER_LOOKUP,
             "4096-Voice render publication performed {comparisons} comparisons"
+        );
+    }
+
+    #[test]
+    fn completed_voice_publication_association_is_bounded_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        const MAX_LOGARITHMIC_COMPARISONS_PER_VOICE: usize = 40;
+        let mut workload = input(Arc::new(NoGeometry));
+        let template = workload.voices[0].clone();
+        workload.voices = (0..VOICES)
+            .map(|voice| {
+                let mut voice_input = template.clone();
+                voice_input.voice_id = VoiceId::from(voice as u64 + 1);
+                voice_input.routing_generation = voice as u64 + 11;
+                voice_input.emitter.index = voice as u32;
+                voice_input
+            })
+            .collect();
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 0,
+            max_direct_rays: 0,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let mut output = None;
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            output = Some(AcousticSolver::new(VOICES).solve_with_telemetry(&workload, 1.0, plan));
+        });
+        let output = output.unwrap();
+
+        assert_eq!(output.response.direct.len(), VOICES);
+        assert_eq!(output.telemetry.len(), VOICES);
+        assert_eq!(output.conclusions.len(), VOICES);
+        for voice in [1, VOICES as u64 / 2, VOICES as u64] {
+            let response = output
+                .response
+                .voice_response(VoiceId::from(voice))
+                .unwrap();
+            assert_eq!(response.direct_gain_target(), None);
+            let telemetry = &output.telemetry[voice as usize - 1];
+            assert_eq!(telemetry.voice_id, voice);
+            assert_eq!(telemetry.solve_status, AcousticSolveStatus::Deferred);
+            let conclusion = &output.conclusions[voice as usize - 1].telemetry;
+            assert_eq!(conclusion.voice_id, voice);
+            assert_eq!(conclusion.solve_status, Some(AcousticSolveStatus::Deferred));
+        }
+        assert!(
+            comparisons <= VOICES * MAX_LOGARITHMIC_COMPARISONS_PER_VOICE,
+            "4096-Voice completion association performed {comparisons} comparisons"
         );
     }
 

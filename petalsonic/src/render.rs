@@ -819,10 +819,15 @@ impl RenderQuantum {
     /// Replacing the buffer preserves the no-allocation contract if cleanup is retried and the
     /// engine is subsequently reconciled again.
     pub(crate) fn take_quiesced_voice_retirements(&mut self) -> Vec<VoiceRetirement> {
-        std::mem::replace(
+        let retirements = std::mem::replace(
             &mut self.pending_voice_retirements,
             Vec::with_capacity(self.max_voices),
-        )
+        );
+        if !retirements.is_empty() {
+            self.active_voice_count
+                .fetch_sub(retirements.len(), Ordering::AcqRel);
+        }
+        retirements
     }
 
     fn try_send_event(

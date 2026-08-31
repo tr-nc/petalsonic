@@ -292,6 +292,7 @@ impl PreparedVoice {
             fade_out_remaining_frames: 0,
             fade_out_total_frames: 0,
             retired: false,
+            reclaim_issued: false,
         };
         playback.play_from_beginning();
         (voice_id, playback, acoustic_voice)
@@ -373,6 +374,13 @@ pub struct PlaybackInstance {
     fade_out_remaining_frames: usize,
     fade_out_total_frames: usize,
     retired: bool,
+    reclaim_issued: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackReclaim {
+    pub emitter: Emitter,
+    pub completion_tag: Option<PlaybackTag>,
 }
 
 impl PlaybackInstance {
@@ -393,6 +401,7 @@ impl PlaybackInstance {
     pub fn play_from_beginning(&mut self) {
         self.reset();
         self.retired = false;
+        self.reclaim_issued = false;
         self.fade_out_remaining_frames = 0;
         self.fade_out_total_frames = 0;
         self.resume();
@@ -638,8 +647,19 @@ impl PlaybackInstance {
         }
     }
 
-    pub(crate) fn should_reclaim(&self) -> bool {
-        self.retired || matches!(self.loop_mode, LoopMode::Once) && self.info.is_finished()
+    pub(crate) fn take_reclaim(&mut self) -> Option<PlaybackReclaim> {
+        #[cfg(test)]
+        crate::test_support::record_render_completion_step();
+        let reclaimable =
+            self.retired || matches!(self.loop_mode, LoopMode::Once) && self.info.is_finished();
+        if self.reclaim_issued || !reclaimable {
+            return None;
+        }
+        self.reclaim_issued = true;
+        Some(PlaybackReclaim {
+            emitter: self.emitter,
+            completion_tag: self.completion_tag,
+        })
     }
 
     pub(crate) fn take_first_render_command_id(&mut self) -> Option<PlayCommandId> {
@@ -941,7 +961,12 @@ mod tests {
         assert_eq!(instance.fill_mono_buffer(&mut output, 1.0), 240);
         assert!(output[0] > output[120]);
         assert!(output[120] > output[239]);
-        assert!(instance.should_reclaim());
+        let reclaim = instance
+            .take_reclaim()
+            .expect("completed fade must issue one reclaim");
+        assert_eq!(reclaim.emitter, instance.emitter);
+        assert_eq!(reclaim.completion_tag, None);
+        assert_eq!(instance.take_reclaim(), None);
         assert_eq!(instance.completion_tag, None);
     }
 }

@@ -175,12 +175,13 @@ impl AcousticResponse {
         #[cfg(test)]
         crate::test_support::record_acoustic_response_lookup();
         self.direct
-            .iter()
-            .find(|response| {
+            .binary_search_by(|response| {
                 #[cfg(test)]
                 crate::test_support::record_acoustic_publication_comparison();
-                response.voice_id == voice_id
+                response.voice_id.value().cmp(&voice_id.value())
             })
+            .ok()
+            .map(|index| &self.direct[index])
             .map(|voice| VoiceAcousticResponse { frame: self, voice })
     }
 }

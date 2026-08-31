@@ -96,6 +96,35 @@ pub(crate) struct SupervisorSchedule {
     last_advance: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct RuntimeCloseReport {
+    failure: Option<String>,
+}
+
+impl RuntimeCloseReport {
+    fn capture(result: Result<()>) -> Self {
+        let failure = match result {
+            Ok(()) => None,
+            Err(PetalSonicError::Engine(detail)) => Some(detail),
+            Err(error) => Some(error.to_string()),
+        };
+        Self { failure }
+    }
+
+    fn result(&self) -> Result<()> {
+        match &self.failure {
+            Some(detail) => Err(PetalSonicError::Engine(detail.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RuntimeCloseState {
+    Open,
+    Closed(RuntimeCloseReport),
+}
+
 impl SupervisorSchedule {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
@@ -132,7 +161,7 @@ pub(crate) struct AudioRuntime {
     services: RuntimeServices,
     #[cfg(test)]
     render_worker_fault: RenderWorkerFaultInjector,
-    close_lock: Mutex<()>,
+    close_state: Mutex<RuntimeCloseState>,
 }
 
 impl AudioRuntime {
@@ -249,7 +278,7 @@ impl AudioRuntime {
             services,
             #[cfg(test)]
             render_worker_fault,
-            close_lock: Mutex::new(()),
+            close_state: Mutex::new(RuntimeCloseState::Open),
         })
     }
 
@@ -537,22 +566,26 @@ impl AudioRuntime {
     }
 
     pub(crate) fn close(&self) -> Result<()> {
-        let _close_guard = self
-            .close_lock
+        let mut close_state = self
+            .close_state
             .lock()
             .map_err(|_| PetalSonicError::Engine("Runtime close lock is poisoned".into()))?;
-        if RuntimeState::load(&self.runtime_state) == RuntimeState::Closed {
-            return Ok(());
+        if let RuntimeCloseState::Closed(report) = &*close_state {
+            return report.result();
         }
         self.runtime_state
             .store(RuntimeState::Closing as u8, Ordering::Release);
-        let shutdown_result = self.services.close();
+        let report = RuntimeCloseReport::capture(self.services.close());
         self.spatial_frames.close();
         self.acoustic_propagation.close_publication();
         self.active_voice_count.store(0, Ordering::Release);
+        *close_state = RuntimeCloseState::Closed(report);
         self.runtime_state
             .store(RuntimeState::Closed as u8, Ordering::Release);
-        shutdown_result
+        let RuntimeCloseState::Closed(report) = &*close_state else {
+            unreachable!("the close transaction committed its terminal report")
+        };
+        report.result()
     }
 
     pub(crate) fn supervisor_tick<D: OutputRuntimeDriver>(

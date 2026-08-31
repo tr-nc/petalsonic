@@ -1169,13 +1169,54 @@ mod tests {
 
         world.runtime.fail_acoustic_worker_for_test();
         wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Failed);
-        let close_error = world
+        let first_close_error = world
             .close()
             .expect_err("an abnormal acoustics exit must remain visible during close");
+        let repeated_close_error = world
+            .close()
+            .expect_err("the terminal child failure must remain visible on close reentry");
         assert!(
-            close_error.to_string().contains("acoustics"),
-            "close reported an unrelated failure: {close_error}"
+            first_close_error.to_string().contains("acoustics"),
+            "close reported an unrelated failure: {first_close_error}"
         );
+        assert_eq!(
+            repeated_close_error.to_string(),
+            first_close_error.to_string(),
+            "close reentry must observe the original terminal outcome"
+        );
+        assert_eq!(world.runtime_status().state, RuntimeState::Closed);
+    }
+
+    #[test]
+    fn concurrent_close_observers_share_one_terminal_child_failure() {
+        let device = PlatformFakeDevice::stereo("A", 48_000);
+        let (adapter, _) = FakeOutputPlatform::scripted(vec![device], Some(0));
+        let desc = crate::config::PetalSonicWorldDesc {
+            environmental_acoustics_enabled: true,
+            ..Default::default()
+        };
+        let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
+        world.runtime.fail_acoustic_worker_for_test();
+        wait_for_async_observation(|| world.runtime_status().state == RuntimeState::Failed);
+
+        let start = std::sync::Barrier::new(3);
+        let (left, right) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                start.wait();
+                world.close()
+            });
+            let right = scope.spawn(|| {
+                start.wait();
+                world.close()
+            });
+            start.wait();
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        let left = left.expect_err("every close observer must see the terminal child failure");
+        let right = right.expect_err("every close observer must see the terminal child failure");
+
+        assert_eq!(left.to_string(), right.to_string());
+        assert!(left.to_string().contains("acoustics"));
         assert_eq!(world.runtime_status().state, RuntimeState::Closed);
     }
 
@@ -1189,6 +1230,7 @@ mod tests {
         };
         let world = PetalSonicWorld::new_with_output(desc, move || Ok(Box::new(adapter))).unwrap();
 
+        world.close().unwrap();
         world.close().unwrap();
         assert_eq!(world.runtime_status().state, RuntimeState::Closed);
     }

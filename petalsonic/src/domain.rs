@@ -1,4 +1,4 @@
-use crate::audio_data::PetalSonicAudioData;
+use crate::audio_data::{PetalSonicAudioData, decode_file};
 use crate::math::Pose;
 pub use crate::occlusion::{DistributedOcclusionProfile, MAX_DIRECT_LOBES, OcclusionProfile};
 use crate::playback::LoopMode;
@@ -21,12 +21,19 @@ impl ResidentClip {
             crate::error::PetalSonicError::AudioLoading("Audio path is not valid UTF-8".to_string())
         })?;
         Ok(Self {
-            data: PetalSonicAudioData::from_path(path)?,
+            data: Arc::new(decode_file(path)?),
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn from_audio_data(data: Arc<PetalSonicAudioData>) -> Self {
         Self { data }
+    }
+
+    pub(crate) fn resampled_to(self, sample_rate: u32) -> crate::error::Result<Self> {
+        Ok(Self {
+            data: self.data.resample(sample_rate)?,
+        })
     }
 
     /// Take ownership of predecoded interleaved PCM without copying its sample buffer.
@@ -146,6 +153,37 @@ mod tests {
             crate::error::PetalSonicError::Io(ref source)
                 if source.kind() == std::io::ErrorKind::NotFound
         ));
+    }
+
+    #[test]
+    fn resident_clip_decodes_supported_file_through_public_constructor() {
+        let path = std::env::temp_dir().join(format!(
+            "petalsonic-resident-clip-{}-mono.wav",
+            std::process::id()
+        ));
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&40_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&4_u32.to_le_bytes());
+        wav.extend_from_slice(&0_i16.to_le_bytes());
+        wav.extend_from_slice(&i16::MAX.to_le_bytes());
+        std::fs::write(&path, wav).unwrap();
+
+        let decoded = ResidentClip::from_path(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(decoded.sample_rate(), 8_000);
+        assert_eq!(decoded.channels(), 1);
+        assert_eq!(decoded.total_frames(), 2);
     }
 
     #[cfg(unix)]

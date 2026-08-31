@@ -110,6 +110,59 @@ mod tests {
     }
 
     #[test]
+    fn resident_clip_owns_noop_and_converting_resampling() {
+        let clip = ResidentClip::from_interleaved_pcm(
+            (0..4_096)
+                .flat_map(|frame| {
+                    let sample = frame as f32 / 4_096.0;
+                    [sample, -sample]
+                })
+                .collect(),
+            24_000,
+            2,
+        )
+        .unwrap();
+
+        let unchanged = clip.clone().resampled_to(24_000).unwrap();
+        assert_eq!(unchanged.sample_rate(), 24_000);
+        assert_eq!(unchanged.channels(), 2);
+        assert_eq!(unchanged.total_frames(), 4_096);
+
+        let converted = clip.resampled_to(48_000).unwrap();
+        assert_eq!(converted.sample_rate(), 48_000);
+        assert_eq!(converted.channels(), 2);
+        assert!(converted.total_frames() > 4_096);
+    }
+
+    #[test]
+    fn resident_clip_preserves_missing_file_error_kind() {
+        let path = std::env::temp_dir().join(format!(
+            "petalsonic-definitely-missing-{}-resident-clip.wav",
+            std::process::id()
+        ));
+        let error = ResidentClip::from_path(path).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::PetalSonicError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_clip_preserves_non_utf8_path_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        let error = ResidentClip::from_path(path).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::PetalSonicError::AudioLoading(ref reason)
+                if reason == "Audio path is not valid UTF-8"
+        ));
+    }
+
+    #[test]
     fn spatial_frame_indexes_the_complete_emitter_generation() {
         let old_generation = Emitter {
             world_id: 7,

@@ -278,9 +278,9 @@ impl InputState {
     }
 
     fn voice_route_is_current(&self, route: VoiceRouteKey) -> bool {
-        self.voices.iter().any(|voice| {
-            voice.voice_id == route.voice_id && voice.routing_generation == route.routing_generation
-        })
+        self.voices
+            .iter()
+            .any(|voice| compare_voice_routes(voice.route_key(), route) == CmpOrdering::Equal)
     }
 }
 
@@ -2712,6 +2712,98 @@ mod tests {
         assert!(
             comparisons <= VOICES * MAX_LOGARITHMIC_COMPARISONS_PER_VOICE,
             "4096-Voice completion association performed {comparisons} comparisons"
+        );
+    }
+
+    #[test]
+    fn compatibility_retain_is_bounded_and_keeps_voice_envelopes_grouped() {
+        const VOICES: usize = 4_096;
+        const REROUTED: usize = 16;
+        const RETIRED: usize = 16;
+        const MAX_LOGARITHMIC_COMPARISONS_PER_VOICE: usize = 32;
+        let mut captured = input(Arc::new(NoGeometry));
+        let template = captured.voices[0].clone();
+        captured.voices = (0..VOICES)
+            .map(|voice| {
+                let mut voice_input = template.clone();
+                voice_input.voice_id = VoiceId::from(voice as u64 + 1);
+                voice_input.routing_generation = voice as u64 + 11;
+                voice_input.emitter.index = voice as u32;
+                voice_input
+            })
+            .collect();
+        let plan = AcousticSolvePlan {
+            max_direct_sources: 0,
+            max_direct_rays: 0,
+            max_early_reflection_sources: 0,
+            early_reflection_taps: 0,
+            early_reflection_ray_count: 0,
+            late_ray_count: 0,
+            late_bounce_count: 0,
+        };
+        let completed = AcousticSolver::new(VOICES).solve_completed(&captured, 1.0, plan);
+        let mut current = InputState::new(0.5, VOICES);
+        current.scene = Some(captured.scene.clone());
+        current.spatial = Some(Arc::new(SpatialFrame::new(
+            captured.spatial.revision() + 99,
+            captured.spatial.sim_time_seconds() + 1.0,
+            Pose::from_position(Vec3::X),
+            Vec::new(),
+        )));
+        current.voices = captured.voices.clone();
+        for voice in current
+            .voices
+            .iter_mut()
+            .filter(|voice| voice.voice_id.value() <= REROUTED as u64)
+        {
+            voice.routing_generation += 10_000;
+        }
+        current
+            .voices
+            .retain(|voice| voice.voice_id.value() <= (VOICES - RETIRED) as u64);
+        current.voices.reverse();
+        let mut retained = None;
+
+        let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
+            retained = AcousticPublisher::retain_compatible(&current, completed);
+        });
+        let retained = retained.unwrap().into_solve_output(Instant::now());
+        let expected = VOICES - REROUTED - RETIRED;
+
+        assert_eq!(retained.response.direct.len(), expected);
+        assert_eq!(retained.telemetry.len(), expected);
+        assert_eq!(retained.conclusions.len(), expected);
+        assert_eq!(
+            retained.response.spatial_revision,
+            captured.spatial.revision()
+        );
+        assert!(
+            retained
+                .response
+                .voice_response(VoiceId::from(REROUTED as u64))
+                .is_none()
+        );
+        assert_eq!(
+            retained.response.direct.first().unwrap().voice_id,
+            VoiceId::from(REROUTED as u64 + 1)
+        );
+        assert_eq!(
+            retained.response.direct.last().unwrap().voice_id,
+            VoiceId::from((VOICES - RETIRED) as u64)
+        );
+        for index in [0, expected / 2, expected - 1] {
+            assert_eq!(
+                retained.response.direct[index].voice_id.value(),
+                retained.telemetry[index].voice_id
+            );
+            assert_eq!(
+                retained.response.direct[index].voice_id.value(),
+                retained.conclusions[index].telemetry.voice_id
+            );
+        }
+        assert!(
+            comparisons <= VOICES * MAX_LOGARITHMIC_COMPARISONS_PER_VOICE,
+            "4096-Voice compatibility retain performed {comparisons} comparisons"
         );
     }
 

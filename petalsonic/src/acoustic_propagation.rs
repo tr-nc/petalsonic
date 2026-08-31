@@ -540,6 +540,29 @@ impl AcousticVoiceInput {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn wake_generation_for_test(&self) -> u64 {
+        self.input.state.lock().unwrap().wake_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn voice_spatial_for_test(&self, voice_id: VoiceId) -> Option<(Pose, f32, bool)> {
+        self.input
+            .state
+            .lock()
+            .unwrap()
+            .voices
+            .iter()
+            .find(|voice| voice.voice_id == voice_id)
+            .map(|voice| {
+                (
+                    voice.emitter_world_pose,
+                    voice.acoustic_priority,
+                    voice.detached,
+                )
+            })
+    }
+
     /// Attempts one complete render-to-worker synchronization without ever waiting.
     ///
     /// A busy worker leaves the registry dirty so the next render quantum retries. Poison is

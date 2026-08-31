@@ -536,7 +536,6 @@ impl RenderQuantum {
             return;
         };
         Self::apply_spatial_frame_to_voices(&next, &mut self.active_playback);
-        self.acoustic_voices.apply_spatial_frame(&next);
         if let Some(previous) = self.current_spatial_frame.replace(next) {
             self.spatial_frames.retire(previous);
         }

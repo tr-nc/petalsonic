@@ -508,21 +508,6 @@ impl AcousticVoiceRegistry {
         self.dirty |= changed;
     }
 
-    pub(crate) fn apply_spatial_frame(&mut self, frame: &SpatialFrame) {
-        let mut changed = false;
-        for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
-            if voice.detached {
-                continue;
-            }
-            if let Some(emitter) = frame.emitter_state(voice.emitter) {
-                voice.emitter_world_pose = emitter.pose;
-                voice.acoustic_priority = emitter.acoustic_priority();
-                changed = true;
-            }
-        }
-        self.dirty |= changed;
-    }
-
     #[cfg(test)]
     fn len(&self) -> usize {
         self.indices.len()

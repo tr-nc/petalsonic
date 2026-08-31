@@ -20,6 +20,8 @@ use crate::spatial::LateReverbParameters;
 use crossbeam_channel::{Receiver, Sender};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -195,6 +197,59 @@ pub(crate) struct AcousticVoice {
     pub source_extent: SourceExtent,
     pub occlusion_profile: OcclusionProfile,
     pub(crate) routing_generation: u64,
+    #[cfg(test)]
+    pub(crate) retirement_witness: Option<AcousticVoiceRetirementWitness>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AcousticVoiceRetirementObservation {
+    dropped_identity: AtomicU64,
+    drop_count: AtomicUsize,
+    realtime_drop_count: AtomicUsize,
+}
+
+#[cfg(test)]
+impl AcousticVoiceRetirementObservation {
+    pub(crate) fn observed(&self) -> (u64, usize, usize) {
+        (
+            self.dropped_identity.load(Ordering::Acquire),
+            self.drop_count.load(Ordering::Acquire),
+            self.realtime_drop_count.load(Ordering::Acquire),
+        )
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct AcousticVoiceRetirementWitness {
+    identity: u64,
+    observation: Arc<AcousticVoiceRetirementObservation>,
+}
+
+#[cfg(test)]
+impl AcousticVoiceRetirementWitness {
+    pub(crate) fn new(identity: u64, observation: Arc<AcousticVoiceRetirementObservation>) -> Self {
+        Self {
+            identity,
+            observation,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AcousticVoiceRetirementWitness {
+    fn drop(&mut self) {
+        self.observation
+            .dropped_identity
+            .store(self.identity, Ordering::Release);
+        self.observation.drop_count.fetch_add(1, Ordering::AcqRel);
+        if crate::test_support::realtime_probe_is_active() {
+            self.observation
+                .realtime_drop_count
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl AcousticVoice {
@@ -2911,6 +2966,7 @@ mod tests {
                 environment_send: EnvironmentSend::default(),
                 source_extent: SourceExtent::Point,
                 occlusion_profile: OcclusionProfile::PointExact,
+                retirement_witness: None,
             }],
             environmental_acoustics_quality: 0.5,
         }
@@ -3955,6 +4011,7 @@ mod tests {
                 source_extent: SourceExtent::Point,
                 occlusion_profile: OcclusionProfile::PointExact,
                 routing_generation: 1,
+                retirement_witness: None,
             },
             AcousticVoice {
                 voice_id: VoiceId::from(42),
@@ -3969,6 +4026,7 @@ mod tests {
                 source_extent: SourceExtent::Point,
                 occlusion_profile: OcclusionProfile::PointExact,
                 routing_generation: 2,
+                retirement_witness: None,
             },
         ];
 
@@ -4068,6 +4126,7 @@ mod tests {
             source_extent: SourceExtent::Point,
             occlusion_profile: OcclusionProfile::PointExact,
             routing_generation: 0,
+            retirement_witness: None,
         });
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(7, query.clone())))
@@ -4248,6 +4307,7 @@ mod tests {
             source_extent: SourceExtent::Point,
             occlusion_profile: OcclusionProfile::PointExact,
             routing_generation: 0,
+            retirement_witness: None,
         });
         propagation
             .publish_scene(Arc::new(AcousticSceneSnapshot::new(

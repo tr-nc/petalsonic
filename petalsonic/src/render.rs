@@ -988,6 +988,7 @@ mod tests {
                     source_extent: SourceExtent::Point,
                     occlusion_profile: OcclusionProfile::PointExact,
                     routing_generation: 0,
+                    retirement_witness: None,
                 });
             harness
                 .acoustic_responses

@@ -704,16 +704,157 @@ impl Drop for AudioRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acoustic_propagation::{
+        AcousticVoiceInput, AcousticVoiceRetirementObservation, AcousticVoiceRetirementWitness,
+    };
+    use crate::audio_data::PetalSonicAudioData;
+    use crate::domain::{
+        Emitter, EmitterDesc, ExtentSample, ExtentSampleId, PlayOptions, SourceExtent,
+    };
     use crate::platform::output::{
         OutputDeviceState, OutputRecoveryCause, OutputRecoveryRequest, OutputRecoveryResult,
+        fake::FakeOutputPlatform,
     };
-    use std::sync::atomic::{AtomicU8, AtomicU64};
+    use crate::playback::prepare_test_voice;
+    use crate::realtime_latest::RealtimeLatest;
+    use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct FakeDevice {
         name: &'static str,
         sample_rate: u32,
         channels: u16,
+    }
+
+    struct RetirementEngineFixture {
+        engine: PetalSonicEngine,
+        commands: Sender<PlaybackCommand>,
+        active_voice_count: Arc<AtomicUsize>,
+        runtime_state: Arc<AtomicU8>,
+        recovery_attempts: Arc<AtomicU64>,
+        schedule: SupervisorSchedule,
+        now: Instant,
+    }
+
+    fn retirement_engine_fixture(max_voices: usize) -> RetirementEngineFixture {
+        let desc = PetalSonicWorldDesc {
+            block_size: 64,
+            max_voices,
+            control_queue_capacity: max_voices.max(1),
+            lifecycle_queue_capacity: max_voices.max(1),
+            event_queue_capacity: 16,
+            timing_queue_capacity: 16,
+            ..PetalSonicWorldDesc::default()
+        };
+        let (commands, regular_commands) = crossbeam_channel::bounded(desc.control_queue_capacity);
+        let (_lifecycle_sender, lifecycle_commands) =
+            crossbeam_channel::bounded(desc.lifecycle_queue_capacity);
+        let active_voice_count = Arc::new(AtomicUsize::new(0));
+        let (control_retirement_sender, _) = crossbeam_channel::bounded(desc.max_voices);
+        let (_spatial_publisher, spatial_frames) = RealtimeLatest::bounded(1);
+        let (_response_publisher, acoustic_responses) = RealtimeLatest::bounded(2);
+        let (startup, _) = PreparedEngine::new(
+            desc.clone(),
+            active_voice_count.clone(),
+            control_retirement_sender,
+            spatial_frames,
+            acoustic_responses,
+            AcousticVoiceInput::isolated(desc.max_voices),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+            regular_commands,
+            lifecycle_commands,
+        );
+        let (platform, _) = FakeOutputPlatform::scripted(Vec::new(), None);
+        let runtime_state = Arc::new(AtomicU8::new(RuntimeState::Recovering as u8));
+        let recovery_attempts = Arc::new(AtomicU64::new(0));
+        let now = Instant::now();
+        RetirementEngineFixture {
+            engine: PetalSonicEngine::new_with_output(
+                startup,
+                Box::new(platform),
+                vec![BusParams::default()],
+                RuntimeFailurePublisher::new(runtime_state.clone()),
+                RenderWorkerFaultInjector::default(),
+            )
+            .unwrap(),
+            commands,
+            active_voice_count,
+            runtime_state,
+            recovery_attempts,
+            schedule: SupervisorSchedule::new(now),
+            now,
+        }
+    }
+
+    fn witnessed_once_voice(
+        identity: u64,
+        observation: Arc<AcousticVoiceRetirementObservation>,
+    ) -> PlaybackCommand {
+        let extent = SourceExtent::weighted_samples(vec![
+            ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::X, 1.0).unwrap(),
+            ExtentSample::new(ExtentSampleId(2), crate::math::Vec3::Y, 3.0).unwrap(),
+        ])
+        .unwrap();
+        let emitter = Emitter {
+            world_id: 1,
+            index: identity as u32,
+            generation: 1,
+        };
+        let audio = Arc::new(PetalSonicAudioData::new(
+            vec![0.25; 96],
+            48_000,
+            1,
+            Duration::from_millis(2),
+        ));
+        PlaybackCommand::Play(
+            prepare_test_voice(
+                VoiceId::from(identity),
+                emitter,
+                audio,
+                EmitterDesc::spatial(crate::math::Pose::identity()).with_extent(extent),
+                PlayOptions::once().detached(),
+                None,
+                0,
+                64,
+            )
+            .with_acoustic_retirement_witness(AcousticVoiceRetirementWitness::new(
+                identity,
+                observation,
+            )),
+        )
+    }
+
+    #[test]
+    fn supervisor_receives_the_original_acoustic_voice_before_dropping_it_off_realtime() {
+        let mut fixture = retirement_engine_fixture(1);
+        let observation = Arc::new(AcousticVoiceRetirementObservation::default());
+        fixture.active_voice_count.store(1, Ordering::Release);
+        fixture
+            .commands
+            .try_send(witnessed_once_voice(901, observation.clone()))
+            .unwrap();
+
+        let render_activity = crate::test_support::realtime_memory_activity(|| {
+            AudioRuntime::supervisor_tick(
+                &mut fixture.engine,
+                &fixture.runtime_state,
+                &fixture.recovery_attempts,
+                &mut fixture.schedule,
+                fixture.now + Duration::from_millis(2),
+            );
+        });
+
+        assert_eq!(render_activity, 0);
+        assert_eq!(observation.observed(), (0, 0, 0));
+        AudioRuntime::supervisor_tick(
+            &mut fixture.engine,
+            &fixture.runtime_state,
+            &fixture.recovery_attempts,
+            &mut fixture.schedule,
+            fixture.now + Duration::from_millis(3),
+        );
+        assert_eq!(observation.observed(), (901, 1, 0));
     }
 
     struct SupervisorFakeDriver {

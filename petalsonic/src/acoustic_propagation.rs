@@ -276,12 +276,6 @@ impl InputState {
         self.next_routing_generation = self.next_routing_generation.wrapping_add(1).max(1);
         voice.routing_generation = self.next_routing_generation;
     }
-
-    fn voice_route_is_current(&self, route: VoiceRouteKey) -> bool {
-        self.voices
-            .iter()
-            .any(|voice| compare_voice_routes(voice.route_key(), route) == CmpOrdering::Equal)
-    }
 }
 
 struct SharedInput {
@@ -709,23 +703,6 @@ struct AcousticPublisher {
 }
 
 impl AcousticPublisher {
-    /// Applies the ADR 0003 compatibility barrier to one completed frame.
-    ///
-    /// Scene replacement rejects the whole frame. Ordinary pose revisions are deliberately
-    /// absent, while retirement or rerouting removes one complete Voice envelope.
-    fn retain_compatible(
-        current: &InputState,
-        mut completed: CompletedAcousticFrame,
-    ) -> Option<CompletedAcousticFrame> {
-        if current.scene.as_ref().map(|scene| scene.version()) != Some(completed.geometry_version) {
-            return None;
-        }
-        completed
-            .voices
-            .retain(|voice| current.voice_route_is_current(voice.route));
-        Some(completed)
-    }
-
     fn commit(
         &self,
         captured_wake_generation: u64,
@@ -739,7 +716,7 @@ impl AcousticPublisher {
         let newer_input_pending = publication_guard.wake_generation != captured_wake_generation;
         let discarded_spatial_revision = completed.spatial_revision;
         let discarded_geometry_version = completed.geometry_version;
-        let Some(completed) = Self::retain_compatible(&publication_guard, completed) else {
+        let Some(completed) = completed.retain_compatible(&publication_guard) else {
             drop(publication_guard);
             self.counters
                 .superseded_solve_count
@@ -926,7 +903,8 @@ fn retain_compatible_completed_results(
     current: &InputState,
     completed: CompletedAcousticFrame,
 ) -> Option<AcousticSolveOutput> {
-    AcousticPublisher::retain_compatible(current, completed)
+    completed
+        .retain_compatible(current)
         .map(|completed| completed.into_solve_output(Instant::now()))
 }
 
@@ -1172,6 +1150,47 @@ impl CompletedAcousticFrame {
     fn with_solve_time(mut self, solve_time_us: u64) -> Self {
         self.solve_time_us = solve_time_us;
         self
+    }
+
+    /// Applies the ADR 0003 compatibility barrier as one consuming publication transition.
+    ///
+    /// Scene replacement rejects the whole frame. Ordinary pose revisions are deliberately
+    /// absent, while retirement or rerouting removes the complete grouped Voice envelope. Both
+    /// route sets are sorted once and then compared with a linear merge-join.
+    fn retain_compatible(mut self, current: &InputState) -> Option<Self> {
+        if current.scene.as_ref().map(|scene| scene.version()) != Some(self.geometry_version) {
+            return None;
+        }
+        let mut current_routes = current
+            .voices
+            .iter()
+            .map(AcousticVoice::route_key)
+            .collect::<Vec<_>>();
+        current_routes.sort_by(|left, right| compare_voice_routes(*left, *right));
+        assert!(
+            current_routes.windows(2).all(|pair| {
+                compare_voice_ids(pair[0].voice_id, pair[1].voice_id) == CmpOrdering::Less
+            }),
+            "active acoustic Voice identities must be unique"
+        );
+
+        let mut current_index = 0;
+        self.voices.retain(|completed| {
+            loop {
+                let Some(current_route) = current_routes.get(current_index).copied() else {
+                    return false;
+                };
+                match compare_voice_routes(current_route, completed.route) {
+                    CmpOrdering::Less => current_index += 1,
+                    CmpOrdering::Equal => {
+                        current_index += 1;
+                        return true;
+                    }
+                    CmpOrdering::Greater => return false,
+                }
+            }
+        });
+        Some(self)
     }
 
     fn into_solve_output(self, published_at: Instant) -> AcousticSolveOutput {
@@ -2765,7 +2784,7 @@ mod tests {
         let mut retained = None;
 
         let comparisons = crate::test_support::acoustic_publication_comparison_activity(|| {
-            retained = AcousticPublisher::retain_compatible(&current, completed);
+            retained = completed.retain_compatible(&current);
         });
         let retained = retained.unwrap().into_solve_output(Instant::now());
         let expected = VOICES - REROUTED - RETIRED;

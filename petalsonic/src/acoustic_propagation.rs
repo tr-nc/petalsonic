@@ -2291,21 +2291,23 @@ fn solve_early_reflections(
         &mut surface_hits,
     );
 
-    for candidate in candidates.iter().take(plan.max_early_reflection_sources) {
-        let Some((representatives, aggregate_environment_gain)) = responses
-            .iter()
-            .find(|response| {
-                compare_voice_ids(response.voice_id, candidate.voice.voice_id) == CmpOrdering::Equal
-            })
-            .map(|response| {
-                (
-                    response.environment_representatives.clone(),
-                    response.environment_gain,
-                )
-            })
-        else {
-            continue;
-        };
+    assert_eq!(
+        candidates.len(),
+        responses.len(),
+        "each selected acoustic candidate must own one response"
+    );
+    for (candidate, response) in candidates
+        .iter()
+        .zip(responses.iter_mut())
+        .take(plan.max_early_reflection_sources)
+    {
+        assert_eq!(
+            compare_voice_ids(response.voice_id, candidate.voice.voice_id),
+            CmpOrdering::Equal,
+            "selected candidate and response order diverged"
+        );
+        let representatives = response.environment_representatives.clone();
+        let aggregate_environment_gain = response.environment_gain;
         if representatives.is_empty() {
             continue;
         }
@@ -2421,11 +2423,7 @@ fn solve_early_reflections(
         });
         taps.truncate(plan.early_reflection_taps);
         taps.sort_by_key(|tap| tap.path_id);
-        if let Some(response) = responses.iter_mut().find(|response| {
-            compare_voice_ids(response.voice_id, candidate.voice.voice_id) == CmpOrdering::Equal
-        }) {
-            response.early_reflections = taps;
-        }
+        response.early_reflections = taps;
     }
 }
 

@@ -536,6 +536,10 @@ impl RenderQuantum {
             return;
         };
         Self::apply_spatial_frame_to_voices(&next, &mut self.active_playback);
+        #[cfg(test)]
+        self.counters
+            .rendered_spatial_revision
+            .store(next.revision(), Ordering::Release);
         if let Some(previous) = self.current_spatial_frame.replace(next) {
             self.spatial_frames.retire(previous);
         }

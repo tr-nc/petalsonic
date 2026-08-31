@@ -996,6 +996,7 @@ mod tests {
 
         fixture.engine.close().unwrap();
         assert_eq!(observation.observed(), (921, 1, 0));
+        assert_eq!(fixture.active_voice_count.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1022,6 +1023,7 @@ mod tests {
 
         assert!(fixture.engine.close().is_err());
         assert_eq!(observation.observed(), (931, 1, 0));
+        assert_eq!(fixture.active_voice_count.load(Ordering::Acquire), 0);
         assert!(fixture.engine.close().is_err());
         assert_eq!(observation.observed(), (931, 1, 0));
 

@@ -762,6 +762,10 @@ mod tests {
     }
 
     fn harness(block_size: usize, max_voices: usize) -> Harness {
+        harness_with_buses(block_size, max_voices, vec![BusParams::default()])
+    }
+
+    fn harness_with_buses(block_size: usize, max_voices: usize, buses: Vec<BusParams>) -> Harness {
         let desc = PetalSonicWorldDesc {
             block_size,
             max_voices,
@@ -796,12 +800,7 @@ mod tests {
             Arc::new(RuntimeCounters::default()),
         );
         Harness {
-            quantum: RenderQuantum::new(
-                startup,
-                vec![BusParams::default()],
-                voice_retirement_sender,
-            )
-            .unwrap(),
+            quantum: RenderQuantum::new(startup, buses, voice_retirement_sender).unwrap(),
             acoustic_responses,
             commands,
             events,
@@ -881,6 +880,31 @@ mod tests {
         ))
     }
 
+    fn bus_play_command(
+        voice_id: VoiceId,
+        emitter: Emitter,
+        sample: f32,
+        bus_index: usize,
+        block_size: usize,
+    ) -> PlaybackCommand {
+        let clip = Arc::new(PetalSonicAudioData::new(
+            vec![sample; block_size * 16],
+            48_000,
+            1,
+            Duration::from_secs_f64((block_size * 16) as f64 / 48_000.0),
+        ));
+        PlaybackCommand::Play(prepare_test_voice(
+            voice_id,
+            emitter,
+            clip,
+            EmitterDesc::non_spatial(),
+            PlayOptions::looping(),
+            None,
+            bus_index,
+            block_size,
+        ))
+    }
+
     fn retirement_play_command(
         voice_id: VoiceId,
         emitter: Emitter,
@@ -951,6 +975,108 @@ mod tests {
                 .info
                 .current_frame,
             block_size * 2
+        );
+    }
+
+    #[test]
+    fn named_bus_pause_freezes_only_its_voice_through_the_render_owner() {
+        let block_size = 4;
+        let mut harness = harness_with_buses(
+            block_size,
+            2,
+            vec![
+                BusParams::default(),
+                BusParams {
+                    paused: true,
+                    ..BusParams::default()
+                },
+                BusParams::default(),
+            ],
+        );
+        harness
+            .quantum
+            .active_voice_count
+            .store(2, Ordering::Release);
+        for (voice, bus, sample) in [(61, 1, 1.0), (62, 2, 0.5)] {
+            harness
+                .commands
+                .try_send(bus_play_command(
+                    VoiceId::from(voice),
+                    retirement_emitter(voice as u32),
+                    sample,
+                    bus,
+                    block_size,
+                ))
+                .unwrap();
+        }
+        let mut consumer = harness.quantum.connect_output(48_000).unwrap();
+
+        harness.quantum.render();
+
+        assert!(consumer.try_pop().is_some());
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(61)]
+                .info
+                .current_frame,
+            0
+        );
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(62)]
+                .info
+                .current_frame,
+            block_size * 2
+        );
+    }
+
+    #[test]
+    fn master_and_named_bus_rates_compose_through_the_render_owner() {
+        let block_size = 4;
+        let mut harness = harness_with_buses(
+            block_size,
+            2,
+            vec![
+                BusParams {
+                    playback_rate: 0.5,
+                    ..BusParams::default()
+                },
+                BusParams {
+                    playback_rate: 2.0,
+                    ..BusParams::default()
+                },
+                BusParams::default(),
+            ],
+        );
+        harness
+            .quantum
+            .active_voice_count
+            .store(2, Ordering::Release);
+        for (voice, bus) in [(63, 1), (64, 2)] {
+            harness
+                .commands
+                .try_send(bus_play_command(
+                    VoiceId::from(voice),
+                    retirement_emitter(voice as u32),
+                    0.25,
+                    bus,
+                    block_size,
+                ))
+                .unwrap();
+        }
+        let _consumer = harness.quantum.connect_output(48_000).unwrap();
+
+        harness.quantum.render();
+
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(63)]
+                .info
+                .current_frame,
+            block_size * 2
+        );
+        assert_eq!(
+            harness.quantum.active_playback[&VoiceId::from(64)]
+                .info
+                .current_frame,
+            block_size
         );
     }
 

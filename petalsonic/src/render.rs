@@ -488,11 +488,7 @@ impl RenderQuantum {
             if voice.detached {
                 continue;
             }
-            if let Some(spatial) = frame
-                .emitters()
-                .iter()
-                .find(|spatial| spatial.emitter == voice.emitter)
-            {
+            if let Some(spatial) = frame.emitter_state(voice.emitter) {
                 voice.render_state.set_spatial_pose(spatial.pose);
             }
         }

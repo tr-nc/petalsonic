@@ -913,8 +913,9 @@ impl SpatialFrame {
         revision: u64,
         sim_time_seconds: f64,
         listener: Pose,
-        emitters: Vec<EmitterSpatialState>,
+        mut emitters: Vec<EmitterSpatialState>,
     ) -> Self {
+        emitters.sort_unstable_by(|left, right| compare_emitter_key(left.emitter, right.emitter));
         Self {
             revision,
             sim_time_seconds,
@@ -938,4 +939,21 @@ impl SpatialFrame {
     pub fn emitters(&self) -> &[EmitterSpatialState] {
         &self.emitters
     }
+
+    pub(crate) fn emitter_state(&self, emitter: Emitter) -> Option<&EmitterSpatialState> {
+        self.emitters
+            .binary_search_by(|candidate| compare_emitter_key(candidate.emitter, emitter))
+            .ok()
+            .map(|index| &self.emitters[index])
+    }
+}
+
+fn compare_emitter_key(left: Emitter, right: Emitter) -> std::cmp::Ordering {
+    #[cfg(test)]
+    crate::test_support::record_spatial_frame_comparison();
+    (left.world_id, left.index, left.generation).cmp(&(
+        right.world_id,
+        right.index,
+        right.generation,
+    ))
 }

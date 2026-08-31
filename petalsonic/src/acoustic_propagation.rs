@@ -339,10 +339,7 @@ impl AcousticVoiceInput {
             return;
         };
         if let Some(spatial) = &state.spatial
-            && let Some(emitter) = spatial
-                .emitters()
-                .iter()
-                .find(|candidate| candidate.emitter == voice.emitter)
+            && let Some(emitter) = spatial.emitter_state(voice.emitter)
         {
             voice.emitter_world_pose = emitter.pose;
             voice.acoustic_priority = emitter.acoustic_priority();
@@ -607,11 +604,7 @@ impl AcousticPropagation {
             if voice.detached {
                 continue;
             }
-            if let Some(emitter) = frame
-                .emitters()
-                .iter()
-                .find(|candidate| candidate.emitter == voice.emitter)
-            {
+            if let Some(emitter) = frame.emitter_state(voice.emitter) {
                 voice.emitter_world_pose = emitter.pose;
                 voice.acoustic_priority = emitter.acoustic_priority();
             }

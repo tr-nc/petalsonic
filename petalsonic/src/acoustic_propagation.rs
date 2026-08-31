@@ -458,11 +458,11 @@ impl AcousticVoiceInput {
             voice.acoustic_priority = emitter.acoustic_priority();
         }
         state.assign_routing_generation(&mut voice);
-        if let Some(current) = state
-            .voices
-            .iter_mut()
-            .find(|current| current.voice_id == voice.voice_id)
-        {
+        if let Some(current) = state.voices.iter_mut().find(|current| {
+            #[cfg(test)]
+            crate::test_support::record_acoustic_input_comparison();
+            current.voice_id == voice.voice_id
+        }) {
             *current = voice;
         } else if state.voices.len() < state.voices.capacity() {
             state.voices.push(voice);
@@ -478,11 +478,11 @@ impl AcousticVoiceInput {
         let Ok(mut state) = self.input.state.lock() else {
             return None;
         };
-        let Some(index) = state
-            .voices
-            .iter()
-            .position(|voice| voice.voice_id == voice_id)
-        else {
+        let Some(index) = state.voices.iter().position(|voice| {
+            #[cfg(test)]
+            crate::test_support::record_acoustic_input_comparison();
+            voice.voice_id == voice_id
+        }) else {
             return None;
         };
         let retired = state.voices.swap_remove(index);
@@ -4517,6 +4517,85 @@ mod tests {
         let state = input_port.input.state.lock().unwrap();
         assert_eq!(state.voices[0].audibility, 0.25);
         assert_eq!(state.voices[1].audibility, 1.0);
+    }
+
+    #[test]
+    fn active_acoustic_voice_edits_are_linear_for_4096_voices() {
+        const VOICES: usize = 4_096;
+        let input_port = AcousticVoiceInput::isolated(VOICES);
+        let emitter = |index: usize| Emitter {
+            world_id: 1,
+            index: index as u32,
+            generation: 1,
+        };
+        let comparisons = crate::test_support::acoustic_input_comparison_activity(|| {
+            for voice in 0..VOICES {
+                input_port.activate(AcousticVoice {
+                    voice_id: VoiceId::from(voice as u64 + 1),
+                    emitter: emitter(voice),
+                    emitter_world_pose: Pose::identity(),
+                    acoustic_priority: 1.0,
+                    audibility: 1.0,
+                    detached: false,
+                    direct_path: DirectPath::default(),
+                    environment_send: EnvironmentSend::default(),
+                    source_extent: SourceExtent::Point,
+                    occlusion_profile: OcclusionProfile::PointExact,
+                    routing_generation: 0,
+                    _retirement_witness: None,
+                });
+            }
+            for voice in 0..VOICES {
+                assert!(input_port.retire(VoiceId::from(voice as u64 + 1)).is_some());
+            }
+        });
+
+        assert!(
+            comparisons <= VOICES * 4,
+            "4096 activate/retire edits performed {comparisons} identity comparisons"
+        );
+    }
+
+    #[test]
+    fn render_voice_input_never_waits_for_the_worker_mutex() {
+        let input_port = AcousticVoiceInput::isolated(1);
+        let guard = input_port.input.state.lock().unwrap();
+        let (done_sender, done_receiver) = crossbeam_channel::bounded(1);
+        let completed_without_unlock = std::thread::scope(|scope| {
+            let render_input = input_port.clone();
+            let worker = scope.spawn(move || {
+                render_input.activate(AcousticVoice {
+                    voice_id: VoiceId::from(1),
+                    emitter: Emitter {
+                        world_id: 1,
+                        index: 0,
+                        generation: 1,
+                    },
+                    emitter_world_pose: Pose::identity(),
+                    acoustic_priority: 1.0,
+                    audibility: 1.0,
+                    detached: false,
+                    direct_path: DirectPath::default(),
+                    environment_send: EnvironmentSend::default(),
+                    source_extent: SourceExtent::Point,
+                    occlusion_profile: OcclusionProfile::PointExact,
+                    routing_generation: 0,
+                    _retirement_witness: None,
+                });
+                done_sender.send(()).unwrap();
+            });
+            let completed = done_receiver
+                .recv_timeout(Duration::from_millis(20))
+                .is_ok();
+            drop(guard);
+            worker.join().unwrap();
+            completed
+        });
+
+        assert!(
+            completed_without_unlock,
+            "render Voice input waited for the worker-owned mutex"
+        );
     }
 
     #[test]

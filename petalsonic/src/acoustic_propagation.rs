@@ -4370,6 +4370,85 @@ mod tests {
     }
 
     #[test]
+    fn activation_and_spatial_publication_share_bounded_emitter_lookup() {
+        const EMITTERS: usize = 4_096;
+        const VOICES: usize = 2_048;
+        const MAX_BINARY_COMPARISONS: usize = 13;
+        let emitter = |index: usize| Emitter {
+            world_id: 1,
+            index: index as u32,
+            generation: 1,
+        };
+        let frame = Arc::new(SpatialFrame::new(
+            23,
+            2.0,
+            Pose::identity(),
+            (0..EMITTERS)
+                .rev()
+                .map(|index| {
+                    EmitterSpatialState::new(
+                        emitter(index),
+                        Pose::from_position(Vec3::new(index as f32, 1.0, 0.0)),
+                    )
+                    .with_acoustic_priority(index as f32 + 1.0)
+                })
+                .collect(),
+        ));
+        let input_port = AcousticVoiceInput::isolated(1);
+        input_port.input.state.lock().unwrap().spatial = Some(frame.clone());
+        let mut activated = input(Arc::new(NoGeometry)).voices.remove(0);
+        activated.emitter = emitter(EMITTERS - 1);
+        activated.emitter_world_pose = Pose::from_position(-Vec3::Y);
+        let activation_comparisons = crate::test_support::spatial_frame_comparison_activity(|| {
+            input_port.activate(activated);
+        });
+        assert!(activation_comparisons > 0);
+        assert!(activation_comparisons <= MAX_BINARY_COMPARISONS);
+        let state = input_port.input.state.lock().unwrap();
+        assert_eq!(
+            state.voices[0].emitter_world_pose.position,
+            Vec3::new((EMITTERS - 1) as f32, 1.0, 0.0)
+        );
+        assert_eq!(state.voices[0].acoustic_priority, EMITTERS as f32);
+        drop(state);
+
+        let (propagation, _worker) = AcousticPropagation::prepare(
+            1.0,
+            Arc::new(AtomicBool::new(true)),
+            0.5,
+            EnvironmentalAcousticsBudget::default(),
+            VOICES,
+            1,
+        );
+        let voice_input = propagation.voice_input();
+        let template = input(Arc::new(NoGeometry)).voices.remove(0);
+        for voice_index in 0..VOICES {
+            let mut voice = template.clone();
+            voice.voice_id = VoiceId::from(voice_index as u64 + 1);
+            voice.emitter = emitter(voice_index * 2);
+            voice.emitter_world_pose = Pose::from_position(-Vec3::Y);
+            voice.detached = voice_index == 0;
+            voice_input.activate(voice);
+        }
+
+        let publication_comparisons =
+            crate::test_support::spatial_frame_comparison_activity(|| {
+                propagation.publish_spatial_frame(frame).unwrap();
+            });
+
+        assert!(publication_comparisons >= VOICES - 1);
+        assert!(publication_comparisons <= (VOICES - 1) * MAX_BINARY_COMPARISONS);
+        let state = voice_input.input.state.lock().unwrap();
+        assert_eq!(state.voices.len(), VOICES);
+        assert_eq!(state.voices[0].emitter_world_pose.position, -Vec3::Y);
+        assert_eq!(
+            state.voices[VOICES - 1].emitter_world_pose.position,
+            Vec3::new(((VOICES - 1) * 2) as f32, 1.0, 0.0)
+        );
+        assert_eq!(state.voices[VOICES - 1].source_extent, SourceExtent::Point);
+    }
+
+    #[test]
     fn overlapping_voices_keep_independent_fixed_acoustic_origins() {
         let mut input = input(Arc::new(DirectionalTransmission));
         let emitter = input.voices[0].emitter;

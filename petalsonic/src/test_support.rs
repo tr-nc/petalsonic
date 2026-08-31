@@ -10,6 +10,8 @@ thread_local! {
     static ACOUSTIC_LOOKUP_COUNT: Cell<usize> = const { Cell::new(0) };
     static ACOUSTIC_COMPARISON_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static ACOUSTIC_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
+    static SPATIAL_FRAME_COMPARISON_PROBE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static SPATIAL_FRAME_COMPARISON_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 #[global_allocator]
@@ -82,4 +84,20 @@ pub(crate) fn acoustic_publication_comparison_activity(operation: impl FnOnce())
     operation();
     ACOUSTIC_COMPARISON_PROBE_ACTIVE.with(|active| active.set(false));
     ACOUSTIC_COMPARISON_COUNT.with(Cell::get)
+}
+
+pub(crate) fn record_spatial_frame_comparison() {
+    SPATIAL_FRAME_COMPARISON_PROBE_ACTIVE.with(|active| {
+        if active.get() {
+            SPATIAL_FRAME_COMPARISON_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    });
+}
+
+pub(crate) fn spatial_frame_comparison_activity(operation: impl FnOnce()) -> usize {
+    SPATIAL_FRAME_COMPARISON_COUNT.with(|count| count.set(0));
+    SPATIAL_FRAME_COMPARISON_PROBE_ACTIVE.with(|active| active.set(true));
+    operation();
+    SPATIAL_FRAME_COMPARISON_PROBE_ACTIVE.with(|active| active.set(false));
+    SPATIAL_FRAME_COMPARISON_COUNT.with(Cell::get)
 }

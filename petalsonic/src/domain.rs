@@ -110,6 +110,44 @@ mod tests {
     }
 
     #[test]
+    fn spatial_frame_indexes_the_complete_emitter_generation() {
+        let old_generation = Emitter {
+            world_id: 7,
+            index: 2,
+            generation: 1,
+        };
+        let current_generation = Emitter {
+            generation: 2,
+            ..old_generation
+        };
+        let other_world = Emitter {
+            world_id: 3,
+            index: 99,
+            generation: 4,
+        };
+        let current_pose = Pose::from_position(crate::math::Vec3::Y);
+        let frame = SpatialFrame::new(
+            11,
+            1.25,
+            Pose::identity(),
+            vec![
+                EmitterSpatialState::new(current_generation, current_pose),
+                EmitterSpatialState::new(other_world, Pose::identity()),
+            ],
+        );
+
+        assert_eq!(
+            frame
+                .emitter_state(current_generation)
+                .map(|state| state.pose),
+            Some(current_pose)
+        );
+        assert!(frame.emitter_state(old_generation).is_none());
+        assert_eq!(frame.emitters()[0].emitter, other_world);
+        assert_eq!(frame.emitters()[1].emitter, current_generation);
+    }
+
+    #[test]
     fn play_options_default_to_compatible_world_routing() {
         let options = PlayOptions::once();
         assert_eq!(options.direct_path(), DirectPath::world());

@@ -5,6 +5,25 @@ on:
   pull_request:
 
 jobs:
+  quality:
+    name: Linux quality policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux audio headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Validate the quality workflow contract
+        run: tools/tests/platforms_quality_job_test.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint every target
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test library documentation
+        run: cargo test -p petalsonic --doc
+      - name: Test the release gate contract without timing hardware
+        run: tools/tests/publish_realtime_gate_test.sh
+
   check:
     strategy:
       fail-fast: false

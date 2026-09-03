@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-04
+
+### Added
+- Added deterministic public-World lifecycle and capacity acceptance coverage, strict Linux CI
+  quality gates, and a release-time near-capacity realtime performance gate.
+
+### Changed
+- `SpatialFrame::new` now validates complete snapshots at construction and returns a `Result`,
+  rejecting duplicate Emitters and invalid poses before publication.
+- Refactored per-World lifecycle, output recovery, physical device adaptation, and terminal close
+  outcomes behind a single internal runtime owner while preserving the `PetalSonicWorld` API.
+- Centralized render-quantum ownership of Voices, resident PCM, mixing, spatial processing,
+  telemetry, retirement, and acoustic-response acceptance.
+- Made spatial and acoustic publications transactional and latest-compatible, with indexed Voice
+  routing and bounded render-path lookups instead of repeated linear association work.
+- Moved completed Voice reclamation and resource retirement off realtime paths and made shutdown
+  ordering explicit across output, render, and acoustic worker dependencies.
+
 ## [0.8.0] - 2026-08-25
 
 ### Added
@@ -145,7 +163,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RayTracer` trait - Custom ray tracing implementation support
 - Three-layer threading model (main thread, render thread, audio callback)
 
-[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/tr-nc/petalsonic/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/tr-nc/petalsonic/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/tr-nc/petalsonic/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/tr-nc/petalsonic/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/tr-nc/petalsonic/compare/v0.5.0...v0.6.0

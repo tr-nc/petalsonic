@@ -353,12 +353,12 @@ impl SpatialAudioDemo {
             // Vertical lines (constant X)
             let top = self.world_to_screen(Vec3::new(offset, 0.0, self.grid_size), rect);
             let bottom = self.world_to_screen(Vec3::new(offset, 0.0, -self.grid_size), rect);
-            painter.line_segment([top, bottom], Stroke::new(1.0, Color32::from_gray(60)));
+            painter.line_segment([top, bottom], Stroke::new(1.0_f32, Color32::from_gray(60)));
 
             // Horizontal lines (constant Z)
             let left = self.world_to_screen(Vec3::new(-self.grid_size, 0.0, offset), rect);
             let right = self.world_to_screen(Vec3::new(self.grid_size, 0.0, offset), rect);
-            painter.line_segment([left, right], Stroke::new(1.0, Color32::from_gray(60)));
+            painter.line_segment([left, right], Stroke::new(1.0_f32, Color32::from_gray(60)));
         }
 
         // Draw axes (thicker, colored)
@@ -368,11 +368,11 @@ impl SpatialAudioDemo {
 
         painter.line_segment(
             [origin, x_axis_end],
-            Stroke::new(2.0, Color32::from_rgb(255, 100, 100)), // X axis - red
+            Stroke::new(2.0_f32, Color32::from_rgb(255, 100, 100)), // X axis - red
         );
         painter.line_segment(
             [origin, z_axis_end],
-            Stroke::new(2.0, Color32::from_rgb(100, 100, 255)), // Z axis - blue
+            Stroke::new(2.0_f32, Color32::from_rgb(100, 100, 255)), // Z axis - blue
         );
     }
 
@@ -432,7 +432,7 @@ impl SpatialAudioDemo {
 
         // Draw red circle for listener
         painter.circle_filled(listener_pos, 8.0, Color32::from_rgb(255, 50, 50));
-        painter.circle_stroke(listener_pos, 8.0, Stroke::new(2.0, Color32::WHITE));
+        painter.circle_stroke(listener_pos, 8.0, Stroke::new(2.0_f32, Color32::WHITE));
 
         // Draw label
         painter.text(
@@ -452,7 +452,7 @@ impl SpatialAudioDemo {
 
             // Draw blue circle for source
             painter.circle_filled(source_pos, 8.0, Color32::from_rgb(50, 150, 255));
-            painter.circle_stroke(source_pos, 8.0, Stroke::new(2.0, Color32::WHITE));
+            painter.circle_stroke(source_pos, 8.0, Stroke::new(2.0_f32, Color32::WHITE));
 
             // Draw label with file name and distance
             let distance_world = source.position.length();

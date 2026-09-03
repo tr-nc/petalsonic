@@ -158,7 +158,7 @@ pub fn draw_profiling_widget(
                 Pos2::new(rect.min.x, constraint_y),
                 Pos2::new(rect.max.x, constraint_y),
             ],
-            Stroke::new(2.0, Color32::RED),
+            Stroke::new(2.0_f32, Color32::RED),
         );
 
         // Draw constraint label
@@ -183,7 +183,7 @@ pub fn draw_profiling_widget(
 
         // Draw line segments
         for window in total_points.windows(2) {
-            painter.line_segment([window[0], window[1]], Stroke::new(2.0, Color32::WHITE));
+            painter.line_segment([window[0], window[1]], Stroke::new(2.0_f32, Color32::WHITE));
         }
 
         // Draw mixing time (cyan line)
@@ -197,7 +197,7 @@ pub fn draw_profiling_widget(
         for window in mixing_points.windows(2) {
             painter.line_segment(
                 [window[0], window[1]],
-                Stroke::new(1.5, Color32::LIGHT_BLUE),
+                Stroke::new(1.5_f32, Color32::LIGHT_BLUE),
             );
         }
 
@@ -211,7 +211,7 @@ pub fn draw_profiling_widget(
         }
 
         for window in direct_points.windows(2) {
-            painter.line_segment([window[0], window[1]], Stroke::new(1.2, Color32::GREEN));
+            painter.line_segment([window[0], window[1]], Stroke::new(1.2_f32, Color32::GREEN));
         }
 
         // Draw spatial mixing time (magenta line)
@@ -225,7 +225,7 @@ pub fn draw_profiling_widget(
         for window in spatial_points.windows(2) {
             painter.line_segment(
                 [window[0], window[1]],
-                Stroke::new(1.2, Color32::from_rgb(198, 120, 221)),
+                Stroke::new(1.2_f32, Color32::from_rgb(198, 120, 221)),
             );
         }
 
@@ -238,7 +238,10 @@ pub fn draw_profiling_widget(
         }
 
         for window in resampling_points.windows(2) {
-            painter.line_segment([window[0], window[1]], Stroke::new(1.5, Color32::YELLOW));
+            painter.line_segment(
+                [window[0], window[1]],
+                Stroke::new(1.5_f32, Color32::YELLOW),
+            );
         }
 
         // Draw legend
@@ -250,7 +253,7 @@ pub fn draw_profiling_widget(
                 Pos2::new(legend_x, legend_y),
                 Pos2::new(legend_x + 20.0, legend_y),
             ],
-            Stroke::new(2.0, Color32::WHITE),
+            Stroke::new(2.0_f32, Color32::WHITE),
         );
         painter.text(
             Pos2::new(legend_x + 25.0, legend_y),
@@ -265,7 +268,7 @@ pub fn draw_profiling_widget(
                 Pos2::new(legend_x, legend_y + 15.0),
                 Pos2::new(legend_x + 20.0, legend_y + 15.0),
             ],
-            Stroke::new(1.5, Color32::LIGHT_BLUE),
+            Stroke::new(1.5_f32, Color32::LIGHT_BLUE),
         );
         painter.text(
             Pos2::new(legend_x + 25.0, legend_y + 15.0),
@@ -280,7 +283,7 @@ pub fn draw_profiling_widget(
                 Pos2::new(legend_x, legend_y + 30.0),
                 Pos2::new(legend_x + 20.0, legend_y + 30.0),
             ],
-            Stroke::new(1.5, Color32::YELLOW),
+            Stroke::new(1.5_f32, Color32::YELLOW),
         );
         painter.text(
             Pos2::new(legend_x + 25.0, legend_y + 30.0),
@@ -295,7 +298,7 @@ pub fn draw_profiling_widget(
                 Pos2::new(legend_x, legend_y + 45.0),
                 Pos2::new(legend_x + 20.0, legend_y + 45.0),
             ],
-            Stroke::new(1.2, Color32::GREEN),
+            Stroke::new(1.2_f32, Color32::GREEN),
         );
         painter.text(
             Pos2::new(legend_x + 25.0, legend_y + 45.0),
@@ -311,7 +314,7 @@ pub fn draw_profiling_widget(
                 Pos2::new(legend_x, legend_y + 60.0),
                 Pos2::new(legend_x + 20.0, legend_y + 60.0),
             ],
-            Stroke::new(1.2, magenta),
+            Stroke::new(1.2_f32, magenta),
         );
         painter.text(
             Pos2::new(legend_x + 25.0, legend_y + 60.0),

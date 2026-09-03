@@ -657,7 +657,9 @@ impl RenderQuantum {
                 let mut pushed = 0;
                 for samples in output
                     .resampled_buffer
-                    .chunks_exact(LOGICAL_CHANNELS as usize)
+                    .as_chunks::<{ LOGICAL_CHANNELS as usize }>()
+                    .0
+                    .iter()
                     .take(frames_out)
                 {
                     if output

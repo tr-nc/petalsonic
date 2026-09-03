@@ -425,6 +425,27 @@ struct SharedInput {
     changed: Condvar,
 }
 
+impl SharedInput {
+    fn new(environmental_acoustics_quality: f32, max_voices: usize) -> Self {
+        let input = Self {
+            state: Mutex::new(InputState::new(environmental_acoustics_quality, max_voices)),
+            changed: Condvar::new(),
+        };
+
+        // pthread-backed Rust targets initialize these synchronization primitives lazily with
+        // heap allocations. Force that one-time work onto the control thread so the first render
+        // publication has the same allocation-free contract on every supported platform.
+        drop(
+            input
+                .state
+                .lock()
+                .expect("new acoustic input state cannot be poisoned"),
+        );
+        input.changed.notify_one();
+        input
+    }
+}
+
 /// Bounded render-runtime port for active Voice acoustics state.
 #[derive(Clone)]
 pub(crate) struct AcousticVoiceInput {
@@ -518,10 +539,7 @@ impl AcousticVoiceInput {
     #[cfg(test)]
     pub(crate) fn isolated(max_voices: usize) -> Self {
         Self {
-            input: Arc::new(SharedInput {
-                state: Mutex::new(InputState::new(0.5, max_voices)),
-                changed: Condvar::new(),
-            }),
+            input: Arc::new(SharedInput::new(0.5, max_voices)),
         }
     }
 
@@ -734,10 +752,10 @@ impl AcousticPropagation {
         max_voices: usize,
         telemetry_capacity: usize,
     ) -> (Self, AcousticWorker) {
-        let input = Arc::new(SharedInput {
-            state: Mutex::new(InputState::new(environmental_acoustics_quality, max_voices)),
-            changed: Condvar::new(),
-        });
+        let input = Arc::new(SharedInput::new(
+            environmental_acoustics_quality,
+            max_voices,
+        ));
         let (response_publication, response_consumer) = RealtimeLatest::bounded(2);
         let counters = Arc::new(AcousticPropagationCounters::default());
         let (telemetry_sender, telemetry_receiver) = crossbeam_channel::bounded(telemetry_capacity);

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Eagerly initialize pthread-backed render and acoustic synchronization on the control thread so
+  first-use platform allocations cannot enter realtime paths on macOS and other pthread targets.
+
 ## [0.9.0] - 2026-09-04
 
 ### Added

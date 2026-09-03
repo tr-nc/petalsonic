@@ -185,6 +185,10 @@ impl OutputSession {
         runtime_failure: RuntimeFailurePublisher,
         #[cfg(test)] render_worker_fault: RenderWorkerFaultInjector,
     ) -> Self {
+        // Rust's pthread-backed Mutex is initialized lazily with a heap allocation. Acquire it
+        // once while the control owner is still constructing the session so the render callback
+        // and no-output advancement paths remain allocation-free on those targets.
+        drop(render.lock().expect("new render state cannot be poisoned"));
         Self {
             output_device: desc.output_device,
             block_size: desc.block_size,

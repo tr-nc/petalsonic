@@ -359,7 +359,8 @@ pub enum AcousticOcclusionState {
 /// Per-route measurements captured entirely on the acoustics worker.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcousticRouteTelemetry {
-    /// Number of observations in `samples`; active routes contain 1..=8, inactive routes contain 0.
+    /// Number of observations in `samples`; active routes contain the complete captured extent,
+    /// inactive routes contain 0. The producer chooses the extent's sample budget.
     pub sample_count: usize,
     /// Stable-ID-ordered observations that produced `raw_gain`, `hit_count`, and `visible_fraction`.
     pub samples: Vec<AcousticSampleObservation>,

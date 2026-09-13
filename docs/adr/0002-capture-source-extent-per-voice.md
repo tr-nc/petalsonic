@@ -55,12 +55,15 @@ age limit, then becomes explicitly deferred; deferred does not mean unity.
 
 - Producers must keep sample IDs stable while representatives describe the same physical region.
 - Shape changes are full-frame publications, not low-frequency Emitter property updates.
-- Eight samples and four render lobes are hard library bounds; world configuration can impose
-  lower solve-wide extent and direct-ray limits.
+- As of 0.9.1, eight samples is only the compatibility constructor's limit.
+  `weighted_samples_with_limit` accepts a caller-owned positive budget without a fixed backend
+  sample-count cap. Four render lobes remain a hard bound; world configuration imposes solve-wide
+  extent and direct-ray limits. Admission uses the actual sample count and never truncates a Voice.
+  Producers own memory and per-extent CPU budgets, including unoccluded render aggregation.
 - The worker may allocate and query geometry. The render path only reads an immutable bounded
   target and uses preallocated state.
 - Acoustic telemetry is an independent bounded stream, so lifecycle-event compatibility is not
-  coupled to diagnostic volume. Each active route publishes at most eight stable-ID sample
+  coupled to diagnostic volume. Each active route publishes the complete extent's stable-ID sample
   observations containing normalized power, world position, hit state, and the exact three-band
   material transmission used by aggregation; cache reuse and retained responses preserve those
   observations rather than fabricating misses.

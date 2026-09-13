@@ -3078,6 +3078,16 @@ mod tests {
     #[test]
     #[ignore = "release-mode extended-source renderer performance probe"]
     fn extended_source_direction_field_release_budget() {
+        measure_extended_source_direction_field(8);
+    }
+
+    #[test]
+    #[ignore = "release-mode extended source performance acceptance"]
+    fn sixteen_sample_direction_field_release_budget() {
+        measure_extended_source_direction_field(16);
+    }
+
+    fn measure_extended_source_direction_field(sample_count: usize) {
         use crate::domain::{
             DistributedOcclusionProfile, ExtentSample, ExtentSampleId, SourceExtent,
         };
@@ -3090,18 +3100,19 @@ mod tests {
         let voice_ids = (1..=VOICES)
             .map(|voice| VoiceId::from(voice as u64))
             .collect::<Vec<_>>();
-        let extent = SourceExtent::weighted_samples(
-            (0..8)
+        let extent = SourceExtent::weighted_samples_with_limit(
+            (0..sample_count)
                 .map(|id| {
-                    let angle = id as f32 * std::f32::consts::TAU / 8.0;
+                    let angle = id as f32 * std::f32::consts::TAU / sample_count as f32;
                     ExtentSample::new(
-                        ExtentSampleId(id),
+                        ExtentSampleId(id as u64),
                         Vec3::new(angle.cos(), angle.sin() * 0.5, angle.sin()),
                         1.0,
                     )
                     .unwrap()
                 })
                 .collect(),
+            sample_count,
         )
         .unwrap();
         let profile = OcclusionProfile::AmbientDistributed(
@@ -3235,7 +3246,7 @@ mod tests {
         let audio_seconds = FRAMES as f64 * BLOCKS as f64 / SAMPLE_RATE as f64;
         let elapsed_seconds = elapsed_us.iter().sum::<u64>() as f64 / 1_000_000.0;
         println!(
-            "PETALSONIC_EXTENDED_RENDER_METRICS {{\"voices\":{VOICES},\"samples_per_extent\":8,\"lobes_per_voice\":3,\"blocks\":{BLOCKS},\"frames\":{FRAMES},\"p50_us\":{},\"p95_us\":{},\"p99_us\":{},\"max_us\":{},\"realtime_cpu_percent\":{}}}",
+            "PETALSONIC_EXTENDED_RENDER_METRICS {{\"voices\":{VOICES},\"samples_per_extent\":{sample_count},\"lobes_per_voice\":3,\"blocks\":{BLOCKS},\"frames\":{FRAMES},\"p50_us\":{},\"p95_us\":{},\"p99_us\":{},\"max_us\":{},\"realtime_cpu_percent\":{}}}",
             elapsed_us[BLOCKS / 2],
             elapsed_us[BLOCKS * 95 / 100],
             elapsed_us[BLOCKS * 99 / 100],

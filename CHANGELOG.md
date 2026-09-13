@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-13
+
+### Added
+- Caller-owned extent budgets through `SourceExtent::weighted_samples_with_limit`; any positive
+  limit is supported without changing the backend. The compatibility constructor keeps its
+  eight-sample default. Full extents are admitted or deferred by the actual global ray cost.
+- Coverage for 16, 64 and 257 samples, exact telemetry/cache retention and whole-Voice deferral.
+
 ### Fixed
 - Eagerly initialize pthread-backed render and acoustic synchronization on the control thread so
   first-use platform allocations cannot enter realtime paths on macOS and other pthread targets.

@@ -1978,7 +1978,7 @@ fn route_telemetry(
         return inactive_route_telemetry();
     };
     let aggregate = aggregate.expect("a traced extent always has an energy aggregate");
-    debug_assert!(trace.samples.len() <= MAX_EXTENT_SAMPLES);
+    debug_assert!(!trace.samples.is_empty());
     AcousticRouteTelemetry {
         sample_count: trace.samples.len(),
         samples: trace
@@ -4134,6 +4134,65 @@ mod tests {
                 .map(|lobe| lobe.gain[band] * lobe.gain[band])
                 .sum::<f32>();
             assert!((lobe_energy - response.direct[0].gain[band].powi(2)).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn caller_sized_extents_are_solved_cached_and_budgeted_whole() {
+        use crate::domain::{ExtentSample, ExtentSampleId};
+        for count in [16, 64, 257] {
+            let mut input = input(Arc::new(NoGeometry));
+            input.voices[0].source_extent = SourceExtent::weighted_samples_with_limit(
+                (0..count)
+                    .map(|i| {
+                        ExtentSample::new(ExtentSampleId(i as u64), Vec3::X * i as f32 * 0.01, 1.0)
+                            .unwrap()
+                    })
+                    .collect(),
+                count,
+            )
+            .unwrap();
+            let plan = AcousticSolvePlan {
+                max_direct_sources: 1,
+                max_direct_rays: count * 2,
+                max_early_reflection_sources: 0,
+                early_reflection_taps: 0,
+                early_reflection_ray_count: 0,
+                late_ray_count: 0,
+                late_bounce_count: 0,
+            };
+            let mut solver = AcousticSolver::new(1);
+            let output = solver.solve_with_telemetry(&input, 1.0, plan);
+            assert_eq!(output.response.direct.len(), 1);
+            let event = &output.telemetry[0];
+            assert_eq!(event.extent_sample_count, count);
+            for route in [&event.direct, &event.environment] {
+                assert_eq!(route.samples.len(), count);
+                assert_eq!(
+                    route.samples.last().unwrap().sample_id,
+                    ExtentSampleId((count - 1) as u64)
+                );
+                assert_eq!(route.ray_count, count);
+            }
+            let cached = solver.solve_with_telemetry(&input, 1.0, plan);
+            assert_eq!(cached.telemetry[0].direct.cache_hit_count, count);
+            assert_eq!(cached.telemetry[0].environment.cache_hit_count, count);
+            let mut fresh_solver = AcousticSolver::new(1);
+            let deferred = fresh_solver.solve_with_telemetry(
+                &input,
+                1.0,
+                AcousticSolvePlan {
+                    max_direct_rays: count * 2 - 1,
+                    ..plan
+                },
+            );
+            assert!(!deferred.telemetry[0].budget_member);
+            assert_eq!(
+                deferred.telemetry[0].solve_status,
+                AcousticSolveStatus::Deferred
+            );
+            assert!(deferred.telemetry[0].direct.samples.is_empty());
+            assert!(deferred.telemetry[0].environment.samples.is_empty());
         }
     }
 

@@ -402,6 +402,30 @@ mod tests {
     }
 
     #[test]
+    fn caller_owned_extent_limits_are_not_backend_capacity_limits() {
+        for count in [1, 16, 64, 257] {
+            let samples = (0..count)
+                .rev()
+                .map(|id| {
+                    ExtentSample::new(ExtentSampleId(id as u64), crate::math::Vec3::X, 1.0).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(SourceExtent::weighted_samples_with_limit(samples.clone(), count - 1).is_err());
+            let extent = SourceExtent::weighted_samples_with_limit(samples, count).unwrap();
+            assert_eq!(extent.sample_count(), count);
+            let samples = extent.weighted().unwrap().samples();
+            assert_eq!(samples[0].id(), ExtentSampleId(0));
+            assert_eq!(samples[count - 1].id(), ExtentSampleId((count - 1) as u64));
+            assert!(
+                (samples.iter().map(ExtentSample::power_weight).sum::<f32>() - 1.0).abs() < 1e-6
+            );
+        }
+        assert!(SourceExtent::weighted_samples_with_limit(Vec::new(), 0).is_err());
+        let duplicate = ExtentSample::new(ExtentSampleId(1), crate::math::Vec3::ZERO, 1.0).unwrap();
+        assert!(SourceExtent::weighted_samples_with_limit(vec![duplicate; 16], 16).is_err());
+    }
+
+    #[test]
     fn occlusion_profile_defaults_to_compatible_point_exact() {
         assert_eq!(OcclusionProfile::default(), OcclusionProfile::PointExact);
         assert_eq!(

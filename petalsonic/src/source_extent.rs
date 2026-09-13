@@ -2,10 +2,10 @@ use crate::error::{PetalSonicError, Result};
 use crate::math::Vec3;
 use std::sync::Arc;
 
-/// Maximum number of stable samples in one source extent.
+/// Compatibility limit used by [`SourceExtent::weighted_samples`].
 ///
-/// A producer with a denser representation must reduce it to stable representatives before
-/// publication so worker and render costs stay bounded.
+/// This is not a backend capacity bound. Producers needing a different budget can use
+/// [`SourceExtent::weighted_samples_with_limit`].
 pub const MAX_EXTENT_SAMPLES: usize = 8;
 
 /// Defensive local-radius bound used to keep distance and ray arithmetic reliable.
@@ -81,10 +81,10 @@ pub struct WeightedSamples {
 }
 
 impl WeightedSamples {
-    fn new(mut samples: Vec<ExtentSample>) -> Result<Self> {
-        if samples.is_empty() || samples.len() > MAX_EXTENT_SAMPLES {
+    fn new(mut samples: Vec<ExtentSample>, max_samples: usize) -> Result<Self> {
+        if max_samples == 0 || samples.is_empty() || samples.len() > max_samples {
             return Err(invalid_extent(format!(
-                "weighted samples must contain 1..={MAX_EXTENT_SAMPLES} entries"
+                "weighted samples require a positive limit and 1..={max_samples} entries"
             )));
         }
         samples.sort_by_key(ExtentSample::id);
@@ -158,7 +158,35 @@ pub enum SourceExtent {
 impl SourceExtent {
     /// Validates, normalizes, and stable-ID-orders a weighted source extent.
     pub fn weighted_samples(samples: Vec<ExtentSample>) -> Result<Self> {
-        Ok(Self::WeightedSamples(WeightedSamples::new(samples)?))
+        Self::weighted_samples_with_limit(samples, MAX_EXTENT_SAMPLES)
+    }
+
+    /// Constructs an extent with a caller-owned sample budget, without truncation.
+    ///
+    /// Any positive limit is accepted. The producer owns sampling/coverage policy and memory
+    /// cost; construction sorts and normalizes on the calling thread. Extent size contributes
+    /// to worker cost and unoccluded render-direction aggregation, so choose a measured budget.
+    /// The world's acoustic ray budget admits or defers whole Voices, never partial extents.
+    /// Render lobe count and playback Voice count do not grow with this limit.
+    ///
+    /// ```
+    /// use petalsonic::{ExtentSample, ExtentSampleId, SourceExtent, Vec3};
+    /// let budget = 16;
+    /// let samples = (0..budget).map(|i|
+    ///     ExtentSample::new(ExtentSampleId(i as u64), Vec3::X * i as f32, 1.0)
+    /// ).collect::<Result<Vec<_>, _>>()?;
+    /// let extent = SourceExtent::weighted_samples_with_limit(samples, budget)?;
+    /// assert_eq!(extent.sample_count(), budget);
+    /// # Ok::<(), petalsonic::PetalSonicError>(())
+    /// ```
+    pub fn weighted_samples_with_limit(
+        samples: Vec<ExtentSample>,
+        max_samples: usize,
+    ) -> Result<Self> {
+        Ok(Self::WeightedSamples(WeightedSamples::new(
+            samples,
+            max_samples,
+        )?))
     }
 
     pub fn sample_count(&self) -> usize {

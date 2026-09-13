@@ -12,7 +12,7 @@ fixed backend sample-count cap. Validate untrusted input sizes before constructi
 Construction is control-thread work; storage, telemetry and unoccluded direction aggregation scale
 with sample count. Four render lobes and one Voice/decoder remain unchanged.
 
-The world's `AcousticBudget.max_direct_rays` and quality plan still limit solve-wide work.
+The world's `EnvironmentalAcousticsBudget.max_direct_rays` and quality plan still limit solve-wide work.
 Both active routes cost two rays per representative. A Voice that cannot fit is retained/deferred
 as a whole, so increasing a producer's budget does not guarantee admission. Choose producer and
 world budgets together and measure realtime cost; a larger constructor limit is not a performance

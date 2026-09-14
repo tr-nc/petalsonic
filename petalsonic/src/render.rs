@@ -157,6 +157,7 @@ impl RenderSchedule {
 }
 
 struct LogicalStereoOutput {
+    limiter: crate::output_limiter::OutputLimiter,
     resampler: StreamingResampler,
     producer: HeapProd<StereoFrame>,
     world_buffer: Vec<f32>,
@@ -348,6 +349,7 @@ impl RenderQuantum {
             Some(ResamplerType::Fast),
         )?;
         self.output = Some(LogicalStereoOutput {
+            limiter: crate::output_limiter::OutputLimiter::new(device_sample_rate),
             resampler,
             producer,
             world_buffer: vec![0.0; self.block_size * LOGICAL_CHANNELS as usize],
@@ -648,10 +650,9 @@ impl RenderQuantum {
                 .process_interleaved(&output.world_buffer, &mut output.resampled_buffer)
             {
                 timing.resampling_time_us += resampling_start.elapsed().as_micros() as u64;
-                apply_master_gain_and_limit(
+                output.limiter.process(
                     &mut output.resampled_buffer,
                     frames_out,
-                    LOGICAL_CHANNELS as usize,
                     self.master_gain_linear,
                 );
                 let mut pushed = 0;
@@ -888,14 +889,23 @@ fn effective_bus_params(index: usize, buses: &[BusParams]) -> BusParams {
     }
 }
 
-fn apply_master_gain_and_limit(buffer: &mut [f32], frames_out: usize, channels: usize, gain: f32) {
-    for sample in buffer.iter_mut().take(frames_out * channels) {
-        *sample = (*sample * gain).clamp(-1.0, 1.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_overload_preserves_stereo_ratio() {
+        let mut buffer = vec![0.0; 1024];
+        for frame in buffer.chunks_exact_mut(2) {
+            frame[0] = 3.0;
+            frame[1] = 0.3;
+        }
+        crate::output_limiter::OutputLimiter::new(48_000).process(&mut buffer, 512, 1.0);
+        for frame in buffer.chunks_exact(2).filter(|f| f[0] != 0.0) {
+            assert!(
+                (frame[1] / frame[0] - 0.1).abs() < 0.00001,
+                "output overload changed stereo balance: {frame:?}"
+            );
+        }
+    }
     use super::*;
     use crate::acoustic_propagation::AcousticVoice;
     use crate::audio_data::PetalSonicAudioData;
@@ -1298,14 +1308,64 @@ mod tests {
 
         harness.quantum.render();
 
-        let frame = consumer.try_pop().expect("quantum produced stereo output");
-        assert!(frame.left > 0.0 && frame.right > 0.0);
+        let mut initial_frames = Vec::new();
+        while let Some(frame) = consumer.try_pop() {
+            initial_frames.push(frame);
+        }
+        assert!(!initial_frames.is_empty());
+        assert!(
+            initial_frames
+                .iter()
+                .all(|f| f.left == 0.0 && f.right == 0.0)
+        );
         assert_eq!(
             harness.quantum.active_playback[&VoiceId::from(1)]
                 .info
                 .current_frame,
             block_size * 2
         );
+        // Source progress remains immediate; device output carries the fixed
+        // lookahead. Subsequent quanta must deliver the buffered stereo signal.
+        harness.quantum.render();
+        let mut heard = false;
+        while let Some(frame) = consumer.try_pop() {
+            heard |= frame.left > 0.0 && frame.right > 0.0;
+        }
+        assert!(heard);
+    }
+
+    #[test]
+    fn device_output_protects_overloaded_voice_after_resampling() {
+        let mut harness = harness(128, 1);
+        let samples: Vec<f32> = (0..4096)
+            .map(|i| (i as f32 * std::f32::consts::TAU / 48.0).sin() * 6.0)
+            .collect();
+        let clip = Arc::new(PetalSonicAudioData::new(
+            samples,
+            48_000,
+            1,
+            Duration::from_secs(1),
+        ));
+        harness
+            .commands
+            .try_send(play_command(
+                VoiceId::from(1),
+                retirement_emitter(0),
+                clip,
+                128,
+            ))
+            .unwrap();
+        let mut output = harness.quantum.connect_output(44_100).unwrap();
+        let mut peak = 0.0f32;
+        for _ in 0..12 {
+            harness.quantum.render();
+            while let Some(frame) = output.try_pop() {
+                assert!(frame.left.is_finite() && frame.right.is_finite());
+                peak = peak.max(frame.left.abs()).max(frame.right.abs());
+            }
+        }
+        assert!(peak > 0.5, "protection must not silence the source");
+        assert!(peak <= 0.980001, "device output hard-clipped: {peak}");
     }
 
     #[test]

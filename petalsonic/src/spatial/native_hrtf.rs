@@ -770,6 +770,65 @@ fn normalize_direction(direction: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires PETALSONIC_CICADA_ASSET_ROOT; offline real-game asset limiter probe"]
+    fn cicada_assets_do_not_hard_clip_at_near_distance() {
+        let root = std::env::var("PETALSONIC_CICADA_ASSET_ROOT")
+            .expect("set the Re: Flora assets directory");
+        let table = Arc::new(
+            NativeHrtfTable::from_petalhrtf_file(format!("{root}/hrtf/hrtf_b_nh172.petalhrtf"))
+                .unwrap(),
+        );
+        let renderer = NativeHrtfRenderer::with_frame_size(table, 512).unwrap();
+        for (name, event_db) in [("dog_day_01", -20.0), ("linne_01", -24.0)] {
+            let clip =
+                crate::audio_data::decode_file(&format!("{root}/sfx/summer_cicadas/{name}.wav"))
+                    .unwrap();
+            assert_eq!(clip.channels(), 1);
+            assert_eq!(clip.sample_rate(), 48_000);
+            for distance in [1.0f32, 15.0] {
+                let gain = 17.0 * 128.0 * crate::gain::db_to_linear(event_db + 1.0) / distance
+                    * (-0.0002 * distance).exp();
+                let headroom = crate::gain::db_to_linear(crate::render::MASTER_HEADROOM_DB);
+                let mut state = renderer.create_source_state();
+                let mut limiter = crate::output_limiter::OutputLimiter::new(48_000);
+                let mut before_peak = 0.0f32;
+                let mut after_peak = 0.0f32;
+                let mut old_clips = 0;
+                let mut after_clips = 0;
+                for chunk in clip.samples().chunks(512) {
+                    let mut input = [0.0; 512];
+                    for (out, sample) in input.iter_mut().zip(chunk) {
+                        *out = sample * gain;
+                    }
+                    let mut output = [0.0; 1024];
+                    renderer
+                        .render_source(&mut state, Vec3::Z, &input, &mut output)
+                        .unwrap();
+                    for sample in &output {
+                        before_peak = before_peak.max((sample * headroom).abs());
+                        old_clips += usize::from((sample * headroom).abs() >= 1.0);
+                    }
+                    limiter.process(&mut output, 512, headroom);
+                    for sample in &output {
+                        assert!(sample.is_finite());
+                        after_peak = after_peak.max(sample.abs());
+                        after_clips += usize::from(sample.abs() >= 1.0);
+                    }
+                }
+                eprintln!(
+                    "{name} distance_m={distance} before_peak={before_peak:.5} after_peak={after_peak:.5} old_hard_clips={old_clips} new_hard_clips={after_clips}"
+                );
+                assert_eq!(after_clips, 0);
+                assert!(after_peak <= 0.980001);
+                if distance == 1.0 {
+                    assert!(old_clips > 0);
+                } else {
+                    assert_eq!(old_clips, 0);
+                }
+            }
+        }
+    }
+    #[test]
     fn rotation_only_filter_boundary_is_continuous() {
         for fft in [false, true] {
             let table = Arc::new(

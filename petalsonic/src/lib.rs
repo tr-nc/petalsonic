@@ -82,6 +82,7 @@ mod events;
 mod gain;
 mod math;
 mod occlusion;
+mod output_limiter;
 mod output_session;
 mod platform;
 mod playback;

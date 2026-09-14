@@ -375,6 +375,10 @@ impl OutputSession {
             MASTER_HEADROOM_DB,
             crate::gain::db_to_linear(MASTER_HEADROOM_DB)
         );
+        log::info!(
+            "PetalSonic stereo output limiter: {} ms lookahead, sample-peak protection",
+            crate::output_limiter::LOOKAHEAD_MS
+        );
         let consumer = match self
             .render
             .lock()

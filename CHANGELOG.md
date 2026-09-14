@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-15
+
+### Fixed
+- Prevent native HRTF filter-switch discontinuities during listener rotation by
+  crossfading complete old/new convolutions over a render block.
+- Use shared input history for overlap-save FFT and FIR fallback so filter changes
+  and variable block sizes do not retain tails from incompatible filters.
+
+### Added
+- Regression coverage for rotation-only continuity, long filter histories,
+  rapid direction reversals, mixed block sizes, reset, and a release real-HRIR sweep.
+
 ## [0.9.1] - 2026-09-13
 
 ### Added

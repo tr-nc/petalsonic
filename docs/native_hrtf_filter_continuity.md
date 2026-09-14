@@ -44,4 +44,6 @@ cargo test --release -p petalsonic real_table_rotation_sweep_matches_fir -- --ig
 tools/publish_realtime_gate.sh
 ```
 
-Local repair only: no version bump, registry publication, tag or remote push.
+Initial validation was local only, without publication. On 2026-09-15 the
+Re: Flora user reported that the rotation crackle appeared fixed during
+listening and explicitly authorized publishing this repair as patch 0.9.2.
